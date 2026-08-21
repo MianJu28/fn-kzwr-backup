@@ -103,6 +103,47 @@ impl KzwrTarget {
             .cloned()
             .ok_or_else(|| StorageError::NotFound(path.to_string_lossy().into_owned()))
     }
+
+    /// 确保目标文件夹存在（逐级创建）。folder 为 "/" 或空时跳过。
+    async fn ensure_folder(&self, folder: &str) -> StorageResult<()> {
+        let folder = folder.trim_matches('/');
+        if folder.is_empty() {
+            return Ok(());
+        }
+        // 逐级创建：fn-backup/sub -> fn-backup, fn-backup/sub
+        // 不先 list 检查（list 对不存在目录可能报错），直接尝试创建，
+        // create_folder 对已存在目录返回已存在错误（可忽略）
+        let mut parent = "/".to_string();
+        for part in folder.split('/') {
+            if part.is_empty() {
+                continue;
+            }
+            let path = if parent == "/" {
+                format!("/{}", part)
+            } else {
+                format!("{}/{}", parent, part)
+            };
+            match self.client.create_folder(part, &parent).await {
+                Ok(_) => {}
+                Err(e) => {
+                    let msg = e.to_string();
+                    // "已存在" / "存在同名" / "exist" 等已存在错误视为成功
+                    let is_exists = msg.contains("已存在")
+                        || msg.contains("同名的")
+                        || msg.contains("exist")
+                        || msg.contains("already");
+                    if !is_exists {
+                        return Err(StorageError::Protocol(format!(
+                            "创建文件夹 {} 失败: {}",
+                            path, e
+                        )));
+                    }
+                }
+            }
+            parent = path;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -121,13 +162,27 @@ impl TargetStorage for KzwrTarget {
         }
         tmp.flush().map_err(StorageError::Io)?;
 
+        // 目标文件夹需以 "/" 开头（kzwr 路径约定），如 "/fn-backup"
         let folder = path
             .parent()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "/".to_string());
-        let folder = if folder.is_empty() { "/".to_string() } else { folder };
+        let folder = if folder.is_empty() || !folder.starts_with('/') {
+            format!("/{}", folder)
+        } else {
+            folder
+        };
 
-        upload_file(&self.client, tmp.path(), &folder, "Auto", 0, 3)
+        // 确保目标文件夹存在（逐级创建）
+        self.ensure_folder(&folder).await?;
+
+        // 目标文件名：用逻辑路径的真实文件名（而非临时文件 .tmpXXXX）
+        let target_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string());
+
+        upload_file(&self.client, tmp.path(), &folder, "Auto", 0, 3, target_name.as_deref())
             .await
             .map_err(|e| StorageError::Protocol(e.to_string()))?;
         Ok(())

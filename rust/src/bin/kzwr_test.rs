@@ -148,7 +148,7 @@ async fn physical_delete_test(client: &KzwrClient) {
         println!("[!] 生成物理删除测试文件失败");
         return;
     }
-    match upload_file(client, &local_path, "/share", "Auto", 0, 3).await {
+    match upload_file(client, &local_path, "/share", "Auto", 0, 3, None).await {
         Ok(_) => println!("[+] 临时文件上传成功: {}", file_name),
         Err(e) => {
             println!("[!] 上传失败: {:?}", e);
@@ -375,7 +375,7 @@ async fn upload_test(client: &KzwrClient) -> Option<Uploaded> {
 
     // 上传到 /share 目录
     println!("[*] 分片上传到 /share ...");
-    match upload_file(client, &local_path, "/share", "Auto", 0, 3).await {
+    match upload_file(client, &local_path, "/share", "Auto", 0, 3, None).await {
         Ok(resp) => {
             println!("[+] 上传完成! 响应: {}", serde_json::to_string_pretty(&resp).unwrap());
             Some(Uploaded {

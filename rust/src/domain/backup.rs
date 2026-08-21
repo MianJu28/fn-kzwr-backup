@@ -30,6 +30,8 @@ pub struct BackupJob {
     pub target: Arc<dyn TargetStorage>,
     pub crypto: CryptoSession,
     pub store: Arc<SnapshotStore>,
+    /// 目标根目录前缀（如 "/fn-backup"），为 None 时写入目标根
+    pub target_prefix: Option<String>,
 }
 
 impl BackupJob {
@@ -65,7 +67,7 @@ impl BackupJob {
         // 4) 删除目标中已不存在的文件
         let mut deleted = 0usize;
         for rel in &changeset.delete {
-            let target_path = PathBuf::from(rel);
+            let target_path = self.target_path(rel);
             match self.target.delete(&target_path).await {
                 Ok(()) => {
                     deleted += 1;
@@ -110,11 +112,27 @@ impl BackupJob {
         })
         .await??;
 
-        // 写入目标
+        // 写入目标（带 target_prefix）
         let bytes = Bytes::from(encrypted);
         let stream = Box::new(futures::stream::iter(vec![bytes]));
-        self.target.write_stream(&PathBuf::from(rel_path), stream).await?;
+        let target_path = self.target_path(rel_path);
+        self.target.write_stream(&target_path, stream).await?;
         Ok(plain_len as u64)
+    }
+
+    /// 计算目标路径：把相对路径拼上 target_prefix 前缀
+    fn target_path(&self, rel_path: &str) -> PathBuf {
+        match &self.target_prefix {
+            Some(prefix) => {
+                let prefix = prefix.trim_matches('/');
+                if prefix.is_empty() {
+                    PathBuf::from(rel_path)
+                } else {
+                    PathBuf::from(format!("{}/{}", prefix, rel_path.trim_start_matches('/')))
+                }
+            }
+            None => PathBuf::from(rel_path),
+        }
     }
 }
 

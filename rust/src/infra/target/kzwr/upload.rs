@@ -118,6 +118,7 @@ pub async fn upload_file(
     scene: &str,
     region: u64,
     concurrency: usize,
+    target_name: Option<&str>,
 ) -> KzwrResult<Value> {
     if !file_path.is_file() {
         return Err(KzwrError::Other(format!(
@@ -125,10 +126,15 @@ pub async fn upload_file(
             file_path.display()
         )));
     }
-    let file_name = file_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| KzwrError::Other("无法获取文件名".to_string()))?;
+    // 目标文件名：优先用显式 target_name（如逻辑路径文件名），否则取文件路径名
+    let file_name = match target_name {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => file_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| KzwrError::Other("无法获取文件名".to_string()))?
+            .to_string(),
+    };
 
     // 1) 计算哈希并创建上传索引
     let h = hash_first_last_and_pieces(file_path)?;
@@ -173,7 +179,7 @@ pub async fn upload_file(
             client,
             file_path,
             folder,
-            file_name,
+            &file_name,
             &file_identifier,
             ci,
             total_bytes,
