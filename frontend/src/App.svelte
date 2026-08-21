@@ -1,15 +1,16 @@
 <script>
-  import LiveStatus from './components/LiveStatus.svelte';
-  import OverviewSection from './components/OverviewSection.svelte';
-  import LoginSection from './components/LoginSection.svelte';
-  import BackupConfigSection from './components/BackupConfigSection.svelte';
-  import BackupSection from './components/BackupSection.svelte';
-  import RestoreSection from './components/RestoreSection.svelte';
+  import DashboardPage from './views/DashboardPage.svelte';
+  import BackupPage from './views/BackupPage.svelte';
+  import RestorePage from './views/RestorePage.svelte';
+  import SettingsPage from './views/SettingsPage.svelte';
 
   // 全局状态
   let health = '检查中...';
   let error = null;
   let busy = false;
+
+  // 当前页面（导航切换）
+  let currentPage = 'dashboard';
 
   // kzwr 登录
   let loggedIn = false;
@@ -27,6 +28,13 @@
   // 实时任务状态（WebSocket 推送）
   let liveStatus = null; // { kind, status, current_file, done, total }
   let wsConnected = false;
+
+  const navItems = [
+    { id: 'dashboard', label: '📊 概览' },
+    { id: 'backup', label: '⬆️ 备份' },
+    { id: 'restore', label: '⬇️ 恢复' },
+    { id: 'settings', label: '⚙️ 设置' },
+  ];
 
   // 连接 WebSocket 实时状态流
   function connectWS() {
@@ -99,7 +107,7 @@
     }
   }
 
-  // kzwr 登录（供 LoginSection 调用，返回消息字符串）
+  // kzwr 登录（供 SettingsPage 调用，返回消息字符串）
   async function handleLogin(username, password) {
     busy = true;
     error = null;
@@ -123,7 +131,7 @@
     }
   }
 
-  // 保存配置（供 BackupConfigSection 调用）
+  // 保存配置（供 BackupPage 调用）
   async function handleSaveConfig() {
     busy = true;
     error = null;
@@ -148,7 +156,7 @@
     }
   }
 
-  // 立即备份（供 BackupSection 调用）
+  // 立即备份（供 BackupPage 调用）
   async function handleRunBackup() {
     busy = true;
     error = null;
@@ -165,7 +173,7 @@
     }
   }
 
-  // 恢复请求（供 RestoreSection 调用，返回 {restored, restored_bytes, error}）
+  // 恢复请求（供 RestorePage 调用，返回 {restored, restored_bytes, error}）
   async function handleRestore(files, sourcePath) {
     const body = { files, source_path: sourcePath };
     const res = await fetch('/api/restore/run', {
@@ -188,41 +196,50 @@
     <p class="health" class:ok={health.startsWith('服务正常')}>{health}</p>
   </header>
 
+  <!-- 顶部导航栏 -->
+  <nav class="top-nav">
+    {#each navItems as item}
+      <button
+        class="nav-item"
+        class:active={currentPage === item.id}
+        on:click={() => (currentPage = item.id)}
+      >
+        {item.label}
+      </button>
+    {/each}
+  </nav>
+
   {#if error}
     <div class="error">⚠️ {error}</div>
   {/if}
 
-  <!-- 实时任务状态（WebSocket 推送） -->
-  <LiveStatus {liveStatus} />
-
-  <!-- 当前配置概览 -->
-  <OverviewSection
-    {backupPaths}
-    {targetFolder}
-    {loggedIn}
-    {restoreFolders}
-    {scheduleCron}
-    {scheduleCronValid}
-  />
-
-  <!-- kzwr 登录 -->
-  <LoginSection {loggedIn} {busy} onLogin={handleLogin} />
-
-  <!-- 备份路径配置 + 定时 cron -->
-  <BackupConfigSection
-    bind:backupPaths
-    bind:targetFolder
-    bind:scheduleCron
-    bind:scheduleCronValid
-    {busy}
-    onSave={handleSaveConfig}
-  />
-
-  <!-- 备份 -->
-  <BackupSection {busy} {backupResult} onRunBackup={handleRunBackup} />
-
-  <!-- 恢复 -->
-  <RestoreSection {restoreFolders} {busy} onRestore={handleRestore} />
+  <!-- 按功能切换页面 -->
+  {#if currentPage === 'dashboard'}
+    <DashboardPage
+      {liveStatus}
+      {backupPaths}
+      {targetFolder}
+      {loggedIn}
+      {restoreFolders}
+      {scheduleCron}
+      {scheduleCronValid}
+    />
+  {:else if currentPage === 'backup'}
+    <BackupPage
+      bind:backupPaths
+      bind:targetFolder
+      bind:scheduleCron
+      bind:scheduleCronValid
+      {busy}
+      {backupResult}
+      onSave={handleSaveConfig}
+      onRunBackup={handleRunBackup}
+    />
+  {:else if currentPage === 'restore'}
+    <RestorePage {restoreFolders} {busy} onRestore={handleRestore} />
+  {:else if currentPage === 'settings'}
+    <SettingsPage {loggedIn} {busy} onLogin={handleLogin} />
+  {/if}
 
   <footer>fnos-backup · age 加密 · kzwr 增量备份</footer>
 </main>
@@ -239,10 +256,41 @@
     margin: 0 auto;
     padding: 24px 16px 40px;
   }
-  header { padding: 24px 0 16px; border-bottom: 1px solid #e0e4ea; }
+  header { padding: 24px 0 12px; border-bottom: 1px solid #e0e4ea; }
   h1 { margin: 0; font-size: 24px; }
   .health { color: #5a6a7a; }
   .health.ok { color: #22a06b; }
+
+  /* 顶部导航栏 */
+  .top-nav {
+    display: flex;
+    gap: 4px;
+    padding: 12px 0;
+    border-bottom: 1px solid #e0e4ea;
+    position: sticky;
+    top: 0;
+    background: #f5f6fa;
+    z-index: 10;
+  }
+  .nav-item {
+    flex: 1;
+    background: transparent;
+    color: #5a6a7a;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin: 0;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s;
+  }
+  .nav-item:hover { background: #eef1f6; color: #1f2d3d; }
+  .nav-item.active {
+    background: #2563eb;
+    color: #fff;
+  }
+
   .error { background: #fef2f2; color: #b91c1c; padding: 12px; border-radius: 6px; margin-top: 12px; }
   footer { text-align: center; color: #8a94a6; font-size: 13px; margin-top: 28px; }
 </style>
