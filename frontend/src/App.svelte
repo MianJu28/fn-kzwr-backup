@@ -15,6 +15,17 @@
   let backupPaths = [];
   let pathInput = '';
   let targetFolder = 'fn-backup';
+  // 定时备份 cron 配置
+  let scheduleCron = '';
+  let scheduleCronValid = true;
+  const cronPresets = [
+    { label: '每天 00:00', value: '0 0 * * *' },
+    { label: '每天 06:00', value: '0 6 * * *' },
+    { label: '每天 23:00', value: '0 23 * * *' },
+    { label: '每小时整点', value: '0 * * * *' },
+    { label: '每 12 小时', value: '0 */12 * * *' },
+    { label: '每周一 02:00', value: '0 2 * * 1' },
+  ];
 
   // 备份/恢复
   let backupResult = null;
@@ -80,6 +91,8 @@
       const data = await res.json();
       backupPaths = data.backup_paths || [];
       targetFolder = data.target_folder || 'fn-backup';
+      scheduleCron = data.schedule_cron || '';
+      scheduleCronValid = data.schedule_cron_valid !== false;
       loggedIn = data.logged_in;
       if (data.error) error = data.error;
     } catch (e) {
@@ -226,15 +239,26 @@
       const res = await fetch('/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ backup_paths: backupPaths, target_folder: targetFolder }),
+        body: JSON.stringify({
+          backup_paths: backupPaths,
+          target_folder: targetFolder,
+          schedule_cron: scheduleCron.trim(),
+        }),
       });
       const data = await res.json();
+      scheduleCronValid = data.schedule_cron_valid !== false;
       if (data.error) error = data.error;
+      else if (!scheduleCronValid) error = 'cron 表达式无效，已拒绝保存';
     } catch (e) {
       error = e.message;
     } finally {
       busy = false;
     }
+  }
+
+  function applyCronPreset(val) {
+    scheduleCron = val;
+    scheduleCronValid = true;
   }
 
   async function runBackup() {
@@ -317,6 +341,12 @@
       <span class="ov-value">{loggedIn ? '✅ 已登录' : '⚠️ 未登录'}</span>
     </div>
     <div class="ov-row">
+      <span class="ov-label">定时备份</span>
+      <span class="ov-value">
+        {scheduleCron ? (scheduleCronValid ? `⏰ ${scheduleCron}` : '⚠️ cron 无效') : '未启用'}
+      </span>
+    </div>
+    <div class="ov-row">
       <span class="ov-label">可恢复文件</span>
       <span class="ov-value">{restoreFolders.length > 0 ? `${restoreFolders.length} 个文件夹` : '未配置'}</span>
     </div>
@@ -364,6 +394,29 @@
         </li>
       {/each}
     </ul>
+
+    <div class="cron-block">
+      <h3>⏰ 定时备份</h3>
+      <p class="hint">设置 cron 表达式定时自动触发备份。留空关闭定时备份。标准 5 段格式：<code>分 时 日 月 周</code>。</p>
+      <div class="cron-presets">
+        {#each cronPresets as preset}
+          <button class="chip" type="button" on:click={() => applyCronPreset(preset.value)}>{preset.label}</button>
+        {/each}
+        <button class="chip off" type="button" on:click={() => applyCronPreset('')}>关闭定时</button>
+      </div>
+      <label>cron 表达式
+        <input
+          bind:value={scheduleCron}
+          placeholder="0 0 * * *  (每天零点)"
+          class:invalid={!scheduleCronValid && scheduleCron.trim() !== ''}
+        />
+      </label>
+      {#if !scheduleCronValid && scheduleCron.trim() !== ''}
+        <p class="warn">⚠️ cron 表达式无效，请检查格式（分 时 日 月 周）</p>
+      {/if}
+      <p class="example">示例：<code>0 */12 * * *</code> 每 12 小时 · <code>0 2 * * 1</code> 每周一 02:00</p>
+    </div>
+
     <button on:click={saveConfig} disabled={busy}>
       {busy ? '保存中...' : '保存配置'}
     </button>
@@ -550,6 +603,25 @@
     font-family: monospace;
     font-size: 13px;
   }
+  .cron-block { margin-top: 16px; padding-top: 14px; border-top: 1px solid #eef1f6; }
+  .cron-block h3 { margin: 0 0 6px; font-size: 15px; }
+  .cron-block code { background: #f1f5f9; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+  .cron-presets { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 2px; }
+  .chip {
+    background: #f1f5f9;
+    color: #334155;
+    border: 1px solid #e2e8f0;
+    border-radius: 20px;
+    padding: 6px 12px;
+    margin: 0;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .chip:hover { background: #e0e7ff; color: #2563eb; border-color: #a5b4fc; }
+  .chip.off { color: #b91c1c; }
+  input.invalid { border-color: #dc2626; background: #fef2f2; }
+  .example { color: #64748b; font-size: 12px; margin: 8px 0 0; }
   .result { margin-top: 14px; padding: 12px; background: #ecfdf3; border-radius: 6px; }
   .result p { margin: 0 0 6px; font-weight: 600; }
   .result ul { margin: 0; padding-left: 20px; }

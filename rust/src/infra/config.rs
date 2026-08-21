@@ -34,6 +34,9 @@ pub struct BackupConfig {
     /// 保留策略（孤儿文件清理）
     #[serde(default)]
     pub retention: RetentionConfig,
+    /// 定时备份 cron 表达式（如 "0 0 * * *" 每天零点；None/空 = 不启用）
+    #[serde(default)]
+    pub schedule_cron: Option<String>,
 }
 
 /// 保留策略配置

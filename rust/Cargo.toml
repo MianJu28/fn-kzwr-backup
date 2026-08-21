@@ -59,6 +59,10 @@ anyhow = "1"
 # 临时文件（kzwr 分片上传暂存）
 tempfile = "3"
 
+# 定时备份调度（cron 解析 + 时间计算）
+croner = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
 [profile.release]
 lto = true
 strip = true

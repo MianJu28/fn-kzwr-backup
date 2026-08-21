@@ -42,6 +42,10 @@ pub struct LoginResponse {
 pub struct ConfigResponse {
     pub backup_paths: Vec<String>,
     pub target_folder: String,
+    /// 定时备份 cron 表达式（空 = 未启用）
+    pub schedule_cron: String,
+    /// cron 表达式是否合法（供前端提示）
+    pub schedule_cron_valid: bool,
     pub logged_in: bool,
     pub login_bin_available: bool,
     pub error: Option<String>,
@@ -52,6 +56,8 @@ pub struct ConfigResponse {
 pub struct ConfigSaveRequest {
     pub backup_paths: Vec<String>,
     pub target_folder: Option<String>,
+    /// 定时备份 cron 表达式（空 = 关闭定时）
+    pub schedule_cron: Option<String>,
 }
 
 /// 备份响应
@@ -141,6 +147,26 @@ async fn auth_login(
 }
 
 /// 读取配置（不含敏感字段明文）
+/// 由配置构造响应（含 cron 校验）
+fn config_response(
+    cfg: &crate::infra::config::AppConfig,
+    state: &AppState,
+    logged_in: bool,
+    error: Option<String>,
+) -> ConfigResponse {
+    let schedule = cfg.backup.schedule_cron.clone().unwrap_or_default();
+    let valid = crate::domain::scheduler::validate_cron(&schedule).is_ok();
+    ConfigResponse {
+        backup_paths: cfg.backup.paths.clone(),
+        target_folder: cfg.backup.target_folder.clone(),
+        schedule_cron: schedule,
+        schedule_cron_valid: valid,
+        logged_in,
+        login_bin_available: state.auth.bin_exists(),
+        error,
+    }
+}
+
 async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
     let cfg_guard = state.config.lock().unwrap();
     let cfg = match cfg_guard.load() {
@@ -149,6 +175,8 @@ async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
             return Json(ConfigResponse {
                 backup_paths: Vec::new(),
                 target_folder: state.target_folder.clone(),
+                schedule_cron: String::new(),
+                schedule_cron_valid: true,
                 logged_in: false,
                 login_bin_available: state.auth.bin_exists(),
                 error: Some(format!("{:#}", e)),
@@ -156,16 +184,10 @@ async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
         }
     };
     let logged_in = crate::infra::kzwr_auth::KzwrAuthService::has_credentials(&cfg);
-    Json(ConfigResponse {
-        backup_paths: cfg.backup.paths.clone(),
-        target_folder: cfg.backup.target_folder.clone(),
-        logged_in,
-        login_bin_available: state.auth.bin_exists(),
-        error: None,
-    })
+    Json(config_response(&cfg, &state, logged_in, None))
 }
 
-/// 保存配置（备份路径、目标文件夹）
+/// 保存配置（备份路径、目标文件夹、定时 cron）
 async fn config_save(
     State(state): State<AppState>,
     Json(body): Json<ConfigSaveRequest>,
@@ -181,50 +203,61 @@ async fn config_save(
             cfg.backup.target_folder = folder;
         }
     }
+    // 定时 cron：校验合法性；空串视为关闭
+    if let Some(cron) = body.schedule_cron {
+        let cron = cron.trim().to_string();
+        if let Err(e) = crate::domain::scheduler::validate_cron(&cron) {
+            let resp = config_response(&cfg, &state, cfg.kzwr.username_enc.is_some(), Some(e.to_string()));
+            return Json(resp);
+        }
+        if cron.is_empty() {
+            cfg.backup.schedule_cron = None;
+        } else {
+            cfg.backup.schedule_cron = Some(cron);
+        }
+    }
     match cfg_guard.save(&cfg) {
-        Ok(_) => Json(ConfigResponse {
-            backup_paths: cfg.backup.paths.clone(),
-            target_folder: cfg.backup.target_folder.clone(),
-            logged_in: cfg.kzwr.username_enc.is_some(),
-            login_bin_available: state.auth.bin_exists(),
-            error: None,
-        }),
-        Err(e) => Json(ConfigResponse {
-            backup_paths: body.backup_paths,
-            target_folder: cfg.backup.target_folder.clone(),
-            logged_in: false,
-            login_bin_available: state.auth.bin_exists(),
-            error: Some(format!("{:#}", e)),
-        }),
+        Ok(_) => {
+            let logged_in = cfg.kzwr.username_enc.is_some();
+            Json(config_response(&cfg, &state, logged_in, None))
+        }
+        Err(e) => Json(config_response(&cfg, &state, false, Some(format!("{:#}", e)))),
     }
 }
 
 /// 触发备份：确保登录 + 遍历配置的多备份路径
 async fn backup_run(State(state): State<AppState>) -> Json<BackupResponse> {
+    Json(run_backup_now(&state).await)
+}
+
+/// 执行一次备份（可被 HTTP handler 与定时调度器复用）
+///
+/// 返回 BackupResponse（含 uploaded/deleted/orphan_removed/error）。
+pub async fn run_backup_now(state: &AppState) -> BackupResponse {
     // 1) 确保已登录（token 过期自动重登）
     if let Err(e) = state.auth.ensure_login() {
-        return Json(BackupResponse {
+        return BackupResponse {
             uploaded: 0,
             uploaded_bytes: 0,
             deleted: 0,
             unchanged: 0,
             orphan_removed: 0,
             error: Some(format!("登录失败: {:#}", e)),
-        });
+        };
     }
 
     // 2) 读取配置的备份路径（锁操作隔离在同步函数，避免跨 await）
-    let (paths, target_folder, retention_cfg) = read_backup_config(&state);
+    let (paths, target_folder, retention_cfg) = read_backup_config(state);
 
     if paths.is_empty() {
-        return Json(BackupResponse {
+        return BackupResponse {
             uploaded: 0,
             uploaded_bytes: 0,
             deleted: 0,
             unchanged: 0,
             orphan_removed: 0,
             error: Some("未配置备份路径".to_string()),
-        });
+        };
     }
 
     // 3) 执行多路径备份
@@ -255,22 +288,22 @@ async fn backup_run(State(state): State<AppState>) -> Json<BackupResponse> {
         retention,
     };
     match job.run_multi(&paths).await {
-        Ok(summary) => Json(BackupResponse {
+        Ok(summary) => BackupResponse {
             uploaded: summary.uploaded,
             uploaded_bytes: summary.uploaded_bytes,
             deleted: summary.deleted,
             unchanged: summary.unchanged,
             orphan_removed: summary.orphan_removed,
             error: None,
-        }),
-        Err(e) => Json(BackupResponse {
+        },
+        Err(e) => BackupResponse {
             uploaded: 0,
             uploaded_bytes: 0,
             deleted: 0,
             unchanged: 0,
             orphan_removed: 0,
             error: Some(format!("{:#}", e)),
-        }),
+        },
     }
 }
 

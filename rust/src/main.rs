@@ -113,6 +113,10 @@ async fn main() -> anyhow::Result<()> {
         default_restore_dir,
     };
 
+    // 定时备份调度器（后台任务，到点触发备份）
+    let scheduler_state = state.clone();
+    fnos_backup::domain::scheduler::spawn_scheduler(scheduler_state, 60);
+
     // 前端静态资源目录
     let www_dir = std::env::var("TRIM_WWW_DIR").unwrap_or_else(|_| "www".to_string());
     let www_dir = std::path::PathBuf::from(&www_dir);
