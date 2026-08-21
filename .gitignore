@@ -29,6 +29,7 @@ bin/run_headful.sh
 bin/run_api_test.sh
 bin/run_kzwr_backup_test.sh
 bin/run_cleanup_test.sh
+bin/run_restore_test.sh
 bin/login_fixed.py
 
 # ── Python ─────────────────────────────────────

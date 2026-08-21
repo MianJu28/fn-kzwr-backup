@@ -120,7 +120,7 @@ impl BackupJob {
         Ok(plain_len as u64)
     }
 
-    /// 计算目标路径：把相对路径拼上 target_prefix 前缀
+    /// 计算目标路径：把相对路径拼上 target_prefix 前缀（统一带前导斜杠，如 "/fn-backup/xxx"）
     fn target_path(&self, rel_path: &str) -> PathBuf {
         match &self.target_prefix {
             Some(prefix) => {
@@ -128,7 +128,7 @@ impl BackupJob {
                 if prefix.is_empty() {
                     PathBuf::from(rel_path)
                 } else {
-                    PathBuf::from(format!("{}/{}", prefix, rel_path.trim_start_matches('/')))
+                    PathBuf::from(format!("/{}/{}", prefix, rel_path.trim_start_matches('/')))
                 }
             }
             None => PathBuf::from(rel_path),
