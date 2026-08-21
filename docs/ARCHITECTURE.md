@@ -308,6 +308,8 @@ trait TargetStorage {
 
 项目遵循飞牛应用规范，Rust 源码与前端源码在开发期独立，打包时合入飞牛目录结构。
 
+> 以下为**目标结构**（飞牛应用部署形态）。开发期 `rust/` 与 `frontend/` 独立演进，打包时合入飞牛目录。**当前实际 Rust 源码结构**见文末"项目进度"一节。
+
 ```
 fnos-backup/
 ├── manifest                    # 飞牛应用元数据 (appname/version/platform/ctl_stop)
@@ -341,56 +343,69 @@ fnos-backup/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs             # 入口: axum HTTP 服务启动
+│       ├── lib.rs              # 库入口 (AppState 等)
 │       ├── http/               # 接口层 (REST + WebSocket)
-│       │   ├── routes.rs       # 路由定义
-│       │   ├── handler/        # backup/restore/config handler
+│       │   ├── routes.rs       # 路由 + 各 handler (backup/restore/config/health)
 │       │   └── ws.rs           # 状态推送 WebSocket
-│       ├── app/                # 应用编排层
-│       │   ├── scheduling/     # 备份调度 (BackupJob 聚合)
-│       │   └── restore/        # 恢复编排 (RestoreJob 聚合)
 │       ├── domain/             # 领域核心层 (纯逻辑, 无 IO)
-│       │   ├── sync/           # 增量同步 (SyncSession 聚合)
-│       │   ├── crypto/         # 加密 (CryptoSession 聚合)
-│       │   └── metadata/       # 元数据索引 (领域模型)
+│       │   ├── backup.rs       # 备份调度 (BackupJob 聚合)
+│       │   ├── sync.rs         # 增量同步 (SyncSession 聚合)
+│       │   ├── crypto.rs       # 加密 (CryptoSession 聚合)
+│       │   ├── restore.rs      # 恢复编排 (RestoreJob 聚合)
+│       │   └── retention.rs    # 保留策略 (孤儿文件清理)
 │       ├── infra/              # 基础设施层 (ACL 适配器)
-│       │   ├── source/         # Source 适配器: local/ (仅本地FS)
-│       │   ├── target/         # Target 适配器: kzwr/ (酷族自定义API, Rust 重写实现)
-│       │   ├── storage_trait.rs
-│       │   └── fnos/           # fnos 集成: 路径环境变量/通知
-│       ├── persistence/        # 数据层
-│       │   ├── sqlite/         # rusqlite + 迁移
-│       │   ├── keystore/       # 密钥加密存储
-│       │   └── config/         # TOML 配置 (读 TRIM_PKGETC)
-│       ├── eventbus/           # 内部事件总线
-│       └── logging/            # tracing 配置
+│       │   ├── source/local/   # Source 适配器: local/ (仅本地FS)
+│       │   ├── target/kzwr/    # Target 适配器: kzwr/ (client/storage/upload)
+│       │   ├── persistence/    # snapshot.rs (SQLite 快照)
+│       │   ├── config.rs       # TOML 配置 (读 TRIM_PKGETC)
+│       │   ├── keystore.rs     # 密钥加密存储
+│       │   ├── kzwr_auth.rs    # 酷族登录认证服务
+│       │   └── storage_trait.rs
+│       ├── bin/                # 测试二进制 (开发期, 不入生产)
+│       └── eventbus.rs         # 内部事件总线
 ├── frontend/                   # 前端源码 (开发期)
 │   ├── package.json
 │   ├── vite.config.ts
 │   ├── src/
 │   │   ├── App.svelte
-│   │   ├── views/              # Dashboard/BackupConfig/RestoreWizard
-│   │   └── stores/
+│   │   └── ...
 │   └── dist/                   # 构建产物 → 拷贝至 app/www/
-├── migrations/                 # SQLite 迁移脚本
+├── bin/                        # 开发期测试/启动脚本 (不入库, gitignored)
 └── docs/
-    └── ARCHITECTURE.md         # 本文档
+    ├── ARCHITECTURE.md         # 本文档
+    └── TECH_SELECTION.md       # 技术选型分析
 ```
 
 **构建流程**：`cargo build --release` → 二进制入 `target/bin/`；酷族登录脚本（`kzwr_login_turnstile.py`）经 PyInstaller 编译为 `kzwr-login` 二进制（x86_64+aarch64）入 `target/bin/`；`cd frontend && npm run build` → 产物入 `app/www/`；`fnpack build` → 生成 `.fpk`。
+
+> 注：开发期通过 WSL 构建（`cargo build`），实际源码以 Windows 侧 `rust/src/` 为准，构建前用 `cp -r` 同步到 WSL `$HOME/fnos-backup/src`。
 
 ---
 
 ## 8. 演进路线图
 
-| 阶段 | 交付物 | 关键风险 | 可逆性 |
-|------|--------|----------|--------|
-| **Phase 1 · MVP** | 全量备份 · 单源单目标 · 基础 Web UI · 本地 FS 源 · 酷族自定义 API 目标 · 飞牛 `.fpk` 打包 | 酷族 session 对接 · 飞牛生命周期集成 | 完全可逆 |
-| **Phase 2 · 增量加密** | mtime 差分 · age 加密 · 流式管道 · 64MB 分块 · SQLite 元数据 | 私钥管理 · 大文件内存 | 完全可逆 |
-| **Phase 3 · 恢复能力** | 选择性恢复 · 恢复向导 UI · 完整性校验 · BLAKE3 严格模式 | 索引膨胀 | 部分可逆（元数据格式定型需迁移） |
-| **Phase 4 · 生产强化** | 多目标支持 · 保留策略 · 断点续传 · 监控告警 · fnos 服务化 | 并发控制 · 资源争用 | 部分可逆 |
-| **Phase 5 · 演进扩展** | 异地恢复 · 密钥轮换 · 插件化 · 可选分布式 | 跨节点一致性 | 视需求启用 |
+> 状态图例：✅ 已完成 · 🔶 部分完成 · ⏳ 规划中
+
+| 阶段 | 交付物 | 状态 | 关键风险 | 可逆性 |
+|------|--------|------|----------|--------|
+| **Phase 1 · MVP** | 全量备份 · 单源单目标 · 基础 Web UI · 本地 FS 源 · 酷族自定义 API 目标 · 飞牛 `.fpk` 打包 | ✅ 核心完成（.fpk 打包待部署） | 酷族 session 对接（已解决）· 飞牛生命周期集成 | 完全可逆 |
+| **Phase 2 · 增量加密** | mtime 差分 · age 加密 · 流式管道 · 64MB 分块 · SQLite 元数据 | ✅ 完成 | 私钥管理（已用密钥库解决）· 大文件内存 | 完全可逆 |
+| **Phase 3 · 恢复能力** | 选择性恢复 · 恢复向导 UI · 完整性校验 · BLAKE3 严格模式 | ✅ 完成 | 索引膨胀（结合保留策略缓解） | 部分可逆（元数据格式定型需迁移） |
+| **Phase 4 · 生产强化** | 多目标支持 · 保留策略 · 断点续传 · 监控告警 · fnos 服务化 | 🔶 保留策略✅ / 断点续传✅ / WebSocket 监控✅；多目标已放弃，.fpk 服务化⏳ | 并发控制 · 资源争用 | 部分可逆 |
+| **Phase 5 · 演进扩展** | 异地恢复 · 密钥轮换 · 插件化 · 可选分布式 | ⏳ 规划中 | 跨节点一致性 | 视需求启用 |
 
 **可逆性原则**：Phase 1-2 纯增量能力叠加，决策完全可逆；Phase 3-4 元数据格式定型后部分可逆（需写迁移脚本）；Phase 5 视实际需求启用，避免过早优化。
+
+**实际完成功能清单**（按 git 提交历史梳理）：
+- ✅ 增量加密备份（mtime+size 差分、age 加密、断点续传每文件即时快照）
+- ✅ BLAKE3 严格模式差分（内容哈希确认，ADR-004）
+- ✅ age 公私钥密钥库持久化（私钥被口令派生密钥加密存储）
+- ✅ kzwr API 全量 Rust 重写（分块上传/下载/删除/两阶段物理删除/文件夹 CRUD）
+- ✅ 恢复编排（RestoreJob）+ 恢复到源路径 + 多路径多 job 快照
+- ✅ 备份/恢复 HTTP API + Svelte Web UI（登录页、多路径配置、恢复树形视图）
+- ✅ WebSocket 实时任务监控（ADR-007 事件总线）
+- ✅ 保留策略：目标端孤儿文件清理（Phase 4）
+- 🔶 飞牛 `.fpk` 打包部署（待验证）
 
 ---
 
@@ -430,18 +445,106 @@ fnos-backup/
 
 ### 已选型（方案已定）
 
-| 选型项 | 结论 | Phase |
-|--------|------|-------|
-| 酷族网软对接 | 登录用编译二进制产出 session token；API 已用 Rust 重写实现 Target 适配器 | 1-2 |
-| 飞牛源访问 | 仅本地 FS（tokio::fs），不考虑 SMB/NFS | 1 |
-| 双架构编译 | musl 静态链接 + cross 工具，全纯 Rust 依赖，GitHub Actions matrix | 1 |
-| 源目录授权 | config/resource 声明 + 运行时引导，弃 root 模式 | 1 |
-| UI 暴露认证 | 端口服务 + JWT（wizard 设管理员口令），WebSocket 状态推送 | 1 |
-| 密钥管理 | age 公私钥（X25519）；备份用公钥加密、恢复用私钥解密；私钥可被口令派生密钥加密存储 | 2 |
+| 选型项 | 结论 | Phase | 状态 |
+|--------|------|-------|------|
+| 酷族网软对接 | 登录用编译二进制产出 session token；API 已用 Rust 重写实现 Target 适配器 | 1-2 | ✅ 已实现并实测 |
+| 飞牛源访问 | 仅本地 FS（tokio::fs），不考虑 SMB/NFS | 1 | ✅ 已实现 |
+| 双架构编译 | musl 静态链接 + cross 工具，全纯 Rust 依赖，GitHub Actions matrix | 1 | ⏳ 依赖 GitHub Actions 工作流 |
+| 源目录授权 | config/resource 声明 + 运行时引导，弃 root 模式 | 1 | 🔶 开发期用环境变量；飞牛部署待验证 |
+| UI 暴露认证 | 端口服务 + JWT（wizard 设管理员口令），WebSocket 状态推送 | 1 | 🔶 WebSocket✅；JWT 认证待部署 |
+| 密钥管理 | age 公私钥（X25519）；备份用公钥加密、恢复用私钥解密；私钥可被口令派生密钥加密存储 | 2 | ✅ 已实现（keystore 加密持久化） |
 
 ### 待验证（需实际测试）
 
-1. ⏳ **酷族 session token 对接**：编译二进制登录产出的 session token 需在本系统验证复用与过期处理（`TOKEN_EXPIRED` 暂停重登）
-2. ⏳ **config/resource 格式**：查阅飞牛文档确认共享目录声明的具体字段
-3. ⏳ **iframe 内 WebSocket**：验证飞牛 iframe CSP 是否允许 localhost WS 连接
-4. ⏳ **大文件块级增量**：Phase 3 评估是否引入块级 BLAKE3 哈希
+1. ✅ **酷族 session token 对接**：已通过 `kzwr_auth.rs` 实现 token 复用、`init_from_config` 启动加载、过期自动重登，实测通过
+2. ⏳ **config/resource 格式**：查阅飞牛文档确认共享目录声明的具体字段（.fpk 部署阶段）
+3. ⏳ **iframe 内 WebSocket**：WebSocket 本地已实测通过；飞牛 iframe CSP 是否允许 localhost WS 需部署验证
+4. ⏳ **大文件块级增量**：未引入块级 BLAKE3 哈希（当前整文件差分，块级留待 Phase 5 评估）
+5. ⏳ **飞牛 `.fpk` 打包部署**：双架构 GitHub Actions 构建工作流 + `fnpack` 打包验证
+
+---
+
+## 11. 项目进度（实现状态）
+
+> 本节为**滚动更新的当前进度基线**，随每次功能迭代更新。状态图例：✅ 已完成并实测 · 🔶 部分完成 · ⏳ 规划中。
+
+### 11.1 当前开发状态
+
+**核心备份/恢复主链路已完成并实测通过**，进入 Phase 4 生产强化收尾阶段。当前使用 WSL（Ubuntu）构建与测试，构建前将 Windows 侧 `rust/src/` 同步到 WSL `$HOME/fnos-backup/src`，运行编译好的二进制或通过 HTTP API 测试。
+
+### 11.2 已实现功能（按模块）
+
+| 模块 | 功能 | 状态 | 说明 |
+|------|------|------|------|
+| **备份调度** | 增量备份（mtime+size 差分） | ✅ | `BackupJob::run` / `run_strict` / `run_multi` |
+| | 断点续传 | ✅ | 每文件上传后即时存快照，中断可续 |
+| | 多路径备份 | ✅ | 每个源路径独立 job_id 快照，共享 target_prefix |
+| | 保留策略（孤儿清理） | ✅ | `domain/retention.rs`，备份后自动清理目标端孤儿文件 |
+| **增量同步** | 双策略差分 | ✅ | 快速 mtime+size / 严格 BLAKE3（ADR-004） |
+| **加密** | age 公私钥加密 | ✅ | 64MB 分块，公钥加密/私钥解密（ADR-003） |
+| | 密钥库持久化 | ✅ | 私钥被口令派生密钥加密存储，跨重启可用 |
+| **恢复** | 恢复编排 | ✅ | `RestoreJob`，选择性恢复、恢复到源路径 |
+| | 完整性校验 | ✅ | age AEAD tag 自动验证；恢复后内容对比校验 |
+| **kzwr 目标** | Rust API 重写 | ✅ | 分块上传/下载/删除、session 认证、token 刷新 |
+| | 两阶段物理删除 | ✅ | 逻辑删除进回收站 + 回收站 purge（Pids/FolderIds） |
+| | 文件夹 CRUD | ✅ | 创建/逻辑删除/物理删除 |
+| **存储抽象** | Source/Target trait | ✅ | `storage_trait.rs`（ADR-005），ACL 防腐层 |
+| **元数据** | SQLite 快照 | ✅ | `sync_snapshots` 表，WAL 模式（ADR-006） |
+| **事件总线** | 内部事件总线 | ✅ | tokio::broadcast，备份/恢复进度事件（ADR-007） |
+| **WebSocket** | 实时状态推送 | ✅ | `/api/ws`，前端实时进度条，断线重连 |
+| **Web UI** | Svelte 前端 | ✅ | 登录页、多路径配置、备份触发、恢复树形视图、配置概览 |
+| **HTTP API** | 备份/恢复/配置 | ✅ | `http/routes.rs`，axum 路由 |
+| **配置** | 加密 TOML 配置 | ✅ | kzwr 凭据/密码/token 加密存储（age scrypt） |
+| **测试** | 端到端测试 | ✅ | 真实 kzwr 备份/恢复/删除/多级文件夹/物理删除/保留策略 |
+| **飞牛部署** | `.fpk` 打包 | 🔶 | 结构已规划，GitHub Actions 双架构构建待实现 |
+| **监控告警** | 失败通知/告警 | ⏳ | 规划中（当前仅 WebSocket 实时状态） |
+| **多目标** | 备份到多个目标 | ❌ 放弃 | 按用户决策，保留策略实现，多目标不做 |
+
+### 11.3 当前实际 Rust 源码结构
+
+```
+rust/src/
+├── main.rs              # 入口: axum HTTP 服务启动
+├── lib.rs               # 库入口 (AppState 等)
+├── http/
+│   ├── mod.rs
+│   ├── routes.rs        # 路由 + 各 handler (backup/restore/config/health)
+│   └── ws.rs            # WebSocket 状态推送
+├── domain/
+│   ├── mod.rs
+│   ├── backup.rs        # BackupJob (备份调度 + 保留策略接入)
+│   ├── sync.rs          # SyncSession (差分)
+│   ├── crypto.rs        # CryptoSession (age 加密) + AgeKeys
+│   ├── restore.rs       # RestoreJob (恢复编排)
+│   └── retention.rs     # RetentionPolicy (孤儿文件清理)
+├── infra/
+│   ├── mod.rs
+│   ├── storage_trait.rs # SourceStorage / TargetStorage trait
+│   ├── source/local/    # LocalFsSource
+│   ├── target/kzwr/     # client.rs / storage.rs / upload.rs / mod.rs
+│   ├── persistence/snapshot.rs  # SnapshotStore (SQLite)
+│   ├── config.rs        # ConfigManager (TOML)
+│   ├── keystore.rs      # 密钥库
+│   └── kzwr_auth.rs     # KzwrAuthService (登录/token 管理)
+├── bin/                 # 测试二进制 (开发期)
+├── eventbus.rs          # EventBus (tokio::broadcast)
+└── ...
+```
+
+### 11.4 关键决策落地说明
+
+- **镜像一致而非多版本**：目标端与本地保持一致（`8ee9b0a` 移除版本树），不做多版本历史，简化恢复与保留语义
+- **保留策略语义**：因无多版本，保留策略聚焦"目标端孤儿文件清理"（不在任何 job 快照中的残留），防目标空间膨胀
+- **恢复目标**：支持恢复到配置源路径（原位置）或指定目录；目录用"新建/覆盖"按钮控制
+- **token 管理**：启动从配置加载已保存 token 避免重复登录，过期自动重登（`kzwr_auth.rs`）
+
+### 11.5 后续待办（按优先级）
+
+1. **飞牛 `.fpk` 打包 + GitHub Actions 双架构构建**（Phase 4 收尾）
+2. **监控告警**：备份失败/恢复失败的通知（fnos 通知或 Webhook）
+3. **密钥丢失恢复流程**：私钥备份/恢复引导（Phase 5 备用）
+4. **大文件块级增量**：按需评估（Phase 5）
+
+---
+
+> 本文档为权威架构基线。功能迭代时同步更新第 8 节（路线图状态）、第 10 节（选型状态）与第 11 节（项目进度）。
