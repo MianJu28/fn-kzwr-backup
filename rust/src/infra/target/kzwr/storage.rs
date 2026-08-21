@@ -70,11 +70,16 @@ impl KzwrTarget {
         &self,
         path: &Path,
     ) -> StorageResult<serde_json::Value> {
+        // 父目录需以 "/" 开头（kzwr API 约定），如 "/share" 而非 "share"
         let parent = path
             .parent()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "/".to_string());
-        let parent = if parent.is_empty() { "/".to_string() } else { parent };
+        let parent = if parent.is_empty() || !parent.starts_with('/') {
+            format!("/{}", parent)
+        } else {
+            parent
+        };
         let file_name = path
             .file_name()
             .and_then(|s| s.to_str())
@@ -153,13 +158,14 @@ impl TargetStorage for KzwrTarget {
 
     async fn delete(&self, path: &Path) -> StorageResult<()> {
         let entry = self.find_entry(path).await?;
-        let sid = entry
-            .get("sid")
-            .or_else(|| entry.get("id"))
+        // 与 Python 参考实现一致：先逻辑删除（进回收站）
+        // sids 传文件的 id（encodedId，对应 restore_file 的 Pids 语义）
+        let id = entry
+            .get("id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| StorageError::Other("条目中无 sid".to_string()))?;
+            .ok_or_else(|| StorageError::Other("条目中无 id".to_string()))?;
         self.client
-            .delete_file(&[sid.to_string()], true)
+            .delete_file(&[id.to_string()], false)
             .await
             .map_err(|e| StorageError::Protocol(e.to_string()))?;
         Ok(())
