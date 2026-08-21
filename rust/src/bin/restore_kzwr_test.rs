@@ -53,6 +53,7 @@ async fn main() -> Result<()> {
         store: store.clone(),
         target_prefix: Some(TARGET_FOLDER.to_string()),
         eventbus: None,
+        retention: None,
     };
     let s = backup_job.run(&src_root).await?;
     println!("[+] 备份: uploaded={}", s.uploaded);

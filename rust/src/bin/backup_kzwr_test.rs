@@ -66,6 +66,7 @@ async fn main() -> Result<()> {
         store: store.clone(),
         target_prefix: Some(TARGET_FOLDER.to_string()),
         eventbus: None,
+        retention: None,
     };
 
     // 1) 首次全量备份

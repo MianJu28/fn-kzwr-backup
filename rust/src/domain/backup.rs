@@ -17,6 +17,7 @@ use futures::StreamExt;
 use tracing::info;
 
 use crate::domain::crypto::CryptoSession;
+use crate::domain::retention::RetentionPolicy;
 use crate::domain::sync::SyncSession;
 use crate::infra::persistence::snapshot::{SnapshotEntry, SnapshotStore};
 use crate::infra::storage_trait::{
@@ -34,6 +35,8 @@ pub struct BackupJob {
     pub target_prefix: Option<String>,
     /// 内部事件总线（进度推送，可选）
     pub eventbus: Option<Arc<crate::eventbus::EventBus>>,
+    /// 保留策略（可选）：备份完成后清理目标端孤儿文件
+    pub retention: Option<RetentionPolicy>,
 }
 
 impl BackupJob {
@@ -52,6 +55,7 @@ impl BackupJob {
     /// 多路径备份：遍历多个源目录，各自增量备份到目标
     pub async fn run_multi(&self, roots: &[std::path::PathBuf]) -> Result<BackupSummary> {
         let mut total = BackupSummary::default();
+        let mut job_ids: Vec<String> = Vec::new();
         for (i, root) in roots.iter().enumerate() {
             // 每个源路径对应独立 job 快照（用序号作 job_id 后缀，避免快照互相覆盖）
             let job_id = format!("{}-{}", self.job_id, i);
@@ -61,9 +65,37 @@ impl BackupJob {
             total.uploaded_bytes += sub.uploaded_bytes;
             total.deleted += sub.deleted;
             total.unchanged += sub.unchanged;
+            job_ids.push(job_id);
             info!(root = %root.display(), "子路径备份完成");
         }
+
+        // 保留策略：备份完成后清理目标端孤儿文件
+        if let Some(rt) = &self.retention {
+            let managed = self.managed_paths(&job_ids)?;
+            let report = rt.cleanup_unmanaged(&managed).await?;
+            total.orphan_removed += report.removed;
+            info!(
+                removed = report.removed,
+                failed = report.failed,
+                scanned = report.scanned_files,
+                "保留策略：孤儿文件清理完成"
+            );
+        }
+
         Ok(total)
+    }
+
+    /// 汇总多个 job 的快照，构造受管理的相对路径集合（用于保留策略）
+    fn managed_paths(&self, job_ids: &[String]) -> Result<std::collections::HashSet<String>> {
+        let mut set = std::collections::HashSet::new();
+        for job_id in job_ids {
+            for entry in self.store.load_snapshot(job_id)? {
+                if !entry.is_dir {
+                    set.insert(entry.rel_path);
+                }
+            }
+        }
+        Ok(set)
     }
 
     /// 备份核心实现
@@ -173,6 +205,7 @@ impl BackupJob {
             uploaded_bytes,
             deleted,
             unchanged: changeset.unchanged,
+            orphan_removed: 0,
         })
     }
 
@@ -252,6 +285,8 @@ pub struct BackupSummary {
     pub uploaded_bytes: u64,
     pub deleted: usize,
     pub unchanged: usize,
+    /// 保留策略清理的孤儿文件数
+    pub orphan_removed: usize,
 }
 
 /// 递归扫描源目录（使用相对路径，Source 内部解析到自身 root）

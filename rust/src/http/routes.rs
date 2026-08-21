@@ -61,6 +61,8 @@ pub struct BackupResponse {
     pub uploaded_bytes: u64,
     pub deleted: usize,
     pub unchanged: usize,
+    /// 保留策略清理的孤儿文件数
+    pub orphan_removed: usize,
     pub error: Option<String>,
 }
 
@@ -206,12 +208,13 @@ async fn backup_run(State(state): State<AppState>) -> Json<BackupResponse> {
             uploaded_bytes: 0,
             deleted: 0,
             unchanged: 0,
+            orphan_removed: 0,
             error: Some(format!("登录失败: {:#}", e)),
         });
     }
 
     // 2) 读取配置的备份路径（锁操作隔离在同步函数，避免跨 await）
-    let (paths, target_folder) = read_backup_config(&state);
+    let (paths, target_folder, retention_cfg) = read_backup_config(&state);
 
     if paths.is_empty() {
         return Json(BackupResponse {
@@ -219,11 +222,28 @@ async fn backup_run(State(state): State<AppState>) -> Json<BackupResponse> {
             uploaded_bytes: 0,
             deleted: 0,
             unchanged: 0,
+            orphan_removed: 0,
             error: Some("未配置备份路径".to_string()),
         });
     }
 
     // 3) 执行多路径备份
+    //    保留策略：启用时构造 RetentionPolicy，备份完成后清理目标端孤儿文件
+    let retention = if retention_cfg.enabled && retention_cfg.cleanup_unmanaged {
+        let rt = crate::domain::retention::RetentionPolicy::new(
+            state.target.clone(),
+            &target_folder,
+        );
+        let rt = if retention_cfg.min_age_days > 0 {
+            rt.with_min_age_secs(retention_cfg.min_age_days * 86400)
+        } else {
+            rt
+        };
+        Some(rt)
+    } else {
+        None
+    };
+
     let job = BackupJob {
         job_id: state.job_id.clone(),
         source: Arc::new(crate::infra::source::local::LocalFsSource::new(&paths[0])),
@@ -232,6 +252,7 @@ async fn backup_run(State(state): State<AppState>) -> Json<BackupResponse> {
         store: state.store.clone(),
         target_prefix: Some(target_folder),
         eventbus: Some(state.eventbus.clone()),
+        retention,
     };
     match job.run_multi(&paths).await {
         Ok(summary) => Json(BackupResponse {
@@ -239,6 +260,7 @@ async fn backup_run(State(state): State<AppState>) -> Json<BackupResponse> {
             uploaded_bytes: summary.uploaded_bytes,
             deleted: summary.deleted,
             unchanged: summary.unchanged,
+            orphan_removed: summary.orphan_removed,
             error: None,
         }),
         Err(e) => Json(BackupResponse {
@@ -246,21 +268,29 @@ async fn backup_run(State(state): State<AppState>) -> Json<BackupResponse> {
             uploaded_bytes: 0,
             deleted: 0,
             unchanged: 0,
+            orphan_removed: 0,
             error: Some(format!("{:#}", e)),
         }),
     }
 }
 
 /// 读取备份配置（同步，锁在函数内释放）
-fn read_backup_config(state: &AppState) -> (Vec<PathBuf>, String) {
+fn read_backup_config(
+    state: &AppState,
+) -> (Vec<PathBuf>, String, crate::infra::config::RetentionConfig) {
     let cfg_guard = state.config.lock().unwrap();
     match cfg_guard.load() {
         Ok(cfg) => {
             let paths = cfg.backup.paths.iter().map(PathBuf::from).collect();
             let folder = cfg.backup.target_folder.clone();
-            (paths, folder)
+            let retention = cfg.backup.retention.clone();
+            (paths, folder, retention)
         }
-        Err(_) => (Vec::new(), state.target_folder.clone()),
+        Err(_) => (
+            Vec::new(),
+            state.target_folder.clone(),
+            crate::infra::config::RetentionConfig::default(),
+        ),
     }
 }
 

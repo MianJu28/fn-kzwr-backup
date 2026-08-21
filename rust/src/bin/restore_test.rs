@@ -120,6 +120,7 @@ async fn main() -> Result<()> {
         store: store.clone(),
         target_prefix: Some(PREFIX.to_string()),
         eventbus: None,
+        retention: None,
     };
     println!("=== 1. 备份 ===");
     let s = backup_job.run(&src_root).await?;

@@ -5,4 +5,5 @@
 pub mod backup;
 pub mod crypto;
 pub mod restore;
+pub mod retention;
 pub mod sync;

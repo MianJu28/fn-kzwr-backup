@@ -31,6 +31,27 @@ pub struct BackupConfig {
     /// 目标文件夹前缀
     #[serde(default = "default_target_folder")]
     pub target_folder: String,
+    /// 保留策略（孤儿文件清理）
+    #[serde(default)]
+    pub retention: RetentionConfig,
+}
+
+/// 保留策略配置
+///
+/// 当前系统为镜像同步（目标与源保持一致），保留策略聚焦于
+/// 目标端孤儿文件清理：清理目标端残留的、不在任何备份任务
+/// 快照管理下的文件，防止目标空间无限膨胀。不改动备份逻辑。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RetentionConfig {
+    /// 是否启用保留策略
+    #[serde(default)]
+    pub enabled: bool,
+    /// 清理未管理（孤儿）文件：删除目标端存在但不在任何快照中的文件
+    #[serde(default)]
+    pub cleanup_unmanaged: bool,
+    /// 可选：只清理创建时间早于该天数（0 表示不限制）
+    #[serde(default)]
+    pub min_age_days: u64,
 }
 
 /// kzwr 认证配置（敏感字段加密存储）

@@ -118,6 +118,7 @@ async fn main() -> Result<()> {
         store: store.clone(),
         target_prefix: None,
         eventbus: None,
+        retention: None,
     };
 
     // 1) 首次全量备份
