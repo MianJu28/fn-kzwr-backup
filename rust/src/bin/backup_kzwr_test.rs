@@ -36,14 +36,18 @@ async fn main() -> Result<()> {
     client.set_token(&token);
     let target: Arc<dyn TargetStorage> = Arc::new(KzwrTarget::new(client));
 
-    // 准备本地源目录 + 测试文件
+    // 准备本地源目录 + 测试文件（含多级嵌套目录）
     let dir = TempDir::new()?;
     let src_root = dir.path().join("src");
     std::fs::create_dir_all(&src_root)?;
     std::fs::write(src_root.join("readme.txt"), "fnos backup test readme\n".as_bytes()).unwrap();
     std::fs::write(src_root.join("data.bin"), generate_bytes(300_000)).unwrap();
-    std::fs::create_dir_all(src_root.join("docs")).unwrap();
+    // 多级嵌套目录：docs/manual/chapter1/guide.txt, docs/manual/chapter2/summary.md
+    std::fs::create_dir_all(src_root.join("docs/manual/chapter1")).unwrap();
+    std::fs::create_dir_all(src_root.join("docs/manual/chapter2")).unwrap();
     std::fs::write(src_root.join("docs/note.md"), "# Backup Note\ncontent here\n".as_bytes()).unwrap();
+    std::fs::write(src_root.join("docs/manual/chapter1/guide.txt"), "Chapter 1 guide deep content\n".as_bytes()).unwrap();
+    std::fs::write(src_root.join("docs/manual/chapter2/summary.md"), "Chapter 2 summary\n".as_bytes()).unwrap();
 
     // 加密组件
     let keys = AgeKeys::generate();
@@ -70,7 +74,7 @@ async fn main() -> Result<()> {
         "[+] 首次: uploaded={} bytes={} deleted={} unchanged={}",
         s1.uploaded, s1.uploaded_bytes, s1.deleted, s1.unchanged
     );
-    assert!(s1.uploaded == 3, "首次应上传 3 个文件");
+    assert!(s1.uploaded == 5, "首次应上传 5 个文件（含多级嵌套）");
 
     // 2) 二次备份（无变化，应全跳过）
     println!("=== 2. 增量备份（无变化）===");
@@ -91,44 +95,58 @@ async fn main() -> Result<()> {
     );
     assert!(s3.uploaded == 1, "只应上传修改的 readme.txt");
 
-    // 3b) 诊断：列出 /fn-backup 内容
-    println!("=== 3b. 诊断 list(/fn-backup) ===");
+    // 3b) 修改多级深层文件 → 只上传该文件
+    std::fs::write(src_root.join("docs/manual/chapter1/guide.txt"), "Chapter 1 guide UPDATED v2\n".as_bytes()).unwrap();
+    println!("=== 3b. 增量备份（多级深层 guide.txt 已修改）===");
+    let s3b = job.run(&src_root).await?;
+    println!(
+        "[+] 三次b: uploaded={} bytes={} unchanged={}",
+        s3b.uploaded, s3b.uploaded_bytes, s3b.unchanged
+    );
+    assert!(s3b.uploaded == 1, "只应上传多级深层修改的 guide.txt");
+
+    // 3c) 诊断：列出 /fn-backup 内容（递归确认多级目录结构）
+    println!("=== 3c. 诊断 list(/fn-backup) ===");
     match target.list("/fn-backup").await {
         Ok(entries) => {
-            println!("[+] /fn-backup 共 {} 条目:", entries.len());
-            for e in entries {
+            println!("[+] /fn-backup 顶层 {} 条目:", entries.len());
+            for e in &entries {
                 println!("    - [{}] {} (size={})", if e.is_dir { "DIR" } else { "FILE" }, e.rel_path, e.size);
+            }
+            // 递归列出 docs 子目录，确认多级结构
+            for sub in ["/fn-backup/docs", "/fn-backup/docs/manual", "/fn-backup/docs/manual/chapter1", "/fn-backup/docs/manual/chapter2"] {
+                if let Ok(sub_entries) = target.list(sub).await {
+                    for e in sub_entries {
+                        println!("    {sub}/[{}] {} (size={})", if e.is_dir { "DIR" } else { "FILE" }, e.rel_path, e.size);
+                    }
+                }
             }
         }
         Err(e) => println!("[!] list(/fn-backup) 失败: {:?}", e),
     }
 
-    // 4) 从 kzwr 下载解密校验
+    // 4) 从 kzwr 下载解密校验（含多级文件）
     println!("=== 4. 从 kzwr 下载解密校验 ===");
-    for rel in ["readme.txt", "data.bin", "docs/note.md"] {
+    let expected: &[(&str, &[u8])] = &[
+        ("readme.txt", b"fnos backup test readme v2\n"),
+        ("data.bin", &generate_bytes(300_000)),
+        ("docs/note.md", b"# Backup Note\ncontent here\n"),
+        ("docs/manual/chapter1/guide.txt", b"Chapter 1 guide UPDATED v2\n"),
+        ("docs/manual/chapter2/summary.md", b"Chapter 2 summary\n"),
+    ];
+    for (rel, exp) in expected {
         let rel_path = Path::new(TARGET_FOLDER).join(rel);
         let mut stream = target.read_stream(&rel_path).await?;
         let mut enc = Vec::new();
         while let Some(chunk) = stream.next().await {
             enc.extend_from_slice(&chunk?);
         }
-        // 解密
+        // 解密并校验
         let mut out = Vec::new();
         crypto.decrypt_stream(&enc[..], &mut out)?;
-        println!("[+] {} 解密成功 ({} 字节)", rel, out.len());
+        assert_eq!(out.as_slice(), *exp, "{} 内容应一致", rel);
+        println!("[+] {} 解密校验通过 ({} 字节)", rel, out.len());
     }
-
-    // 5) 校验 readme.txt 是最新内容
-    let rel_path = Path::new(TARGET_FOLDER).join("readme.txt");
-    let mut stream = target.read_stream(&rel_path).await?;
-    let mut enc = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        enc.extend_from_slice(&chunk?);
-    }
-    let mut out = Vec::new();
-    crypto.decrypt_stream(&enc[..], &mut out)?;
-    assert_eq!(out, b"fnos backup test readme v2\n", "readme.txt 应为最新内容");
-    println!("[+] readme.txt 内容校验通过: {}", String::from_utf8_lossy(&out));
 
     println!("\n=== kzwr 真实增量备份测试全部通过 ===");
     Ok(())
