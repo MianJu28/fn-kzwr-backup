@@ -25,7 +25,8 @@ async fn main() -> anyhow::Result<()> {
 
     // 源目录：默认当前目录，实际由授权机制指定
     let source_root = std::env::var("TRIM_SOURCE_DIR").unwrap_or_else(|_| ".".to_string());
-    let source = Arc::new(infra::source::local::LocalFsSource::new(source_root));
+    let source_root = std::path::PathBuf::from(&source_root);
+    let source = Arc::new(infra::source::local::LocalFsSource::new(&source_root));
 
     // 目标：kzwr 酷族网软，token 从 TRIM_KZWR_TOKEN 读取（实际由登录二进制产出 session 加密存储后注入）
     let target_token = std::env::var("TRIM_KZWR_TOKEN").unwrap_or_default();
@@ -40,7 +41,34 @@ async fn main() -> anyhow::Result<()> {
     };
     let target = Arc::new(infra::target::kzwr::storage::KzwrTarget::new(kzwr_client));
 
-    let state = AppState { source, target };
+    // 加密：age 密钥对（Phase 5 前用内存生成；实际应从加密密钥库加载私钥）
+    let keys = fnos_backup::domain::crypto::AgeKeys::generate();
+    let crypto = fnos_backup::domain::crypto::CryptoSession::full(&keys);
+
+    // 元数据快照库：存 $TRIM_PKGVAR（飞牛数据目录）
+    let var_dir = std::env::var("TRIM_PKGVAR").unwrap_or_else(|_| ".".to_string());
+    let store = std::sync::Arc::new(
+        infra::persistence::snapshot::SnapshotStore::open(
+            &std::path::PathBuf::from(&var_dir).join("meta.db"),
+        )?,
+    );
+
+    // 目标前缀 + 任务 id
+    let target_prefix = std::env::var("TRIM_KZWR_FOLDER")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "fn-backup".to_string());
+    let job_id = std::env::var("TRIM_JOB_ID").unwrap_or_else(|_| "default".to_string());
+
+    let state = AppState {
+        source,
+        target,
+        crypto,
+        store,
+        source_root,
+        target_prefix: Some(target_prefix),
+        job_id,
+    };
 
     let app = http::routes::router(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
