@@ -51,18 +51,22 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => println!("[!] list 失败: {:?}", e),
     }
 
-    // 4) 下载并对比（若上传成功）
+    // 4) 文件夹创建/删除测试
+    println!("\n=== 4. 文件夹创建/删除测试 ===");
+    folder_test(target.client()).await;
+
+    // 5) 下载并对比（若上传成功）
     if let Some(uploaded) = &upload_test {
-        println!("\n=== 4. 下载一致性测试 ===");
+        println!("\n=== 5. 下载一致性测试 ===");
         download_test(&target, uploaded).await;
     }
 
-    // 5) 删除测试：删除 share 下所有 rust_upload_test_*.bin 测试文件
-    println!("\n=== 5. 删除测试（清理测试文件）===");
+    // 6) 删除测试：删除 share 下所有 rust_upload_test_*.bin 测试文件
+    println!("\n=== 6. 删除测试（清理测试文件）===");
     delete_test_files(&target).await;
 
-    // 6) ping
-    println!("\n=== 6. KzwrTarget::ping ===");
+    // 7) ping
+    println!("\n=== 7. KzwrTarget::ping ===");
     match target.ping().await {
         Ok(_) => println!("[+] ping 通过（凭证有效）"),
         Err(e) => println!("[!] ping 失败: {:?}", e),
@@ -120,6 +124,80 @@ async fn delete_test_files(target: &KzwrTarget) {
     } else {
         println!("[*] 未发现需要删除的测试文件");
     }
+}
+
+/// 文件夹创建/删除测试（对照 Python create_folder/delete_folder 逻辑）
+async fn folder_test(client: &KzwrClient) {
+    // 1) 创建测试文件夹
+    let folder_name = format!(
+        "rust_folder_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    );
+    println!("[*] 创建文件夹: {}", folder_name);
+    let created = match client.create_folder(&folder_name, "/").await {
+        Ok(p) => p,
+        Err(e) => {
+            println!("[!] create_folder 失败: {:?}", e);
+            return;
+        }
+    };
+    println!("[+] create_folder 返回路径: {}", created);
+
+    // 2) 列出根文件夹，找到新建文件夹的 encodedId
+    // 注：list_folders 返回的 id 是短码，删除需用 list_files 的 folders[].encodedId
+    println!("[*] 查找文件夹 encodedId ...");
+    let mut encoded_id = None;
+    if let Ok(files) = client.list_files("/", 1, true).await {
+        encoded_id = find_folder_encoded_id(&files, &folder_name);
+    }
+    let encoded_id = match encoded_id {
+        Some(id) => {
+            println!("[+] 找到文件夹 encodedId: {}", id);
+            id
+        }
+        None => {
+            println!("[!] 在根目录未找到新文件夹（删除测试跳过）");
+            return;
+        }
+    };
+
+    // 3) 逻辑删除文件夹（对照 Python delete_folder physical=False）
+    println!("[*] 逻辑删除文件夹 ...");
+    match client
+        .delete_folder(&[encoded_id.to_string()], false)
+        .await
+    {
+        Ok(_) => println!("[+] 文件夹删除成功"),
+        Err(e) => println!("[!] delete_folder 失败: {:?}", e),
+    }
+}
+
+/// 从 list_folders 响应中按名字找文件夹 encodedId
+fn find_folder_encoded_id(resp: &serde_json::Value, name: &str) -> Option<String> {
+    // 优先顶层 folders，兼容 data.folders
+    let folders = resp
+        .get("folders")
+        .or_else(|| resp.get("data").and_then(|d| d.get("folders")))
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
+    folders
+        .iter()
+        .find(|it| {
+            it.get("name")
+                .or_else(|| it.get("folderName"))
+                .and_then(|v| v.as_str())
+                == Some(name)
+        })
+        .and_then(|it| {
+            it.get("encodedId")
+                .or_else(|| it.get("id"))
+                .and_then(|v| v.as_str())
+        })
+        .map(|s| s.to_string())
 }
 
 /// 上传信息
