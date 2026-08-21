@@ -1,0 +1,63 @@
+[package]
+name = "fnos-backup"
+version = "0.1.0"
+edition = "2021"
+description = "飞牛 NAS 增量加密备份系统（备份至酷族网软）"
+license = "MIT"
+
+[lib]
+name = "fnos_backup"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fnos-backup"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP 后端
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP 客户端（Rust 重写 kzwr API 用）
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+
+# 数据库
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# 加密（age 公私钥）
+age = "0.10"
+argon2 = "0.5"
+zeroize = { version = "1", features = ["derive"] }
+
+# 哈希（增量检测 + kzwr 上传对齐）
+blake3 = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+
+# 配置与日志
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# 文件系统流式处理
+futures = "0.3"
+bytes = "1"
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
+async-trait = "0.1"
+
+# 错误处理
+thiserror = "1"
+anyhow = "1"
+
+# 临时文件（kzwr 分片上传暂存）
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"

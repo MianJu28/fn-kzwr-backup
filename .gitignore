@@ -1,0 +1,43 @@
+# ── 认证与敏感信息 ─────────────────────────────
+# 会话 token / 密钥 / 环境变量（禁止提交）
+session.json
+*.session.json
+.env
+.env.*
+*.pem
+*.key
+!*.example
+
+# ── Rust ───────────────────────────────────────
+# Cargo.lock 对二进制项目应提交以保证可复现构建，故不忽略
+# 仅忽略根目录 rust/target/ 编译产物；src/infra/target/ 是源码目录，不忽略
+rust/target/
+rust/.cargo/config.toml
+
+# ── 登录二进制（编译产物，经 GitHub Release 分发）──
+bin/*-linux-x64
+bin/*-linux-arm64
+bin/*.exe
+bin/dist/
+bin/build/
+bin/*.spec
+
+# 本地临时测试脚本（登录/诊断等一次性产物）
+bin/run_login_*.py
+bin/run_login_*.sh
+bin/run_headful.sh
+bin/run_api_test.sh
+bin/login_fixed.py
+
+# ── Python ─────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ── 测试/临时产物 ──────────────────────────────
+*.tmp
+*.download
+*.log
