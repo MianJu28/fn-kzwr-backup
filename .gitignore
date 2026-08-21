@@ -14,19 +14,8 @@ session.json
 backend/target/
 backend/.cargo/config.toml
 
-# ── 登录二进制（编译产物，经 GitHub Release 分发）──
-bin/*-linux-x64
-bin/*-linux-arm64
-bin/*.exe
-bin/dist/
-bin/build/
-bin/*.spec
-
-# 本地临时测试脚本（登录/诊断等一次性产物）
-bin/*.sh
-bin/*.py
-bin/*.log
-bin/*.txt
+bin/
+docs/
 
 # ── 前端 ─────────────────────────────────────
 frontend/node_modules/

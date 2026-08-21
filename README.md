@@ -23,8 +23,6 @@
 |------|------|
 | `backend/` | Rust 后端（axum HTTP API + 备份/恢复核心） |
 | `frontend/` | Svelte 前端（vite 构建，多页面导航） |
-| `bin/` | 开发期启动/测试脚本（不入库） |
-| `docs/` | 架构与选型文档 |
 
 后端采用分层架构（ADR）：
 
@@ -34,8 +32,6 @@ infra/   基础设施（source/target 适配器、SQLite 快照、密钥库、TO
 http/    接口层（REST + WebSocket）
 eventbus/ 内部事件总线（tokio::broadcast）
 ```
-
-关键 ADR：ADT-003 age 加密 · ADR-004 BLAKE3 严格差分 · ADR-005 存储抽象 · ADR-006 SQLite 元数据 · ADR-007 事件总线。详见 `docs/ARCHITECTURE.md`。
 
 ## 🔐 安全模型
 
@@ -93,11 +89,6 @@ min_age_days = 0
 [backup.schedule_cron]     # 可选：定时备份
 schedule_cron = "0 2 * * *"  # 每天 02:00
 ```
-
-## 🧪 测试
-
-使用真实 kzwr 的端到端测试（`bin/run_*.sh`）覆盖：
-备份/恢复/删除/多级文件夹/物理删除/保留策略/定时触发。
 
 ## 📄 文档
 
