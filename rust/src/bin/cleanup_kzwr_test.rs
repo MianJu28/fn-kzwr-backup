@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     let base_url = std::env::var("TRIM_KZWR_BASE_URL")
         .unwrap_or_else(|_| "https://www.kzwr.com".to_string());
 
-    let mut client = KzwrClient::new(&base_url, 30);
+    let client = KzwrClient::new(&base_url, 30);
     client.set_token(&token);
 
     // 1) 找 /fn-backup 文件夹的 encodedId

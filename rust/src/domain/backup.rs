@@ -37,26 +37,51 @@ pub struct BackupJob {
 impl BackupJob {
     /// 执行一次增量备份（快速模式 mtime+size）
     pub async fn run(&self, source_root: &Path) -> Result<BackupSummary> {
-        self.run_inner(source_root, false).await
+        self.run_inner(&*self.source, source_root, &self.job_id, false)
+            .await
     }
 
     /// 执行一次增量备份（严格模式，BLAKE3 内容哈希确认）
     pub async fn run_strict(&self, source_root: &Path) -> Result<BackupSummary> {
-        self.run_inner(source_root, true).await
+        self.run_inner(&*self.source, source_root, &self.job_id, true)
+            .await
+    }
+
+    /// 多路径备份：遍历多个源目录，各自增量备份到目标
+    pub async fn run_multi(&self, roots: &[std::path::PathBuf]) -> Result<BackupSummary> {
+        let mut total = BackupSummary::default();
+        for (i, root) in roots.iter().enumerate() {
+            // 每个源路径对应独立 job 快照（用序号作 job_id 后缀，避免快照互相覆盖）
+            let job_id = format!("{}-{}", self.job_id, i);
+            let source = crate::infra::source::local::LocalFsSource::new(root);
+            let sub = self.run_inner(&source, root, &job_id, false).await?;
+            total.uploaded += sub.uploaded;
+            total.uploaded_bytes += sub.uploaded_bytes;
+            total.deleted += sub.deleted;
+            total.unchanged += sub.unchanged;
+            info!(root = %root.display(), "子路径备份完成");
+        }
+        Ok(total)
     }
 
     /// 备份核心实现
-    async fn run_inner(&self, source_root: &Path, strict: bool) -> Result<BackupSummary> {
+    async fn run_inner(
+        &self,
+        source: &dyn SourceStorage,
+        source_root: &Path,
+        job_id: &str,
+        strict: bool,
+    ) -> Result<BackupSummary> {
         // 1) 扫描源目录（严格模式时计算 BLAKE3 内容哈希）
         let current = if strict {
-            scan_all_strict(&*self.source, source_root).await?
+            scan_all_strict(source, source_root).await?
         } else {
-            scan_all(&*self.source, source_root).await?
+            scan_all(source, source_root).await?
         };
         info!(count = current.len(), strict, "源扫描完成");
 
         // 2) 加载上次快照 + 差分
-        let last = self.store.load_snapshot(&self.job_id)?;
+        let last = self.store.load_snapshot(job_id)?;
         let changeset = if strict {
             // 严格模式：对 mtime/size 变化的文件算哈希确认
             let root = source_root.to_path_buf();
@@ -87,7 +112,7 @@ impl BackupJob {
             if fd.is_dir {
                 continue;
             }
-            let n = self.upload_one(&fd.rel_path).await?;
+            let n = self.upload_one(source, &fd.rel_path).await?;
             uploaded += 1;
             uploaded_bytes += n;
             info!("已上传: {} ({n} B)", fd.rel_path);
@@ -109,7 +134,7 @@ impl BackupJob {
 
         // 5) 保存新快照
         let snapshot: Vec<SnapshotEntry> = current.iter().map(SnapshotEntry::from_fd).collect();
-        self.store.save_snapshot(&self.job_id, &snapshot)?;
+        self.store.save_snapshot(job_id, &snapshot)?;
 
         Ok(BackupSummary {
             uploaded,
@@ -120,9 +145,9 @@ impl BackupJob {
     }
 
     /// 上传单个文件：源流 → age 加密 → 目标
-    async fn upload_one(&self, rel_path: &str) -> Result<u64> {
+    async fn upload_one(&self, source: &dyn SourceStorage, rel_path: &str) -> Result<u64> {
         let src = PathBuf::from(rel_path);
-        let mut stream = self.source.read_stream(&src).await?;
+        let mut stream = source.read_stream(&src).await?;
 
         // 收集源流字节（Phase 2 简化：整文件收集后分块加密）
         let mut plain = Vec::new();

@@ -28,7 +28,7 @@ impl KzwrTarget {
 
     /// 直接使用 access-token 创建
     pub fn with_token(base_url: &str, token: impl Into<String>) -> Self {
-        let mut client = KzwrClient::new(base_url, 30);
+        let client = KzwrClient::new(base_url, 30);
         client.set_token(token);
         Self { client }
     }

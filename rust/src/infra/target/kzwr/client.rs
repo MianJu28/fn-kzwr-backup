@@ -4,6 +4,7 @@
 //! 认证头 `access-token`。
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
@@ -28,8 +29,8 @@ pub struct KzwrClient {
     base_url: String,
     timeout: std::time::Duration,
     http: reqwest::Client,
-    /// access-token（登录后设置）
-    pub access_token: Option<String>,
+    /// access-token（登录后设置，Arc 共享支持运行时更新）
+    pub access_token: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for KzwrClient {
@@ -70,13 +71,23 @@ impl KzwrClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             timeout: std::time::Duration::from_secs(timeout_secs),
             http,
-            access_token: None,
+            access_token: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// 从 session 设置 access-token
-    pub fn set_token(&mut self, token: impl Into<String>) {
-        self.access_token = Some(token.into());
+    /// 从 session 设置 access-token（Arc 共享，运行时可更新）
+    pub fn set_token(&self, token: impl Into<String>) {
+        *self.access_token.lock().unwrap() = Some(token.into());
+    }
+
+    /// 获取当前 access-token
+    pub fn get_token(&self) -> Option<String> {
+        self.access_token.lock().unwrap().clone()
+    }
+
+    /// 获取共享的 token 存储（供认证管理器更新）
+    pub fn token_store(&self) -> Arc<Mutex<Option<String>>> {
+        self.access_token.clone()
     }
 
     /// 构造完整 URL
@@ -91,8 +102,8 @@ impl KzwrClient {
     /// 带认证头的请求头构造
     fn auth_headers(&self) -> HashMap<String, String> {
         let mut h = HashMap::new();
-        if let Some(token) = &self.access_token {
-            h.insert("access-token".to_string(), token.clone());
+        if let Some(token) = self.access_token.lock().unwrap().clone() {
+            h.insert("access-token".to_string(), token);
         }
         h
     }
@@ -214,7 +225,7 @@ impl KzwrClient {
             .and_then(|d| d.get("token"))
             .and_then(|t| t.as_str())
             .ok_or_else(|| KzwrError::Api(format!("登录失败: 响应中无 token -> {}", data)))?;
-        self.access_token = Some(token.to_string());
+        self.set_token(token.to_string());
         Ok(token.to_string())
     }
 

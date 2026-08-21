@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "https://www.kzwr.com".to_string());
 
     // 构建 kzwr Target（认证）
-    let mut client = KzwrClient::new(&base_url, 30);
+    let client = KzwrClient::new(&base_url, 30);
     client.set_token(&token);
     let target: Arc<dyn TargetStorage> = Arc::new(KzwrTarget::new(client));
 

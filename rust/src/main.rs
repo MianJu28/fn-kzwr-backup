@@ -1,9 +1,9 @@
 //! fnos 增量加密备份系统 · 主入口
 //!
-//! axum HTTP 服务启动，托管 REST API 与（后续）前端静态文件。
+//! axum HTTP 服务启动，托管 REST API 与前端静态文件。
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use fnos_backup::http;
 use fnos_backup::infra;
@@ -23,49 +23,36 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_PORT);
 
-    // 源目录：默认当前目录，实际由授权机制指定
-    let source_root = std::env::var("TRIM_SOURCE_DIR").unwrap_or_else(|_| ".".to_string());
-    let source_root = std::path::PathBuf::from(&source_root);
-    let source = Arc::new(infra::source::local::LocalFsSource::new(&source_root));
-
-    // 目标：kzwr 酷族网软，token 从 TRIM_KZWR_TOKEN 读取（实际由登录二进制产出 session 加密存储后注入）
-    let target_token = std::env::var("TRIM_KZWR_TOKEN").unwrap_or_default();
-    let base_url = std::env::var("TRIM_KZWR_BASE_URL")
-        .unwrap_or_else(|_| "https://www.kzwr.com".to_string());
-    let kzwr_client = {
-        let mut c = infra::target::kzwr::client::KzwrClient::new(&base_url, 30);
-        if !target_token.is_empty() {
-            c.set_token(&target_token);
-        }
-        c
-    };
-    let target = Arc::new(infra::target::kzwr::storage::KzwrTarget::new(kzwr_client));
-
-    // 数据目录（快照）与配置目录（密钥库）
+    // 数据目录（快照）与配置目录（配置/密钥库）
     let var_dir = std::env::var("TRIM_PKGVAR").unwrap_or_else(|_| ".".to_string());
     let cfg_dir = std::env::var("TRIM_PKGETC").unwrap_or_else(|_| ".".to_string());
+    let tmp_dir = std::env::var("TRIM_APPTMP").unwrap_or_else(|_| ".".to_string());
     let var_dir = std::path::PathBuf::from(&var_dir);
     let cfg_dir = std::path::PathBuf::from(&cfg_dir);
+    let tmp_dir = std::path::PathBuf::from(&tmp_dir);
+    let backup_tmp = tmp_dir.join("staging");
+    std::fs::create_dir_all(&backup_tmp).ok();
 
-    // 元数据快照库：存 $TRIM_PKGVAR（飞牛数据目录）
-    let store = std::sync::Arc::new(
-        infra::persistence::snapshot::SnapshotStore::open(&var_dir.join("meta.db"))?,
-    );
+    // 元数据快照库：存 $TRIM_PKGVAR
+    let store = Arc::new(infra::persistence::snapshot::SnapshotStore::open(
+        &var_dir.join("meta.db"),
+    )?);
 
-    // 密钥库：从 $TRIM_PKGETC 加载，不存在则生成并加密存储。
-    // 口令来自 TRIM_PASSPHRASE（实际由安装向导设置，注入环境变量）
+    // 口令：用于敏感字段（kzwr 凭据、密钥库）加密
     let passphrase = std::env::var("TRIM_PASSPHRASE").unwrap_or_else(|_| "change-me".to_string());
-    let passphrase = fnos_backup::infra::keystore::secret(&passphrase);
+    let passphrase = infra::keystore::secret(&passphrase);
+
+    // 加密会话（age 密钥对，从密钥库加载或生成）
     let keys = {
-        let ks_path = fnos_backup::infra::keystore::keystore_path(&cfg_dir);
-        match fnos_backup::infra::keystore::load_keystore(&passphrase, &ks_path) {
+        let ks_path = infra::keystore::keystore_path(&cfg_dir);
+        match infra::keystore::load_keystore(&passphrase, &ks_path) {
             Ok(k) => {
                 info!("已从密钥库加载 age 私钥");
                 k
             }
             Err(_) => {
                 let k = fnos_backup::domain::crypto::AgeKeys::generate();
-                fnos_backup::infra::keystore::save_keystore(&k, &passphrase, &ks_path)?;
+                infra::keystore::save_keystore(&k, &passphrase, &ks_path)?;
                 info!("已生成并加密存储 age 密钥对");
                 k
             }
@@ -73,29 +60,58 @@ async fn main() -> anyhow::Result<()> {
     };
     let crypto = fnos_backup::domain::crypto::CryptoSession::full(&keys);
 
-    // 目标前缀 + 任务 id
-    let target_prefix = std::env::var("TRIM_KZWR_FOLDER")
+    // 配置管理器
+    let config_mgr = Arc::new(Mutex::new(infra::config::ConfigManager::new(
+        &cfg_dir,
+        passphrase,
+    )));
+
+    // kzwr 目标客户端（token 由认证服务管理）
+    let base_url = std::env::var("TRIM_KZWR_BASE_URL")
+        .unwrap_or_else(|_| "https://www.kzwr.com".to_string());
+    let kzwr_client = infra::target::kzwr::client::KzwrClient::new(&base_url, 30);
+    let token_store = kzwr_client.token_store();
+    let target: Arc<dyn fnos_backup::infra::storage_trait::TargetStorage> =
+        Arc::new(infra::target::kzwr::storage::KzwrTarget::new(kzwr_client));
+
+    // 认证服务
+    let login_bin_dir = std::env::var("TRIM_LOGIN_BIN_DIR").unwrap_or_else(|_| ".".to_string());
+    let auth = Arc::new(infra::kzwr_auth::KzwrAuthService::new(
+        &std::path::PathBuf::from(&login_bin_dir),
+        &tmp_dir,
+        config_mgr.clone(),
+        token_store,
+    ));
+
+    // 目标文件夹 + 任务 id（默认值，实际由配置决定）
+    let target_folder = std::env::var("TRIM_KZWR_FOLDER")
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "fn-backup".to_string());
     let job_id = std::env::var("TRIM_JOB_ID").unwrap_or_else(|_| "default".to_string());
+    let default_restore_dir = std::env::var("TRIM_RESTORE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| var_dir.join("restore"));
 
     let state = AppState {
-        source,
         target,
         crypto,
         store,
-        source_root,
-        target_prefix: Some(target_prefix),
+        config: config_mgr,
+        auth,
+        target_folder,
         job_id,
+        var_dir,
+        tmp_dir,
+        backup_tmp,
+        default_restore_dir,
     };
 
-    // 前端静态资源目录（默认当前目录的 www，飞牛部署时为 $TRIM_APPDEST/www）
+    // 前端静态资源目录
     let www_dir = std::env::var("TRIM_WWW_DIR").unwrap_or_else(|_| "www".to_string());
     let www_dir = std::path::PathBuf::from(&www_dir);
 
     let api_router = http::routes::router(state);
-    // 托管前端 SPA + API 路由
     let app = axum::Router::new()
         .nest("/api", api_router)
         .fallback_service(

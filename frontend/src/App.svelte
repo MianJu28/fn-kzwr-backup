@@ -1,14 +1,25 @@
 <script>
   let health = '检查中...';
+  let error = null;
+  let busy = false;
+
+  // kzwr 登录
+  let username = '';
+  let password = '';
+  let loggedIn = false;
+  let loginMsg = '';
+
+  // 备份配置
+  let backupPaths = [];
+  let pathInput = '';
+  let targetFolder = 'fn-backup';
+
+  // 备份/恢复
   let backupResult = null;
   let restoreResult = null;
-  let busy = false;
-  let error = null;
-
-  // 恢复表单
-  let restoreDir = '/volume1/restore';
+  let restoreDir = '';
   let restoreFiles = '';
-  let restoreType = 'full'; // full | selective
+  let restoreType = 'full';
 
   async function checkHealth() {
     try {
@@ -17,6 +28,74 @@
       health = `服务正常 (v${data.version})`;
     } catch (e) {
       health = `服务异常: ${e.message}`;
+    }
+  }
+
+  async function loadConfig() {
+    try {
+      const res = await fetch('/api/config');
+      const data = await res.json();
+      backupPaths = data.backup_paths || [];
+      targetFolder = data.target_folder || 'fn-backup';
+      loggedIn = data.logged_in;
+      if (data.error) error = data.error;
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
+  async function login() {
+    busy = true;
+    error = null;
+    loginMsg = '';
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        loggedIn = true;
+        loginMsg = `已登录: ${data.username}`;
+        password = '';
+      } else {
+        loginMsg = `登录失败: ${data.error}`;
+      }
+    } catch (e) {
+      error = e.message;
+    } finally {
+      busy = false;
+    }
+  }
+
+  function addPath() {
+    const p = pathInput.trim();
+    if (p && !backupPaths.includes(p)) {
+      backupPaths = [...backupPaths, p];
+      pathInput = '';
+    }
+  }
+
+  function removePath(i) {
+    backupPaths = backupPaths.filter((_, idx) => idx !== i);
+  }
+
+  async function saveConfig() {
+    busy = true;
+    error = null;
+    try {
+      const res = await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ backup_paths: backupPaths, target_folder: targetFolder }),
+      });
+      const data = await res.json();
+      if (data.error) error = data.error;
+    } catch (e) {
+      error = e.message;
+    } finally {
+      busy = false;
     }
   }
 
@@ -61,6 +140,7 @@
   }
 
   checkHealth();
+  loadConfig();
 </script>
 
 <main>
@@ -73,9 +153,57 @@
     <div class="error">⚠️ {error}</div>
   {/if}
 
+  <!-- kzwr 登录 -->
   <section>
-    <h2>备份</h2>
-    <p>将本地目录增量加密备份至酷族网软（fn-backup）。</p>
+    <h2>🔑 kzwr 登录</h2>
+    <p class="hint">登录酷族网软（kzwr.com），凭据加密存储，token 过期自动重新登录。</p>
+    {#if loggedIn}
+      <p class="ok">✅ 已登录</p>
+    {:else}
+      <p class="warn">⚠️ 未登录，请填写凭据</p>
+    {/if}
+    <label>用户名（邮箱）
+      <input bind:value={username} type="email" placeholder="you@example.com" />
+    </label>
+    <label>密码
+      <input bind:value={password} type="password" placeholder="••••••••" />
+    </label>
+    <button on:click={login} disabled={busy || !username || !password}>
+      {busy ? '登录中...' : (loggedIn ? '更新凭据' : '登录 kzwr')}
+    </button>
+    {#if loginMsg}
+      <p class:ok={loggedIn} class:warn={!loggedIn}>{loginMsg}</p>
+    {/if}
+  </section>
+
+  <!-- 备份路径配置 -->
+  <section>
+    <h2>📁 备份路径配置</h2>
+    <p class="hint">设置要备份的文件夹路径，支持多个。</p>
+    <label>目标文件夹
+      <input bind:value={targetFolder} placeholder="fn-backup" />
+    </label>
+    <div class="path-add">
+      <input bind:value={pathInput} placeholder="/volume1/data" />
+      <button on:click={addPath} disabled={busy || !pathInput.trim()}>添加</button>
+    </div>
+    <ul class="paths">
+      {#each backupPaths as p, i (p)}
+        <li>
+          <span>{p}</span>
+          <button class="remove" on:click={() => removePath(i)}>✕</button>
+        </li>
+      {/each}
+    </ul>
+    <button on:click={saveConfig} disabled={busy}>
+      {busy ? '保存中...' : '保存配置'}
+    </button>
+  </section>
+
+  <!-- 备份 -->
+  <section>
+    <h2>⬆️ 备份</h2>
+    <p class="hint">将配置的文件夹增量加密备份至 kzwr。</p>
     <button on:click={runBackup} disabled={busy}>
       {busy ? '执行中...' : '立即备份'}
     </button>
@@ -92,14 +220,13 @@
     {/if}
   </section>
 
+  <!-- 恢复 -->
   <section>
-    <h2>恢复</h2>
-    <p>从酷族网软下载解密，恢复到本地目录。</p>
-
+    <h2>⬇️ 恢复</h2>
+    <p class="hint">从 kzwr 下载解密，恢复到本地目录。</p>
     <label>恢复目标目录
-      <input bind:value={restoreDir} />
+      <input bind:value={restoreDir} placeholder="/volume1/restore" />
     </label>
-
     <label class="radio">
       <input type="radio" value="full" bind:group={restoreType} />
       全量恢复
@@ -108,17 +235,14 @@
       <input type="radio" value="selective" bind:group={restoreType} />
       选择性恢复
     </label>
-
     {#if restoreType === 'selective'}
       <label>要恢复的文件（每行一个相对路径）
         <textarea bind:value={restoreFiles} rows="4" placeholder="file1.txt&#10;docs/note.md"></textarea>
       </label>
     {/if}
-
     <button on:click={runRestore} disabled={busy}>
       {busy ? '执行中...' : '开始恢复'}
     </button>
-
     {#if restoreResult && !restoreResult.error}
       <div class="result">
         <p>✅ 恢复完成</p>
@@ -145,10 +269,7 @@
     margin: 0 auto;
     padding: 24px 16px 40px;
   }
-  header {
-    padding: 24px 0 16px;
-    border-bottom: 1px solid #e0e4ea;
-  }
+  header { padding: 24px 0 16px; border-bottom: 1px solid #e0e4ea; }
   h1 { margin: 0; font-size: 24px; }
   .health { color: #5a6a7a; }
   .health.ok { color: #22a06b; }
@@ -160,6 +281,9 @@
     box-shadow: 0 1px 3px rgba(0,0,0,.06);
   }
   h2 { margin: 0 0 8px; font-size: 18px; }
+  .hint { color: #5a6a7a; font-size: 13px; margin: 0 0 10px; }
+  .ok { color: #22a06b; }
+  .warn { color: #b45309; }
   button {
     background: #2563eb;
     color: #fff;
@@ -171,6 +295,7 @@
     margin-top: 12px;
   }
   button:disabled { background: #9db4e8; cursor: not-allowed; }
+  button.remove { background: transparent; color: #b91c1c; padding: 2px 8px; margin: 0; }
   label { display: block; margin: 12px 0 4px; font-size: 14px; color: #42526e; }
   input, textarea {
     width: 100%;
@@ -183,25 +308,24 @@
   }
   .radio { display: inline-flex; align-items: center; gap: 6px; margin-right: 16px; }
   .radio input { width: auto; }
-  .result {
-    margin-top: 14px;
-    padding: 12px;
-    background: #ecfdf3;
+  .path-add { display: flex; gap: 8px; margin-top: 8px; }
+  .path-add input { flex: 1; }
+  .path-add button { margin: 0; white-space: nowrap; }
+  .paths { list-style: none; padding: 0; margin: 8px 0 0; }
+  .paths li {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 10px;
+    background: #f8fafc;
     border-radius: 6px;
+    margin-top: 6px;
+    font-family: monospace;
+    font-size: 13px;
   }
+  .result { margin-top: 14px; padding: 12px; background: #ecfdf3; border-radius: 6px; }
   .result p { margin: 0 0 6px; font-weight: 600; }
   .result ul { margin: 0; padding-left: 20px; }
-  .error {
-    background: #fef2f2;
-    color: #b91c1c;
-    padding: 12px;
-    border-radius: 6px;
-    margin-top: 12px;
-  }
-  footer {
-    text-align: center;
-    color: #8a94a6;
-    font-size: 13px;
-    margin-top: 28px;
-  }
+  .error { background: #fef2f2; color: #b91c1c; padding: 12px; border-radius: 6px; margin-top: 12px; }
+  footer { text-align: center; color: #8a94a6; font-size: 13px; margin-top: 28px; }
 </style>

@@ -18,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
     let base_url = std::env::var("TRIM_KZWR_BASE_URL")
         .unwrap_or_else(|_| "https://www.kzwr.com".to_string());
 
-    let mut client = KzwrClient::new(&base_url, 30);
+    let client = KzwrClient::new(&base_url, 30);
     client.set_token(&token);
     println!("[*] 已设置 token (长度 {})", token.len());
 

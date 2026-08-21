@@ -33,6 +33,8 @@ bin/run_restore_test.sh
 bin/run_http_test.sh
 bin/run_keystore_test.sh
 bin/run_web_test.sh
+bin/start_web.sh
+bin/run_auth_test.sh
 bin/login_fixed.py
 
 # ── 前端 ─────────────────────────────────────
