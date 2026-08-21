@@ -16,12 +16,15 @@ use infra::config::ConfigManager;
 use infra::kzwr_auth::KzwrAuthService;
 use infra::persistence::snapshot::SnapshotStore;
 use infra::storage_trait::TargetStorage;
+use infra::target::kzwr::client::KzwrClient;
 
 /// 应用全局共享状态
 #[derive(Clone)]
 pub struct AppState {
     /// 目标存储适配器（kzwr 酷族网软）
     pub target: Arc<dyn TargetStorage>,
+    /// kzwr 客户端（用户信息/容量查询；token 与 target 共享）
+    pub kzwr_client: Arc<KzwrClient>,
     /// 加密会话（备份加密/恢复解密）
     pub crypto: CryptoSession,
     /// 内部事件总线（状态推送）

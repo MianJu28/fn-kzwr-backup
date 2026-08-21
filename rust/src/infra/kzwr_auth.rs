@@ -69,6 +69,29 @@ impl KzwrAuthService {
                     info!("已从配置加载 kzwr token");
                 }
             }
+            // 恢复当前登录用户（记录在配置中）
+            if let Ok(Some(username)) = cfg_guard.decrypt_field(&cfg.kzwr.username_enc) {
+                if !username.is_empty() {
+                    *self.username.lock().unwrap() = Some(username);
+                }
+            }
+        }
+    }
+
+    /// 获取当前登录用户名（优先内存缓存，否则从配置解密）
+    pub fn current_username(&self) -> Option<String> {
+        if let Some(name) = self.username.lock().unwrap().clone() {
+            return Some(name);
+        }
+        // 内存未缓存，从配置读取
+        let cfg_guard = self.config.lock().unwrap();
+        match cfg_guard.load() {
+            Ok(cfg) => cfg_guard
+                .decrypt_field(&cfg.kzwr.username_enc)
+                .ok()
+                .flatten()
+                .filter(|s| !s.is_empty()),
+            Err(_) => None,
         }
     }
 

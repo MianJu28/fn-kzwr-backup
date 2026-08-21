@@ -22,6 +22,24 @@ pub struct HealthResponse {
     pub version: &'static str,
 }
 
+/// 用户信息响应（来自 get_member + 配置）
+#[derive(Serialize, Default)]
+pub struct UserInfoResponse {
+    pub email: Option<String>,
+    pub name: Option<String>,
+    pub avatar: Option<String>,
+    pub plan: Option<String>,
+    /// 总容量（字节）
+    pub total: u64,
+    /// 已用容量（字节）
+    pub use_bytes: u64,
+    /// 已用百分比（如 "8.38%"）
+    pub percentage: Option<String>,
+    /// 配置中记录的登录用户名
+    pub logged_in_username: Option<String>,
+    pub error: Option<String>,
+}
+
 /// kzwr 登录请求
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -225,6 +243,41 @@ async fn config_save(
     }
 }
 
+/// 获取当前登录用户信息（含存储容量，来自 get_member）
+async fn user_info(State(state): State<AppState>) -> Json<UserInfoResponse> {
+    // 1) 配置中记录的登录用户名
+    let logged_in_username = state.auth.current_username();
+
+    // 2) 从 kzwr API 获取用户信息与容量
+    match state.kzwr_client.get_member().await {
+        Ok(v) => {
+            let data = v.get("data").cloned().unwrap_or_default();
+            let num = |key: &str| {
+                data.get(key).and_then(|x| x.as_u64()).unwrap_or(0)
+            };
+            let opt_str = |key: &str| {
+                data.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
+            };
+            Json(UserInfoResponse {
+                email: opt_str("email").or_else(|| logged_in_username.clone()),
+                name: opt_str("name"),
+                avatar: opt_str("avatar"),
+                plan: opt_str("plan"),
+                total: num("total").max(num("capacity")),
+                use_bytes: num("use"),
+                percentage: opt_str("percentage"),
+                logged_in_username,
+                error: None,
+            })
+        }
+        Err(e) => Json(UserInfoResponse {
+            logged_in_username,
+            error: Some(format!("获取用户信息失败: {e}")),
+            ..Default::default()
+        }),
+    }
+}
+
 /// 触发备份：确保登录 + 遍历配置的多备份路径
 async fn backup_run(State(state): State<AppState>) -> Json<BackupResponse> {
     Json(run_backup_now(&state).await)
@@ -413,6 +466,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/ws", get(ws::ws_handler))
         .route("/auth/login", post(auth_login))
+        .route("/user/info", get(user_info))
         .route("/config", get(config_get).post(config_save))
         .route("/backup/run", post(backup_run))
         .route("/restore/files", get(restore_files))

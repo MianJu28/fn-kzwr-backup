@@ -28,6 +28,9 @@
   // 实时任务状态（WebSocket 推送）
   let liveStatus = null; // { kind, status, current_file, done, total }
   let wsConnected = false;
+  // 用户信息（含存储容量）
+  let userInfo = null;
+  let userInfoError = null;
 
   const navItems = [
     { id: 'dashboard', label: '📊 概览' },
@@ -95,6 +98,18 @@
     }
   }
 
+  // 加载用户信息与存储容量
+  async function loadUserInfo() {
+    try {
+      const res = await fetch('/api/user/info');
+      const data = await res.json();
+      userInfo = data;
+      userInfoError = data.error || null;
+    } catch (e) {
+      userInfoError = e.message;
+    }
+  }
+
   // 加载可恢复文件列表（从 SQLite 快照查询）
   async function loadRestoreFiles() {
     try {
@@ -120,6 +135,7 @@
       const data = await res.json();
       if (data.success) {
         loggedIn = true;
+        loadUserInfo();
         return `已登录: ${data.username}`;
       }
       return `登录失败: ${data.error}`;
@@ -187,6 +203,7 @@
   checkHealth();
   loadConfig();
   loadRestoreFiles();
+  loadUserInfo();
   connectWS();
 </script>
 
@@ -223,6 +240,8 @@
       {restoreFolders}
       {scheduleCron}
       {scheduleCronValid}
+      {userInfo}
+      {userInfoError}
     />
   {:else if currentPage === 'backup'}
     <BackupPage
@@ -238,7 +257,7 @@
   {:else if currentPage === 'restore'}
     <RestorePage {restoreFolders} {busy} onRestore={handleRestore} />
   {:else if currentPage === 'settings'}
-    <SettingsPage {loggedIn} {busy} onLogin={handleLogin} />
+    <SettingsPage {loggedIn} {busy} {userInfo} onLogin={handleLogin} />
   {/if}
 
   <footer>fnos-backup · age 加密 · kzwr 增量备份</footer>

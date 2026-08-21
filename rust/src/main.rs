@@ -71,6 +71,8 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "https://www.kzwr.com".to_string());
     let kzwr_client = infra::target::kzwr::client::KzwrClient::new(&base_url, 30);
     let token_store = kzwr_client.token_store();
+    // 用户信息/容量查询用（clone 共享同一 access_token）
+    let app_kzwr_client = Arc::new(kzwr_client.clone());
     let target: Arc<dyn fnos_backup::infra::storage_trait::TargetStorage> =
         Arc::new(infra::target::kzwr::storage::KzwrTarget::new(kzwr_client));
 
@@ -100,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState {
         target,
+        kzwr_client: app_kzwr_client,
         crypto,
         store,
         eventbus,
