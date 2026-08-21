@@ -311,5 +311,9 @@
   }
 
   .error { background: #fef2f2; color: #b91c1c; padding: 12px; border-radius: 6px; margin-top: 12px; }
+  /* 全局 section 间距（统一卡片之间的留白） */
+  :global(main > section) {
+    margin-top: 20px;
+  }
   footer { text-align: center; color: #8a94a6; font-size: 13px; margin-top: 28px; }
 </style>

@@ -308,7 +308,7 @@ trait TargetStorage {
 
 项目遵循飞牛应用规范，Rust 源码与前端源码在开发期独立，打包时合入飞牛目录结构。
 
-> 以下为**目标结构**（飞牛应用部署形态）。开发期 `rust/` 与 `frontend/` 独立演进，打包时合入飞牛目录。**当前实际 Rust 源码结构**见文末"项目进度"一节。
+> 以下为**目标结构**（飞牛应用部署形态）。开发期 `backend/` 与 `frontend/` 独立演进，打包时合入飞牛目录。**当前实际 Rust 源码结构**见文末"项目进度"一节。
 
 ```
 fnos-backup/
@@ -339,7 +339,7 @@ fnos-backup/
 │   └── bin/
 │       ├── fnos-backup         # 主二进制
 │       └── kzwr-login          # 酷族登录编译二进制 (源自 kzwr_login_turnstile.py, PyInstaller 产物)
-├── rust/                       # Rust 源码 (开发期)
+├── backend/                    # Rust 后端源码 (开发期)
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs             # 入口: axum HTTP 服务启动
@@ -378,7 +378,7 @@ fnos-backup/
 
 **构建流程**：`cargo build --release` → 二进制入 `target/bin/`；酷族登录脚本（`kzwr_login_turnstile.py`）经 PyInstaller 编译为 `kzwr-login` 二进制（x86_64+aarch64）入 `target/bin/`；`cd frontend && npm run build` → 产物入 `app/www/`；`fnpack build` → 生成 `.fpk`。
 
-> 注：开发期通过 WSL 构建（`cargo build`），实际源码以 Windows 侧 `rust/src/` 为准，构建前用 `cp -r` 同步到 WSL `$HOME/fnos-backup/src`。
+> 注：开发期通过 WSL 构建（`cargo build`），实际源码以 Windows 侧 `backend/src/` 为准，构建前用 `cp -r` 同步到 WSL `$HOME/fnos-backup/src`。
 
 ---
 
@@ -470,7 +470,7 @@ fnos-backup/
 
 ### 11.1 当前开发状态
 
-**核心备份/恢复主链路已完成并实测通过**，进入 Phase 4 生产强化收尾阶段。当前使用 WSL（Ubuntu）构建与测试，构建前将 Windows 侧 `rust/src/` 同步到 WSL `$HOME/fnos-backup/src`，运行编译好的二进制或通过 HTTP API 测试。
+**核心备份/恢复主链路已完成并实测通过**，进入 Phase 4 生产强化收尾阶段。当前使用 WSL（Ubuntu）构建与测试，构建前将 Windows 侧 `backend/src/` 同步到 WSL `$HOME/fnos-backup/src`，运行编译好的二进制或通过 HTTP API 测试。
 
 ### 11.2 已实现功能（按模块）
 
@@ -480,6 +480,7 @@ fnos-backup/
 | | 断点续传 | ✅ | 每文件上传后即时存快照，中断可续 |
 | | 多路径备份 | ✅ | 每个源路径独立 job_id 快照，共享 target_prefix |
 | | 保留策略（孤儿清理） | ✅ | `domain/retention.rs`，备份后自动清理目标端孤儿文件 |
+| | 定时备份（cron） | ✅ | `domain/scheduler.rs`，cron 表达式到点触发，配置热更新、防重入 |
 | **增量同步** | 双策略差分 | ✅ | 快速 mtime+size / 严格 BLAKE3（ADR-004） |
 | **加密** | age 公私钥加密 | ✅ | 64MB 分块，公钥加密/私钥解密（ADR-003） |
 | | 密钥库持久化 | ✅ | 私钥被口令派生密钥加密存储，跨重启可用 |
@@ -492,10 +493,13 @@ fnos-backup/
 | **元数据** | SQLite 快照 | ✅ | `sync_snapshots` 表，WAL 模式（ADR-006） |
 | **事件总线** | 内部事件总线 | ✅ | tokio::broadcast，备份/恢复进度事件（ADR-007） |
 | **WebSocket** | 实时状态推送 | ✅ | `/api/ws`，前端实时进度条，断线重连 |
-| **Web UI** | Svelte 前端 | ✅ | 登录页、多路径配置、备份触发、恢复树形视图、配置概览 |
+| **Web UI** | Svelte 前端 | ✅ | 导航栏多页面（概览/备份/恢复/设置）；views+components 分层 |
+| | 用户信息 + 容量 | ✅ | 头像/用户名/邮箱/套餐 + 存储空间进度条（UserCard 组件） |
 | **HTTP API** | 备份/恢复/配置 | ✅ | `http/routes.rs`，axum 路由 |
+| | 用户信息 | ✅ | `/api/user/info`，调用 get_member 返回容量/已用/套餐 |
 | **配置** | 加密 TOML 配置 | ✅ | kzwr 凭据/密码/token 加密存储（age scrypt） |
-| **测试** | 端到端测试 | ✅ | 真实 kzwr 备份/恢复/删除/多级文件夹/物理删除/保留策略 |
+| | 记录登录用户 | ✅ | 配置解密 username_enc，启动恢复；`current_username()` |
+| **测试** | 端到端测试 | ✅ | 真实 kzwr 备份/恢复/删除/多级文件夹/物理删除/保留策略/定时触发 |
 | **飞牛部署** | `.fpk` 打包 | 🔶 | 结构已规划，GitHub Actions 双架构构建待实现 |
 | **监控告警** | 失败通知/告警 | ⏳ | 规划中（当前仅 WebSocket 实时状态） |
 | **多目标** | 备份到多个目标 | ❌ 放弃 | 按用户决策，保留策略实现，多目标不做 |
@@ -503,12 +507,12 @@ fnos-backup/
 ### 11.3 当前实际 Rust 源码结构
 
 ```
-rust/src/
+backend/src/
 ├── main.rs              # 入口: axum HTTP 服务启动
-├── lib.rs               # 库入口 (AppState 等)
+├── lib.rs               # 库入口 (AppState 等，含 kzwr_client)
 ├── http/
 │   ├── mod.rs
-│   ├── routes.rs        # 路由 + 各 handler (backup/restore/config/health)
+│   ├── routes.rs        # 路由 + 各 handler (backup/restore/config/health/user_info)
 │   └── ws.rs            # WebSocket 状态推送
 ├── domain/
 │   ├── mod.rs
@@ -516,7 +520,8 @@ rust/src/
 │   ├── sync.rs          # SyncSession (差分)
 │   ├── crypto.rs        # CryptoSession (age 加密) + AgeKeys
 │   ├── restore.rs       # RestoreJob (恢复编排)
-│   └── retention.rs     # RetentionPolicy (孤儿文件清理)
+│   ├── retention.rs     # RetentionPolicy (孤儿文件清理)
+│   └── scheduler.rs     # Scheduler (cron 定时备份调度)
 ├── infra/
 │   ├── mod.rs
 │   ├── storage_trait.rs # SourceStorage / TargetStorage trait
@@ -525,10 +530,31 @@ rust/src/
 │   ├── persistence/snapshot.rs  # SnapshotStore (SQLite)
 │   ├── config.rs        # ConfigManager (TOML)
 │   ├── keystore.rs      # 密钥库
-│   └── kzwr_auth.rs     # KzwrAuthService (登录/token 管理)
+│   └── kzwr_auth.rs     # KzwrAuthService (登录/token/current_username)
 ├── bin/                 # 测试二进制 (开发期)
 ├── eventbus.rs          # EventBus (tokio::broadcast)
 └── ...
+
+### 11.3.1 当前前端结构
+
+```
+frontend/src/
+├── App.svelte              # 应用壳：导航 + 页面切换 + 全局状态/WebSocket
+├── main.js                 # Svelte 挂载入口
+├── views/                  # 页面级组件
+│   ├── DashboardPage.svelte  # 概览：UserCard + LiveStatus + Overview
+│   ├── BackupPage.svelte     # 备份：配置 + 定时 + 执行
+│   ├── RestorePage.svelte    # 恢复
+│   └── SettingsPage.svelte   # 设置：UserCard + 登录
+├── components/             # 功能区块组件
+│   ├── LiveStatus.svelte      # 实时任务状态（WebSocket 进度）
+│   ├── OverviewSection.svelte # 配置概览（网格卡片）
+│   ├── UserCard.svelte        # 用户信息 + 存储容量
+│   ├── LoginSection.svelte    # kzwr 登录
+│   ├── BackupConfigSection.svelte # 备份路径 + 定时 cron
+│   ├── BackupSection.svelte   # 备份执行
+│   └── RestoreSection.svelte  # 恢复目录树
+└── TreeNode.svelte          # 目录树递归节点
 ```
 
 ### 11.4 关键决策落地说明
@@ -537,6 +563,8 @@ rust/src/
 - **保留策略语义**：因无多版本，保留策略聚焦"目标端孤儿文件清理"（不在任何 job 快照中的残留），防目标空间膨胀
 - **恢复目标**：支持恢复到配置源路径（原位置）或指定目录；目录用"新建/覆盖"按钮控制
 - **token 管理**：启动从配置加载已保存 token 避免重复登录，过期自动重登（`kzwr_auth.rs`）
+- **定时备份**：cron 表达式到点触发，运行中改配置热更新（`domain/scheduler.rs`）
+- **用户信息**：登录用户记录在配置（username_enc 解密），容量来自 kzwr get_member（`/api/user/info`）
 
 ### 11.5 后续待办（按优先级）
 

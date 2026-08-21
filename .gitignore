@@ -10,9 +10,9 @@ session.json
 
 # ── Rust ───────────────────────────────────────
 # Cargo.lock 对二进制项目应提交以保证可复现构建，故不忽略
-# 仅忽略根目录 rust/target/ 编译产物；src/infra/target/ 是源码目录，不忽略
-rust/target/
-rust/.cargo/config.toml
+# 仅忽略根目录 backend/target/ 编译产物；src/infra/target/ 是源码目录，不忽略
+backend/target/
+backend/.cargo/config.toml
 
 # ── 登录二进制（编译产物，经 GitHub Release 分发）──
 bin/*-linux-x64

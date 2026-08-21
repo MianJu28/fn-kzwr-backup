@@ -45,26 +45,47 @@
         {scheduleCron ? (scheduleCronValid ? `⏰ ${scheduleCron}` : '⚠️ cron 无效') : '未启用'}
       </span>
     </div>
-    <div class="ov-item">
-      <span class="ov-label">可恢复</span>
-      <span class="ov-value">{restoreFolders.length > 0 ? `${restoreFolders.length} 个文件夹` : '未配置'}</span>
+    <div class="ov-item ov-item-wide">
+      <span class="ov-label">可恢复 ({restoreFolders.length} 个文件夹)</span>
+      <span class="ov-value">
+        {#if restoreFolders.length > 0}
+          <span class="paths-list">
+            {#each restoreFolders as f (f.path)}
+              <span class="path-chip">
+                {f.path}
+                {#if f.files && f.files.length > 0}
+                  <span class="file-count">· {f.files.length} 文件</span>
+                {/if}
+              </span>
+            {/each}
+          </span>
+        {:else}
+          <span class="muted">未配置</span>
+        {/if}
+      </span>
     </div>
   </div>
 </section>
 
 <style>
-  .overview { background: #f0f7ff; border: 1px solid #cfe4ff; }
-  h2 { margin: 0 0 14px; font-size: 18px; }
+  .overview { background: #f0f7ff; border: 1px solid #cfe4ff; padding: 24px; }
+  h2 { margin: 0 0 20px; font-size: 18px; }
   .ov-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-    gap: 14px;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 18px;
+  }
+  @media (max-width: 600px) {
+    .ov-grid { grid-template-columns: 1fr; }
   }
   .ov-item {
     background: #fff;
     border: 1px solid #e2efff;
     border-radius: 8px;
-    padding: 12px 14px;
+    padding: 16px 18px;
+  }
+  .ov-item-wide {
+    grid-column: 1 / -1;
   }
   .ov-label {
     display: block;
@@ -73,18 +94,19 @@
     font-size: 12px;
     text-transform: uppercase;
     letter-spacing: 0.03em;
-    margin-bottom: 6px;
+    margin-bottom: 8px;
   }
-  .ov-value { color: #1f2d3d; font-size: 14px; word-break: break-all; line-height: 1.5; }
+  .ov-value { color: #1f2d3d; font-size: 14px; word-break: break-all; line-height: 1.6; }
   .muted { color: #8a94a6; }
   .paths-list { display: flex; flex-wrap: wrap; gap: 6px; }
   .path-chip {
     background: #eef2ff;
     color: #2563eb;
     border-radius: 6px;
-    padding: 3px 8px;
+    padding: 4px 10px;
     font-family: monospace;
     font-size: 12px;
     word-break: break-all;
   }
+  .file-count { color: #8a94a6; font-size: 11px; }
 </style>

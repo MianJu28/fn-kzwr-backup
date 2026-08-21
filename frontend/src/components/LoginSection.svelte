@@ -40,6 +40,12 @@
 </section>
 
 <style>
+  section {
+    background: #fff;
+    border-radius: 10px;
+    padding: 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.06);
+  }
   h2 { margin: 0 0 8px; font-size: 18px; }
   .hint { color: #5a6a7a; font-size: 13px; margin: 0 0 10px; }
   .ok { color: #22a06b; }
