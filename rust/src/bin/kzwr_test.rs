@@ -65,6 +65,10 @@ async fn main() -> anyhow::Result<()> {
     println!("\n=== 6. 删除测试（清理测试文件）===");
     delete_test_files(&target).await;
 
+    // 6b) 物理删除测试（文件 + 文件夹）
+    println!("\n=== 6b. 物理删除测试（文件 + 文件夹）===");
+    physical_delete_test(target.client()).await;
+
     // 7) ping
     println!("\n=== 7. KzwrTarget::ping ===");
     match target.ping().await {
@@ -124,6 +128,154 @@ async fn delete_test_files(target: &KzwrTarget) {
     } else {
         println!("[*] 未发现需要删除的测试文件");
     }
+}
+
+/// 物理删除测试：kzwr 为两阶段删除，先逻辑删除(进回收站)再从回收站物理删除(purge)
+/// 对照 Python delete_file/delete_folder 的 physical=True 分支
+async fn physical_delete_test(client: &KzwrClient) {
+    // ── 文件：上传 → 逻辑删除(进回收站) → 物理删除(purge) ──
+    println!("[*] 上传临时文件用于物理删除测试 ...");
+    let dir = std::env::temp_dir();
+    let file_name = format!(
+        "rust_physdel_{}.bin",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    );
+    let local_path = dir.join(&file_name);
+    if generate_test_file(&local_path, 200_000).is_err() {
+        println!("[!] 生成物理删除测试文件失败");
+        return;
+    }
+    match upload_file(client, &local_path, "/share", "Auto", 0, 3).await {
+        Ok(_) => println!("[+] 临时文件上传成功: {}", file_name),
+        Err(e) => {
+            println!("[!] 上传失败: {:?}", e);
+            let _ = std::fs::remove_file(&local_path);
+            return;
+        }
+    }
+    let _ = std::fs::remove_file(&local_path);
+
+    // 拿文件 id（encodedId），先逻辑删除进回收站
+    if let Ok(files) = client.list_files("/share", 1, true).await {
+        if let Some(file_id) = files
+            .get("files")
+            .and_then(|f| f.as_array())
+            .and_then(|arr| {
+                arr.iter().find(|it| {
+                    it.get("fileName")
+                        .or_else(|| it.get("name"))
+                        .and_then(|v| v.as_str())
+                        == Some(file_name.as_str())
+                })
+            })
+            .and_then(|it| it.get("id").and_then(|v| v.as_str()))
+        {
+            println!("[*] 文件逻辑删除(进回收站): id={}", file_id);
+            if let Err(e) = client.delete_file(&[file_id.to_string()], false).await {
+                println!("[!] 文件逻辑删除失败: {:?}", e);
+                return;
+            }
+        }
+    }
+
+    // ── 文件夹：创建 → 逻辑删除(进回收站) → 物理删除 ──
+    println!("[*] 创建临时文件夹用于物理删除测试 ...");
+    let folder_name = format!(
+        "rust_physdel_folder_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    );
+    if let Err(e) = client.create_folder(&folder_name, "/").await {
+        println!("[!] 创建文件夹失败: {:?}", e);
+        return;
+    }
+    println!("[+] 文件夹创建成功: {}", folder_name);
+
+    // 拿文件夹 encodedId，逻辑删除进回收站
+    if let Ok(files) = client.list_files("/", 1, true).await {
+        if let Some(enc) = files
+            .get("folders")
+            .and_then(|f| f.as_array())
+            .and_then(|arr| {
+                arr.iter().find(|it| {
+                    it.get("name")
+                        .or_else(|| it.get("folderName"))
+                        .and_then(|v| v.as_str())
+                        == Some(folder_name.as_str())
+                })
+            })
+            .and_then(|it| it.get("encodedId").and_then(|v| v.as_str()))
+        {
+            println!("[*] 文件夹逻辑删除(进回收站): encodedId={}", enc);
+            if let Err(e) = client.delete_folder(&[enc.to_string()], false).await {
+                println!("[!] 文件夹逻辑删除失败: {:?}", e);
+                return;
+            }
+        }
+    }
+
+    // ── 从回收站物理删除文件与文件夹 ──
+    println!("[*] 从回收站物理删除(purge) ...");
+    match purge_from_trash(client, &file_name, &folder_name).await {
+        Ok(()) => println!("[+] 回收站物理删除完成"),
+        Err(e) => println!("[!] 回收站物理删除失败: {:?}", e),
+    }
+}
+
+/// 从回收站中物理删除(purge)目标文件与文件夹，并清理全部历史测试条目
+/// 参照 Python delete_trash_items：文件用 Pids、文件夹用 FolderIds（都是回收站 encodedId）
+async fn purge_from_trash(
+    client: &KzwrClient,
+    file_name: &str,
+    folder_name: &str,
+) -> anyhow::Result<()> {
+    let trash = client.get_trash(1).await?;
+    let items = trash
+        .get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    println!("[+] 回收站共 {} 个条目", items.len());
+
+    // 收集要物理删除的条目（目标文件/文件夹 + 全部历史测试条目）
+    let mut to_purge: Vec<serde_json::Value> = Vec::new();
+    let mut target_hit = false;
+    for it in &items {
+        let name = it.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let is_target = name == file_name || name == folder_name;
+        let is_test = name.starts_with("rust_");
+        if is_target {
+            target_hit = true;
+        }
+        if is_target || is_test {
+            to_purge.push(it.clone());
+        }
+    }
+
+    for it in &to_purge {
+        let name = it.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let item_type = it.get("itemType").and_then(|v| v.as_str()).unwrap_or("");
+        let enc = it.get("encodedId").and_then(|v| v.as_str()).unwrap_or("");
+        println!("  [{}] 待物理删除: {} -> {}", item_type, name, enc);
+    }
+
+    if !to_purge.is_empty() {
+        client.delete_trash_items(&to_purge).await?;
+        println!("[+] 已物理删除 {} 个条目", to_purge.len());
+    } else {
+        println!("[*] 回收站无待删除条目");
+    }
+
+    if !target_hit {
+        println!("[!] 未在回收站匹配到目标文件/文件夹");
+    }
+    Ok(())
 }
 
 /// 文件夹创建/删除测试（对照 Python create_folder/delete_folder 逻辑）

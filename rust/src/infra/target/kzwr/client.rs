@@ -438,4 +438,47 @@ impl KzwrClient {
         let params = [("page", page.to_string())];
         self.get_json("/api/v2/user/trash", &params).await
     }
+
+    /// 从回收站永久删除文件(物理删除)。
+    /// pids 用回收站条目的 encodedId(不是普通列表的 sid)。
+    /// 端点: POST /api/v2/files/delete/physical, body: {Pids: [...]}
+    pub async fn delete_trash_files(&self, pids: &[String]) -> KzwrResult<Value> {
+        self.post_json("/api/v2/files/delete/physical", json!({ "Pids": pids }))
+            .await
+    }
+
+    /// 从回收站永久删除文件夹(物理删除)。
+    /// folder_encoded_ids 用回收站条目的 encodedId。
+    /// 端点: POST /api/v2/folder/delete/physical, body: {FolderIds: [...]}
+    pub async fn delete_trash_folders(&self, folder_encoded_ids: &[String]) -> KzwrResult<Value> {
+        self.post_json(
+            "/api/v2/folder/delete/physical",
+            json!({ "FolderIds": folder_encoded_ids }),
+        )
+        .await
+    }
+
+    /// 从回收站批量永久删除条目(文件+文件夹自动区分)。
+    /// items 为 get_trash() 返回的 items 数组，按 itemType 分发。
+    pub async fn delete_trash_items(&self, items: &[Value]) -> KzwrResult<Vec<Value>> {
+        let file_pids: Vec<String> = items
+            .iter()
+            .filter(|it| it.get("itemType").and_then(|v| v.as_str()) != Some("folder"))
+            .filter_map(|it| it.get("encodedId").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .collect();
+        let folder_ids: Vec<String> = items
+            .iter()
+            .filter(|it| it.get("itemType").and_then(|v| v.as_str()) == Some("folder"))
+            .filter_map(|it| it.get("encodedId").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .collect();
+
+        let mut results = Vec::new();
+        if !file_pids.is_empty() {
+            results.push(self.delete_trash_files(&file_pids).await?);
+        }
+        if !folder_ids.is_empty() {
+            results.push(self.delete_trash_folders(&folder_ids).await?);
+        }
+        Ok(results)
+    }
 }
