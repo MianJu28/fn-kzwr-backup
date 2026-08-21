@@ -39,6 +39,35 @@ impl SyncSession {
         current: &[FileDescriptor],
         last_snapshot: &[SnapshotEntry],
     ) -> ChangeSet {
+        Self::diff_inner(current, last_snapshot, &|_| None)
+    }
+
+    /// 执行差分（严格策略）
+    ///
+    /// 在 mtime/size 变化时，再调用 `hasher` 计算 BLAKE3 内容哈希确认：
+    /// - mtime/size 变了但内容哈希相同 → 跳过（防 mtime 欺骗导致的误判）
+    /// - mtime 被欺骗改回旧值但内容变了 → 比较哈希能发现（需 last.digest 非空）
+    /// hasher 需返回该文件的 BLAKE3 内容哈希（hex 字符串）。
+    pub fn diff_strict<F>(
+        current: &[FileDescriptor],
+        last_snapshot: &[SnapshotEntry],
+        hasher: F,
+    ) -> ChangeSet
+    where
+        F: Fn(&FileDescriptor) -> Option<String>,
+    {
+        Self::diff_inner(current, last_snapshot, &hasher)
+    }
+
+    /// 差分核心实现，`hasher` 用于严格模式下对可疑文件算内容哈希
+    fn diff_inner<F>(
+        current: &[FileDescriptor],
+        last_snapshot: &[SnapshotEntry],
+        hasher: &F,
+    ) -> ChangeSet
+    where
+        F: Fn(&FileDescriptor) -> Option<String>,
+    {
         // 上次快照映射：rel_path -> entry
         let mut last_map: HashMap<&str, &SnapshotEntry> = HashMap::new();
         for e in last_snapshot {
@@ -59,10 +88,21 @@ impl SyncSession {
                 Some(last) => {
                     let mtime_changed = last.mtime_secs != mtime_secs(fd);
                     let size_changed = last.size != fd.size;
-                    if mtime_changed || size_changed {
-                        DiffAction::Upload
+                    // 严格模式：优先用内容哈希判断（可发现 mtime/size 欺骗）
+                    let cur_digest = hasher(fd);
+                    if let Some(cur_d) = &cur_digest {
+                        match &last.digest {
+                            // 上次也有哈希 → 直接比较内容哈希（权威判定）
+                            Some(last_d) if last_d == cur_d => DiffAction::Skip,
+                            _ => DiffAction::Upload,
+                        }
                     } else {
-                        DiffAction::Skip
+                        // 无法算哈希（目录等）→ 回退到 mtime/size
+                        if mtime_changed || size_changed {
+                            DiffAction::Upload
+                        } else {
+                            DiffAction::Skip
+                        }
                     }
                 }
             };
@@ -80,6 +120,18 @@ impl SyncSession {
             }
         }
         cs
+    }
+}
+
+/// 计算文件的 BLAKE3 内容哈希（hex 字符串）
+pub fn blake3_hex(data: &[u8]) -> String {
+    blake3::hash(data).to_hex().to_string()
+}
+
+impl SyncSession {
+    /// BLAKE3 hex（供严格模式差分使用）
+    pub fn blake3_hex(data: &[u8]) -> String {
+        blake3::hash(data).to_hex().to_string()
     }
 }
 

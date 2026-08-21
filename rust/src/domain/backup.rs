@@ -35,19 +35,48 @@ pub struct BackupJob {
 }
 
 impl BackupJob {
-    /// 执行一次增量备份，返回上传/删除统计
+    /// 执行一次增量备份（快速模式 mtime+size）
     pub async fn run(&self, source_root: &Path) -> Result<BackupSummary> {
-        // 1) 扫描源目录
-        let current = scan_all(&*self.source, source_root).await?;
-        info!(count = current.len(), "源扫描完成");
+        self.run_inner(source_root, false).await
+    }
+
+    /// 执行一次增量备份（严格模式，BLAKE3 内容哈希确认）
+    pub async fn run_strict(&self, source_root: &Path) -> Result<BackupSummary> {
+        self.run_inner(source_root, true).await
+    }
+
+    /// 备份核心实现
+    async fn run_inner(&self, source_root: &Path, strict: bool) -> Result<BackupSummary> {
+        // 1) 扫描源目录（严格模式时计算 BLAKE3 内容哈希）
+        let current = if strict {
+            scan_all_strict(&*self.source, source_root).await?
+        } else {
+            scan_all(&*self.source, source_root).await?
+        };
+        info!(count = current.len(), strict, "源扫描完成");
 
         // 2) 加载上次快照 + 差分
         let last = self.store.load_snapshot(&self.job_id)?;
-        let changeset = SyncSession::diff(&current, &last);
+        let changeset = if strict {
+            // 严格模式：对 mtime/size 变化的文件算哈希确认
+            let root = source_root.to_path_buf();
+            let hasher = move |fd: &FileDescriptor| -> Option<String> {
+                if fd.is_dir {
+                    return None;
+                }
+                let path = root.join(&fd.rel_path);
+                let data = std::fs::read(&path).ok()?;
+                Some(SyncSession::blake3_hex(&data))
+            };
+            SyncSession::diff_strict(&current, &last, hasher)
+        } else {
+            SyncSession::diff(&current, &last)
+        };
         info!(
             upload = changeset.upload.len(),
             delete = changeset.delete.len(),
             unchanged = changeset.unchanged,
+            strict,
             "差分完成"
         );
 
@@ -164,4 +193,37 @@ async fn scan_all(
         }
     }
     Ok(out)
+}
+
+/// 递归扫描源目录（严格模式：为文件计算 BLAKE3 内容哈希存入 digest）
+async fn scan_all_strict(
+    source: &dyn SourceStorage,
+    root: &Path,
+) -> Result<Vec<FileDescriptor>> {
+    let mut out = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![PathBuf::new()];
+    while let Some(rel) = stack.pop() {
+        let entries = source.list(&rel).await?;
+        for mut e in entries {
+            if !e.is_dir {
+                // 计算 BLAKE3 内容哈希
+                if let Some(digest) = read_blake3(root, &e.rel_path) {
+                    e.digest = Some(digest);
+                }
+            }
+            out.push(e.clone());
+            if e.is_dir {
+                let child_rel = PathBuf::from(&e.rel_path);
+                stack.push(child_rel);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 读取文件并计算 BLAKE3 内容哈希（32 字节）
+fn read_blake3(root: &Path, rel: &str) -> Option<[u8; 32]> {
+    let path = root.join(rel);
+    let data = std::fs::read(&path).ok()?;
+    Some(blake3::hash(&data).into())
 }

@@ -20,6 +20,8 @@ pub struct SnapshotEntry {
     /// mtime 秒级时间戳（0 表示未知）
     pub mtime_secs: i64,
     pub is_dir: bool,
+    /// BLAKE3 内容哈希（严格模式用，hex 字符串；目录为 None）
+    pub digest: Option<String>,
 }
 
 /// 快照存储（线程安全，单写多读）
@@ -43,6 +45,7 @@ impl SnapshotStore {
                 size       INTEGER NOT NULL,
                 mtime_secs INTEGER NOT NULL,
                 is_dir     INTEGER NOT NULL,
+                digest     TEXT,
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY (job_id, rel_path)
              );
@@ -63,12 +66,13 @@ impl SnapshotStore {
         let tx = conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO sync_snapshots (job_id, rel_path, size, mtime_secs, is_dir, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO sync_snapshots (job_id, rel_path, size, mtime_secs, is_dir, digest, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(job_id, rel_path) DO UPDATE SET
                     size = excluded.size,
                     mtime_secs = excluded.mtime_secs,
                     is_dir = excluded.is_dir,
+                    digest = excluded.digest,
                     updated_at = excluded.updated_at",
             )?;
             for e in entries {
@@ -78,6 +82,7 @@ impl SnapshotStore {
                     e.size as i64,
                     e.mtime_secs,
                     e.is_dir as i64,
+                    e.digest,
                     now
                 ])?;
             }
@@ -89,7 +94,7 @@ impl SnapshotStore {
     pub fn load_snapshot(&self, job_id: &str) -> rusqlite::Result<Vec<SnapshotEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT rel_path, size, mtime_secs, is_dir FROM sync_snapshots WHERE job_id = ?1",
+            "SELECT rel_path, size, mtime_secs, is_dir, digest FROM sync_snapshots WHERE job_id = ?1",
         )?;
         let rows = stmt.query_map([job_id], |r| {
             Ok(SnapshotEntry {
@@ -97,6 +102,7 @@ impl SnapshotStore {
                 size: r.get::<_, i64>(1)? as u64,
                 mtime_secs: r.get(2)?,
                 is_dir: r.get::<_, i64>(3)? != 0,
+                digest: r.get(4)?,
             })
         })?;
         rows.collect()
@@ -107,7 +113,7 @@ impl SnapshotStore {
         let conn = self.conn.lock().unwrap();
         let row = conn
             .query_row(
-                "SELECT rel_path, size, mtime_secs, is_dir FROM sync_snapshots WHERE job_id=?1 AND rel_path=?2",
+                "SELECT rel_path, size, mtime_secs, is_dir, digest FROM sync_snapshots WHERE job_id=?1 AND rel_path=?2",
                 [job_id, rel_path],
                 |r| {
                     Ok(SnapshotEntry {
@@ -115,6 +121,7 @@ impl SnapshotStore {
                         size: r.get::<_, i64>(1)? as u64,
                         mtime_secs: r.get(2)?,
                         is_dir: r.get::<_, i64>(3)? != 0,
+                        digest: r.get(4)?,
                     })
                 },
             )
@@ -136,6 +143,9 @@ impl SnapshotEntry {
             size: fd.size,
             mtime_secs,
             is_dir: fd.is_dir,
+            digest: fd
+                .digest
+                .map(|d| d.iter().map(|b| format!("{:02x}", b)).collect()),
         }
     }
 }
