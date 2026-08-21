@@ -41,17 +41,37 @@ async fn main() -> anyhow::Result<()> {
     };
     let target = Arc::new(infra::target::kzwr::storage::KzwrTarget::new(kzwr_client));
 
-    // 加密：age 密钥对（Phase 5 前用内存生成；实际应从加密密钥库加载私钥）
-    let keys = fnos_backup::domain::crypto::AgeKeys::generate();
-    let crypto = fnos_backup::domain::crypto::CryptoSession::full(&keys);
+    // 数据目录（快照）与配置目录（密钥库）
+    let var_dir = std::env::var("TRIM_PKGVAR").unwrap_or_else(|_| ".".to_string());
+    let cfg_dir = std::env::var("TRIM_PKGETC").unwrap_or_else(|_| ".".to_string());
+    let var_dir = std::path::PathBuf::from(&var_dir);
+    let cfg_dir = std::path::PathBuf::from(&cfg_dir);
 
     // 元数据快照库：存 $TRIM_PKGVAR（飞牛数据目录）
-    let var_dir = std::env::var("TRIM_PKGVAR").unwrap_or_else(|_| ".".to_string());
     let store = std::sync::Arc::new(
-        infra::persistence::snapshot::SnapshotStore::open(
-            &std::path::PathBuf::from(&var_dir).join("meta.db"),
-        )?,
+        infra::persistence::snapshot::SnapshotStore::open(&var_dir.join("meta.db"))?,
     );
+
+    // 密钥库：从 $TRIM_PKGETC 加载，不存在则生成并加密存储。
+    // 口令来自 TRIM_PASSPHRASE（实际由安装向导设置，注入环境变量）
+    let passphrase = std::env::var("TRIM_PASSPHRASE").unwrap_or_else(|_| "change-me".to_string());
+    let passphrase = fnos_backup::infra::keystore::secret(&passphrase);
+    let keys = {
+        let ks_path = fnos_backup::infra::keystore::keystore_path(&cfg_dir);
+        match fnos_backup::infra::keystore::load_keystore(&passphrase, &ks_path) {
+            Ok(k) => {
+                info!("已从密钥库加载 age 私钥");
+                k
+            }
+            Err(_) => {
+                let k = fnos_backup::domain::crypto::AgeKeys::generate();
+                fnos_backup::infra::keystore::save_keystore(&k, &passphrase, &ks_path)?;
+                info!("已生成并加密存储 age 密钥对");
+                k
+            }
+        }
+    };
+    let crypto = fnos_backup::domain::crypto::CryptoSession::full(&keys);
 
     // 目标前缀 + 任务 id
     let target_prefix = std::env::var("TRIM_KZWR_FOLDER")

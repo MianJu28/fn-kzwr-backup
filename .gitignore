@@ -31,6 +31,7 @@ bin/run_kzwr_backup_test.sh
 bin/run_cleanup_test.sh
 bin/run_restore_test.sh
 bin/run_http_test.sh
+bin/run_keystore_test.sh
 bin/login_fixed.py
 
 # ── Python ─────────────────────────────────────
