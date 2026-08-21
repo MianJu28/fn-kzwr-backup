@@ -90,7 +90,18 @@ async fn main() -> anyhow::Result<()> {
         job_id,
     };
 
-    let app = http::routes::router(state);
+    // 前端静态资源目录（默认当前目录的 www，飞牛部署时为 $TRIM_APPDEST/www）
+    let www_dir = std::env::var("TRIM_WWW_DIR").unwrap_or_else(|_| "www".to_string());
+    let www_dir = std::path::PathBuf::from(&www_dir);
+
+    let api_router = http::routes::router(state);
+    // 托管前端 SPA + API 路由
+    let app = axum::Router::new()
+        .nest("/api", api_router)
+        .fallback_service(
+            tower_http::services::ServeDir::new(&www_dir)
+                .not_found_service(tower_http::services::ServeFile::new(www_dir.join("index.html"))),
+        );
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     info!("fnos-backup 服务启动: http://{addr}");

@@ -111,11 +111,11 @@ async fn restore_run(
     }
 }
 
-/// 构建应用路由
+/// 构建应用路由（不含 /api 前缀，由 main.rs nest("/api") 统一加前缀）
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/api/health", get(health))
-        .route("/api/backup/run", post(backup_run))
-        .route("/api/restore/run", post(restore_run))
+        .route("/health", get(health))
+        .route("/backup/run", post(backup_run))
+        .route("/restore/run", post(restore_run))
         .with_state(state)
 }
