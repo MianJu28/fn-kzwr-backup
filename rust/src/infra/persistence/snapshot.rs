@@ -90,6 +90,35 @@ impl SnapshotStore {
         tx.commit()
     }
 
+    /// 保存单条快照（断点续传用：每上传完一个文件即时记录，中断后可续传）
+    pub fn save_entry(&self, job_id: &str, entry: &SnapshotEntry) -> rusqlite::Result<()> {
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sync_snapshots (job_id, rel_path, size, mtime_secs, is_dir, digest, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(job_id, rel_path) DO UPDATE SET
+                size = excluded.size,
+                mtime_secs = excluded.mtime_secs,
+                is_dir = excluded.is_dir,
+                digest = excluded.digest,
+                updated_at = excluded.updated_at",
+            rusqlite::params![
+                job_id,
+                entry.rel_path,
+                entry.size as i64,
+                entry.mtime_secs,
+                entry.is_dir as i64,
+                entry.digest,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
     /// 加载某个任务的完整快照（用于差分基线）
     pub fn load_snapshot(&self, job_id: &str) -> rusqlite::Result<Vec<SnapshotEntry>> {
         let conn = self.conn.lock().unwrap();

@@ -106,6 +106,7 @@ impl BackupJob {
         );
 
         // 3) 上传新增/修改文件（目录不实际上传，仅记录）
+        //    断点续传：每上传完一个文件即时保存其快照，中断后下次可从断点继续
         let mut uploaded = 0usize;
         let mut uploaded_bytes = 0u64;
         for fd in &changeset.upload {
@@ -115,6 +116,8 @@ impl BackupJob {
             let n = self.upload_one(source, &fd.rel_path).await?;
             uploaded += 1;
             uploaded_bytes += n;
+            // 即时记录已上传文件的快照（断点续传关键）
+            self.store.save_entry(job_id, &SnapshotEntry::from_fd(fd))?;
             info!("已上传: {} ({n} B)", fd.rel_path);
         }
 
@@ -132,7 +135,7 @@ impl BackupJob {
             }
         }
 
-        // 5) 保存新快照
+        // 5) 保存新快照（完整覆盖，含未变化文件与删除后的状态）
         let snapshot: Vec<SnapshotEntry> = current.iter().map(SnapshotEntry::from_fd).collect();
         self.store.save_snapshot(job_id, &snapshot)?;
 
