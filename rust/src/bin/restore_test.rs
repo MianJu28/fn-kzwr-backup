@@ -119,6 +119,7 @@ async fn main() -> Result<()> {
         crypto: crypto.clone(),
         store: store.clone(),
         target_prefix: Some(PREFIX.to_string()),
+        eventbus: None,
     };
     println!("=== 1. 备份 ===");
     let s = backup_job.run(&src_root).await?;
@@ -137,6 +138,7 @@ async fn main() -> Result<()> {
         target: target.clone(),
         crypto: crypto.clone(),
         target_prefix: Some(PREFIX.to_string()),
+        eventbus: None,
     };
     let r1 = restore_job.run(&[], &restore_dir1).await?;
     println!("[+] 恢复: restored={} bytes={}", r1.restored, r1.restored_bytes);

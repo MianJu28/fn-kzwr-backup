@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::backup::BackupJob;
 use crate::domain::restore::RestoreJob;
+use crate::http::ws;
 use crate::AppState;
 
 // ── 响应/请求结构 ──────────────────────────────
@@ -230,6 +231,7 @@ async fn backup_run(State(state): State<AppState>) -> Json<BackupResponse> {
         crypto: state.crypto.clone(),
         store: state.store.clone(),
         target_prefix: Some(target_folder),
+        eventbus: Some(state.eventbus.clone()),
     };
     match job.run_multi(&paths).await {
         Ok(summary) => Json(BackupResponse {
@@ -326,6 +328,7 @@ async fn restore_run(
         target: state.target.clone(),
         crypto: state.crypto.clone(),
         target_prefix: Some(state.target_folder.clone()),
+        eventbus: Some(state.eventbus.clone()),
     };
     match job.run(&files, std::path::Path::new(&restore_root)).await {
         Ok(summary) => Json(RestoreResponse {
@@ -345,6 +348,7 @@ async fn restore_run(
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/ws", get(ws::ws_handler))
         .route("/auth/login", post(auth_login))
         .route("/config", get(config_get).post(config_save))
         .route("/backup/run", post(backup_run))

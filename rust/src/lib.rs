@@ -6,10 +6,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 pub mod domain;
+pub mod eventbus;
 pub mod http;
 pub mod infra;
 
 use domain::crypto::CryptoSession;
+use eventbus::EventBus;
 use infra::config::ConfigManager;
 use infra::kzwr_auth::KzwrAuthService;
 use infra::persistence::snapshot::SnapshotStore;
@@ -22,6 +24,8 @@ pub struct AppState {
     pub target: Arc<dyn TargetStorage>,
     /// 加密会话（备份加密/恢复解密）
     pub crypto: CryptoSession,
+    /// 内部事件总线（状态推送）
+    pub eventbus: Arc<EventBus>,
     /// 元数据快照库
     pub store: Arc<SnapshotStore>,
     /// 配置管理器（含多备份路径、kzwr 凭据）

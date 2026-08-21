@@ -65,6 +65,7 @@ async fn main() -> Result<()> {
         crypto: crypto.clone(),
         store: store.clone(),
         target_prefix: Some(TARGET_FOLDER.to_string()),
+        eventbus: None,
     };
 
     // 1) 首次全量备份

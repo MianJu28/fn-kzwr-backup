@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 # HTTP 后端
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
 serde = { version = "1", features = ["derive"] }

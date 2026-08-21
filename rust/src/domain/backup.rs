@@ -32,6 +32,8 @@ pub struct BackupJob {
     pub store: Arc<SnapshotStore>,
     /// 目标根目录前缀（如 "/fn-backup"），为 None 时写入目标根
     pub target_prefix: Option<String>,
+    /// 内部事件总线（进度推送，可选）
+    pub eventbus: Option<Arc<crate::eventbus::EventBus>>,
 }
 
 impl BackupJob {
@@ -107,6 +109,16 @@ impl BackupJob {
 
         // 3) 上传新增/修改文件（目录不实际上传，仅记录）
         //    断点续传：每上传完一个文件即时保存其快照，中断后下次可从断点继续
+        let total_upload = changeset.upload.iter().filter(|fd| !fd.is_dir).count() as u64;
+        self.publish(
+            job_id,
+            crate::eventbus::TaskStatus::Started,
+            None,
+            0,
+            total_upload,
+            None,
+        );
+
         let mut uploaded = 0usize;
         let mut uploaded_bytes = 0u64;
         for fd in &changeset.upload {
@@ -118,6 +130,14 @@ impl BackupJob {
             uploaded_bytes += n;
             // 即时记录已上传文件的快照（断点续传关键）
             self.store.save_entry(job_id, &SnapshotEntry::from_fd(fd))?;
+            self.publish(
+                job_id,
+                crate::eventbus::TaskStatus::Progress,
+                Some(fd.rel_path.clone()),
+                uploaded as u64,
+                total_upload,
+                None,
+            );
             info!("已上传: {} ({n} B)", fd.rel_path);
         }
 
@@ -139,12 +159,44 @@ impl BackupJob {
         let snapshot: Vec<SnapshotEntry> = current.iter().map(SnapshotEntry::from_fd).collect();
         self.store.save_snapshot(job_id, &snapshot)?;
 
+        self.publish(
+            job_id,
+            crate::eventbus::TaskStatus::Completed,
+            None,
+            uploaded as u64,
+            total_upload,
+            None,
+        );
+
         Ok(BackupSummary {
             uploaded,
             uploaded_bytes,
             deleted,
             unchanged: changeset.unchanged,
         })
+    }
+
+    /// 发布进度事件（事件总线可选）
+    fn publish(
+        &self,
+        job_id: &str,
+        status: crate::eventbus::TaskStatus,
+        current_file: Option<String>,
+        done: u64,
+        total: u64,
+        message: Option<String>,
+    ) {
+        if let Some(eb) = &self.eventbus {
+            eb.task_event(
+                crate::eventbus::TaskKind::Backup,
+                status,
+                job_id.to_string(),
+                current_file,
+                done,
+                total,
+                message,
+            );
+        }
     }
 
     /// 上传单个文件：源流 → age 加密 → 目标

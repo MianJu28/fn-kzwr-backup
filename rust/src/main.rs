@@ -95,10 +95,14 @@ async fn main() -> anyhow::Result<()> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| var_dir.join("restore"));
 
+    // 内部事件总线（状态推送）
+    let eventbus = Arc::new(fnos_backup::eventbus::EventBus::new());
+
     let state = AppState {
         target,
         crypto,
         store,
+        eventbus,
         config: config_mgr,
         auth,
         target_folder,

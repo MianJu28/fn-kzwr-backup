@@ -21,6 +21,8 @@ pub struct RestoreJob {
     pub crypto: CryptoSession,
     /// 目标根前缀（备份时写入的前缀，如 "fn-backup"），与备份对应
     pub target_prefix: Option<String>,
+    /// 内部事件总线（进度推送，可选）
+    pub eventbus: Option<Arc<crate::eventbus::EventBus>>,
 }
 
 impl RestoreJob {
@@ -36,6 +38,15 @@ impl RestoreJob {
         } else {
             rel_files.to_vec()
         };
+        let total = files_to_restore.iter().filter(|r| !r.trim().is_empty()).count() as u64;
+
+        self.publish(
+            crate::eventbus::TaskStatus::Started,
+            None,
+            0,
+            total,
+            None,
+        );
 
         let mut restored = 0usize;
         let mut restored_bytes = 0u64;
@@ -46,13 +57,50 @@ impl RestoreJob {
             let n = self.restore_one(rel, restore_dir).await?;
             restored += 1;
             restored_bytes += n;
+            self.publish(
+                crate::eventbus::TaskStatus::Progress,
+                Some(rel.clone()),
+                restored as u64,
+                total,
+                None,
+            );
             info!("已恢复: {} ({n} B)", rel);
         }
+
+        self.publish(
+            crate::eventbus::TaskStatus::Completed,
+            None,
+            restored as u64,
+            total,
+            None,
+        );
 
         Ok(RestoreSummary {
             restored,
             restored_bytes,
         })
+    }
+
+    /// 发布进度事件（事件总线可选）
+    fn publish(
+        &self,
+        status: crate::eventbus::TaskStatus,
+        current_file: Option<String>,
+        done: u64,
+        total: u64,
+        message: Option<String>,
+    ) {
+        if let Some(eb) = &self.eventbus {
+            eb.task_event(
+                crate::eventbus::TaskKind::Restore,
+                status,
+                "restore".to_string(),
+                current_file,
+                done,
+                total,
+                message,
+            );
+        }
     }
 
     /// 恢复单个文件：目标读密文 → age 解密 → 写本地
