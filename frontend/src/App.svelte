@@ -1,4 +1,6 @@
 <script>
+  import TreeNode from './TreeNode.svelte';
+
   let health = '检查中...';
   let error = null;
   let busy = false;
@@ -17,13 +19,13 @@
   // 备份/恢复
   let backupResult = null;
   let restoreResult = null;
-  let restoreDir = '';
-  let restoreFiles = '';
-  let restoreType = 'full';
+  let restoreMsg = '';
   // 可恢复文件（从 SQLite 查询）
   let restoreFolders = [];
-  let expandedFolder = null;
-  let restoreMsg = '';
+  let restoreTrees = [];
+  // 展开的目录路径集合（Set）
+  let expandedSet = new Set();
+  let expandedFolderIdx = null;
 
   async function checkHealth() {
     try {
@@ -48,16 +50,40 @@
     }
   }
 
-  // 加载可恢复文件列表（从 SQLite 快照查询）
+  // 加载可恢复文件列表（从 SQLite 快照查询），并构建目录树
   async function loadRestoreFiles() {
     try {
       const res = await fetch('/api/restore/files');
       const data = await res.json();
       restoreFolders = data.folders || [];
+      restoreTrees = restoreFolders.map((f) => buildTree(f.files));
       if (data.error) error = data.error;
     } catch (e) {
       error = e.message;
     }
+  }
+
+  // 把扁平的快照文件列表构造成目录树
+  function buildTree(files) {
+    const root = {};
+    for (const f of files || []) {
+      const parts = f.rel_path.split('/');
+      let node = root;
+      let cur = '';
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        cur = cur ? `${cur}/${part}` : part;
+        if (i === parts.length - 1) {
+          node[part] = { rel_path: cur, name: part, size: f.size, is_dir: f.is_dir, children: f.is_dir ? {} : null };
+        } else {
+          if (!node[part]) {
+            node[part] = { rel_path: cur, name: part, size: 0, is_dir: true, children: {} };
+          }
+          node = node[part].children;
+        }
+      }
+    }
+    return root;
   }
 
   // 恢复单个文件
@@ -67,7 +93,8 @@
     restoreMsg = '';
     restoreResult = null;
     try {
-      const body = { restore_dir: restoreDir, files: [relPath] };
+      // 不传 restore_dir，后端使用默认恢复目录
+      const body = { files: [relPath] };
       const res = await fetch('/api/restore/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -85,14 +112,16 @@
   }
 
   function toggleFolder(i) {
-    expandedFolder = expandedFolder === i ? null : i;
+    expandedFolderIdx = expandedFolderIdx === i ? null : i;
   }
 
-  function fmtSize(bytes) {
-    if (bytes >= 1024 * 1024 * 1024) return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB';
-    if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(2) + ' MB';
-    if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
-    return bytes + ' B';
+  // 展开/折叠目录节点
+  function toggleDir(relPath) {
+    if (expandedSet.has(relPath)) {
+      expandedSet = new Set([...expandedSet].filter((p) => p !== relPath));
+    } else {
+      expandedSet = new Set([...expandedSet, relPath]);
+    }
   }
 
   async function login() {
@@ -158,30 +187,6 @@
       const res = await fetch('/api/backup/run', { method: 'POST' });
       const data = await res.json();
       backupResult = data;
-      if (data.error) error = data.error;
-    } catch (e) {
-      error = e.message;
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function runRestore() {
-    busy = true;
-    error = null;
-    restoreResult = null;
-    try {
-      const body = { restore_dir: restoreDir };
-      if (restoreType === 'selective' && restoreFiles.trim()) {
-        body.files = restoreFiles.split('\n').map((f) => f.trim()).filter(Boolean);
-      }
-      const res = await fetch('/api/restore/run', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      const data = await res.json();
-      restoreResult = data;
       if (data.error) error = data.error;
     } catch (e) {
       error = e.message;
@@ -296,12 +301,9 @@
   <!-- 恢复 -->
   <section>
     <h2>⬇️ 恢复</h2>
-    <p class="hint">选择要恢复的文件夹和文件，恢复到本地目录。</p>
-    <label>恢复目标目录
-      <input bind:value={restoreDir} placeholder="/volume1/restore" />
-    </label>
+    <p class="hint">展开文件夹选择要恢复的文件，恢复到默认目录。</p>
 
-    <!-- 配置的备份文件夹 + 文件列表（来自 SQLite 快照） -->
+    <!-- 配置的备份文件夹 + 目录树（来自 SQLite 快照） -->
     {#if restoreFolders.length === 0}
       <p class="warn">尚未配置备份路径或没有备份数据</p>
     {:else}
@@ -309,7 +311,7 @@
         {#each restoreFolders as folder, i (folder.path)}
           <div class="folder">
             <button class="folder-head" on:click={() => toggleFolder(i)}>
-              <span class="folder-icon">{expandedFolder === i ? '▾' : '▸'}</span>
+              <span class="folder-icon">{expandedFolderIdx === i ? '▾' : '▸'}</span>
               <span class="folder-name">📁 {folder.path}</span>
               {#if folder.has_backup}
                 <span class="badge">{folder.files.length} 个文件</span>
@@ -317,24 +319,21 @@
                 <span class="badge warn">未备份</span>
               {/if}
             </button>
-            {#if expandedFolder === i}
-              <ul class="files">
-                {#each folder.files as file (file.rel_path)}
-                  <li>
-                    <span class="file-icon">{file.is_dir ? '📂' : '📄'}</span>
-                    <span class="file-name">{file.rel_path}</span>
-                    <span class="file-size">{fmtSize(file.size)}</span>
-                    <button
-                      class="restore-btn"
-                      on:click={() => restoreOne(file.rel_path)}
-                      disabled={busy}
-                    >恢复</button>
-                  </li>
+            {#if expandedFolderIdx === i}
+              <div class="tree-root">
+                {#each Object.values(restoreTrees[i] || {}) as node (node.rel_path)}
+                  <TreeNode
+                    node={node}
+                    expandedSet={expandedSet}
+                    busy={busy}
+                    onToggleDir={toggleDir}
+                    onRestore={restoreOne}
+                  />
                 {/each}
-                {#if folder.files.length === 0}
-                  <li class="empty">该文件夹暂无备份文件</li>
+                {#if !restoreTrees[i] || Object.keys(restoreTrees[i]).length === 0}
+                  <p class="empty">该文件夹暂无备份文件</p>
                 {/if}
-              </ul>
+              </div>
             {/if}
           </div>
         {/each}
@@ -472,30 +471,6 @@
     font-size: 12px;
   }
   .badge.warn { background: #fef3c7; color: #b45309; }
-  .files { list-style: none; padding: 0; margin: 0; border-top: 1px solid #eef1f6; }
-  .files li {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 12px;
-    border-bottom: 1px solid #f0f2f7;
-    font-size: 13px;
-  }
-  .files li:last-child { border-bottom: none; }
-  .file-icon { color: #8a94a6; }
-  .file-name { flex: 1; font-family: monospace; word-break: break-all; }
-  .file-size { color: #8a94a6; font-size: 12px; white-space: nowrap; }
-  .restore-btn {
-    background: #22a06b;
-    color: #fff;
-    border: none;
-    border-radius: 4px;
-    padding: 4px 12px;
-    margin: 0;
-    font-size: 12px;
-    cursor: pointer;
-    white-space: nowrap;
-  }
-  .restore-btn:disabled { background: #8cc9b0; }
-  .empty { color: #8a94a6; font-style: italic; }
+  .tree-root { padding: 4px 8px; border-top: 1px solid #eef1f6; }
+  .empty { color: #8a94a6; font-style: italic; padding: 10px 12px; }
 </style>
