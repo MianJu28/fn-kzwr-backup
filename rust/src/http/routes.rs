@@ -152,7 +152,7 @@ async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
             })
         }
     };
-    let logged_in = cfg.kzwr.username_enc.is_some() && state.auth.has_credentials();
+    let logged_in = crate::infra::kzwr_auth::KzwrAuthService::has_credentials(&cfg);
     Json(ConfigResponse {
         backup_paths: cfg.backup.paths.clone(),
         target_folder: cfg.backup.target_folder.clone(),

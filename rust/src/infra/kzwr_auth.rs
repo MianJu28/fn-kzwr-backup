@@ -64,11 +64,16 @@ impl KzwrAuthService {
         self.bin_dir.join(LOGIN_BIN).exists()
     }
 
-    /// 是否已保存凭据
-    pub fn has_credentials(&self) -> bool {
-        let cfg = self.config.lock().unwrap();
-        match cfg.load() {
-            Ok(c) => c.kzwr.username_enc.is_some() && c.kzwr.password_enc.is_some(),
+    /// 判断配置中是否已保存凭据（接收已加载的配置，避免重复加锁死锁）
+    pub fn has_credentials(cfg: &crate::infra::config::AppConfig) -> bool {
+        cfg.kzwr.username_enc.is_some() && cfg.kzwr.password_enc.is_some()
+    }
+
+    /// 是否已保存凭据（自行加载配置，供不持锁的调用方使用）
+    pub fn has_credentials_self(&self) -> bool {
+        let cfg_guard = self.config.lock().unwrap();
+        match cfg_guard.load() {
+            Ok(c) => Self::has_credentials(&c),
             Err(_) => false,
         }
     }

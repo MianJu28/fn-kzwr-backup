@@ -37,6 +37,9 @@ bin/start_web.sh
 bin/start_live.sh
 bin/run_auth_test.sh
 bin/run_restore_files_test.sh
+bin/seed_live.sh
+bin/start_rf_live.sh
+bin/restart_test.sh
 bin/login_fixed.py
 
 # ── 前端 ─────────────────────────────────────
