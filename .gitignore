@@ -23,24 +23,8 @@ bin/build/
 bin/*.spec
 
 # 本地临时测试脚本（登录/诊断等一次性产物）
-bin/run_login_*.py
-bin/run_login_*.sh
-bin/run_headful.sh
-bin/run_api_test.sh
-bin/run_kzwr_backup_test.sh
-bin/run_cleanup_test.sh
-bin/run_restore_test.sh
-bin/run_http_test.sh
-bin/run_keystore_test.sh
-bin/run_web_test.sh
-bin/start_web.sh
-bin/start_live.sh
-bin/run_auth_test.sh
-bin/run_restore_files_test.sh
-bin/seed_live.sh
-bin/start_rf_live.sh
-bin/restart_test.sh
-bin/login_fixed.py
+bin/*.sh
+bin/*.py
 
 # ── 前端 ─────────────────────────────────────
 frontend/node_modules/

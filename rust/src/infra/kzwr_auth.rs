@@ -59,6 +59,19 @@ impl KzwrAuthService {
         }
     }
 
+    /// 启动时从配置加载已保存的 token 到共享 token 存储（避免每次重启都重新登录）
+    pub fn init_from_config(&self) {
+        let cfg_guard = self.config.lock().unwrap();
+        if let Ok(cfg) = cfg_guard.load() {
+            if let Ok(Some(token)) = cfg_guard.decrypt_field(&cfg.kzwr.token_enc) {
+                if !token.is_empty() {
+                    *self.token_store.lock().unwrap() = Some(token);
+                    info!("已从配置加载 kzwr token");
+                }
+            }
+        }
+    }
+
     /// 登录二进制是否存在
     pub fn bin_exists(&self) -> bool {
         self.bin_dir.join(LOGIN_BIN).exists()

@@ -82,6 +82,8 @@ async fn main() -> anyhow::Result<()> {
         config_mgr.clone(),
         token_store,
     ));
+    // 启动时从配置加载已保存的 token（避免每次重启都重新登录）
+    auth.init_from_config();
 
     // 目标文件夹 + 任务 id（默认值，实际由配置决定）
     let target_folder = std::env::var("TRIM_KZWR_FOLDER")

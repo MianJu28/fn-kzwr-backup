@@ -86,15 +86,24 @@
     return root;
   }
 
-  // 恢复单个文件
-  async function restoreOne(relPath) {
+  // 恢复单个文件（恢复到备份源路径）
+  async function restoreOne(relPath, sourcePath) {
+    await restoreFiles([relPath], relPath, sourcePath);
+  }
+
+  // 恢复文件列表（files 为相对路径数组，sourcePath 为恢复目标根=备份源路径）
+  async function restoreFiles(files, label, sourcePath) {
+    if (!files || files.length === 0) {
+      restoreMsg = '该目录没有可恢复的文件';
+      return;
+    }
     busy = true;
     error = null;
     restoreMsg = '';
     restoreResult = null;
     try {
-      // 不传 restore_dir，后端使用默认恢复目录
-      const body = { files: [relPath] };
+      // 传 source_path（备份源路径），恢复到原位置
+      const body = { files, source_path: sourcePath };
       const res = await fetch('/api/restore/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -102,7 +111,9 @@
       });
       const data = await res.json();
       restoreResult = data;
-      restoreMsg = data.error ? `恢复失败: ${data.error}` : `已恢复: ${relPath}`;
+      restoreMsg = data.error
+        ? `恢复失败: ${data.error}`
+        : `已恢复 ${data.restored} 个文件到 ${sourcePath}: ${label}`;
       if (data.error) error = data.error;
     } catch (e) {
       error = e.message;
@@ -327,7 +338,8 @@
                     expandedSet={expandedSet}
                     busy={busy}
                     onToggleDir={toggleDir}
-                    onRestore={restoreOne}
+                    onRestore={(relPath) => restoreOne(relPath, folder.path)}
+                    onRestoreDir={(files) => restoreFiles(files, folder.path, folder.path)}
                   />
                 {/each}
                 {#if !restoreTrees[i] || Object.keys(restoreTrees[i]).length === 0}

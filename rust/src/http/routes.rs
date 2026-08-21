@@ -68,8 +68,8 @@ pub struct BackupResponse {
 pub struct RestoreRequest {
     /// 要恢复的文件相对路径列表；空 = 全量
     pub files: Option<Vec<String>>,
-    /// 本地恢复目标目录
-    pub restore_dir: String,
+    /// 恢复目标根目录（未传则用配置的备份源路径，恢复到原位置）
+    pub source_path: Option<String>,
 }
 
 /// 恢复响应
@@ -299,14 +299,22 @@ async fn restore_run(
     State(state): State<AppState>,
     body: Option<axum::extract::Json<RestoreRequest>>,
 ) -> Json<RestoreResponse> {
-    let (files, restore_dir) = match body {
+    // 恢复前确保已登录（token 过期自动重登）
+    if let Err(e) = state.auth.ensure_login() {
+        return Json(RestoreResponse {
+            restored: 0,
+            restored_bytes: 0,
+            error: Some(format!("登录失败: {:#}", e)),
+        });
+    }
+
+    // 恢复目标根：优先用前端传入的 source_path（备份源路径，恢复到原位置），否则用默认目录
+    let (files, restore_root) = match body {
         Some(Json(req)) => (
             req.files.unwrap_or_default(),
-            if req.restore_dir.trim().is_empty() {
-                state.default_restore_dir.to_string_lossy().into_owned()
-            } else {
-                req.restore_dir
-            },
+            req.source_path
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| state.default_restore_dir.to_string_lossy().into_owned()),
         ),
         None => (
             Vec::new(),
@@ -319,7 +327,7 @@ async fn restore_run(
         crypto: state.crypto.clone(),
         target_prefix: Some(state.target_folder.clone()),
     };
-    match job.run(&files, std::path::Path::new(&restore_dir)).await {
+    match job.run(&files, std::path::Path::new(&restore_root)).await {
         Ok(summary) => Json(RestoreResponse {
             restored: summary.restored,
             restored_bytes: summary.restored_bytes,
