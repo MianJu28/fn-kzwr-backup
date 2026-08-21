@@ -20,6 +20,10 @@
   let restoreDir = '';
   let restoreFiles = '';
   let restoreType = 'full';
+  // 可恢复文件（从 SQLite 查询）
+  let restoreFolders = [];
+  let expandedFolder = null;
+  let restoreMsg = '';
 
   async function checkHealth() {
     try {
@@ -42,6 +46,53 @@
     } catch (e) {
       error = e.message;
     }
+  }
+
+  // 加载可恢复文件列表（从 SQLite 快照查询）
+  async function loadRestoreFiles() {
+    try {
+      const res = await fetch('/api/restore/files');
+      const data = await res.json();
+      restoreFolders = data.folders || [];
+      if (data.error) error = data.error;
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
+  // 恢复单个文件
+  async function restoreOne(relPath) {
+    busy = true;
+    error = null;
+    restoreMsg = '';
+    restoreResult = null;
+    try {
+      const body = { restore_dir: restoreDir, files: [relPath] };
+      const res = await fetch('/api/restore/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      restoreResult = data;
+      restoreMsg = data.error ? `恢复失败: ${data.error}` : `已恢复: ${relPath}`;
+      if (data.error) error = data.error;
+    } catch (e) {
+      error = e.message;
+    } finally {
+      busy = false;
+    }
+  }
+
+  function toggleFolder(i) {
+    expandedFolder = expandedFolder === i ? null : i;
+  }
+
+  function fmtSize(bytes) {
+    if (bytes >= 1024 * 1024 * 1024) return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+    if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(2) + ' MB';
+    if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return bytes + ' B';
   }
 
   async function login() {
@@ -141,6 +192,7 @@
 
   checkHealth();
   loadConfig();
+  loadRestoreFiles();
 </script>
 
 <main>
@@ -223,26 +275,54 @@
   <!-- 恢复 -->
   <section>
     <h2>⬇️ 恢复</h2>
-    <p class="hint">从 kzwr 下载解密，恢复到本地目录。</p>
+    <p class="hint">选择要恢复的文件夹和文件，恢复到本地目录。</p>
     <label>恢复目标目录
       <input bind:value={restoreDir} placeholder="/volume1/restore" />
     </label>
-    <label class="radio">
-      <input type="radio" value="full" bind:group={restoreType} />
-      全量恢复
-    </label>
-    <label class="radio">
-      <input type="radio" value="selective" bind:group={restoreType} />
-      选择性恢复
-    </label>
-    {#if restoreType === 'selective'}
-      <label>要恢复的文件（每行一个相对路径）
-        <textarea bind:value={restoreFiles} rows="4" placeholder="file1.txt&#10;docs/note.md"></textarea>
-      </label>
+
+    <!-- 配置的备份文件夹 + 文件列表（来自 SQLite 快照） -->
+    {#if restoreFolders.length === 0}
+      <p class="warn">尚未配置备份路径或没有备份数据</p>
+    {:else}
+      <div class="folders">
+        {#each restoreFolders as folder, i (folder.path)}
+          <div class="folder">
+            <button class="folder-head" on:click={() => toggleFolder(i)}>
+              <span class="folder-icon">{expandedFolder === i ? '▾' : '▸'}</span>
+              <span class="folder-name">📁 {folder.path}</span>
+              {#if folder.has_backup}
+                <span class="badge">{folder.files.length} 个文件</span>
+              {:else}
+                <span class="badge warn">未备份</span>
+              {/if}
+            </button>
+            {#if expandedFolder === i}
+              <ul class="files">
+                {#each folder.files as file (file.rel_path)}
+                  <li>
+                    <span class="file-icon">{file.is_dir ? '📂' : '📄'}</span>
+                    <span class="file-name">{file.rel_path}</span>
+                    <span class="file-size">{fmtSize(file.size)}</span>
+                    <button
+                      class="restore-btn"
+                      on:click={() => restoreOne(file.rel_path)}
+                      disabled={busy}
+                    >恢复</button>
+                  </li>
+                {/each}
+                {#if folder.files.length === 0}
+                  <li class="empty">该文件夹暂无备份文件</li>
+                {/if}
+              </ul>
+            {/if}
+          </div>
+        {/each}
+      </div>
     {/if}
-    <button on:click={runRestore} disabled={busy}>
-      {busy ? '执行中...' : '开始恢复'}
-    </button>
+
+    {#if restoreMsg}
+      <p class:ok={!restoreResult || !restoreResult.error} class:warn={restoreResult?.error}>{restoreMsg}</p>
+    {/if}
     {#if restoreResult && !restoreResult.error}
       <div class="result">
         <p>✅ 恢复完成</p>
@@ -328,4 +408,62 @@
   .result ul { margin: 0; padding-left: 20px; }
   .error { background: #fef2f2; color: #b91c1c; padding: 12px; border-radius: 6px; margin-top: 12px; }
   footer { text-align: center; color: #8a94a6; font-size: 13px; margin-top: 28px; }
+
+  /* 恢复文件列表 */
+  .folders { margin-top: 12px; }
+  .folder {
+    border: 1px solid #e0e4ea;
+    border-radius: 8px;
+    margin-top: 8px;
+    overflow: hidden;
+  }
+  .folder-head {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: #f8fafc;
+    padding: 10px 12px;
+    margin: 0;
+    border: none;
+    border-radius: 0;
+    cursor: pointer;
+    text-align: left;
+  }
+  .folder-icon { color: #42526e; font-size: 14px; }
+  .folder-name { flex: 1; font-size: 14px; font-weight: 500; }
+  .badge {
+    background: #e6f4ff;
+    color: #2563eb;
+    border-radius: 12px;
+    padding: 2px 10px;
+    font-size: 12px;
+  }
+  .badge.warn { background: #fef3c7; color: #b45309; }
+  .files { list-style: none; padding: 0; margin: 0; border-top: 1px solid #eef1f6; }
+  .files li {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid #f0f2f7;
+    font-size: 13px;
+  }
+  .files li:last-child { border-bottom: none; }
+  .file-icon { color: #8a94a6; }
+  .file-name { flex: 1; font-family: monospace; word-break: break-all; }
+  .file-size { color: #8a94a6; font-size: 12px; white-space: nowrap; }
+  .restore-btn {
+    background: #22a06b;
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    padding: 4px 12px;
+    margin: 0;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .restore-btn:disabled { background: #8cc9b0; }
+  .empty { color: #8a94a6; font-style: italic; }
 </style>

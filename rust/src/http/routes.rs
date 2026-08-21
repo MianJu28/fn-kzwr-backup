@@ -80,6 +80,32 @@ pub struct RestoreResponse {
     pub error: Option<String>,
 }
 
+/// 可恢复文件条目
+#[derive(Serialize)]
+pub struct RestorableFile {
+    pub rel_path: String,
+    pub size: u64,
+    pub is_dir: bool,
+}
+
+/// 一个备份文件夹及其可恢复文件
+#[derive(Serialize)]
+pub struct RestorableFolder {
+    /// 备份源路径（本地目录）
+    pub path: String,
+    /// 是否已有备份数据（SQLite 快照）
+    pub has_backup: bool,
+    /// 文件列表
+    pub files: Vec<RestorableFile>,
+}
+
+/// 恢复文件列表响应
+#[derive(Serialize)]
+pub struct RestoreFilesResponse {
+    pub folders: Vec<RestorableFolder>,
+    pub error: Option<String>,
+}
+
 // ── Handler ────────────────────────────────────
 
 async fn health(State(_state): State<AppState>) -> Json<HealthResponse> {
@@ -236,6 +262,38 @@ fn read_backup_config(state: &AppState) -> (Vec<PathBuf>, String) {
     }
 }
 
+/// 列出配置的备份文件夹及其可恢复文件（从 SQLite 快照查询）
+async fn restore_files(State(state): State<AppState>) -> Json<RestoreFilesResponse> {
+    let paths = read_backup_config(&state).0;
+    let mut folders = Vec::new();
+
+    for (i, path) in paths.iter().enumerate() {
+        // 多路径备份时，每个路径的 job_id = "{base}-{i}"
+        let job_id = format!("{}-{}", state.job_id, i);
+        let entries = state.store.load_snapshot(&job_id);
+
+        let files = match entries {
+            Ok(entries) => entries
+                .iter()
+                .map(|e| RestorableFile {
+                    rel_path: e.rel_path.clone(),
+                    size: e.size,
+                    is_dir: e.is_dir,
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+
+        folders.push(RestorableFolder {
+            path: path.to_string_lossy().into_owned(),
+            has_backup: !files.is_empty(),
+            files,
+        });
+    }
+
+    Json(RestoreFilesResponse { folders, error: None })
+}
+
 /// 触发恢复
 async fn restore_run(
     State(state): State<AppState>,
@@ -282,6 +340,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/login", post(auth_login))
         .route("/config", get(config_get).post(config_save))
         .route("/backup/run", post(backup_run))
+        .route("/restore/files", get(restore_files))
         .route("/restore/run", post(restore_run))
         .with_state(state)
 }
