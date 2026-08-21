@@ -466,6 +466,7 @@
     align-items: center;
     gap: 8px;
     background: #f8fafc;
+    color: #1f2d3d;
     padding: 10px 12px;
     margin: 0;
     border: none;
@@ -474,13 +475,23 @@
     text-align: left;
   }
   .folder-icon { color: #42526e; font-size: 14px; }
-  .folder-name { flex: 1; font-size: 14px; font-weight: 500; }
+  .folder-name {
+    flex: 1;
+    min-width: 0;
+    color: #1f2d3d;
+    font-size: 14px;
+    font-weight: 500;
+    word-break: break-all;
+    line-height: 1.4;
+  }
   .badge {
+    flex-shrink: 0;
     background: #e6f4ff;
     color: #2563eb;
     border-radius: 12px;
     padding: 2px 10px;
     font-size: 12px;
+    white-space: nowrap;
   }
   .badge.warn { background: #fef3c7; color: #b45309; }
   .tree-root { padding: 4px 8px; border-top: 1px solid #eef1f6; }
