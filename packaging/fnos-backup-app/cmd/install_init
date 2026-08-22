@@ -79,14 +79,35 @@ if [ -f "$APPDEST/cache/camoufox-browser.zip" ] && [ ! -x "$CAMO_DIR/camoufox-bi
 fi
 
 # ── 3. Xvfb + Firefox 运行时库（headless="virtual" 需要）──
-if ! command -v Xvfb >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
-    log_i "安装 Xvfb 与 Firefox 运行时库 ..."
-    apt-get update >/dev/null 2>&1 || true
+# Camoufox 强制软件渲染（LIBGL_ALWAYS_SOFTWARE=1 + mesa），必须装 Mesa 软件 GL，
+# 否则 Xvfb 启动失败（CannotExecuteXvfb: got b'', exit=1）。
+
+# 3.0) 修复 /tmp/.X11-unix（Xvfb 的 unix socket 目录，需 1777；只读会导致 Xvfb 无法建 socket）
+log_i "修复 /tmp/.X11-unix 权限（Xvfb socket 目录）..."
+mkdir -p /tmp/.X11-unix 2>/dev/null || true
+chmod 1777 /tmp/.X11-unix 2>/dev/null || true
+if [ ! -w /tmp/.X11-unix ]; then
+    log_i "警告：/tmp/.X11-unix 仍不可写（可能只读挂载），Xvfb 将无法启动"
+fi
+
+if command -v apt-get >/dev/null 2>&1; then
+    if ! command -v Xvfb >/dev/null 2>&1; then
+        log_i "安装 Xvfb ..."
+        apt-get update >>"$INSTALL_LOG" 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xvfb \
+            >>"$INSTALL_LOG" 2>&1 || true
+    fi
+    # 软件渲染 + Firefox 运行时依赖（每次安装，幂等）
+    log_i "安装软件渲染与 Firefox 运行时库 ..."
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        xvfb \
-        libgtk-3-0 libdbus-glib-1-2 libasound2 \
-        libx11-xcb1 libxtst6 libxrandr2 libxcomposite1 \
-        libxdamage1 libxfixes3 >/dev/null 2>&1 || true
+        libgl1 libgl1-mesa-dri libosmesa6 libegl1 libglu1-mesa \
+        libgtk-3-0 libdbus-glib-1-2 libdbus-1-3 libasound2 \
+        libnspr4 libnss3 \
+        libx11-6 libx11-xcb1 libxcb1 libxext6 libxrender1 libxt6 libxtst6 \
+        libxrandr2 libxcomposite1 libxdamage1 libxfixes3 libxshmfence1 \
+        libfontconfig1 libfreetype6 libpango-1.0-0 libcairo2 \
+        >>"$INSTALL_LOG" 2>&1 || true
 fi
 
 # 缓存目录属主改为应用用户（登录二进制以其运行）

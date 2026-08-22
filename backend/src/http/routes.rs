@@ -291,8 +291,16 @@ async fn login_env_status(State(_state): State<AppState>) -> Json<LoginEnvStatus
 
     // 读取持久化初始化状态（进度/消息/镜像）
     let init = read_login_env_state(&cache_dir);
-    // running 但进程已不在（例如后端重启）→ 视为 idle
-    let running = init.state == "running" && current_dl_pid().lock().unwrap().is_some();
+    // running 判定：state==running 且最近 10 分钟内活跃。
+    // 不依赖 pid（下载完成进入解压阶段时 pid 已清空，但状态仍是 running，前端需保持进度显示）。
+    // 若后端重启导致僵尸 running（updated_at 陈旧）则视为 idle。
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let running = init.state == "running"
+        && init.updated_at > 0
+        && now.saturating_sub(init.updated_at) < 600;
 
     // 完成判定：文件就绪（浏览器+uBlock）即 ready，无论状态文件如何
     let ready = browser_ok && ubo_ok;
@@ -327,6 +335,124 @@ async fn login_env_status(State(_state): State<AppState>) -> Json<LoginEnvStatus
         mirror: init.mirror,
         updated_at: init.updated_at,
     })
+}
+
+/// 确保 Xvfb 可用（登录二进制 headless="virtual" 需要）。
+/// 检查 Xvfb 是否存在 + 试运行；缺失则尝试 apt 安装（补 Mesa 软件渲染 + Firefox 依赖）。
+/// 同时检测 /tmp 可写性，若不可写（Xvfb 写键盘映射文件会失败）则把 TMPDIR 指向 cache_dir 下可写目录。
+/// 返回详细诊断日志（含 apt 输出），供状态文件/日志文件展示。
+fn ensure_xvfb(cache_dir: &str) -> String {
+    let mut log = String::new();
+    let now_line = format!(
+        "===== Xvfb 检测 {:?} =====\n",
+        chrono::Local::now()
+    );
+    log.push_str(&now_line);
+
+    let sh = |cmd: &str| -> (bool, String) {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .output();
+        match out {
+            Ok(o) => (
+                o.status.success(),
+                format!(
+                    "stdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+            ),
+            Err(e) => (false, format!("执行失败: {}", e)),
+        }
+    };
+
+    // 0) 检测/修复 /tmp 与 /tmp/.X11-unix 可写性。
+    //    Xvfb 需写 /tmp/server-N.xkm（键盘映射，可用 TMPDIR 改）和 /tmp/.X11-unix（unix socket，X 协议固定，无法用 TMPDIR 改）。
+    //    若 /tmp 只读（如只读挂载），Xvfb 无法建 unix socket → Failed to find a socket to listen on → 登录失败。
+    log.push_str("[*] 检测 /tmp 与 /tmp/.X11-unix ...\n");
+    let (tmp_writable, _) = sh("test -w /tmp && echo YES || echo NO");
+    log.push_str(&format!("/tmp 可写: {}\n", if tmp_writable { "是" } else { "否" }));
+
+    // 尝试修复 /tmp/.X11-unix（Xvfb unix socket 目录，需 1777）。优先 sudo -n，失败则直接。
+    let fix_cmds = [
+        "sudo -n mkdir -p /tmp/.X11-unix && sudo -n chmod 1777 /tmp/.X11-unix 2>&1 && test -w /tmp/.X11-unix && echo FIXED",
+        "mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix 2>&1 && test -w /tmp/.X11-unix && echo FIXED",
+    ];
+    let mut x11_fixed = false;
+    for c in &fix_cmds {
+        let (ok, out) = sh(c);
+        if out.contains("FIXED") {
+            x11_fixed = true;
+            log.push_str(&format!("[+] /tmp/.X11-unix 已修复为可写 ({}):\n{}\n", c, out));
+            break;
+        }
+        let _ = ok;
+    }
+    if !x11_fixed {
+        log.push_str("[!] /tmp/.X11-unix 仍不可写（可能只读挂载或需 root）。Xvfb 将无法创建 unix socket，登录会失败。\n");
+    }
+
+    // 键盘映射文件用 TMPDIR 指向可写目录（登录二进制继承，其 Xvfb 用此目录写 xkb 文件）
+    let xvfb_tmp = std::path::PathBuf::from(cache_dir).join("xvfb-tmp");
+    if !tmp_writable {
+        let _ = std::fs::create_dir_all(&xvfb_tmp);
+        std::env::set_var("TMPDIR", &xvfb_tmp);
+        log.push_str(&format!(
+            "[+] /tmp 不可写，已设置 TMPDIR={}（解决 xkb 键盘文件）\n",
+            xvfb_tmp.display()
+        ));
+    }
+
+    // 1) Xvfb 是否存在
+    let (xvfb_exists, _) = sh("command -v Xvfb");
+    if !xvfb_exists {
+        log.push_str("[!] 未找到 Xvfb，尝试安装...\n");
+        // 优先 sudo -n（飞牛应用进程可能非 root），失败则直接 apt
+        let install_cmds = [
+            "sudo -n apt-get update && sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y xvfb libgl1 libgl1-mesa-dri libosmesa6 libegl1 libglu1-mesa libnspr4 libnss3 libfontconfig1 2>&1",
+            "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y xvfb libgl1 libgl1-mesa-dri libosmesa6 libegl1 libglu1-mesa libnspr4 libnss3 libfontconfig1 2>&1",
+        ];
+        let mut installed = false;
+        for c in &install_cmds {
+            log.push_str(&format!("$ {}\n", c));
+            let (ok, out) = sh(c);
+            log.push_str(&out);
+            if ok {
+                installed = true;
+                break;
+            }
+        }
+        if installed {
+            log.push_str("[+] Xvfb 安装完成\n");
+        } else {
+            log.push_str("[!] Xvfb 安装失败（可能无 root 权限或软件源缺包），登录需 Xvfb\n");
+            return log;
+        }
+    } else {
+        log.push_str("[+] Xvfb 已存在\n");
+    }
+
+    // 2) 试运行 Xvfb 验证——**用 camoufox 的完整参数**（含 GLX/RENDER 扩展 + displayfd），
+    //    以复现登录二进制调用 camoufox 时 Xvfb 的确切失败原因。
+    log.push_str("[*] 试运行 Xvfb（camoufox 完整参数，含 GLX 扩展）...\n");
+    let (ok, out) = sh(
+        "pkill -f 'Xvfb -displayfd' 2>/dev/null; sleep 0.5; rm -f /tmp/.X11-unix/X* /tmp/.X*-lock 2>/dev/null; D=$(mktemp -d); exec 3>\"$D/fd\"; TMPDIR=\"${TMPDIR:-/tmp}\" Xvfb -displayfd 3 -screen 0 1x1x24 -ac -nolisten tcp -extension RENDER +extension GLX -extension COMPOSITE -extension XVideo -extension XVideo-MotionCompensation -extension XINERAMA -fp built-ins -nocursor -br >/dev/null 2>\"$D/xvfb.err\" & P=$!; sleep 1.5; if kill -0 $P 2>/dev/null; then echo \"RUNNING displayfd=$(cat $D/fd)\"; kill $P 2>/dev/null; else echo FAILED; cat \"$D/xvfb.err\"; fi; rm -rf $D",
+    );
+    log.push_str(&out);
+    if out.contains("RUNNING") {
+        log.push_str("[+] Xvfb 可正常启动（含 GLX 扩展，TMPDIR 已生效）\n");
+    } else {
+        log.push_str("[!] Xvfb 用 camoufox 完整参数启动失败，登录会报 CannotExecuteXvfb\n");
+    }
+    let _ = ok;
+
+    // 3) 若失败，检查关键扩展库是否缺失
+    log.push_str("[*] 检查 Mesa 软件渲染与 GLX 库 ...\n");
+    let (_, gl_out) = sh("ls -l /usr/lib/x86_64-linux-gnu/libGL.so.1 /usr/lib/x86_64-linux-gnu/dri/swrast_dri.so /usr/lib/x86_64-linux-gnu/libOSMesa.so* 2>&1; echo ---; command -v glxinfo && glxinfo -B 2>&1 | head -5 || echo 'glxinfo 不可用'");
+    log.push_str(&gl_out);
+
+    log
 }
 
 /// 用 Rust zip 解压 zip 到目标目录（不依赖系统 unzip，飞牛精简系统也适用）。
@@ -415,6 +541,32 @@ async fn login_env_init(
         let ubo_dir = camo_dir.join("addons").join("UBO");
         let _ = std::fs::create_dir_all(&camo_dir);
         let _ = std::fs::create_dir_all(&ubo_dir);
+
+        // ── 0. 检测/安装 Xvfb（登录二进制 headless="virtual" 需要），记录详细日志 ──
+        write_login_env_state(
+            &cache_dir,
+            &LoginEnvInitState {
+                state: "running".to_string(),
+                progress: 0,
+                message: "检测/安装 Xvfb 虚拟显示...".to_string(),
+                mirror: mirror.clone(),
+                camoufox_version: version.clone(),
+                updated_at: 0,
+            },
+        );
+        let cache_dir_for_xvfb = cache_dir.clone();
+        let setup_log = tokio::task::spawn_blocking(move || ensure_xvfb(&cache_dir_for_xvfb))
+            .await
+            .unwrap_or_default();
+        // 详细日志写入 setup 日志文件
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::path::PathBuf::from(&cache_dir).join("login_env_setup.log"))
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(setup_log.as_bytes())
+            });
 
         // ── 1. 解压 uBlock ──
         let ubo_xpi = std::path::PathBuf::from(&cache_dir).join("ubo.xpi");
