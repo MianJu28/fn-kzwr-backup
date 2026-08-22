@@ -41,6 +41,10 @@ BIN_DIR="$APPDEST/bin"
 DAEMON="$BIN_DIR/fnos-backup"
 PID_FILE="$APPTMP/fnos-backup.pid"
 
+# Camoufox 浏览器缓存目录（登录二进制运行时经 XDG_CACHE_HOME 定位）
+# 安装时由 install_init 把国内镜像下载的浏览器 + uBlock addon 放到这里。
+LOGIN_CACHE_DIR="$APPDEST/cache"
+
 # 前端静态资源目录（后端 axum 托管；package app/ → $TRIM_APPDEST）
 WWW_DIR="${TRIM_WWW_DIR:-$APPDEST/www}"
 
@@ -115,6 +119,7 @@ do_start() {
         TRIM_HTTP_PORT="$SERVICE_PORT" \
         TRIM_PASSPHRASE="$PASSPHRASE" \
         TRIM_LOGIN_BIN_DIR="$BIN_DIR" \
+        TRIM_LOGIN_CACHE_DIR="$LOGIN_CACHE_DIR" \
         TRIM_KZWR_FOLDER="fn-backup" \
         TRIM_KZWR_BASE_URL="https://www.kzwr.com" \
         TRIM_JOB_ID="default" \

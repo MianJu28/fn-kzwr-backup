@@ -68,10 +68,32 @@ fi
 mkdir -p "$PACK_DIR/app/bin"
 cp -f "$BIN_REL" "$PACK_DIR/app/bin/fnos-backup"
 
-# 3) Login binary (copy to app/bin if present)
-LOGIN_BIN="$ROOT/bin/kzwr_login_turnstile-linux-x64"
+# 3) Login binary (Camoufox static build; copy to app/bin if present)
+#    Architecture-aware: x64 (amd64) / arm64. Override with LOGIN_ARCH.
+LOGIN_ARCH="${LOGIN_ARCH:-x64}"
+LOGIN_BIN="$ROOT/bin/kzwr_login_camoufox-linux-${LOGIN_ARCH}"
 if [ -f "$LOGIN_BIN" ]; then
-    cp -f "$LOGIN_BIN" "$PACK_DIR/app/bin/kzwr_login_turnstile-linux-x64"
+    cp -f "$LOGIN_BIN" "$PACK_DIR/app/bin/kzwr_login_camoufox-linux-${LOGIN_ARCH}"
+    echo "==> 已打包登录二进制: $(basename "$LOGIN_BIN")"
+else
+    echo "提示：未找到登录二进制 $LOGIN_BIN（Camoufox 版）。"
+fi
+
+# 3.5) Camoufox 登录环境附属文件（install_init 安装时使用）
+#    - uBlock Origin addon（ubo.xpi）：随 fpk 打包，安装时解压到 camoufox/addons/UBO
+#    - Camoufox 浏览器 zip（可选，camoufox-browser.zip）：若预下载则打包，安装时免联网
+mkdir -p "$PACK_DIR/app/cache"
+UBO_XPI="$ROOT/bin/ubo.xpi"
+if [ -f "$UBO_XPI" ]; then
+    cp -f "$UBO_XPI" "$PACK_DIR/app/cache/ubo.xpi"
+    echo "==> 已打包 uBlock addon (ubo.xpi)"
+else
+    echo "提示：未找到 $UBO_XPI，安装时无法解压 uBlock addon（Camoufox 可能报 InvalidAddonPath）。"
+fi
+CAMO_BROWSER_ZIP="$ROOT/bin/camoufox-browser.zip"
+if [ -f "$CAMO_BROWSER_ZIP" ]; then
+    cp -f "$CAMO_BROWSER_ZIP" "$PACK_DIR/app/cache/camoufox-browser.zip"
+    echo "==> 已打包 Camoufox 浏览器 zip（安装时免联网）"
 fi
 
 # 4) Frontend dist -> app/www

@@ -3,7 +3,7 @@
 //! 整合：登录二进制调用、凭据加密存储、token 共享管理、过期自动重登。
 //!
 //! 登录二进制调用方式：
-//!   kzwr_login_turnstile-linux-x64 <邮箱> <密码>
+//!   kzwr_login_camoufox-linux-x64 <邮箱> <密码>
 //! 产出 session.json：{"access_token": "...", "email": "...", "via": "..."}
 
 use std::path::{Path, PathBuf};
@@ -16,8 +16,12 @@ use tracing::info;
 
 use crate::infra::config::ConfigManager;
 
-/// 登录二进制文件名
-pub const LOGIN_BIN: &str = "kzwr_login_turnstile-linux-x64";
+/// 登录二进制文件名（Camoufox 版，旧 glibc 静态编译，兼容飞牛）
+pub const LOGIN_BIN: &str = "kzwr_login_camoufox-linux-x64";
+
+/// Camoufox 浏览器缓存目录环境变量（指向已下载浏览器的根目录）
+/// 后端用它在调用登录二进制时设置 XDG_CACHE_HOME，使其找到浏览器与 addon。
+pub const CACHE_DIR_ENV: &str = "TRIM_LOGIN_CACHE_DIR";
 
 /// 登录二进制产出的 session
 #[derive(Debug, Deserialize)]
@@ -181,12 +185,17 @@ impl KzwrAuthService {
             ));
         }
         info!("调用 kzwr 登录二进制...");
-        let status = Command::new(&bin)
-            .arg(username)
-            .arg(password)
-            .current_dir(&self.work_dir)
-            .status()
-            .context("启动登录二进制失败")?;
+        // Camoufox 需要 XDG_CACHE_HOME 指向已下载浏览器的根目录（含 camoufox/ 子目录）。
+        // 若宿主通过 TRIM_LOGIN_CACHE_DIR 指定了缓存目录，则注入给登录二进制。
+        let mut cmd = Command::new(&bin);
+        cmd.arg(username).arg(password).current_dir(&self.work_dir);
+        if let Ok(cache_dir) = std::env::var(CACHE_DIR_ENV) {
+            if !cache_dir.is_empty() {
+                cmd.env("XDG_CACHE_HOME", &cache_dir);
+                info!("登录：XDG_CACHE_HOME={}", cache_dir);
+            }
+        }
+        let status = cmd.status().context("启动登录二进制失败")?;
 
         if !status.success() {
             return Err(anyhow::anyhow!(
