@@ -1,0 +1,47 @@
+#!/bin/bash
+#
+# 安装初始化：在应用文件应用前执行。
+# 负责建目录、设权限、落盘安装向导收集的管理员口令（作为密钥库口令）。
+#
+# 参考：docs/fnnas-dev-docs/core-concepts/01-framework.md（安装流程）
+#
+# 向导值以环境变量传入（不使用 TRIM_ 前缀）：
+#   wizard_http_port     HTTP 服务端口（默认 8080）
+#   wizard_admin_pass    管理员口令（用于配置/age 密钥库加密）
+#
+# 注意：不使用 set -e，避免任一命令非零退出导致飞牛判定"执行脚本出错"。
+# 所有非关键命令显式用 || true 容错。
+
+APPDEST="${TRIM_APPDEST:-/var/apps/fnos-backup/target}"
+PKGETC="${TRIM_PKGETC:-$APPDEST/etc}"
+PKGVAR="${TRIM_PKGVAR:-$APPDEST/var}"
+APPTMP="${TRIM_PKGTMP:-$APPDEST/tmp}"
+APP_USER="${TRIM_USERNAME:-fnosbackup}"
+APP_GROUP="${TRIM_GROUPNAME:-fnosbackup}"
+
+mkdir -p "$PKGETC" "$PKGVAR" "$APPTMP" "$APPDEST/bin"
+chown -R "$APP_USER:$APP_GROUP" "$PKGETC" "$PKGVAR" "$APPTMP" 2>/dev/null || true
+
+# ── 管理员口令 → 密钥库口令 ──
+PASSPHRASE_FILE="$PKGETC/.passphrase"
+if [ -n "${wizard_admin_pass:-}" ]; then
+    PASSPHRASE="$wizard_admin_pass"
+elif [ -f "$PASSPHRASE_FILE" ]; then
+    PASSPHRASE="$(cat "$PASSPHRASE_FILE")"
+else
+    # 生成随机口令（避免管道 SIGPIPE：分步执行）
+    PASSPHRASE="$(head -c 32 /dev/urandom 2>/dev/null | base64 2>/dev/null | tr -dc 'A-Za-z0-9' 2>/dev/null | cut -c1-24)"
+    [ -z "$PASSPHRASE" ] && PASSPHRASE="fnos-backup-initsetup"
+fi
+echo -n "$PASSPHRASE" >"$PASSPHRASE_FILE" 2>/dev/null || true
+chown "$APP_USER:$APP_GROUP" "$PASSPHRASE_FILE" 2>/dev/null || true
+chmod 600 "$PASSPHRASE_FILE" 2>/dev/null || true
+
+# ── HTTP 端口 ──
+if [ -n "${wizard_http_port:-}" ]; then
+    mkdir -p "$PKGETC"
+    echo -n "$wizard_http_port" >"$PKGETC/.port" 2>/dev/null || true
+    chown "$APP_USER:$APP_GROUP" "$PKGETC/.port" 2>/dev/null || true
+fi
+
+exit 0

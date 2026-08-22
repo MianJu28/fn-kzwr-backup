@@ -1,0 +1,27 @@
+#!/bin/bash
+#
+# 配置变更回调：应用配置变量更新后执行。
+# 若向导修改了 HTTP 端口或口令，则落盘并重启服务使配置生效。
+# 注意：不使用 set -e，避免任一命令非零退出导致飞牛判定"执行脚本出错"。
+
+APPDEST="${TRIM_APPDEST:-/var/apps/fnos-backup/target}"
+PKGETC="${TRIM_PKGETC:-$APPDEST/etc}"
+
+# 端口变更：写入 .port 供 cmd/main 读取
+if [ -n "${wizard_http_port:-}" ]; then
+    mkdir -p "$PKGETC" 2>/dev/null || true
+    echo -n "$wizard_http_port" >"$PKGETC/.port" 2>/dev/null || true
+fi
+
+# 口令变更：更新 .passphrase
+if [ -n "${wizard_admin_pass:-}" ]; then
+    echo -n "$wizard_admin_pass" >"$PKGETC/.passphrase" 2>/dev/null || true
+    chmod 600 "$PKGETC/.passphrase" 2>/dev/null || true
+fi
+
+# 重启服务使新配置生效（幂等；若未运行则静默）
+if [ -x "$APPDEST/cmd/main" ]; then
+    "$APPDEST/cmd/main" restart >/dev/null 2>&1 || true
+fi
+
+exit 0

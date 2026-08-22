@@ -1,0 +1,13 @@
+{
+  ".url": {
+    "fnos-backup.Application": {
+      "title": "fnOS 备份",
+      "icon": "images/ICON_256.PNG",
+      "type": "iframe",
+      "protocol": "http",
+      "port": "8080",
+      "url": "/",
+      "allUsers": true
+    }
+  }
+}

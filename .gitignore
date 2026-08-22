@@ -14,9 +14,6 @@ session.json
 backend/target/
 backend/.cargo/config.toml
 
-bin/
-docs/
-
 # ── 前端 ─────────────────────────────────────
 frontend/node_modules/
 frontend/dist/
@@ -34,3 +31,5 @@ env/
 *.tmp
 *.download
 *.log
+
+.codebuddy/

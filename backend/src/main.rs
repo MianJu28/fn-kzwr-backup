@@ -26,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
     // 数据目录（快照）与配置目录（配置/密钥库）
     let var_dir = std::env::var("TRIM_PKGVAR").unwrap_or_else(|_| ".".to_string());
     let cfg_dir = std::env::var("TRIM_PKGETC").unwrap_or_else(|_| ".".to_string());
-    let tmp_dir = std::env::var("TRIM_APPTMP").unwrap_or_else(|_| ".".to_string());
+    let tmp_dir = std::env::var("TRIM_PKGTMP").unwrap_or_else(|_| ".".to_string());
     let var_dir = std::path::PathBuf::from(&var_dir);
     let cfg_dir = std::path::PathBuf::from(&cfg_dir);
     let tmp_dir = std::path::PathBuf::from(&tmp_dir);

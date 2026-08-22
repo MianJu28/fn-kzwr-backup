@@ -1,0 +1,14 @@
+#!/bin/bash
+#
+# 卸载准备：卸载前执行，停止服务。
+# 尊重用户数据：默认保留 $TRIM_PKGVAR（快照）与 $TRIM_PKGETC（配置/密钥库）。
+# 若 wizard/uninstall 收集到 wizard_purge_data=purge，则在回调中删除数据。
+# 注意：不使用 set -e，避免任一命令非零退出导致飞牛判定"执行脚本出错"。
+
+# 停止应用进程（如果飞牛未自动停止）
+APPDEST="${TRIM_APPDEST:-/var/apps/fnos-backup/target}"
+if [ -x "$APPDEST/cmd/main" ]; then
+    "$APPDEST/cmd/main" stop >/dev/null 2>&1 || true
+fi
+
+exit 0

@@ -1,0 +1,19 @@
+#!/bin/bash
+#
+# 升级回调：应用新包后执行。
+# 飞牛可能在此后自动重启应用（见框架文档：升级时可能停止并重启）。
+# 当前版本无破坏性迁移，仅确保目录就绪。
+# 注意：不使用 set -e，避免任一命令非零退出导致飞牛判定"执行脚本出错"。
+
+APPDEST="${TRIM_APPDEST:-/var/apps/fnos-backup/target}"
+PKGVAR="${TRIM_PKGVAR:-$APPDEST/var}"
+PKGETC="${TRIM_PKGETC:-$APPDEST/etc}"
+APP_USER="${TRIM_USERNAME:-fnosbackup}"
+APP_GROUP="${TRIM_GROUPNAME:-fnosbackup}"
+
+mkdir -p "$PKGVAR" "$PKGETC" || true
+chown -R "$APP_USER:$APP_GROUP" "$PKGVAR" "$PKGETC" 2>/dev/null || true
+
+# 未来若 schema 变更，在此编写数据迁移逻辑（幂等）。
+
+exit 0
