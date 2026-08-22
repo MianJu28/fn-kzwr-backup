@@ -1,0 +1,86 @@
+name: 构建飞牛应用 (.fpk)
+
+# 在发布 tag（v*）或手动触发时构建双架构飞牛应用包。
+# 架构说明：
+#   - Rust 后端编译为 x86_64 与 aarch64（musl 静态链接，避免运行时依赖）
+#   - 前端 Svelte 一次构建，产物与架构无关
+#   - kzwr 登录二进制需按架构分别提供（本仓库当前含 x86_64 版）
+# 打包产物为单包（.fpk），安装时由 install_init 按 uname -m 选择对应二进制。
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 交叉编译后端
+        uses: houseabsolute/actions-rust-cross@v0
+        with:
+          command: build
+          args: --release --target ${{ matrix.target }}
+          working-directory: backend
+
+      - name: 构建前端
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: cd frontend && npm ci && npm run build
+
+      - name: 组装飞牛应用包
+        run: |
+          # 从可提交的打包源码目录复制骨架
+          PACK=bin/fnos-backup-app
+          rm -rf $PACK
+          mkdir -p $PACK
+          cp -r packaging/fnos-backup-app/. $PACK/
+          ARCH="${{ matrix.target }}"
+          # 拷贝对应架构后端二进制
+          mkdir -p $PACK/app/bin
+          cp backend/target/$ARCH/release/fnos-backup $PACK/app/bin/fnos-backup
+          # 拷贝前端产物
+          rm -rf $PACK/app/www
+          cp -r frontend/dist $PACK/app/www
+          chmod +x $PACK/app/bin/fnos-backup
+          # kzwr 登录二进制：按架构匹配（存在则拷贝）
+          case "$ARCH" in
+            x86_64*) [ -f bin/kzwr_login_turnstile-linux-x64 ] && \
+              cp bin/kzwr_login_turnstile-linux-x64 $PACK/app/bin/ ;;
+            aarch64*) [ -f bin/kzwr_login_turnstile-linux-arm64 ] && \
+              cp bin/kzwr_login_turnstile-linux-arm64 $PACK/app/bin/ ;;
+          esac
+
+      - name: 打包 .fpk
+        run: |
+          # 下载 Linux x86 版 fnpack
+          curl -sSL -o /usr/local/bin/fnpack \
+            https://static2.fnnas.com/fnpack/fnpack-1.2.3-linux-amd64
+          chmod +x /usr/local/bin/fnpack
+          cd bin/fnos-backup-app
+          fnpack build
+          cp ./*.fpk "$GITHUB_WORKSPACE/"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: fnos-backup-${{ matrix.target }}
+          path: |
+            *.fpk
+            bin/fnos-backup-app/app/bin/fnos-backup

@@ -290,8 +290,8 @@ trait TargetStorage {
 - **生命周期**：`cmd/main` 脚本处理 `start`（启动 Rust 进程）/`stop`（优雅关闭）/`status`（检查存活）
 - **UI 入口**：`app/ui/config` 声明 iframe 桌面入口，`type=iframe, protocol=http, port={wizard_port}, url=/`
 - **权限**：`run-as=package`，专用用户 `fnosbackup`；通过 `config/resource` 声明共享目录或引导用户授权源目录
-- **路径**：全部使用 `TRIM_*` 环境变量（`TRIM_APPDEST`/`TRIM_PKGETC`/`TRIM_PKGVAR`/`TRIM_APPTMP`），禁止硬编码
-- **数据归属**：SQLite→`$TRIM_PKGVAR`，配置→`$TRIM_PKGETC`，密钥库→`$TRIM_PKGETC`，临时→`$TRIM_APPTMP`
+- **路径**：全部使用 `TRIM_*` 环境变量（`TRIM_APPDEST`/`TRIM_PKGETC`/`TRIM_PKGVAR`/`TRIM_PKGTMP`），禁止硬编码
+- **数据归属**：SQLite→`$TRIM_PKGVAR`，配置→`$TRIM_PKGETC`，密钥库→`$TRIM_PKGETC`，临时→`$TRIM_PKGTMP`
 - **安装向导**：`wizard/install` 收集 HTTP 端口、初始管理员口令
 
 **后果**：
@@ -391,7 +391,7 @@ fnos-backup/
 | **Phase 1 · MVP** | 全量备份 · 单源单目标 · 基础 Web UI · 本地 FS 源 · 酷族自定义 API 目标 · 飞牛 `.fpk` 打包 | ✅ 核心完成（.fpk 打包待部署） | 酷族 session 对接（已解决）· 飞牛生命周期集成 | 完全可逆 |
 | **Phase 2 · 增量加密** | mtime 差分 · age 加密 · 流式管道 · 64MB 分块 · SQLite 元数据 | ✅ 完成 | 私钥管理（已用密钥库解决）· 大文件内存 | 完全可逆 |
 | **Phase 3 · 恢复能力** | 选择性恢复 · 恢复向导 UI · 完整性校验 · BLAKE3 严格模式 | ✅ 完成 | 索引膨胀（结合保留策略缓解） | 部分可逆（元数据格式定型需迁移） |
-| **Phase 4 · 生产强化** | 多目标支持 · 保留策略 · 断点续传 · 监控告警 · fnos 服务化 | 🔶 保留策略✅ / 断点续传✅ / WebSocket 监控✅；多目标已放弃，.fpk 服务化⏳ | 并发控制 · 资源争用 | 部分可逆 |
+| **Phase 4 · 生产强化** | 多目标支持 · 保留策略 · 断点续传 · 监控告警 · fnos 服务化 | 🔶 保留策略✅ / 断点续传✅ / WebSocket 监控✅ / .fpk 打包✅；多目标已放弃，飞牛设备实测⏳ | 并发控制 · 资源争用 | 部分可逆 |
 | **Phase 5 · 演进扩展** | 异地恢复 · 密钥轮换 · 插件化 · 可选分布式 | ⏳ 规划中 | 跨节点一致性 | 视需求启用 |
 
 **可逆性原则**：Phase 1-2 纯增量能力叠加，决策完全可逆；Phase 3-4 元数据格式定型后部分可逆（需写迁移脚本）；Phase 5 视实际需求启用，避免过早优化。
@@ -449,7 +449,7 @@ fnos-backup/
 |--------|------|-------|------|
 | 酷族网软对接 | 登录用编译二进制产出 session token；API 已用 Rust 重写实现 Target 适配器 | 1-2 | ✅ 已实现并实测 |
 | 飞牛源访问 | 仅本地 FS（tokio::fs），不考虑 SMB/NFS | 1 | ✅ 已实现 |
-| 双架构编译 | musl 静态链接 + cross 工具，全纯 Rust 依赖，GitHub Actions matrix | 1 | ⏳ 依赖 GitHub Actions 工作流 |
+| 双架构编译 | musl 静态链接 + cross 工具，全纯 Rust 依赖，GitHub Actions matrix | 1 | ✅ 已实现（本地 musl 构建验证） |
 | 源目录授权 | config/resource 声明 + 运行时引导，弃 root 模式 | 1 | 🔶 开发期用环境变量；飞牛部署待验证 |
 | UI 暴露认证 | 端口服务 + JWT（wizard 设管理员口令），WebSocket 状态推送 | 1 | 🔶 WebSocket✅；JWT 认证待部署 |
 | 密钥管理 | age 公私钥（X25519）；备份用公钥加密、恢复用私钥解密；私钥可被口令派生密钥加密存储 | 2 | ✅ 已实现（keystore 加密持久化） |
@@ -460,7 +460,7 @@ fnos-backup/
 2. ⏳ **config/resource 格式**：查阅飞牛文档确认共享目录声明的具体字段（.fpk 部署阶段）
 3. ⏳ **iframe 内 WebSocket**：WebSocket 本地已实测通过；飞牛 iframe CSP 是否允许 localhost WS 需部署验证
 4. ⏳ **大文件块级增量**：未引入块级 BLAKE3 哈希（当前整文件差分，块级留待 Phase 5 评估）
-5. ⏳ **飞牛 `.fpk` 打包部署**：双架构 GitHub Actions 构建工作流 + `fnpack` 打包验证
+5. 🔶 **飞牛 `.fpk` 打包部署**：打包结构 + 双架构构建工作流已完成（11.6），待飞牛设备实测安装
 
 ---
 
@@ -500,7 +500,7 @@ fnos-backup/
 | **配置** | 加密 TOML 配置 | ✅ | kzwr 凭据/密码/token 加密存储（age scrypt） |
 | | 记录登录用户 | ✅ | 配置解密 username_enc，启动恢复；`current_username()` |
 | **测试** | 端到端测试 | ✅ | 真实 kzwr 备份/恢复/删除/多级文件夹/物理删除/保留策略/定时触发 |
-| **飞牛部署** | `.fpk` 打包 | 🔶 | 结构已规划，GitHub Actions 双架构构建待实现 |
+| **飞牛部署** | `.fpk` 打包 | ✅ | 完整包结构 + 生命周期脚本 + wizard + GitHub Actions 双架构构建（见 11.6） |
 | **监控告警** | 失败通知/告警 | ⏳ | 规划中（当前仅 WebSocket 实时状态） |
 | **多目标** | 备份到多个目标 | ❌ 放弃 | 按用户决策，保留策略实现，多目标不做 |
 
@@ -568,10 +568,58 @@ frontend/src/
 
 ### 11.5 后续待办（按优先级）
 
-1. **飞牛 `.fpk` 打包 + GitHub Actions 双架构构建**（Phase 4 收尾）
+1. **飞牛 `.fpk` 打包 + GitHub Actions 双架构构建**（✅ 已完成，见 11.6；待飞牛设备实测）
 2. **监控告警**：备份失败/恢复失败的通知（fnos 通知或 Webhook）
 3. **密钥丢失恢复流程**：私钥备份/恢复引导（Phase 5 备用）
 4. **大文件块级增量**：按需评估（Phase 5）
+
+### 11.6 飞牛应用打包实现（基于抓取到的飞牛开发文档）
+
+> 已依据 `docs/fnnas-dev-docs/`（抓取自 developer.fnnas.com）完成 `.fpk` 打包结构。
+
+**打包源目录**：`packaging/fnos-backup-app/`（可提交，CI 与本地构建共用）；构建产物组装至 `bin/fnos-backup-app/`（gitignored）
+
+```
+packaging/fnos-backup-app/
+├── manifest                    # 元数据：platform=x86, ctl_stop=true, service_port=8080
+├── ICON.PNG / ICON_256.PNG     # 128/256 图标
+├── app/                        # → $TRIM_APPDEST（安装后为 /var/apps/{appname}/target）
+│   ├── ui/config               # 桌面入口：iframe → http://localhost:8080/，allUsers=true
+│   ├── ui/images/              # 入口图标
+│   ├── bin/                    # fnos-backup（Rust）+ kzwr_login_turnstile-* 
+│   └── www/                    # 前端构建产物（Svelte dist）
+├── cmd/                        # main/install/upgrade/uninstall/config 生命周期脚本
+├── config/
+│   ├── privilege               # run-as=package, user/group=fnosbackup
+│   └── resource                # data-share: fnos-backup/restore
+└── wizard/                     # install/config/upgrade/uninstall（JSON 步骤数组）
+```
+
+**关键落地点（对照飞牛规范）**：
+- **应用形态**：普通应用（非 Docker），端口服务暴露 UI（ADR-008 / 选型 5）
+- **路径**：全部使用 `TRIM_*` 环境变量（`TRIM_APPDEST`/`TRIM_PKGETC`/`TRIM_PKGVAR`/`TRIM_PKGTMP`/`TRIM_SERVICE_PORT`/`TRIM_USERNAME`），禁止硬编码
+- **权限**：`run-as=package` 专用用户 `fnosbackup`；`cmd/main` 用 `runuser -u $TRIM_USERNAME` 降权启动服务进程
+- **源目录授权**：`disable_authorization_path=false`，用户在应用设置授权备份源目录
+- **端口**：`manifest.service_port` + 安装向导收集（wizard/install），写入 `$PKGETC/.port`，`cmd/main` 优先读取
+- **口令**：安装向导收集管理员口令 → `$PKGETC/.passphrase`（权限 600），用作配置/age 密钥库加密
+- **数据归属**：快照→`$TRIM_PKGVAR`；配置/密钥库→`$TRIM_PKGETC`
+- **错误输出**：生命周期脚本失败时写 `TRIM_TEMP_LOGFILE`
+- **升级**：`upgrade_init` 备份快照/配置/密钥库，支持回滚
+- **卸载**：默认保留数据；`wizard/uninstall` 勾选清除时删除
+
+**构建与 CI**：
+- 本地脚本 `bin/build_fnos_app.sh`：`cargo build --release` + `npm run build` + 组装包 + `fnpack build`
+- GitHub Actions `.github/workflows/build-fnos-app.yml`：`x86_64-unknown-linux-musl` + `aarch64-unknown-linux-musl` 双架构交叉编译、前端构建、fnpack 打包、artifact 上传
+
+**WSL 构建测试已通过（2026-08-22）**：
+- 后端 `cargo build --release` 编译成功（2m02s，4 个 warning）
+- 前端 `vite build` 产物生成（52KB JS + 10.6KB CSS）
+- 后端运行实测：`/api/health`、`/api/config`、`/api/user/info` 返回 200；前端 SPA 静态托管正常；WebSocket `/api/ws` 握手 `101 Switching Protocols`
+- `fnpack build` 生成 `fnos-backup.fpk`（gzip 格式，3.6MB），包内 manifest/cmd/config/wizard/app.tgz 结构完整、脚本可执行
+
+**已知限制**：fnpack v1.2.3 校验 wizard 时**不支持 `checkbox`/`switch` 字段类型**（文档虽列出但实际打包会失败），需用 `radio`/`select` 替代。本应用卸载确认已改用 `select`（keep/purge）。
+
+**待实测**：飞牛设备安装 `.fpk`、iframe WebSocket、`run-as=package` 读授权目录权限、双架构二进制可用性（当前仅 x86_64 登录二进制，aarch64 需补）。
 
 ---
 

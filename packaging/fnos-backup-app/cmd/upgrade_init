@@ -1,0 +1,22 @@
+#!/bin/bash
+#
+# 升级准备：飞牛应用升级前执行。
+# 备份旧数据与配置，确保升级失败可回滚。幂等、可重复执行。
+#
+# 参考：docs/fnnas-dev-docs/core-concepts/01-framework.md（升级流程）
+# 注意：不使用 set -e，避免任一命令非零退出导致飞牛判定"执行脚本出错"。
+
+APPDEST="${TRIM_APPDEST:-/var/apps/fnos-backup/target}"
+PKGVAR="${TRIM_PKGVAR:-$APPDEST/var}"
+PKGETC="${TRIM_PKGETC:-$APPDEST/etc}"
+BACKUP_DIR="$PKGVAR/.upgrade-backup-${TRIM_OLD_APPVER:-old}"
+
+mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+
+# 备份持久数据（快照库）与配置（含密钥库，确保私钥不丢）
+[ -f "$PKGVAR/meta.db" ] && cp -f "$PKGVAR/meta.db" "$BACKUP_DIR/meta.db" 2>/dev/null || true
+[ -f "$PKGETC/config.toml" ] && cp -f "$PKGETC/config.toml" "$BACKUP_DIR/config.toml" 2>/dev/null || true
+[ -f "$PKGETC/agekeys.keystore" ] && cp -f "$PKGETC/agekeys.keystore" "$BACKUP_DIR/agekeys.keystore" 2>/dev/null || true
+[ -f "$PKGETC/.passphrase" ] && cp -f "$PKGETC/.passphrase" "$BACKUP_DIR/.passphrase" 2>/dev/null || true
+
+exit 0

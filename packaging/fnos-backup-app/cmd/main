@@ -1,0 +1,183 @@
+#!/bin/bash
+#
+# fnos-backup 飞牛应用生命周期脚本（start/stop/status/restart）
+#
+# 飞牛 fnOS 在启动/停止/查询应用时调用本脚本。
+# 所有路径使用飞牛注入的 TRIM_* 环境变量，禁止硬编码。
+#
+# 参考：docs/fnnas-dev-docs/core-concepts/01-framework.md / 03-environment-variables.md
+#
+# 关键环境变量：
+#   TRIM_APPDEST     应用文件目录（本脚本与二进制所在）
+#   TRIM_PKGETC      配置目录（config.toml / 密钥库 / .passphrase）
+#   TRIM_PKGVAR      持久数据目录（SQLite 快照）
+#   TRIM_PKGTMP      临时目录
+#   TRIM_SERVICE_PORT  manifest.service_port 声明的服务端口
+#   TRIM_USERNAME    专用应用用户（由 config/privilege 定义）
+#   TRIM_GROUPNAME   专用应用用户组
+#   TRIM_TEMP_LOGFILE 用户可见错误输出
+#
+# 退出码：0=成功/running；1=失败；3=status 时未运行。
+
+# 缺失环境变量时回退（仅用于本地开发，生产环境由飞牛注入）
+APPDEST="${TRIM_APPDEST:-/var/apps/fnos-backup/target}"
+PKGETC="${TRIM_PKGETC:-$APPDEST/etc}"
+PKGVAR="${TRIM_PKGVAR:-$APPDEST/var}"
+APPTMP="${TRIM_PKGTMP:-$APPDEST/tmp}"
+SERVICE_PORT="${TRIM_SERVICE_PORT:-8080}"
+# 优先使用安装向导设置的端口（写于 $PKGETC/.port）
+if [ -f "$PKGETC/.port" ] && [ -s "$PKGETC/.port" ]; then
+    SERVICE_PORT="$(cat "$PKGETC/.port")"
+fi
+APP_USER="${TRIM_USERNAME:-fnosbackup}"
+APP_GROUP="${TRIM_GROUPNAME:-fnosbackup}"
+
+# 飞牛注入的 TRIM_TEMP_LOGFILE 是用户可见错误日志路径（飞牛UI会展示此文件内容）
+# 统一应用日志与生命周期日志到同一个文件，便于用户查看真实错误
+LOG_FILE="${TRIM_TEMP_LOGFILE:-$APPTMP/fnos-backup.log}"
+APP_LOG="$LOG_FILE"
+
+BIN_DIR="$APPDEST/bin"
+DAEMON="$BIN_DIR/fnos-backup"
+PID_FILE="$APPTMP/fnos-backup.pid"
+
+# 前端静态资源目录（后端 axum 托管；package app/ → $TRIM_APPDEST）
+WWW_DIR="${TRIM_WWW_DIR:-$APPDEST/www}"
+
+# 应用口令：来自安装向导（写入 etc/.passphrase），用于配置/密钥库加密
+PASSPHRASE_FILE="$PKGETC/.passphrase"
+if [ -f "$PASSPHRASE_FILE" ]; then
+    PASSPHRASE="$(cat "$PASSPHRASE_FILE")"
+else
+    # 开发回退：未初始化时使用固定值（生产不会走到这）
+    PASSPHRASE="fnos-backup-dev"
+fi
+
+mkdir -p "$PKGETC" "$PKGVAR" "$APPTMP" "$WWW_DIR" "$BIN_DIR"
+# 确保数据/配置目录属主为应用用户
+chown -R "$APP_USER:$APP_GROUP" "$PKGETC" "$PKGVAR" "$APPTMP" 2>/dev/null || true
+
+log_err() {
+    echo "[fnos-backup] $*" >"$LOG_FILE"
+}
+
+is_running() {
+    [ -f "$PID_FILE" ] || return 1
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || echo '')"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+do_start() {
+    if is_running; then
+        echo "fnos-backup 已在运行 (pid $(cat "$PID_FILE"))"
+        exit 0
+    fi
+
+    # 记录启动诊断信息到用户可见日志
+    {
+        echo "===== fnos-backup 启动 ====="
+        echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "APP_USER=$APP_USER APP_GROUP=$APP_GROUP"
+        echo "DAEMON=$DAEMON"
+        echo "APP_LOG=$APP_LOG PID_FILE=$PID_FILE"
+        echo "TRIM_APPDEST=$TRIM_APPDEST"
+        echo "TRIM_PKGETC=$TRIM_PKGETC"
+        echo "TRIM_PKGVAR=$TRIM_PKGVAR"
+        echo "TRIM_PKGTMP=$TRIM_PKGTMP"
+        echo "TRIM_SERVICE_PORT=$TRIM_SERVICE_PORT"
+        echo "TRIM_USERNAME=$TRIM_USERNAME"
+    } >>"$LOG_FILE" 2>&1
+
+    if [ ! -x "$DAEMON" ]; then
+        echo "错误：找不到可执行文件 $DAEMON" | tee -a "$LOG_FILE" >&2
+        exit 1
+    fi
+
+    # 检查后端二进制架构是否匹配本机（避免 x86/aarch64 不匹配）
+    local file_arch
+    file_arch="$(file -b "$DAEMON" 2>/dev/null | head -1)"
+    echo "二进制: $file_arch" >>"$LOG_FILE"
+
+    echo "启动 fnos-backup (port=$SERVICE_PORT) ..." | tee -a "$LOG_FILE"
+    echo "当前执行用户: $(id -un 2>/dev/null) (uid=$(id -u 2>/dev/null))" | tee -a "$LOG_FILE"
+
+    # 直接以当前用户身份启动后端进程（飞牛生命周期脚本默认以应用用户执行，无需降权）
+    # 后端二进制所需的 TRIM_* 环境变量通过 env -i 清 后再注入，避免污染
+    env -i \
+        HOME="$HOME" \
+        PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+        TRIM_APPDEST="$APPDEST" \
+        TRIM_PKGETC="$PKGETC" \
+        TRIM_PKGVAR="$PKGVAR" \
+        TRIM_PKGTMP="$APPTMP" \
+        TRIM_WWW_DIR="$WWW_DIR" \
+        TRIM_HTTP_PORT="$SERVICE_PORT" \
+        TRIM_PASSPHRASE="$PASSPHRASE" \
+        TRIM_LOGIN_BIN_DIR="$BIN_DIR" \
+        TRIM_KZWR_FOLDER="fn-backup" \
+        TRIM_KZWR_BASE_URL="https://www.kzwr.com" \
+        TRIM_JOB_ID="default" \
+        nohup "$DAEMON" >>"$APP_LOG" 2>&1 &
+    local pid="$!"
+
+    if [ -z "$pid" ] || ! echo "$pid" | grep -qE '^[0-9]+$'; then
+        echo "启动失败：未能获取 PID（pid='$pid'）" | tee -a "$LOG_FILE" >&2
+        exit 1
+    fi
+
+    echo "$pid" >"$PID_FILE"
+    sleep 1
+    if is_running; then
+        echo "启动成功 (pid $pid)" | tee -a "$LOG_FILE"
+    else
+        echo "启动失败：进程未存活，PID=$pid" | tee -a "$LOG_FILE" >&2
+        echo "查看详细日志: $APP_LOG" | tee -a "$LOG_FILE" >&2
+        rm -f "$PID_FILE"
+        exit 1
+    fi
+}
+
+do_stop() {
+    if ! is_running; then
+        echo "fnos-backup 未运行"
+        rm -f "$PID_FILE"
+        exit 0
+    fi
+    local pid
+    pid="$(cat "$PID_FILE")"
+    echo "停止 fnos-backup (pid $pid) ..."
+    kill -TERM "$pid" 2>/dev/null || true
+    # 等待优雅退出
+    for _ in $(seq 1 10); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.5
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "强制终止 ..."
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+    echo "已停止"
+}
+
+do_status() {
+    if is_running; then
+        echo "running (pid $(cat "$PID_FILE"))"
+        exit 0
+    else
+        echo "stopped"
+        exit 3
+    fi
+}
+
+case "$1" in
+    start)   do_start ;;
+    stop)    do_stop ;;
+    status)  do_status ;;
+    restart) do_stop; do_start ;;
+    *)
+        echo "用法: $0 {start|stop|status|restart}" >&2
+        exit 1
+        ;;
+esac

@@ -1,0 +1,27 @@
+[
+  {
+    "stepTitle": "卸载确认",
+    "items": [
+      {
+        "type": "select",
+        "field": "wizard_purge_data",
+        "label": "卸载时如何处理应用数据",
+        "initValue": "keep",
+        "options": [
+          {
+            "label": "保留数据与配置（推荐）",
+            "value": "keep"
+          },
+          {
+            "label": "同时清除数据与配置",
+            "value": "purge"
+          }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "默认保留全部数据（快照与配置/密钥库）。选择清除将删除备份快照与配置；密钥库包含口令保护的 age 私钥，删除后无法解密已上传的备份数据。"
+      }
+    ]
+  }
+]

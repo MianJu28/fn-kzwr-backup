@@ -1,0 +1,24 @@
+#!/bin/bash
+#
+# 安装回调：应用文件应用后执行。
+# 本应用安装即用，无需额外初始化；此处仅做幂等校验与目录就绪确认。
+#
+# 注意：不使用 set -e，避免任一命令非零退出导致飞牛判定"执行脚本出错"。
+
+APPDEST="${TRIM_APPDEST:-/var/apps/fnos-backup/target}"
+PKGVAR="${TRIM_PKGVAR:-$APPDEST/var}"
+PKGETC="${TRIM_PKGETC:-$APPDEST/etc}"
+APP_USER="${TRIM_USERNAME:-fnosbackup}"
+APP_GROUP="${TRIM_GROUPNAME:-fnosbackup}"
+
+# 确保持久数据目录就绪且属主正确
+mkdir -p "$PKGVAR" "$PKGETC" || true
+chown -R "$APP_USER:$APP_GROUP" "$PKGVAR" "$PKGETC" 2>/dev/null || true
+
+# 校验主二进制存在（缺失时写错误日志并返回 1）
+if [ ! -x "$APPDEST/bin/fnos-backup" ]; then
+    echo "安装失败：缺少主二进制 $APPDEST/bin/fnos-backup" >"${TRIM_TEMP_LOGFILE:-/tmp/fnos-backup-install.log}"
+    exit 1
+fi
+
+exit 0

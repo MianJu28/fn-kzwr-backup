@@ -170,6 +170,9 @@ impl KzwrAuthService {
 
     /// 调用登录二进制获取 token
     fn run_login_bin(&self, username: &str, password: &str) -> Result<String> {
+        // 清掉旧 session
+        let _ = std::fs::remove_file(self.work_dir.join("session.json"));
+
         let bin = self.bin_dir.join(LOGIN_BIN);
         if !bin.exists() {
             return Err(anyhow::anyhow!(
@@ -177,9 +180,6 @@ impl KzwrAuthService {
                 bin.display()
             ));
         }
-        // 清掉旧 session
-        let _ = std::fs::remove_file(self.work_dir.join("session.json"));
-
         info!("调用 kzwr 登录二进制...");
         let status = Command::new(&bin)
             .arg(username)
