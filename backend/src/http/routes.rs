@@ -390,7 +390,10 @@ fn ensure_xvfb(cache_dir: &str) -> String {
         let _ = ok;
     }
     if !x11_fixed {
-        log.push_str("[!] /tmp/.X11-unix 仍不可写（可能只读挂载或需 root）。Xvfb 将无法创建 unix socket，登录会失败。\n");
+        log.push_str("[!] /tmp/.X11-unix 仍不可写，Xvfb 将无法创建 unix socket。诊断信息如下：\n");
+        let (_, ls_out) = sh("ls -ld /tmp/.X11-unix 2>&1; stat -c 'mode=%a owner=%U group=%G' /tmp/.X11-unix 2>&1; mount | grep -E ' /tmp |/tmp/.X11-unix' 2>&1; echo ---; touch /tmp/.X11-unix/.wtest 2>&1 && echo WRITABLE && rm -f /tmp/.X11-unix/.wtest || echo NOT_WRITABLE");
+        log.push_str(&ls_out);
+        log.push_str("[!] 若 ls 显示非 1777 且 owner 非 root，需 root 执行: chmod 1777 /tmp/.X11-unix；若为只读挂载(ro)，需: mount -o remount,rw /tmp\n");
     }
 
     // 键盘映射文件用 TMPDIR 指向可写目录（登录二进制继承，其 Xvfb 用此目录写 xkb 文件）
