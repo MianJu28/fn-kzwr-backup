@@ -217,6 +217,13 @@ impl KzwrAuthService {
             if let Some(cache) = &xdg_cache {
                 cmd.env("XDG_CACHE_HOME", cache);
             }
+            // Firefox 启动要求 HOME 为绝对路径（相对/空 HOME 会报 Cannot launch Firefox
+            // with relative home directory）。这里强制设为绝对的工作目录。
+            let home_abs = self.work_dir.canonicalize().unwrap_or_else(|_| self.work_dir.clone());
+            cmd.env("HOME", &home_abs);
+            // 也设 XDG_DATA_HOME / XDG_CONFIG_HOME 为绝对路径，避免相对路径问题
+            cmd.env("XDG_DATA_HOME", home_abs.join(".local/share"));
+            cmd.env("XDG_CONFIG_HOME", home_abs.join(".config"));
             info!(
                 "登录命令: {} {} {} ...",
                 bin.display(),
