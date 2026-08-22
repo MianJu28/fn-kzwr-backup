@@ -46,8 +46,8 @@ fi
 
 # ══════════════════════════════════════════════════════════════
 # Camoufox 登录运行环境准备（登录二进制运行时经 XDG_CACHE_HOME 定位）
-#  - 浏览器二进制：国内镜像 curl 下载（若 fpk 内置 app/cache 则直接解压）
-#  - uBlock Origin addon：随 fpk 打包，安装时解压
+#  - 浏览器二进制：由前端页面触发后端 /api/login-env/init 下载（国内镜像 + 进度）
+#  - uBlock Origin addon：随 fpk 打包 app/cache/ubo.xpi，安装时解压
 #  - Xvfb + Firefox 运行时库：apt 安装（headless="virtual" 需要）
 # ══════════════════════════════════════════════════════════════
 LOGIN_CACHE_DIR="$APPDEST/cache"
@@ -58,67 +58,10 @@ mkdir -p "$LOGIN_CACHE_DIR" "$CAMO_DIR" "$UBO_DIR" 2>/dev/null || true
 
 log_i() { echo "[install_init] $*" >>"$INSTALL_LOG" 2>/dev/null || true; }
 
-# ── 1. 国内镜像源列表（用户可在安装向导/环境变量中选择）──
-# 选择顺序：KZWR_LOGIN_MIRROR 显式指定 > 默认列表（逐个尝试）
-MIRROR_DEFAULT="gh-proxy.com ghproxy.net ghfast.top"
-if [ -n "${KZWR_LOGIN_MIRROR:-}" ]; then
-    MIRROR_LIST="$KZWR_LOGIN_MIRROR"
-else
-    MIRROR_LIST="$MIRROR_DEFAULT"
-fi
-
-# Camoufox 浏览器版本（默认 DEPLOY_FNVM 实测可用版本；可用 KZWR_CAMOUFOX_VERSION 覆盖）
-CAMOUFOX_VERSION="${KZWR_CAMOUFOX_VERSION:-152.0.4-beta.28}"
-# 资产名 pattern：camoufox-{version}-{build}-lin.x86_64.zip；build 未知，尝试候选
-UBO_URL_BASE="https://github.com/gorhill/uBlock/releases/download/1.73.0"
-
-download_via_mirror() {
-    # $1=GitHub 原始 URL；$2=目标文件；依次用国内镜像尝试
-    local url="$1" out="$2" m
-    for m in $MIRROR_LIST; do
-        log_i "尝试镜像 $m ..."
-        if curl -sL --connect-timeout 20 --max-time 1200 -o "$out" "https://$m/$url"; then
-            [ -s "$out" ] && return 0
-        fi
-        rm -f "$out" 2>/dev/null || true
-    done
-    return 1
-}
-
-# ── 2. Camoufox 浏览器 ──
-if [ -x "$CAMO_DIR/camoufox-bin" ]; then
-    log_i "Camoufox 浏览器已就绪：$CAMO_DIR"
-elif [ -f "$APPDEST/cache/camoufox-browser.zip" ]; then
-    # fpk 内置浏览器 zip（构建时预下载），直接解压
-    log_i "从 fpk 内置浏览器 zip 解压 ..."
-    cd "$CAMO_DIR" && unzip -o "$APPDEST/cache/camoufox-browser.zip" 2>/dev/null && \
-        chmod +x "$CAMO_DIR/camoufox-bin" 2>/dev/null || true
-else
-    log_i "未找到内置浏览器，开始国内镜像下载 Camoufox ${CAMOUFOX_VERSION} ..."
-    TMP_ZIP="$APPTMP/camoufox-browser.zip"
-    rm -f "$TMP_ZIP" 2>/dev/null || true
-    # 资产名候选（build 未知，枚举可能后缀；首选中含 lin.x86_64 的）
-    CAMO_DL_OK=""
-    for asset in \
-        "camoufox-${CAMOUFOX_VERSION}-lin.x86_64.zip" \
-        "camoufox-${CAMOUFOX_VERSION}-1-lin.x86_64.zip" \
-        "camoufox-${CAMOUFOX_VERSION}-0-lin.x86_64.zip"; do
-        if download_via_mirror "https://github.com/daijro/camoufox/releases/download/${CAMOUFOX_VERSION}/${asset}" "$TMP_ZIP"; then
-            CAMO_DL_OK="1"; break
-        fi
-    done
-    if [ -n "$CAMO_DL_OK" ]; then
-        cd "$CAMO_DIR" && unzip -o "$TMP_ZIP" 2>/dev/null && \
-            chmod +x "$CAMO_DIR/camoufox-bin" 2>/dev/null || true
-        rm -f "$TMP_ZIP" 2>/dev/null || true
-    else
-        log_i "警告：Camoufox 浏览器下载失败。登录功能暂不可用，请检查网络/镜像源。"
-    fi
-fi
-
-# ── 3. uBlock Origin addon（随 fpk 打包，安装时解压）──
-# 源码 manifest.json 缺失会导致 camoufox 报 InvalidAddonPath，故必须解压。
-if [ -f "$APPDEST/cache/ubo.xpi" ]; then
+# ── 1. uBlock Origin addon（随 fpk 打包，安装时解压）──
+# manifest.json 缺失会导致 camoufox 报 InvalidAddonPath，故必须解压。
+# 若 fpk 内置了浏览器 zip（camoufox-browser.zip），也一并解压（免前端下载）。
+if [ -f "$APPDEST/cache/ubo.xpi" ] && [ ! -f "$UBO_DIR/manifest.json" ]; then
     log_i "解压 uBlock Origin addon ..."
     rm -rf "$UBO_DIR" 2>/dev/null || true
     mkdir -p "$UBO_DIR" 2>/dev/null || true
@@ -128,7 +71,14 @@ if [ -f "$APPDEST/cache/ubo.xpi" ]; then
     fi
 fi
 
-# ── 4. Xvfb + Firefox 运行时库（headless="virtual" 需要）──
+# ── 2. 若 fpk 内置了浏览器 zip，直接解压（否则由前端触发下载）──
+if [ -f "$APPDEST/cache/camoufox-browser.zip" ] && [ ! -x "$CAMO_DIR/camoufox-bin" ]; then
+    log_i "从 fpk 内置浏览器 zip 解压 ..."
+    ( cd "$CAMO_DIR" && unzip -o "$APPDEST/cache/camoufox-browser.zip" 2>/dev/null ) || true
+    chmod +x "$CAMO_DIR/camoufox-bin" 2>/dev/null || true
+fi
+
+# ── 3. Xvfb + Firefox 运行时库（headless="virtual" 需要）──
 if ! command -v Xvfb >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
     log_i "安装 Xvfb 与 Firefox 运行时库 ..."
     apt-get update >/dev/null 2>&1 || true

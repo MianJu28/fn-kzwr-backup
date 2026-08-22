@@ -47,6 +47,99 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+/// 登录环境状态（Camoufox 浏览器 + uBlock addon 就绪 + 初始化任务状态）
+#[derive(Serialize, Clone)]
+pub struct LoginEnvStatus {
+    /// Camoufox 浏览器二进制是否就绪（$CACHE_DIR/camoufox/camoufox-bin 存在且可执行）
+    pub camoufox_browser: bool,
+    /// uBlock Origin addon 是否就绪（$CACHE_DIR/camoufox/addons/UBO/manifest.json 存在）
+    pub ubo: bool,
+    /// 综合：两者皆就绪
+    pub ready: bool,
+    /// 缓存目录（TRIM_LOGIN_CACHE_DIR）
+    pub cache_dir: String,
+    /// 当前请求的 Camoufox 版本（默认）
+    pub default_camoufox_version: String,
+    /// 可选国内镜像源列表
+    pub mirrors: Vec<String>,
+    /// 初始化任务状态：idle | running | done | error | cancelled
+    pub state: String,
+    /// 是否正在初始化
+    pub running: bool,
+    /// 下载进度 0-100（-1 表示未知）
+    pub progress: i32,
+    /// 最近一条状态/进度消息
+    pub message: String,
+    /// 当前使用的镜像
+    pub mirror: String,
+    /// 最近更新时间（unix 秒）
+    pub updated_at: u64,
+}
+
+/// 初始化登录环境请求（可选指定国内镜像 + Camoufox 版本）
+#[derive(Deserialize, Default)]
+pub struct InitLoginEnvRequest {
+    #[serde(default)]
+    pub camoufox_version: Option<String>,
+    #[serde(default)]
+    pub mirror: Option<String>,
+}
+
+/// 初始化状态持久化文件内容
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct LoginEnvInitState {
+    #[serde(default)]
+    pub state: String, // idle|running|done|error|cancelled
+    #[serde(default)]
+    pub progress: i32,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub mirror: String,
+    #[serde(default)]
+    pub camoufox_version: String,
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+/// 当前正在运行的下载任务 curl PID（供取消）
+static CURRENT_DL_PID: std::sync::OnceLock<std::sync::Mutex<Option<u32>>> =
+    std::sync::OnceLock::new();
+
+fn current_dl_pid() -> &'static std::sync::Mutex<Option<u32>> {
+    CURRENT_DL_PID.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 登录环境初始化状态文件路径
+fn login_env_state_path(cache_dir: &str) -> PathBuf {
+    PathBuf::from(cache_dir).join(".login_env_init.json")
+}
+
+/// 读取初始化状态文件（不存在则返回 idle 默认）
+fn read_login_env_state(cache_dir: &str) -> LoginEnvInitState {
+    let p = login_env_state_path(cache_dir);
+    std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// 写入初始化状态文件
+fn write_login_env_state(cache_dir: &str, st: &LoginEnvInitState) {
+    let p = login_env_state_path(cache_dir);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut st = st.clone();
+    st.updated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(s) = serde_json::to_string(&st) {
+        let _ = std::fs::write(&p, s);
+    }
+}
+
 /// 登录响应
 #[derive(Serialize)]
 pub struct LoginResponse {
@@ -66,6 +159,8 @@ pub struct ConfigResponse {
     pub schedule_cron_valid: bool,
     pub logged_in: bool,
     pub login_bin_available: bool,
+    /// 是否开启登录二进制 debug 日志
+    pub login_debug: bool,
     pub error: Option<String>,
 }
 
@@ -76,6 +171,9 @@ pub struct ConfigSaveRequest {
     pub target_folder: Option<String>,
     /// 定时备份 cron 表达式（空 = 关闭定时）
     pub schedule_cron: Option<String>,
+    /// 是否开启登录二进制 debug 日志
+    #[serde(default)]
+    pub login_debug: Option<bool>,
 }
 
 /// 备份响应
@@ -164,6 +262,446 @@ async fn auth_login(
     }
 }
 
+/// 检测登录环境状态（Camoufox 浏览器 + uBlock + 初始化任务状态）
+/// 前端页面打开时调用；结合持久化状态文件，避免初始化完成后重复提示。
+async fn login_env_status(State(_state): State<AppState>) -> Json<LoginEnvStatus> {
+    let cache_dir = std::env::var(crate::infra::kzwr_auth::CACHE_DIR_ENV)
+        .unwrap_or_default();
+    let camo_bin = PathBuf::from(&cache_dir).join("camoufox").join("camoufox-bin");
+    let ubo_manifest = PathBuf::from(&cache_dir)
+        .join("camoufox")
+        .join("addons")
+        .join("UBO")
+        .join("manifest.json");
+    let browser_ok = camo_bin.is_file() && {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            camo_bin
+                .metadata()
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    };
+    let ubo_ok = ubo_manifest.is_file();
+
+    // 读取持久化初始化状态（进度/消息/镜像）
+    let init = read_login_env_state(&cache_dir);
+    // running 但进程已不在（例如后端重启）→ 视为 idle
+    let running = init.state == "running" && current_dl_pid().lock().unwrap().is_some();
+
+    // 完成判定：文件就绪（浏览器+uBlock）即 ready，无论状态文件如何
+    let ready = browser_ok && ubo_ok;
+    // 若已 ready 但状态文件仍标记 running/非 done，纠正为 done
+    let state = if ready && init.state != "done" {
+        let mut st = init.clone();
+        st.state = "done".to_string();
+        st.message = "登录环境已就绪".to_string();
+        write_login_env_state(&cache_dir, &st);
+        "done".to_string()
+    } else if running {
+        "running".to_string()
+    } else {
+        init.state.clone()
+    };
+
+    Json(LoginEnvStatus {
+        camoufox_browser: browser_ok,
+        ubo: ubo_ok,
+        ready,
+        cache_dir: cache_dir.clone(),
+        default_camoufox_version: "152.0.4-beta.28".to_string(),
+        mirrors: vec![
+            "gh-proxy.com".to_string(),
+            "ghproxy.net".to_string(),
+            "ghfast.top".to_string(),
+        ],
+        state,
+        running,
+        progress: init.progress,
+        message: init.message,
+        mirror: init.mirror,
+        updated_at: init.updated_at,
+    })
+}
+
+/// 用 Rust zip 解压 zip 到目标目录（不依赖系统 unzip，飞牛精简系统也适用）。
+/// 自动防护路径穿越（跳过绝对路径/..）。
+fn unzip_to_dir(zip_path: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    let file = std::fs::File::open(zip_path).map_err(|e| format!("打开 zip 失败: {}", e))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| format!("解析 zip 失败: {}", e))?;
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("读取 zip 条目失败: {}", e))?;
+        // 防护路径穿越
+        let name = entry.name().replace('\\', "/");
+        if name.starts_with('/') || name.split('/').any(|seg| seg == "..") {
+            continue;
+        }
+        let out_path = dest.join(name);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
+        } else {
+            if let Some(p) = out_path.parent() {
+                std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+            }
+            let mut f = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
+            std::io::copy(&mut entry, &mut f).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// 初始化登录环境：解压 uBlock + 国内镜像下载 Camoufox 浏览器。
+/// 后台任务更新持久化状态文件（进度/消息），前端轮询 /login-env/status 获取进度。
+async fn login_env_init(
+    State(_state): State<AppState>,
+    body: Option<Json<InitLoginEnvRequest>>,
+) -> Json<LoginEnvStatus> {
+    let req = body.map(|j| j.0).unwrap_or_default();
+    let version = req
+        .camoufox_version
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "152.0.4-beta.28".to_string());
+    let mirror = req
+        .mirror
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "gh-proxy.com".to_string());
+
+    let cache_dir = std::env::var(crate::infra::kzwr_auth::CACHE_DIR_ENV).unwrap_or_default();
+
+    // 若已有下载任务在跑，拒绝重复启动
+    if current_dl_pid().lock().unwrap().is_some() {
+        return login_env_status(State(_state)).await;
+    }
+
+    // 记录初始化状态为 running
+    write_login_env_state(
+        &cache_dir,
+        &LoginEnvInitState {
+            state: "running".to_string(),
+            progress: 0,
+            message: "开始初始化...".to_string(),
+            mirror: mirror.clone(),
+            camoufox_version: version.clone(),
+            updated_at: 0,
+        },
+    );
+
+    // 后台任务执行初始化（解压 uBlock + 下载浏览器），写状态文件
+    tokio::spawn(async move {
+        let cache_dir = std::env::var(crate::infra::kzwr_auth::CACHE_DIR_ENV).unwrap_or_default();
+        if cache_dir.is_empty() {
+            write_login_env_state(
+                &cache_dir,
+                &LoginEnvInitState {
+                    state: "error".to_string(),
+                    progress: 0,
+                    message: "未设置 TRIM_LOGIN_CACHE_DIR".to_string(),
+                    mirror: mirror.clone(),
+                    camoufox_version: version.clone(),
+                    updated_at: 0,
+                },
+            );
+            return;
+        }
+        let camo_dir = std::path::PathBuf::from(&cache_dir).join("camoufox");
+        let ubo_dir = camo_dir.join("addons").join("UBO");
+        let _ = std::fs::create_dir_all(&camo_dir);
+        let _ = std::fs::create_dir_all(&ubo_dir);
+
+        // ── 1. 解压 uBlock ──
+        let ubo_xpi = std::path::PathBuf::from(&cache_dir).join("ubo.xpi");
+        if !ubo_dir.join("manifest.json").is_file() {
+            if !ubo_xpi.is_file() {
+                write_login_env_state(
+                    &cache_dir,
+                    &LoginEnvInitState {
+                        state: "error".to_string(),
+                        progress: 0,
+                        message: "未找到 fpk 内置 ubo.xpi".to_string(),
+                        mirror: mirror.clone(),
+                        camoufox_version: version.clone(),
+                        updated_at: 0,
+                    },
+                );
+                return;
+            }
+            write_login_env_state(
+                &cache_dir,
+                &LoginEnvInitState {
+                    state: "running".to_string(),
+                    progress: 0,
+                    message: "正在解压 uBlock Origin addon...".to_string(),
+                    mirror: mirror.clone(),
+                    camoufox_version: version.clone(),
+                    updated_at: 0,
+                },
+            );
+            let _ = std::fs::remove_dir_all(&ubo_dir);
+            let _ = std::fs::create_dir_all(&ubo_dir);
+            let ubo_xpi2 = ubo_xpi.clone();
+            let ubo_dir2 = ubo_dir.clone();
+            let unzip_res = tokio::task::spawn_blocking(move || {
+                unzip_to_dir(&ubo_xpi2, &ubo_dir2)
+            })
+            .await;
+            if !matches!(unzip_res, Ok(Ok(()))) {
+                write_login_env_state(
+                    &cache_dir,
+                    &LoginEnvInitState {
+                        state: "error".to_string(),
+                        progress: 0,
+                        message: "uBlock 解压失败".to_string(),
+                        mirror: mirror.clone(),
+                        camoufox_version: version.clone(),
+                        updated_at: 0,
+                    },
+                );
+                return;
+            }
+        }
+
+        // ── 2. 下载 Camoufox 浏览器（若未就绪）──
+        let camo_bin = camo_dir.join("camoufox-bin");
+        let dl_result = if camo_bin.is_file() {
+            Ok(())
+        } else {
+            write_login_env_state(
+                &cache_dir,
+                &LoginEnvInitState {
+                    state: "running".to_string(),
+                    progress: 0,
+                    message: format!("开始下载 Camoufox {}（镜像 {}）...", version, mirror),
+                    mirror: mirror.clone(),
+                    camoufox_version: version.clone(),
+                    updated_at: 0,
+                },
+            );
+            download_camoufox_browser(&version, &mirror, &cache_dir, &camo_dir).await
+        };
+
+        match dl_result {
+            Ok(()) => write_login_env_state(
+                &cache_dir,
+                &LoginEnvInitState {
+                    state: "done".to_string(),
+                    progress: 100,
+                    message: "登录环境已就绪".to_string(),
+                    mirror: mirror.clone(),
+                    camoufox_version: version.clone(),
+                    updated_at: 0,
+                },
+            ),
+            Err(e) => {
+                // 若用户已取消（状态文件被 cancel 置为 cancelled），则不覆盖为 error
+                let cur = read_login_env_state(&cache_dir);
+                if cur.state == "cancelled" {
+                    // 保持 cancelled，不覆盖
+                } else {
+                    write_login_env_state(
+                        &cache_dir,
+                        &LoginEnvInitState {
+                            state: "error".to_string(),
+                            progress: 0,
+                            message: format!("初始化失败: {}", e),
+                            mirror: mirror.clone(),
+                            camoufox_version: version.clone(),
+                            updated_at: 0,
+                        },
+                    );
+                }
+            }
+        }
+        // 清理下载句柄
+        *current_dl_pid().lock().unwrap() = None;
+    });
+
+    login_env_status(State(_state)).await
+}
+
+/// 取消初始化下载任务
+async fn login_env_cancel(State(_state): State<AppState>) -> Json<LoginEnvStatus> {
+    let cache_dir = std::env::var(crate::infra::kzwr_auth::CACHE_DIR_ENV).unwrap_or_default();
+    // kill 当前下载 curl 进程
+    if let Some(pid) = current_dl_pid().lock().unwrap().take() {
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+    }
+    // 清理临时下载文件
+    let camo_dir = PathBuf::from(&cache_dir).join("camoufox");
+    let _ = std::fs::remove_file(camo_dir.join("__camoufox_browser.zip"));
+    // 重置状态为 cancelled
+    write_login_env_state(
+        &cache_dir,
+        &LoginEnvInitState {
+            state: "cancelled".to_string(),
+            progress: 0,
+            message: "已取消初始化".to_string(),
+            mirror: String::new(),
+            camoufox_version: String::new(),
+            updated_at: 0,
+        },
+    );
+    login_env_status(State(_state)).await
+}
+
+/// 国内镜像下载 Camoufox 浏览器并解压到 camo_dir。
+/// 由版本构造 URL（已确认资产名）：
+///   https://github.com/daijro/camoufox/releases/download/v{version}/camoufox-{version}-lin.x86_64.zip
+/// 用指定国内镜像下载，curl 进度条解析百分比写入持久化状态文件；记录 curl PID 供取消。
+async fn download_camoufox_browser(
+    version: &str,
+    mirror: &str,
+    cache_dir: &str,
+    camo_dir: &std::path::Path,
+) -> Result<(), String> {
+    let tmp_zip = camo_dir.join("__camoufox_browser.zip");
+    let _ = std::fs::remove_file(&tmp_zip);
+
+    let tag = if version.starts_with('v') {
+        version.to_string()
+    } else {
+        format!("v{}", version)
+    };
+    let asset = format!("camoufox-{}-lin.x86_64.zip", version);
+    let gh_url = format!(
+        "https://github.com/daijro/camoufox/releases/download/{}/{}",
+        tag, asset
+    );
+
+    // 写状态 helper（闭包捕获 cache_dir）
+    let set_state = |st: &str, prog: i32, msg: &str| {
+        write_login_env_state(
+            cache_dir,
+            &LoginEnvInitState {
+                state: st.to_string(),
+                progress: prog,
+                message: msg.to_string(),
+                mirror: mirror.to_string(),
+                camoufox_version: version.to_string(),
+                updated_at: 0,
+            },
+        );
+    };
+
+    // 用用户选择的镜像下载。
+    // 注意：curl `-#` 进度条在 stderr 非终端（管道）时不输出，无法实时解析百分比。
+    // 改为：先 HEAD 拿 Content-Length，下载时轮询临时文件大小计算进度。
+    let url = format!("https://{}/{}", mirror, gh_url);
+
+    // 1) HEAD 获取总大小（经国内镜像）
+    let mut total: u64 = 0;
+    for head_m in [mirror] {
+        let head_url = format!("https://{}/{}", head_m, gh_url);
+        let head_out = tokio::process::Command::new("curl")
+            .args(["-sIL", "--connect-timeout", "15", "--max-time", "30", &head_url])
+            .output()
+            .await;
+        if let Ok(o) = head_out {
+            let text = String::from_utf8_lossy(&o.stdout);
+            for line in text.lines() {
+                let l = line.to_lowercase();
+                if let Some(pos) = l.find("content-length:") {
+                    if let Some(v) = l[pos + 15..].trim().parse::<u64>().ok() {
+                        if v > 0 {
+                            total = v;
+                        }
+                    }
+                }
+            }
+            if total > 0 {
+                break;
+            }
+        }
+    }
+
+    set_state("running", 0, &format!("开始下载（镜像 {}）...", mirror));
+
+    // 2) 后台 spawn_blocking 下载（无进度条，静默）
+    let tmp_zip_dl = tmp_zip.clone();
+    let url_dl = url.clone();
+    let dl_handle = tokio::task::spawn_blocking(move || {
+        use std::process::{Command, Stdio};
+        let status = Command::new("curl")
+            .args([
+                "-sL",
+                "--connect-timeout",
+                "20",
+                "--max-time",
+                "3600",
+                "-o",
+            ])
+            .arg(&tmp_zip_dl)
+            .arg(&url_dl)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        status.map_err(|e| e.to_string())
+    });
+    // 记录当前下载 PID 供取消（spawn_blocking 内的 curl 无 pid；用全局状态标记进行中）
+    *current_dl_pid().lock().unwrap() = Some(u32::MAX);
+
+    // 3) 主循环轮询文件大小算进度
+    let mut last_pct: i32 = -1;
+    loop {
+        if dl_handle.is_finished() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let cur = std::fs::metadata(&tmp_zip).map(|m| m.len()).unwrap_or(0);
+        if total > 0 {
+            let p = ((cur as f64 / total as f64) * 100.0) as i32;
+            let p = p.clamp(0, 99);
+            if p != last_pct {
+                last_pct = p;
+                set_state("running", p, &format!("下载中 {}%（{} MB / {} MB）", p, cur / 1024 / 1024, total / 1024 / 1024));
+            }
+        }
+    }
+
+    let dl_result = dl_handle.await.map_err(|e| format!("下载任务失败: {}", e))?;
+    *current_dl_pid().lock().unwrap() = None;
+    let status_success = dl_result.is_ok() && dl_result.as_ref().map(|s| s.success()).unwrap_or(false);
+
+    let ok_size = std::fs::metadata(&tmp_zip)
+        .map(|m| m.len() > 1_000_000)
+        .unwrap_or(false);
+    if !(status_success && ok_size) {
+        let _ = std::fs::remove_file(&tmp_zip);
+        return Err(format!("下载失败 (exit {:?})", dl_result.ok().and_then(|s| s.code())));
+    }
+
+    // 解压
+    set_state("running", 100, "下载完成，正在解压...");
+    let camo_dir2 = camo_dir.to_path_buf();
+    let tmp_zip2 = tmp_zip.clone();
+    let unzip = tokio::task::spawn_blocking(move || {
+        let r = unzip_to_dir(&tmp_zip2, &camo_dir2);
+        let _ = std::fs::remove_file(&tmp_zip2);
+        r
+    })
+    .await
+    .map_err(|e| format!("解压任务失败: {}", e))?;
+    // chmod +x camoufox-bin
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = camo_dir.join("camoufox-bin");
+        if bin.is_file() {
+            let _ = std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    unzip
+}
+
 /// 读取配置（不含敏感字段明文）
 /// 由配置构造响应（含 cron 校验）
 fn config_response(
@@ -181,6 +719,7 @@ fn config_response(
         schedule_cron_valid: valid,
         logged_in,
         login_bin_available: state.auth.bin_exists(),
+        login_debug: cfg.kzwr.login_debug,
         error,
     }
 }
@@ -197,6 +736,7 @@ async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
                 schedule_cron_valid: true,
                 logged_in: false,
                 login_bin_available: state.auth.bin_exists(),
+                login_debug: false,
                 error: Some(format!("{:#}", e)),
             })
         }
@@ -233,6 +773,10 @@ async fn config_save(
         } else {
             cfg.backup.schedule_cron = Some(cron);
         }
+    }
+    // 登录二进制 debug 日志开关
+    if let Some(ld) = body.login_debug {
+        cfg.kzwr.login_debug = ld;
     }
     match cfg_guard.save(&cfg) {
         Ok(_) => {
@@ -471,5 +1015,8 @@ pub fn router(state: AppState) -> Router {
         .route("/backup/run", post(backup_run))
         .route("/restore/files", get(restore_files))
         .route("/restore/run", post(restore_run))
+        .route("/login-env/status", get(login_env_status))
+        .route("/login-env/init", post(login_env_init))
+        .route("/login-env/cancel", post(login_env_cancel))
         .with_state(state)
 }

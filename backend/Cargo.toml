@@ -59,6 +59,9 @@ anyhow = "1"
 # 临时文件（kzwr 分片上传暂存）
 tempfile = "3"
 
+# zip 解压（uBlock xpi / Camoufox 浏览器 zip；纯 Rust，不依赖系统 unzip）
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
 # 定时备份调度（cron 解析 + 时间计算）
 croner = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
