@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::infra::config::ConfigManager;
 
@@ -173,9 +173,16 @@ impl KzwrAuthService {
     }
 
     /// 调用登录二进制获取 token
+    /// 登录失败自动重试 3 次；开启 debug 时传 --debug 并写日志文件。
     fn run_login_bin(&self, username: &str, password: &str) -> Result<String> {
-        // 清掉旧 session
-        let _ = std::fs::remove_file(self.work_dir.join("session.json"));
+        // 是否开启 debug 日志
+        let login_debug = self
+            .config
+            .lock()
+            .unwrap()
+            .load()
+            .map(|c| c.kzwr.login_debug)
+            .unwrap_or(false);
 
         let bin = self.bin_dir.join(LOGIN_BIN);
         if !bin.exists() {
@@ -184,33 +191,123 @@ impl KzwrAuthService {
                 bin.display()
             ));
         }
-        info!("调用 kzwr 登录二进制...");
+
         // Camoufox 需要 XDG_CACHE_HOME 指向已下载浏览器的根目录（含 camoufox/ 子目录）。
-        // 若宿主通过 TRIM_LOGIN_CACHE_DIR 指定了缓存目录，则注入给登录二进制。
-        let mut cmd = Command::new(&bin);
-        cmd.arg(username).arg(password).current_dir(&self.work_dir);
-        if let Ok(cache_dir) = std::env::var(CACHE_DIR_ENV) {
-            if !cache_dir.is_empty() {
-                cmd.env("XDG_CACHE_HOME", &cache_dir);
-                info!("登录：XDG_CACHE_HOME={}", cache_dir);
+        let xdg_cache = std::env::var(CACHE_DIR_ENV).ok().filter(|s| !s.is_empty());
+
+        // 登录失败自动重试 3 次
+        const MAX_ATTEMPTS: usize = 3;
+        let mut last_err: Option<String> = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            info!("调用 kzwr 登录二进制（第 {}/{} 次）...", attempt, MAX_ATTEMPTS);
+            // 清掉旧 session
+            let _ = std::fs::remove_file(self.work_dir.join("session.json"));
+
+            // 参数顺序：<邮箱> <密码> [--debug] [--log-file <路径>]
+            let mut cmd = Command::new(&bin);
+            cmd.arg(username).arg(password).current_dir(&self.work_dir);
+            let log_file = self.work_dir.join("login_debug.log");
+            if login_debug {
+                cmd.arg("--debug");
+                // 二进制支持 --log-file，让二进制把内部日志（含 camoufox/playwright）写盘
+                if let Some(s) = log_file.to_str() {
+                    cmd.arg("--log-file").arg(s);
+                }
             }
-        }
-        let status = cmd.status().context("启动登录二进制失败")?;
+            if let Some(cache) = &xdg_cache {
+                cmd.env("XDG_CACHE_HOME", cache);
+            }
+            info!(
+                "登录命令: {} {} {} ...",
+                bin.display(),
+                username,
+                if login_debug { "[--debug --log-file]" } else { "" }
+            );
 
-        if !status.success() {
-            return Err(anyhow::anyhow!(
-                "kzwr 登录失败（退出码 {:?}），可能凭据错误或验证码未通过",
-                status.code()
-            ));
+            // debug 时捕获输出写日志文件；否则丢弃输出
+            let status = if login_debug {
+                match cmd.output() {
+                    Ok(o) => {
+                        let mut log = format!(
+                            "===== kzwr 登录尝试 #{} ({}) =====\n",
+                            attempt,
+                            chrono::Local::now()
+                        );
+                        log.push_str("--- stdout ---\n");
+                        log.push_str(&String::from_utf8_lossy(&o.stdout));
+                        log.push_str("\n--- stderr ---\n");
+                        log.push_str(&String::from_utf8_lossy(&o.stderr));
+                        log.push('\n');
+                        let _ = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&log_file)
+                            .and_then(|mut f| {
+                                use std::io::Write;
+                                f.write_all(log.as_bytes())
+                            });
+                        let ok = o.status.success();
+                        let code = o.status.code();
+                        if !ok {
+                            last_err = Some(format!("退出码 {:?}", code));
+                        }
+                        if ok {
+                            Some(())
+                        } else {
+                            None
+                        }
+                    }
+                    Err(e) => {
+                        last_err = Some(format!("启动失败: {}", e));
+                        None
+                    }
+                }
+            } else {
+                match cmd.status() {
+                    Ok(s) if s.success() => Some(()),
+                    Ok(s) => {
+                        last_err = Some(format!("退出码 {:?}", s.code()));
+                        None
+                    }
+                    Err(e) => {
+                        last_err = Some(format!("启动失败: {}", e));
+                        None
+                    }
+                }
+            };
+
+            if status.is_none() {
+                warn!(
+                    "kzwr 登录尝试 #{} 失败（{}），{}",
+                    attempt,
+                    last_err.clone().unwrap_or_default(),
+                    if attempt < MAX_ATTEMPTS {
+                        "准备重试"
+                    } else {
+                        "已达最大重试次数"
+                    }
+                );
+                continue;
+            }
+
+            // 成功：读取 session
+            let session_path = self.work_dir.join("session.json");
+            let content =
+                std::fs::read_to_string(&session_path).context("读取 session.json 失败")?;
+            let session: Session =
+                serde_json::from_str(&content).context("解析 session.json 失败")?;
+            if session.access_token.is_empty() {
+                last_err = Some("未返回 access_token".to_string());
+                continue;
+            }
+            info!("kzwr 登录成功");
+            return Ok(session.access_token);
         }
 
-        let session_path = self.work_dir.join("session.json");
-        let content = std::fs::read_to_string(&session_path).context("读取 session.json 失败")?;
-        let session: Session = serde_json::from_str(&content).context("解析 session.json 失败")?;
-        if session.access_token.is_empty() {
-            return Err(anyhow::anyhow!("登录未返回 access_token"));
-        }
-        info!("kzwr 登录成功");
-        Ok(session.access_token)
+        Err(anyhow::anyhow!(
+            "kzwr 登录失败（已重试 {} 次）：{}，可能凭据错误或验证码未通过",
+            MAX_ATTEMPTS,
+            last_err.unwrap_or_else(|| "未知错误".to_string())
+        ))
     }
 }

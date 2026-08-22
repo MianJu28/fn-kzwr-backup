@@ -69,6 +69,9 @@ pub struct KzwrConfig {
     /// 最近一次 access_token（加密存储，用于复用）
     #[serde(default)]
     pub token_enc: Option<String>,
+    /// 是否开启登录二进制 debug 日志（传 --debug 并写日志文件）
+    #[serde(default)]
+    pub login_debug: bool,
 }
 
 fn default_target_folder() -> String {

@@ -3,6 +3,9 @@
   export let loggedIn = false;
   export let busy = false;
   export let onLogin = null; // (username, password) => Promise
+  // 登录二进制 debug 日志开关
+  export let loginDebug = false;
+  export let onToggleLoginDebug = null; // (bool) => Promise
 
   let username = '';
   let password = '';
@@ -13,6 +16,12 @@
     loginMsg = msg;
     if (msg && msg.startsWith('已登录')) {
       password = '';
+    }
+  }
+
+  async function toggleDebug() {
+    if (onToggleLoginDebug) {
+      await onToggleLoginDebug(!loginDebug);
     }
   }
 </script>
@@ -37,6 +46,10 @@
   {#if loginMsg}
     <p class:ok={loggedIn} class:warn={!loggedIn}>{loginMsg}</p>
   {/if}
+  <label class="debug-toggle">
+    <input type="checkbox" checked={loginDebug} on:change={toggleDebug} />
+    开启登录日志（--debug，输出到 login_debug.log）
+  </label>
 </section>
 
 <style>
@@ -70,5 +83,17 @@
     margin-top: 4px;
     font-size: 14px;
     box-sizing: border-box;
+  }
+  .debug-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 14px;
+    font-size: 13px;
+    color: #5a6a7a;
+  }
+  .debug-toggle input {
+    width: auto;
+    margin: 0;
   }
 </style>

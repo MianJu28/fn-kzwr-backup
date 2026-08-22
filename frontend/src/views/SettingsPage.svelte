@@ -7,8 +7,10 @@
   export let userInfo = null;
   export let userInfoError = null;
   export let onLogin = null; // (username, password) => Promise
+  export let loginDebug = false;
+  export let onToggleLoginDebug = null; // (bool) => Promise
 </script>
 
 <UserCard {userInfo} {userInfoError} />
 
-<LoginSection {loggedIn} {busy} {onLogin} />
+<LoginSection {loggedIn} {busy} {onLogin} {loginDebug} {onToggleLoginDebug} />
