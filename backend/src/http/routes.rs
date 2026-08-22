@@ -439,8 +439,10 @@ fn ensure_xvfb(cache_dir: &str) -> String {
     // 2) 试运行 Xvfb 验证——**用 camoufox 的完整参数**（含 GLX/RENDER 扩展 + displayfd），
     //    以复现登录二进制调用 camoufox 时 Xvfb 的确切失败原因。
     log.push_str("[*] 试运行 Xvfb（camoufox 完整参数，含 GLX 扩展）...\n");
+    // 注意：不能用 `pkill -f 'Xvfb -displayfd'`（会匹配并杀掉执行本命令的 shell 自身，导致无输出）。
+    // 用 `pkill -x Xvfb` 精确匹配进程名清理残留，不影响自身 shell。
     let (ok, out) = sh(
-        "pkill -f 'Xvfb -displayfd' 2>/dev/null; sleep 0.5; rm -f /tmp/.X11-unix/X* /tmp/.X*-lock 2>/dev/null; D=$(mktemp -d); exec 3>\"$D/fd\"; TMPDIR=\"${TMPDIR:-/tmp}\" Xvfb -displayfd 3 -screen 0 1x1x24 -ac -nolisten tcp -extension RENDER +extension GLX -extension COMPOSITE -extension XVideo -extension XVideo-MotionCompensation -extension XINERAMA -fp built-ins -nocursor -br >/dev/null 2>\"$D/xvfb.err\" & P=$!; sleep 1.5; if kill -0 $P 2>/dev/null; then echo \"RUNNING displayfd=$(cat $D/fd)\"; kill $P 2>/dev/null; else echo FAILED; cat \"$D/xvfb.err\"; fi; rm -rf $D",
+        "pkill -x Xvfb 2>/dev/null; sleep 0.5; rm -f /tmp/.X11-unix/X* /tmp/.X*-lock 2>/dev/null; D=$(mktemp -d); exec 3>\"$D/fd\"; TMPDIR=\"${TMPDIR:-/tmp}\" Xvfb -displayfd 3 -screen 0 1x1x24 -ac -nolisten tcp -extension RENDER +extension GLX -extension COMPOSITE -extension XVideo -extension XVideo-MotionCompensation -extension XINERAMA -fp built-ins -nocursor -br >/dev/null 2>\"$D/xvfb.err\" & P=$!; sleep 1.5; if kill -0 $P 2>/dev/null; then echo \"RUNNING displayfd=$(cat $D/fd)\"; kill $P 2>/dev/null; else echo FAILED; cat \"$D/xvfb.err\"; fi; rm -rf $D",
     );
     log.push_str(&out);
     if out.contains("RUNNING") {
