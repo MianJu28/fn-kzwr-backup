@@ -268,28 +268,31 @@ async fn login_env_status(State(_state): State<AppState>) -> Json<LoginEnvStatus
     let cache_dir = std::env::var(crate::infra::kzwr_auth::CACHE_DIR_ENV)
         .unwrap_or_default();
     let camo_dir = PathBuf::from(&cache_dir).join("camoufox");
-    let camo_bin = camo_dir.join("camoufox-bin");
     let ubo_manifest = camo_dir
         .join("addons")
         .join("UBO")
         .join("manifest.json");
-    // camoufox 判定浏览器已安装需要 camoufox-bin（可执行）+ version.json（版本信息）
-    let browser_ok = camo_bin.is_file()
-        && camo_dir.join("version.json").is_file()
-        && {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                camo_bin
-                    .metadata()
-                    .map(|m| m.permissions().mode() & 0o111 != 0)
-                    .unwrap_or(false)
-            }
-            #[cfg(not(unix))]
-            {
-                true
-            }
-        };
+    // camoufox 判定浏览器已安装：config.json 的 active_version 指向的版本子目录内有 camoufox-bin（可执行）+ version.json
+    let browser_ok = active_camoufox_bin(&camo_dir)
+        .map(|bin| {
+            bin.join("version.json").is_file()
+                && bin.join("camoufox-bin").is_file()
+                && {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        bin.join("camoufox-bin")
+                            .metadata()
+                            .map(|m| m.permissions().mode() & 0o111 != 0)
+                            .unwrap_or(false)
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        true
+                    }
+                }
+        })
+        .unwrap_or(false);
     let ubo_ok = ubo_manifest.is_file();
 
     // 读取持久化初始化状态（进度/消息/镜像）
@@ -839,37 +842,81 @@ async fn download_camoufox_browser(
         return Err(format!("下载失败 (exit {:?})", dl_result.ok().and_then(|s| s.code())));
     }
 
-    // 解压
+    // 解压到 camoufox 期望的版本子目录：browsers/official/<版本>-<sha8>/
+    // （camoufox 通过 config.json 的 active_version 找到该目录，再读其 version.json 判定已安装）
     set_state("running", 100, "下载完成，正在解压...");
+
+    // 计算下载 zip 的 sha256（取前 8 位作为目录名后缀，与 camoufox 一致）
+    let sha8 = compute_sha8(&tmp_zip);
+    let ver_tag = version.trim_start_matches('v');
+    let ver_dir_name = format!("{}-{}", ver_tag, sha8);
+    let official_dir = camo_dir.join("browsers").join("official");
+    let ver_dir = official_dir.join(&ver_dir_name);
+
     let camo_dir2 = camo_dir.to_path_buf();
     let tmp_zip2 = tmp_zip.clone();
+    let ver_dir2 = ver_dir.clone();
     let unzip = tokio::task::spawn_blocking(move || {
-        let r = unzip_to_dir(&tmp_zip2, &camo_dir2);
+        let r = unzip_to_dir(&tmp_zip2, &ver_dir2);
         let _ = std::fs::remove_file(&tmp_zip2);
         r
     })
     .await
     .map_err(|e| format!("解压任务失败: {}", e))?;
-    // chmod +x camoufox-bin
+    // chmod +x camoufox-bin（版本子目录内）
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let bin = camo_dir.join("camoufox-bin");
+        let bin = ver_dir.join("camoufox-bin");
         if bin.is_file() {
             let _ = std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755));
         }
     }
-    // camoufox 通过 $CACHE_DIR/camoufox/version.json 判定浏览器已安装（Version.from_path）。
-    // 手动解压浏览器不生成该文件，导致 CamoufoxNotInstalled。这里根据 version 参数写入。
-    // version 参数形如 "152.0.4-beta.28"：version=152.0.4，build=beta.28。
-    let vj = camo_dir.join("version.json");
-    if !vj.is_file() {
-        let vdata = parse_camoufox_version(version);
-        if let Ok(s) = serde_json::to_string(&vdata) {
-            let _ = std::fs::write(&vj, s);
-        }
+    // 写版本子目录内的 version.json（camoufox 的 Version.from_path 读取）
+    let vdata = parse_camoufox_version(version);
+    if let Ok(s) = serde_json::to_string(&vdata) {
+        let _ = std::fs::write(ver_dir.join("version.json"), s);
+    }
+    // 写根 config.json，记录 active_version（camoufox 的 get_active_path 读取）
+    let active_rel = format!("browsers/official/{}", ver_dir_name);
+    let cfg_json = serde_json::json!({ "active_version": active_rel });
+    if let Ok(s) = serde_json::to_string(&cfg_json) {
+        let _ = std::fs::write(camo_dir.join("config.json"), s);
     }
     unzip
+}
+
+/// 从 camoufox config.json 的 active_version 读取当前激活的版本子目录路径。
+fn active_camoufox_bin(camo_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let cfg_path = camo_dir.join("config.json");
+    let txt = std::fs::read_to_string(cfg_path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
+    let active = v.get("active_version")?.as_str()?;
+    // active_version 形如 "browsers/official/152.0.4-beta.28-924f3109"
+    let dir = camo_dir.join(active);
+    if dir.is_dir() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// 计算文件 sha256 前 8 位（小写 hex），失败返回空串。
+fn compute_sha8(path: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let mut hasher = Sha256::new();
+    if std::io::copy(&mut f, &mut hasher).is_err() {
+        return String::new();
+    }
+    let digest = hasher.finalize();
+    digest
+        .iter()
+        .take(4)
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 /// 解析 camoufox 版本字符串（如 "152.0.4-beta.28"）为 version.json 的 version/build。
