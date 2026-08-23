@@ -33,15 +33,23 @@ pub struct KzwrClient {
     pub access_token: Arc<Mutex<Option<String>>>,
 }
 
+/// 客户端全局请求超时：60 分钟。
+/// kzwr 存储节点（storage-*.kzwr.com）分片 PUT 响应慢（实测单分片可达 30s+，
+/// 大文件整体上传可达数分钟~十分钟），全局超时过短会导致大文件上传报
+/// "分片 PUT 失败: 网络请求失败: error sending request"。
+/// 全部请求统一 60 分钟，避免上传/下载大文件中途超时失败。
+pub const CLIENT_TIMEOUT_SECS: u64 = 3600;
+
 impl Default for KzwrClient {
     fn default() -> Self {
-        Self::new(BASE_URL, 30)
+        Self::new(BASE_URL, CLIENT_TIMEOUT_SECS)
     }
 }
 
 impl KzwrClient {
-    /// 创建客户端
-    pub fn new(base_url: &str, timeout_secs: u64) -> Self {
+    /// 创建客户端（全局请求超时固定为 60 分钟，见 [`CLIENT_TIMEOUT_SECS`]）
+    pub fn new(base_url: &str, _timeout_secs: u64) -> Self {
+        let timeout_secs = CLIENT_TIMEOUT_SECS;
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
             // 默认请求头与前端 http.Options() 一致
@@ -148,6 +156,9 @@ impl KzwrClient {
     }
 
     /// 二进制 PUT 到预签名 URL，返回带 ETag 的响应
+    ///
+    /// 分片上传较慢（存储节点响应可能数秒~数分钟），全局已设 60 分钟超时
+    /// （见 [`CLIENT_TIMEOUT_SECS`]），避免大文件分片 PUT 超时失败。
     pub(crate) async fn raw_put(&self, url: &str, data: &[u8]) -> KzwrResult<RawPutResponse> {
         let resp = self
             .http
