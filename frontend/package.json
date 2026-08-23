@@ -9,7 +9,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "svelte": "^4.2.19"
+    "svelte": "^4.2.19",
+    "@trimjs/web-app": "^0.4.2"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^3.1.2",

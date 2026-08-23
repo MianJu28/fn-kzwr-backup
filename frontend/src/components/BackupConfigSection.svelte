@@ -1,5 +1,7 @@
 <script>
   // 备份路径配置 + 定时备份 cron
+  import { pickBackupFolder, isInTrimHost } from '../trimSdk.js';
+
   export let backupPaths = [];
   export let targetFolder = 'fn-backup';
   export let scheduleCron = '';
@@ -8,6 +10,8 @@
   export let onSave = null; // () => Promise
 
   let pathInput = '';
+  let pathMsg = '';
+  let inTrimHost = isInTrimHost();
   const cronPresets = [
     { label: '每天 00:00', value: '0 0 * * *' },
     { label: '每天 06:00', value: '0 6 * * *' },
@@ -22,6 +26,30 @@
     if (p && !backupPaths.includes(p)) {
       backupPaths = [...backupPaths, p];
       pathInput = '';
+    }
+  }
+
+  // 调用飞牛系统目录选择器选择要备份的文件夹
+  async function pickDir() {
+    pathMsg = '';
+    try {
+      const dirs = await pickBackupFolder();
+      if (dirs && dirs.length > 0) {
+        // 去重后加入备份路径
+        const added = [];
+        for (const d of dirs) {
+          const p = d.trim();
+          if (p && !backupPaths.includes(p)) {
+            backupPaths = [...backupPaths, p];
+            added.push(p);
+          }
+        }
+        pathMsg = added.length > 0 ? `✅ 已选择 ${added.length} 个目录` : '这些目录已在列表中';
+      } else {
+        pathMsg = '已取消选择';
+      }
+    } catch (e) {
+      pathMsg = `⚠️ ${e.message || '选择目录失败'}`;
     }
   }
 
@@ -42,9 +70,18 @@
     <input bind:value={targetFolder} placeholder="fn-backup" />
   </label>
   <div class="path-add">
-    <input bind:value={pathInput} placeholder="/volume1/data" />
+    <input bind:value={pathInput} placeholder="/vol1/1000/data" />
     <button on:click={addPath} disabled={busy || !pathInput.trim()}>添加</button>
+    {#if inTrimHost}
+      <button class="pick" on:click={pickDir} disabled={busy}>📁 选择目录</button>
+    {/if}
   </div>
+  {#if !inTrimHost}
+    <p class="warn">当前非飞牛宿主环境，可手动输入路径。</p>
+  {/if}
+  {#if pathMsg}
+    <p class="hint path-msg">{pathMsg}</p>
+  {/if}
   <ul class="paths">
     {#each backupPaths as p, i (p)}
       <li>
@@ -115,9 +152,15 @@
     box-sizing: border-box;
   }
   input.invalid { border-color: #dc2626; background: #fef2f2; }
-  .path-add { display: flex; gap: 8px; margin-top: 8px; }
-  .path-add input { flex: 1; }
+  .path-add { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  .path-add input { flex: 1; min-width: 180px; }
   .path-add button { margin: 0; white-space: nowrap; }
+  .path-add button.pick {
+    background: #0f766e;
+    color: #fff;
+  }
+  .path-add button.pick:hover { background: #0b5e58; }
+  .path-msg { margin: 8px 0 0; }
   .paths { list-style: none; padding: 0; margin: 8px 0 0; }
   .paths li {
     display: flex;
