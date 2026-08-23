@@ -26,14 +26,14 @@ fn main() -> Result<()> {
 
     // 1) 模拟备份过程中，逐个文件 save_entry（断点续传）
     println!("=== 1. 逐文件保存快照 (save_entry) ===");
-    store.save_entry("job-0", &make_entry("a.txt"))?;
-    store.save_entry("job-0", &make_entry("b.txt"))?;
+    store.save_entry("job-0", "", &make_entry("a.txt"))?;
+    store.save_entry("job-0", "", &make_entry("b.txt"))?;
     // 模拟 c.txt 上传中断，未保存快照
     println!("[+] 已保存 a.txt, b.txt；c.txt 上传中断未保存");
 
     // 2) 再次备份时加载快照
     println!("=== 2. 加载快照 (断点续传基线) ===");
-    let last = store.load_snapshot("job-0")?;
+    let last = store.load_snapshot("job-0", "")?;
     println!("[+] 快照中有 {} 个文件", last.len());
     assert!(last.len() == 2, "应只有已完成的 2 个文件");
 

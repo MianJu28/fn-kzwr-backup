@@ -40,6 +40,7 @@ impl SnapshotStore {
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
              CREATE TABLE IF NOT EXISTS sync_snapshots (
+                account    TEXT NOT NULL DEFAULT '',
                 job_id     TEXT NOT NULL,
                 rel_path   TEXT NOT NULL,
                 size       INTEGER NOT NULL,
@@ -47,17 +48,51 @@ impl SnapshotStore {
                 is_dir     INTEGER NOT NULL,
                 digest     TEXT,
                 updated_at INTEGER NOT NULL,
-                PRIMARY KEY (job_id, rel_path)
+                PRIMARY KEY (account, job_id, rel_path)
              );
-             CREATE INDEX IF NOT EXISTS idx_snapshots_job ON sync_snapshots(job_id);",
+             CREATE INDEX IF NOT EXISTS idx_snapshots_job ON sync_snapshots(account, job_id);",
         )?;
+        // 迁移旧库：早期版本无 account 列且主键为 (job_id, rel_path)，
+        // 需重建表统一为新主键 (account, job_id, rel_path)，旧数据回填到默认账号 ''
+        let has_account: bool = conn
+            .prepare("PRAGMA table_info(sync_snapshots)")?
+            .query_map([], |r| r.get::<_, String>(1))? // column name
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|name| name == "account");
+        if !has_account {
+            conn.execute_batch(
+                "ALTER TABLE sync_snapshots RENAME TO sync_snapshots_old;
+                 CREATE TABLE sync_snapshots (
+                    account    TEXT NOT NULL DEFAULT '',
+                    job_id     TEXT NOT NULL,
+                    rel_path   TEXT NOT NULL,
+                    size       INTEGER NOT NULL,
+                    mtime_secs INTEGER NOT NULL,
+                    is_dir     INTEGER NOT NULL,
+                    digest     TEXT,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (account, job_id, rel_path)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_snapshots_job ON sync_snapshots(account, job_id);
+                 INSERT INTO sync_snapshots (account, job_id, rel_path, size, mtime_secs, is_dir, digest, updated_at)
+                 SELECT '', job_id, rel_path, size, mtime_secs, is_dir, digest, updated_at
+                 FROM sync_snapshots_old;
+                 DROP TABLE sync_snapshots_old;",
+            )?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
     /// 保存整个快照（事务批量 upsert）
-    pub fn save_snapshot(&self, job_id: &str, entries: &[SnapshotEntry]) -> rusqlite::Result<()> {
+    pub fn save_snapshot(
+        &self,
+        job_id: &str,
+        account: &str,
+        entries: &[SnapshotEntry],
+    ) -> rusqlite::Result<()> {
         let now = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -66,9 +101,9 @@ impl SnapshotStore {
         let tx = conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO sync_snapshots (job_id, rel_path, size, mtime_secs, is_dir, digest, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(job_id, rel_path) DO UPDATE SET
+                "INSERT INTO sync_snapshots (account, job_id, rel_path, size, mtime_secs, is_dir, digest, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(account, job_id, rel_path) DO UPDATE SET
                     size = excluded.size,
                     mtime_secs = excluded.mtime_secs,
                     is_dir = excluded.is_dir,
@@ -77,6 +112,7 @@ impl SnapshotStore {
             )?;
             for e in entries {
                 stmt.execute(rusqlite::params![
+                    account,
                     job_id,
                     e.rel_path,
                     e.size as i64,
@@ -91,22 +127,28 @@ impl SnapshotStore {
     }
 
     /// 保存单条快照（断点续传用：每上传完一个文件即时记录，中断后可续传）
-    pub fn save_entry(&self, job_id: &str, entry: &SnapshotEntry) -> rusqlite::Result<()> {
+    pub fn save_entry(
+        &self,
+        job_id: &str,
+        account: &str,
+        entry: &SnapshotEntry,
+    ) -> rusqlite::Result<()> {
         let now = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO sync_snapshots (job_id, rel_path, size, mtime_secs, is_dir, digest, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(job_id, rel_path) DO UPDATE SET
+            "INSERT INTO sync_snapshots (account, job_id, rel_path, size, mtime_secs, is_dir, digest, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(account, job_id, rel_path) DO UPDATE SET
                 size = excluded.size,
                 mtime_secs = excluded.mtime_secs,
                 is_dir = excluded.is_dir,
                 digest = excluded.digest,
                 updated_at = excluded.updated_at",
             rusqlite::params![
+                account,
                 job_id,
                 entry.rel_path,
                 entry.size as i64,
@@ -119,13 +161,13 @@ impl SnapshotStore {
         Ok(())
     }
 
-    /// 加载某个任务的完整快照（用于差分基线）
-    pub fn load_snapshot(&self, job_id: &str) -> rusqlite::Result<Vec<SnapshotEntry>> {
+    /// 加载某个账号下某个任务的完整快照（用于差分基线）
+    pub fn load_snapshot(&self, job_id: &str, account: &str) -> rusqlite::Result<Vec<SnapshotEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT rel_path, size, mtime_secs, is_dir, digest FROM sync_snapshots WHERE job_id = ?1",
+            "SELECT rel_path, size, mtime_secs, is_dir, digest FROM sync_snapshots WHERE job_id = ?1 AND account = ?2",
         )?;
-        let rows = stmt.query_map([job_id], |r| {
+        let rows = stmt.query_map(rusqlite::params![job_id, account], |r| {
             Ok(SnapshotEntry {
                 rel_path: r.get(0)?,
                 size: r.get::<_, i64>(1)? as u64,

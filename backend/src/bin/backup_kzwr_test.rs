@@ -60,6 +60,7 @@ async fn main() -> Result<()> {
 
     let job = BackupJob {
         job_id: "kzwr-demo".to_string(),
+        account: None,
         source: Arc::new(LocalFsSource::new(&src_root)),
         target: target.clone(),
         crypto: crypto.clone(),

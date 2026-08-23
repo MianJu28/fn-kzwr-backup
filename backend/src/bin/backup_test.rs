@@ -112,6 +112,7 @@ async fn main() -> Result<()> {
 
     let job = BackupJob {
         job_id: "test-job".to_string(),
+        account: None,
         source,
         target: target.clone(),
         crypto: crypto.clone(),

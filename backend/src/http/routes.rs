@@ -1121,6 +1121,7 @@ pub async fn run_backup_now(state: &AppState) -> BackupResponse {
 
     let job = BackupJob {
         job_id: state.job_id.clone(),
+        account: state.auth.current_username(),
         source: Arc::new(crate::infra::source::local::LocalFsSource::new(&paths[0])),
         target: state.target.clone(),
         crypto: state.crypto.clone(),
@@ -1172,12 +1173,14 @@ fn read_backup_config(
 /// 列出配置的备份文件夹及其可恢复文件（从 SQLite 快照查询）
 async fn restore_files(State(state): State<AppState>) -> Json<RestoreFilesResponse> {
     let paths = read_backup_config(&state).0;
+    // 只展示当前登录账号的备份记录；未登录/无账号时归入默认 ''（旧数据）
+    let account = state.auth.current_username().unwrap_or_default();
     let mut folders = Vec::new();
 
     for (i, path) in paths.iter().enumerate() {
         // 多路径备份时，每个路径的 job_id = "{base}-{i}"
         let job_id = format!("{}-{}", state.job_id, i);
-        let entries = state.store.load_snapshot(&job_id);
+        let entries = state.store.load_snapshot(&job_id, &account);
 
         let files = match entries {
             Ok(entries) => entries

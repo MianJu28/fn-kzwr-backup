@@ -27,6 +27,8 @@ use crate::infra::storage_trait::{
 /// 备份任务
 pub struct BackupJob {
     pub job_id: String,
+    /// 备份所属账号（区分不同账号的快照，为 None 时归入默认 ''）
+    pub account: Option<String>,
     pub source: Arc<dyn SourceStorage>,
     pub target: Arc<dyn TargetStorage>,
     pub crypto: CryptoSession,
@@ -40,6 +42,11 @@ pub struct BackupJob {
 }
 
 impl BackupJob {
+    /// 当前账号标识（空字符串表示未区分账号）
+    fn account(&self) -> &str {
+        self.account.as_deref().unwrap_or("")
+    }
+
     /// 执行一次增量备份（快速模式 mtime+size）
     pub async fn run(&self, source_root: &Path) -> Result<BackupSummary> {
         self.run_inner(&*self.source, source_root, &self.job_id, false)
@@ -89,7 +96,7 @@ impl BackupJob {
     fn managed_paths(&self, job_ids: &[String]) -> Result<std::collections::HashSet<String>> {
         let mut set = std::collections::HashSet::new();
         for job_id in job_ids {
-            for entry in self.store.load_snapshot(job_id)? {
+            for entry in self.store.load_snapshot(job_id, self.account())? {
                 if !entry.is_dir {
                     set.insert(entry.rel_path);
                 }
@@ -115,7 +122,7 @@ impl BackupJob {
         info!(count = current.len(), strict, "源扫描完成");
 
         // 2) 加载上次快照 + 差分
-        let last = self.store.load_snapshot(job_id)?;
+        let last = self.store.load_snapshot(job_id, self.account())?;
         let changeset = if strict {
             // 严格模式：对 mtime/size 变化的文件算哈希确认
             let root = source_root.to_path_buf();
@@ -161,7 +168,8 @@ impl BackupJob {
             uploaded += 1;
             uploaded_bytes += n;
             // 即时记录已上传文件的快照（断点续传关键）
-            self.store.save_entry(job_id, &SnapshotEntry::from_fd(fd))?;
+            self.store
+                .save_entry(job_id, self.account(), &SnapshotEntry::from_fd(fd))?;
             self.publish(
                 job_id,
                 crate::eventbus::TaskStatus::Progress,
@@ -189,7 +197,7 @@ impl BackupJob {
 
         // 5) 保存新快照（完整覆盖，含未变化文件与删除后的状态）
         let snapshot: Vec<SnapshotEntry> = current.iter().map(SnapshotEntry::from_fd).collect();
-        self.store.save_snapshot(job_id, &snapshot)?;
+        self.store.save_snapshot(job_id, self.account(), &snapshot)?;
 
         self.publish(
             job_id,
