@@ -14,4 +14,5 @@ ctl_stop              = true
 service_port          = 8080
 checkport             = true
 disable_authorization_path = false
+micro_app             = true
 changelog             = 飞牛 NAS 增量加密备份工具，支持断点续传、保留策略、定时备份、实时状态监控与选择性恢复。
