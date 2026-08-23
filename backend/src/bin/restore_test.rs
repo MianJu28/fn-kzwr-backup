@@ -114,6 +114,7 @@ async fn main() -> Result<()> {
     // 1) 备份
     let backup_job = BackupJob {
         job_id: "restore-test".to_string(),
+        account: None,
         source: source.clone(),
         target: target.clone(),
         crypto: crypto.clone(),

@@ -47,6 +47,7 @@ async fn main() -> Result<()> {
     println!("=== 1. 备份到 kzwr/{TARGET_FOLDER} ===");
     let backup_job = BackupJob {
         job_id: "kzwr-restore".to_string(),
+        account: None,
         source: Arc::new(LocalFsSource::new(&src_root)),
         target: target.clone(),
         crypto: crypto.clone(),
