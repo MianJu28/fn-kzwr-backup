@@ -110,6 +110,14 @@ fn current_dl_pid() -> &'static std::sync::Mutex<Option<u32>> {
     CURRENT_DL_PID.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+/// 初始化取消标志：cancel 时置 true，download 主循环检查后及时退出。
+static DL_CANCEL_FLAG: std::sync::OnceLock<std::sync::atomic::AtomicBool> =
+    std::sync::OnceLock::new();
+
+fn dl_cancel_flag() -> &'static std::sync::atomic::AtomicBool {
+    DL_CANCEL_FLAG.get_or_init(|| std::sync::atomic::AtomicBool::new(false))
+}
+
 /// 登录环境初始化状态文件路径
 fn login_env_state_path(cache_dir: &str) -> PathBuf {
     PathBuf::from(cache_dir).join(".login_env_init.json")
@@ -631,9 +639,22 @@ async fn login_env_init(
             }
         }
 
-        // ── 2. 下载 Camoufox 浏览器（若未就绪）──
-        let camo_bin = camo_dir.join("camoufox-bin");
-        let dl_result = if camo_bin.is_file() {
+        // ── 2. 下载 Camoufox 浏览器（若未就绪；用 config.json 的 active_version 定位）──
+        let browser_ready = active_camoufox_bin(&camo_dir)
+            .map(|b| b.join("camoufox-bin").is_file())
+            .unwrap_or(false);
+        let dl_result = if browser_ready {
+            write_login_env_state(
+                &cache_dir,
+                &LoginEnvInitState {
+                    state: "running".to_string(),
+                    progress: 100,
+                    message: "Camoufox 浏览器已就绪".to_string(),
+                    mirror: mirror.clone(),
+                    camoufox_version: version.clone(),
+                    updated_at: 0,
+                },
+            );
             Ok(())
         } else {
             write_login_env_state(
@@ -692,7 +713,9 @@ async fn login_env_init(
 /// 取消初始化下载任务
 async fn login_env_cancel(State(_state): State<AppState>) -> Json<LoginEnvStatus> {
     let cache_dir = std::env::var(crate::infra::kzwr_auth::CACHE_DIR_ENV).unwrap_or_default();
-    // kill 当前下载 curl 进程
+    // 置取消标志，通知 download 主循环及时退出（防止卡死）
+    dl_cancel_flag().store(true, std::sync::atomic::Ordering::Relaxed);
+    // kill 当前下载 curl 进程（真实 pid）
     if let Some(pid) = current_dl_pid().lock().unwrap().take() {
         let _ = std::process::Command::new("kill")
             .arg(pid.to_string())
@@ -788,34 +811,41 @@ async fn download_camoufox_browser(
 
     set_state("running", 0, &format!("开始下载（镜像 {}）...", mirror));
 
-    // 2) 后台 spawn_blocking 下载（无进度条，静默）
+    // 2) 用 tokio::process::Command 启动 curl（真实 pid，可被 cancel kill）
+    //    主循环轮询文件大小算进度 + 检查取消标志，取消时 kill curl 及时退出。
+    dl_cancel_flag().store(false, std::sync::atomic::Ordering::Relaxed);
     let tmp_zip_dl = tmp_zip.clone();
     let url_dl = url.clone();
-    let dl_handle = tokio::task::spawn_blocking(move || {
-        use std::process::{Command, Stdio};
-        let status = Command::new("curl")
-            .args([
-                "-sL",
-                "--connect-timeout",
-                "20",
-                "--max-time",
-                "3600",
-                "-o",
-            ])
-            .arg(&tmp_zip_dl)
-            .arg(&url_dl)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        status.map_err(|e| e.to_string())
-    });
-    // 记录当前下载 PID 供取消（spawn_blocking 内的 curl 无 pid；用全局状态标记进行中）
-    *current_dl_pid().lock().unwrap() = Some(u32::MAX);
+    let mut child = tokio::process::Command::new("curl")
+        .args([
+            "-sL",
+            "--connect-timeout",
+            "20",
+            "--max-time",
+            "3600",
+            "-o",
+        ])
+        .arg(&tmp_zip_dl)
+        .arg(&url_dl)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("curl 启动失败: {}", e))?;
+    // 记录真实 PID 供取消
+    {
+        let pid = child.id();
+        *current_dl_pid().lock().unwrap() = pid;
+    }
 
-    // 3) 主循环轮询文件大小算进度
+    // 3) 主循环轮询文件大小算进度 + 检查取消
     let mut last_pct: i32 = -1;
     loop {
-        if dl_handle.is_finished() {
+        // 被取消：kill curl，立即退出
+        if dl_cancel_flag().load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = child.kill().await;
+            break;
+        }
+        if let Ok(Some(_)) = child.try_wait() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -830,16 +860,16 @@ async fn download_camoufox_browser(
         }
     }
 
-    let dl_result = dl_handle.await.map_err(|e| format!("下载任务失败: {}", e))?;
+    let status = child.wait().await.map_err(|e| e.to_string())?;
     *current_dl_pid().lock().unwrap() = None;
-    let status_success = dl_result.is_ok() && dl_result.as_ref().map(|s| s.success()).unwrap_or(false);
+    let status_success = status.success();
 
     let ok_size = std::fs::metadata(&tmp_zip)
         .map(|m| m.len() > 1_000_000)
         .unwrap_or(false);
     if !(status_success && ok_size) {
         let _ = std::fs::remove_file(&tmp_zip);
-        return Err(format!("下载失败 (exit {:?})", dl_result.ok().and_then(|s| s.code())));
+        return Err(format!("下载失败 (exit {:?})", status.code()));
     }
 
     // 解压到 camoufox 期望的版本子目录：browsers/official/<版本>-<sha8>/。

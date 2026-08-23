@@ -330,21 +330,54 @@
     <p class="health" class:ok={health.startsWith('服务正常')}>{health}</p>
   </header>
 
-  <!-- 登录环境初始化横幅 -->
-  {#if !loginEnvChecking && loginEnv && !loginEnv.ready && loginEnv.state !== 'cancelled'}
-    <div class="login-env-banner">
+  <!-- 登录环境初始化横幅（逐项状态：idle 初始化 / running 进度 / cancelled 已取消 / error 失败） -->
+  {#if !loginEnvChecking && loginEnv && !loginEnv.ready}
+    <div class="login-env-banner" class:login-env-banner-err={loginEnv.state === 'error'} class:login-env-banner-cancel={loginEnv.state === 'cancelled'}>
       <div class="login-env-head">
         <strong>⚠️ 登录环境未就绪</strong>
         <span class="login-env-sub">
           {#if !loginEnv.camoufox_browser}
             Camoufox 浏览器尚未下载（约 600MB，仅首次需要）
-          {:else}
+          {:else if !loginEnv.ubo}
             uBlock addon 尚未就绪
+          {:else}
+            登录环境缺少必要组件
           {/if}
         </span>
       </div>
 
-      {#if !initRunning}
+      {#if initRunning}
+        <!-- 运行中：进度条 + 取消 -->
+        <div class="login-env-progress">
+          <div class="progress-track">
+            <div class="progress-fill" style="width:{Math.min(initProgress ?? 0, 100)}%"></div>
+          </div>
+          <span class="login-env-pct">{Math.min(initProgress ?? 0, 100)}%</span>
+          <p class="login-env-msg">{initMessage || '正在准备，请耐心等待…'}</p>
+          <button class="btn btn-cancel" on:click={cancelLoginEnvInit}>取消初始化</button>
+        </div>
+      {:else if loginEnv.state === 'cancelled'}
+        <!-- 已取消：提示可重新初始化 -->
+        <p class="login-env-cancel-msg">已取消初始化，登录环境未就绪。</p>
+        <div class="login-env-start">
+          <div class="login-env-row">
+            <label class="login-env-label">国内镜像</label>
+            <select class="login-env-select" bind:value={selectedMirror}>
+              {#each (loginEnv.mirrors || []) as m}
+                <option value={m}>{m}</option>
+              {/each}
+            </select>
+          </div>
+          <button class="btn" on:click={runLoginEnvInit} disabled={loginEnvChecking}>
+            重新初始化
+          </button>
+        </div>
+      {:else if loginEnv.state === 'error'}
+        <!-- 失败：显示错误 + 重试 -->
+        <p class="login-env-err">初始化失败：{initMessage || loginEnv.message}</p>
+        <button class="btn" on:click={runLoginEnvInit}>重试</button>
+      {:else}
+        <!-- 初始：镜像选择 + 初始化按钮 -->
         <div class="login-env-start">
           <div class="login-env-row">
             <label class="login-env-label">国内镜像</label>
@@ -358,20 +391,6 @@
             初始化登录环境
           </button>
         </div>
-      {:else}
-        <div class="login-env-progress">
-          <div class="progress-track">
-            <div class="progress-fill" style="width:{Math.min(initProgress ?? 0, 100)}%"></div>
-          </div>
-          <span class="login-env-pct">{Math.min(initProgress ?? 0, 100)}%</span>
-          <p class="login-env-msg">{initMessage || '正在准备，请耐心等待…'}</p>
-          <button class="btn btn-cancel" on:click={cancelLoginEnvInit}>取消初始化</button>
-        </div>
-      {/if}
-
-      {#if !initRunning && loginEnv.state === 'error'}
-        <p class="login-env-err">初始化失败：{initMessage || loginEnv.message}</p>
-        <button class="btn" on:click={runLoginEnvInit}>重试</button>
       {/if}
     </div>
   {/if}
@@ -503,6 +522,9 @@
   .login-env-pct { font-size: 13px; color: #d46b08; font-weight: 600; }
   .login-env-msg { margin: 6px 0 0; color: #666; font-size: 13px; word-break: break-all; }
   .login-env-err { margin: 6px 0 0; color: #cf1322; font-size: 13px; }
+  .login-env-banner-err { border-color: #ffccc7; border-left-color: #cf1322; background: #fff1f0; }
+  .login-env-banner-cancel { border-color: #d9d9d9; border-left-color: #8c8c8c; background: #fafafa; }
+  .login-env-cancel-msg { margin: 0 0 10px; color: #595959; font-size: 13px; }
   .login-env-start { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
   .login-env-row { display: flex; align-items: center; gap: 8px; }
   .login-env-label { font-size: 13px; color: #666; }
