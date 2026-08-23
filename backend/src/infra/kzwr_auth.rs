@@ -23,6 +23,9 @@ pub const LOGIN_BIN: &str = "kzwr_login_camoufox-linux-x64";
 /// 后端用它在调用登录二进制时设置 XDG_CACHE_HOME，使其找到浏览器与 addon。
 pub const CACHE_DIR_ENV: &str = "TRIM_LOGIN_CACHE_DIR";
 
+/// Camoufox 浏览器启动文件名（在版本子目录内，登录二进制用 --executable-path 指定）
+pub const LOGIN_CAMOUFOX_BIN: &str = "camoufox-bin";
+
 /// 登录二进制产出的 session
 #[derive(Debug, Deserialize)]
 struct Session {
@@ -224,6 +227,15 @@ impl KzwrAuthService {
             // 也设 XDG_DATA_HOME / XDG_CONFIG_HOME 为绝对路径，避免相对路径问题
             cmd.env("XDG_DATA_HOME", home_abs.join(".local/share"));
             cmd.env("XDG_CONFIG_HOME", home_abs.join(".config"));
+            // 登录二进制支持 --executable-path <camoufox-bin 路径>，直接指定浏览器位置，
+            // 避免依赖 camoufox 目录探测。从 config.json 的 active_version 定位。
+            if let Some(cache) = &xdg_cache {
+                if let Some(bin_path) = locate_camoufox_bin(cache) {
+                    if let Some(s) = bin_path.to_str() {
+                        cmd.arg("--executable-path").arg(s);
+                    }
+                }
+            }
             info!(
                 "登录命令: {} {} {} ...",
                 bin.display(),
@@ -316,5 +328,21 @@ impl KzwrAuthService {
             MAX_ATTEMPTS,
             last_err.unwrap_or_else(|| "未知错误".to_string())
         ))
+    }
+}
+
+/// 从 camoufox 缓存目录的 config.json 读取 active_version，定位 camoufox-bin 路径。
+/// 返回 None 表示未找到已安装的浏览器。
+fn locate_camoufox_bin(cache_dir: &str) -> Option<std::path::PathBuf> {
+    let camo_dir = std::path::PathBuf::from(cache_dir).join("camoufox");
+    let cfg_path = camo_dir.join("config.json");
+    let txt = std::fs::read_to_string(cfg_path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
+    let active = v.get("active_version")?.as_str()?;
+    let bin = camo_dir.join(active).join(LOGIN_CAMOUFOX_BIN);
+    if bin.is_file() {
+        Some(bin)
+    } else {
+        None
     }
 }

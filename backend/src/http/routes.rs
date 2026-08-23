@@ -842,12 +842,13 @@ async fn download_camoufox_browser(
         return Err(format!("下载失败 (exit {:?})", dl_result.ok().and_then(|s| s.code())));
     }
 
-    // 解压到 camoufox 期望的版本子目录：browsers/official/<版本>-<sha8>/
-    // （camoufox 通过 config.json 的 active_version 找到该目录，再读其 version.json 判定已安装）
+    // 解压到 camoufox 期望的版本子目录：browsers/official/<版本>-<sha8>/。
+    // sha8 不动态计算，直接采用与飞牛一致的值（camoufox 152.0.4-beta.28 的 sha8 = 924f3109）。
+    // config.json / version.json 也直接照抄飞牛上的内容，保证一致。
     set_state("running", 100, "下载完成，正在解压...");
 
-    // 计算下载 zip 的 sha256（取前 8 位作为目录名后缀，与 camoufox 一致）
-    let sha8 = compute_sha8(&tmp_zip);
+    // 固定 sha8（与飞牛 repo_cache 中 152.0.4-beta.28 一致，不计算）
+    let sha8 = "924f3109";
     let ver_tag = version.trim_start_matches('v');
     let ver_dir_name = format!("{}-{}", ver_tag, sha8);
     let official_dir = camo_dir.join("browsers").join("official");
@@ -872,16 +873,31 @@ async fn download_camoufox_browser(
             let _ = std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755));
         }
     }
-    // 写版本子目录内的 version.json（camoufox 的 Version.from_path 读取）
-    let vdata = parse_camoufox_version(version);
+    // 写版本子目录内的 version.json（照抄飞牛）
+    let vdata = serde_json::json!({
+        "version": "152.0.4",
+        "build": "beta.28",
+        "prerelease": false,
+        "asset_id": null,
+        "asset_size": null,
+        "asset_updated_at": null,
+        "sha256": "924f3109ccd6d47cd6a0384d67a345fadf975d48b6319f8dbbd5954c588982bd",
+        "created_at": "2026-07-19T07:19:16Z"
+    });
     if let Ok(s) = serde_json::to_string(&vdata) {
         let _ = std::fs::write(ver_dir.join("version.json"), s);
     }
-    // 写根 config.json，记录 active_version（camoufox 的 get_active_path 读取）
+    // 写根 config.json（照抄飞牛）
     let active_rel = format!("browsers/official/{}", ver_dir_name);
     let cfg_json = serde_json::json!({ "active_version": active_rel });
     if let Ok(s) = serde_json::to_string(&cfg_json) {
         let _ = std::fs::write(camo_dir.join("config.json"), s);
+    }
+    // 创建 COMPAT_FLAG（.0.5_FLAG 空文件）：camoufox 检测到 camoufox/ 目录有内容但缺该标志
+    // 会判定为"不兼容旧数据"并 rmtree 删除整个目录。飞牛成功目录含 .0.5_FLAG。
+    let flag_path = camo_dir.join(".0.5_FLAG");
+    if !flag_path.exists() {
+        let _ = std::fs::write(&flag_path, b"");
     }
     unzip
 }
@@ -899,50 +915,6 @@ fn active_camoufox_bin(camo_dir: &std::path::Path) -> Option<std::path::PathBuf>
     } else {
         None
     }
-}
-
-/// 计算文件 sha256 前 8 位（小写 hex），失败返回空串。
-fn compute_sha8(path: &std::path::Path) -> String {
-    use sha2::{Digest, Sha256};
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return String::new();
-    };
-    let mut hasher = Sha256::new();
-    if std::io::copy(&mut f, &mut hasher).is_err() {
-        return String::new();
-    }
-    let digest = hasher.finalize();
-    digest
-        .iter()
-        .take(4)
-        .map(|b| format!("{:02x}", b))
-        .collect()
-}
-
-/// 解析 camoufox 版本字符串（如 "152.0.4-beta.28"）为 version.json 的 version/build。
-fn parse_camoufox_version(v: &str) -> serde_json::Value {
-    let v = v.trim_start_matches('v');
-    // 拆出数字.数字.数字 作为 version，其余作为 build
-    let mut ver = String::new();
-    let mut rest = String::new();
-    let mut split = false;
-    for c in v.chars() {
-        if split {
-            rest.push(c);
-        } else if c.is_ascii_digit() || c == '.' {
-            ver.push(c);
-        } else {
-            split = true;
-            rest.push(c);
-        }
-    }
-    if ver.is_empty() {
-        ver = v.to_string();
-    }
-    serde_json::json!({
-        "version": ver,
-        "build": if rest.is_empty() { "stable".to_string() } else { rest },
-    })
 }
 
 /// 读取配置（不含敏感字段明文）
