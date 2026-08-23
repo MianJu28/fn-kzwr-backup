@@ -195,8 +195,19 @@ impl KzwrAuthService {
             ));
         }
 
+        // 登录前重新检测初始化状态：Xvfb / uBlock / Camoufox 浏览器，缺项提示先初始化
+        let cache_dir_env = std::env::var(CACHE_DIR_ENV).ok().filter(|s| !s.is_empty());
+        if let Some(cache_dir) = &cache_dir_env {
+            if let Some(missing) = check_login_env_ready(cache_dir) {
+                return Err(anyhow::anyhow!(
+                    "登录环境未就绪（{}），请在首页完成初始化后再登录",
+                    missing
+                ));
+            }
+        }
+
         // Camoufox 需要 XDG_CACHE_HOME 指向已下载浏览器的根目录（含 camoufox/ 子目录）。
-        let xdg_cache = std::env::var(CACHE_DIR_ENV).ok().filter(|s| !s.is_empty());
+        let xdg_cache = cache_dir_env;
 
         // 登录失败自动重试 3 次
         const MAX_ATTEMPTS: usize = 3;
@@ -344,5 +355,38 @@ fn locate_camoufox_bin(cache_dir: &str) -> Option<std::path::PathBuf> {
         Some(bin)
     } else {
         None
+    }
+}
+
+/// 登录前检测登录环境是否就绪（Xvfb / uBlock / Camoufox 浏览器）。
+/// 返回 None 表示全部就绪；返回 Some(缺项描述) 表示需要先初始化。
+fn check_login_env_ready(cache_dir: &str) -> Option<String> {
+    let camo_dir = std::path::PathBuf::from(cache_dir).join("camoufox");
+    // 1) Xvfb
+    let xvfb_ok = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("command -v Xvfb >/dev/null 2>&1")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    // 2) uBlock
+    let ubo_ok = camo_dir.join("addons").join("UBO").join("manifest.json").is_file();
+    // 3) Camoufox 浏览器（active_version 指向的 camoufox-bin）
+    let browser_ok = locate_camoufox_bin(cache_dir).is_some();
+
+    let mut missing = Vec::new();
+    if !xvfb_ok {
+        missing.push("Xvfb 虚拟显示未安装");
+    }
+    if !ubo_ok {
+        missing.push("uBlock addon 未解压");
+    }
+    if !browser_ok {
+        missing.push("Camoufox 浏览器未下载");
+    }
+    if missing.is_empty() {
+        None
+    } else {
+        Some(missing.join("、"))
     }
 }
