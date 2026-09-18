@@ -326,7 +326,7 @@ trait TargetStorage {
 - 端到端测试（`bin/webdav_backup_test.rs`，真实服务器）：ping ✓、多级目录+特殊字符文件名 roundtrip ✓、BackupJob 全量 4 上传/增量 0/修改 1 ✓、下载解密校验 4/4 ✓、清理 ✓
 
 **大文件分片与地址固定（2026-09-18 补充）**：
-- 网站限制单次上传 100MB → 超过 `PART_SIZE`（默认 8MiB，`FNOS_DAV_PART_SIZE` 可覆盖）的密文文件自动拆分为 `<path>.part0001…` 依次 PUT；下载按序拼接、删除清理全部分片、列表将分片合并为逻辑文件（对核心逻辑透明）
+- 网站限制单次上传 100MB（实测：不分片上传 120MB 被 Cloudflare 返回 `413 Payload Too Large`）→ 超过 `PART_SIZE`（默认 **90MiB**，即限制的 90%；`FNOS_DAV_PART_SIZE` 可覆盖）的密文文件自动拆分为 `<path>.part0001…` 依次 PUT；下载按序拼接、删除清理全部分片、列表将分片合并为逻辑文件（对核心逻辑透明）
 - WebDAV 地址固定为官方地址（`DEFAULT_URL`），UI 仅填用户名/密码；`TRIM_DAV_URL` 环境变量仍可用于开发覆盖
 - 实测坑：服务端/链路对长时 HTTP/2 上传不稳定（~20s 即 PROTOCOL_ERROR）→ 客户端强制 HTTP/1.1；PUT 带 30 分钟总超时 + 4 次重试（5xx/408/429/网络错误可重试）
 
@@ -417,7 +417,7 @@ fnos-backup/
 
 **构建流程**：`cargo build --release` → 二进制入 `target/bin/`；`cd frontend && npm run build` → 产物入 `app/www/`；`fnpack build` → 生成 `.fpk`。
 
-> 注：开发期通过 WSL 构建（`cargo build`），实际源码以 Windows 侧 `backend/src/` 为准，构建前用 `cp -r` 同步到 WSL `$HOME/fnos-backup/src`。
+> 注：开发期构建**通过 SSH 在飞牛 NAS 上进行**，实际源码以 Windows 侧 `backend/`、`frontend/` 为准，构建前用 `pscp`/tar 同步至 NAS `/vol1/1000/Docker/kuzu-backup`。WSL 已废弃（上行仅 ~4KB/s、后台进程随会话被回收）。
 
 ---
 
@@ -496,7 +496,7 @@ fnos-backup/
 
 ### 待验证（需实际测试）
 
-1. ✅ **酷族 session token 对接**：已通过 `kzwr_auth.rs` 实现 token 复用、`init_from_config` 启动加载、过期自动重登，实测通过
+1. ❌ **酷族 session token 对接**：**已作废**——属逆向 REST API 能力，随 ADR-009 从代码库移除（WebDAV 走 HTTP Basic 认证，无 session 复用/过期重登概念）
 2. ⏳ **config/resource 格式**：查阅飞牛文档确认共享目录声明的具体字段（.fpk 部署阶段）
 3. ⏳ **iframe 内 WebSocket**：WebSocket 本地已实测通过；飞牛 iframe CSP 是否允许 localhost WS 需部署验证
 4. ⏳ **大文件块级增量**：未引入块级 BLAKE3 哈希（当前整文件差分，块级留待 Phase 5 评估）
@@ -510,7 +510,7 @@ fnos-backup/
 
 ### 11.1 当前开发状态
 
-**核心备份/恢复主链路已完成并实测通过**，进入 Phase 4 生产强化收尾阶段。当前使用 WSL（Ubuntu）构建与测试，构建前将 Windows 侧 `backend/src/` 同步到 WSL `$HOME/fnos-backup/src`，运行编译好的二进制或通过 HTTP API 测试。
+**核心备份/恢复主链路已完成并实测通过**，进入 Phase 4 生产强化收尾阶段。构建与测试**统一通过 SSH 在飞牛 NAS 上进行**（WSL 已废弃：上行仅 ~4KB/s、后台进程随会话被回收）；源码从 Windows 侧经 `pscp`/tar 同步至 NAS 后 `cargo build`，运行编译好的二进制或通过 HTTP API 测试。
 
 ### 11.2 已实现功能（按模块）
 
@@ -527,16 +527,18 @@ fnos-backup/
 | **恢复** | 恢复编排 | ✅ | `RestoreJob`，选择性恢复、恢复到源路径 |
 | | 完整性校验 | ✅ | age AEAD tag 自动验证；恢复后内容对比校验 |
 | **kzwr 目标** | 官方 WebDAV 适配器 | ✅ | `WebdavTarget`：MKCOL/PUT/GET(302 跟随)/DELETE/PROPFIND；凭据加密存储，保存时 ping 验证并热切换（ADR-009） |
-| | 两阶段物理删除 | ✅ | 逻辑删除进回收站 + 回收站 purge（Pids/FolderIds） |
-| | 文件夹 CRUD | ✅ | 创建/逻辑删除/物理删除 |
+| | 大文件分片上传 | ✅ | 超过 `PART_SIZE`（默认 90MiB = 100MB 网站限制的 90%）自动拆分为 `.part0001…` 依次 PUT；`FNOS_DAV_PART_SIZE` 可覆盖 |
+| | 分片下载拼接与清理 | ✅ | 读取时逻辑文件 404 则按序拼接分片；删除同时清理逻辑文件与全部分片；列表将分片合并为逻辑文件 |
+| | 目录与删除 | ✅ | 写入前逐级 `MKCOL` 确保父目录；`DELETE` 直接删除（无回收站，两阶段物理删除已随 REST 移除） |
 | **存储抽象** | Source/Target trait | ✅ | `storage_trait.rs`（ADR-005），ACL 防腐层 |
 | **元数据** | SQLite 快照 | ✅ | `sync_snapshots` 表，WAL 模式（ADR-006） |
 | **事件总线** | 内部事件总线 | ✅ | tokio::broadcast，备份/恢复进度事件（ADR-007） |
 | **WebSocket** | 实时状态推送 | ✅ | `/api/ws`，前端实时进度条，断线重连 |
 | **Web UI** | Svelte 前端 | ✅ | 导航栏多页面（概览/备份/恢复/设置）；views+components 分层 |
-| | 用户信息 + 容量 | ✅ | 头像/用户名/邮箱/套餐 + 存储空间进度条（UserCard 组件） |
+| | 用户信息 | ✅ | WebDAV 账号卡片（UserCard 组件；WebDAV 无套餐/容量接口，不展示容量条） |
 | **HTTP API** | 备份/恢复/配置 | ✅ | `http/routes.rs`，axum 路由 |
 | | 用户信息 | ✅ | `/api/user/info` 返回本地配置的 WebDAV 账号（WebDAV 无配额/套餐属性） |
+| | 密钥管理 | ✅ | `GET/POST /api/keys`（查公钥 / 自定义私钥）、`POST /api/keys/generate`（自动生成并一次性回传私钥；密钥热切换无需重启） |
 | **配置** | 加密 TOML 配置 | ✅ | kzwr 凭据/密码/token 加密存储（age scrypt） |
 | | 记录账号 | ✅ | 配置解密 username_enc（`webdav_credentials()`） |
 | **测试** | 端到端测试 | ✅ | 真实 kzwr 备份/恢复/删除/多级文件夹/物理删除/保留策略/定时触发 |
@@ -549,10 +551,10 @@ fnos-backup/
 ```
 backend/src/
 ├── main.rs              # 入口: axum HTTP 服务启动
-├── lib.rs               # 库入口 (AppState 等，含 kzwr_client)
+├── lib.rs               # 库入口 (AppState 等)
 ├── http/
 │   ├── mod.rs
-│   ├── routes.rs        # 路由 + 各 handler (backup/restore/config/health/user_info)
+│   ├── routes.rs        # 路由 + 各 handler (backup/restore/config/health/user_info/keys)
 │   └── ws.rs            # WebSocket 状态推送
 ├── domain/
 │   ├── mod.rs
@@ -564,17 +566,16 @@ backend/src/
 │   └── scheduler.rs     # Scheduler (cron 定时备份调度)
 ├── infra/
 │   ├── mod.rs
-│   ├── storage_trait.rs # SourceStorage / TargetStorage trait
+│   ├── storage_trait.rs # TargetStorage/SourceStorage trait + SwapTarget/UnconfiguredTarget
 │   ├── source/local/    # LocalFsSource
-│   ├── target/kzwr/     # client.rs / storage.rs / upload.rs / mod.rs
+│   ├── target/webdav.rs # WebdavTarget (官方 WebDAV，ADR-009)
 │   ├── persistence/snapshot.rs  # SnapshotStore (SQLite)
 │   ├── config.rs        # ConfigManager (TOML，含 WebDAV 凭据加解密)
-│   ├── keystore.rs      # 密钥库
-│   └── storage_trait.rs # TargetStorage trait + SwapTarget/UnconfiguredTarget
-│   └── target/webdav.rs # WebdavTarget (官方 WebDAV)
+│   └── keystore.rs      # 密钥库
 ├── bin/                 # 测试二进制 (开发期)
 ├── eventbus.rs          # EventBus (tokio::broadcast)
 └── ...
+```
 
 ### 11.3.1 当前前端结构
 
@@ -583,15 +584,16 @@ frontend/src/
 ├── App.svelte              # 应用壳：导航 + 页面切换 + 全局状态/WebSocket
 ├── main.js                 # Svelte 挂载入口
 ├── views/                  # 页面级组件
-│   ├── DashboardPage.svelte  # 概览：UserCard + LiveStatus + Overview
+│   ├── DashboardPage.svelte  # 概览：UserCard + Overview（实时任务为右侧常驻面板）
 │   ├── BackupPage.svelte     # 备份：配置 + 定时 + 执行
 │   ├── RestorePage.svelte    # 恢复
-│   └── SettingsPage.svelte   # 设置：UserCard + WebDAV 配置
+│   └── SettingsPage.svelte   # 设置：UserCard + WebDAV 配置 + 密钥管理
 ├── components/             # 功能区块组件
-│   ├── LiveStatus.svelte      # 实时任务状态（WebSocket 进度）
+│   ├── LiveStatus.svelte      # 实时任务状态（右侧常驻面板，WebSocket 进度 + 空闲态）
 │   ├── OverviewSection.svelte # 配置概览（网格卡片）
-│   ├── UserCard.svelte        # 用户信息 + 存储容量
+│   ├── UserCard.svelte        # WebDAV 账号（WebDAV 无容量/套餐接口）
 │   ├── WebdavSection.svelte   # WebDAV 凭据配置（ping 验证后加密保存）
+│   ├── KeySection.svelte      # age 密钥管理（公钥展示 / 自定义私钥 / 自动生成并提醒保存）
 │   ├── BackupConfigSection.svelte # 备份路径 + 定时 cron
 │   ├── BackupSection.svelte   # 备份执行
 │   └── RestoreSection.svelte  # 恢复目录树

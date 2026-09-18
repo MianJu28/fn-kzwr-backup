@@ -11,7 +11,7 @@
   {#if userInfoError}
     <p class="warn">⚠️ {userInfoError}</p>
   {:else if !configured}
-    <p class="warn">⚠️ WebDAV 未配置，请到「设置」填写地址与凭据</p>
+    <p class="warn">⚠️ WebDAV 未配置，请填写用户名与凭据</p>
   {:else}
     <div class="user-head">
       <div class="avatar-placeholder">👤</div>

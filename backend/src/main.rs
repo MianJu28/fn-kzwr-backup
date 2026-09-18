@@ -40,10 +40,12 @@ async fn main() -> anyhow::Result<()> {
     )?);
 
     // 口令：用于敏感字段（WebDAV 凭据、密钥库）加密
-    let passphrase = std::env::var("TRIM_PASSPHRASE").unwrap_or_else(|_| "change-me".to_string());
-    let passphrase = infra::keystore::secret(&passphrase);
+    let passphrase_str =
+        std::env::var("TRIM_PASSPHRASE").unwrap_or_else(|_| "change-me".to_string());
+    let passphrase = Arc::new(infra::keystore::secret(&passphrase_str));
 
-    // 加密会话（age 密钥对，从密钥库加载或生成）
+    // 加密会话（age 密钥对：从密钥库加载；不存在则自动生成并提示用户保存）
+    let pending_reveal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let keys = {
         let ks_path = infra::keystore::keystore_path(&cfg_dir);
         match infra::keystore::load_keystore(&passphrase, &ks_path) {
@@ -54,17 +56,21 @@ async fn main() -> anyhow::Result<()> {
             Err(_) => {
                 let k = fnos_backup::domain::crypto::AgeKeys::generate();
                 infra::keystore::save_keystore(&k, &passphrase, &ks_path)?;
-                info!("已生成并加密存储 age 密钥对");
+                info!("已生成并加密存储 age 密钥对（请在 Web 界面妥善保存私钥）");
+                // 首次自动生成：把私钥经 /api/keys 一次性推送给前端展示
+                *pending_reveal.lock().unwrap() = Some(k.to_secret_key());
                 k
             }
         }
     };
-    let crypto = fnos_backup::domain::crypto::CryptoSession::full(&keys);
+    let crypto = Arc::new(fnos_backup::CryptoSwap::new(
+        fnos_backup::domain::crypto::CryptoSession::full(&keys),
+    ));
 
     // 配置管理器
     let config_mgr = Arc::new(Mutex::new(infra::config::ConfigManager::new(
         &cfg_dir,
-        passphrase,
+        infra::keystore::secret(&passphrase_str),
     )));
 
     // 目标存储：kzwr 官方 WebDAV（唯一目标，ADR-009）
@@ -89,6 +95,9 @@ async fn main() -> anyhow::Result<()> {
         target,
         target_ready,
         crypto,
+        passphrase: passphrase.clone(),
+        cfg_dir,
+        pending_key_reveal: pending_reveal,
         store,
         eventbus,
         config: config_mgr,
