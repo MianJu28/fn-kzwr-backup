@@ -31,6 +31,10 @@ const TARGET_FOLDER: &str = "fnos-dav-test";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 测试时把分片大小调小（256KB），用小文件即可验证多分片拆分/合并/清理逻辑
+    if std::env::var("FNOS_DAV_PART_SIZE").is_err() {
+        std::env::set_var("FNOS_DAV_PART_SIZE", "262144");
+    }
     let url = std::env::var("TRIM_DAV_URL").expect("请设置 TRIM_DAV_URL（如 https://dav.kzwr.com/dav）");
     let user = std::env::var("TRIM_DAV_USER").expect("请设置 TRIM_DAV_USER");
     let pass = std::env::var("TRIM_DAV_PASS").expect("请设置 TRIM_DAV_PASS");
@@ -137,8 +141,60 @@ async fn main() -> Result<()> {
         println!("[+] {} 解密校验通过 ({} 字节)", rel, out.len());
     }
 
-    // 7) 清理测试目录（delete 语义：文件与目录递归）
-    println!("=== 7. 清理测试目录 ===");
+    // 7) 大文件分片上传/下载（> part_size → 自动拆分为 .part0001…；测试用 256KB 分片，700KB=3 分片）
+    println!("=== 7. 分片 roundtrip（700KB，256KB 分片 → 3 分片）===");
+    let big_size = 700 * 1024;
+    let big = generate_bytes(big_size);
+    let big_hash = blake3::hash(&big);
+    let big_path = Path::new(TARGET_FOLDER).join("big.bin");
+    let big_bytes = Arc::new(big.clone());
+    let chunk_stream: Box<dyn futures::Stream<Item = bytes::Bytes> + Send + Unpin> = {
+        // 1MB 一块，避免单次巨大分配
+        let chunks: Vec<bytes::Bytes> = (0..big_size)
+            .step_by(1024 * 1024)
+            .map(|off| {
+                let end = (off + 1024 * 1024).min(big_size);
+                bytes::Bytes::copy_from_slice(&big_bytes[off..end])
+            })
+            .collect();
+        Box::new(futures::stream::iter(chunks))
+    };
+    target.write_stream(&big_path, chunk_stream).await?;
+    println!("[+] 分片上传 OK（{} 字节）", big_size);
+
+    // 列表应合并分片显示为单个逻辑文件
+    let listed = target.list(TARGET_FOLDER).await?;
+    let entry = listed
+        .iter()
+        .find(|e| e.rel_path.ends_with("big.bin"))
+        .expect("列表应包含 big.bin（分片已合并）");
+    assert_eq!(entry.size as usize, big_size, "合并后大小应一致");
+    println!("[+] 列表合并 OK（size={}）", entry.size);
+
+    // 下载拼接后哈希一致
+    let mut got = target.read_stream(&big_path).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut got_len = 0usize;
+    while let Some(chunk) = got.next().await {
+        let c = chunk?;
+        hasher.update(&c);
+        got_len += c.len();
+    }
+    assert_eq!(got_len, big_size, "下载长度应一致");
+    assert_eq!(hasher.finalize(), big_hash, "下载内容哈希应一致");
+    println!("[+] 分片下载拼接校验 OK（{} 字节）", got_len);
+
+    // 删除应清掉逻辑文件与全部分片
+    target.delete(&big_path).await?;
+    let listed_after = target.list(TARGET_FOLDER).await?;
+    assert!(
+        !listed_after.iter().any(|e| e.rel_path.ends_with("big")),
+        "删除后列表不应再有 big.bin 及分片残留"
+    );
+    println!("[+] 分片清理 OK");
+
+    // 8) 清理测试目录（delete 语义：文件与目录递归）
+    println!("=== 8. 清理测试目录 ===");
     cleanup(target.as_ref(), TARGET_FOLDER).await;
     println!("[+] 清理完成");
 

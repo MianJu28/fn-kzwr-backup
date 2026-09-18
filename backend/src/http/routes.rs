@@ -33,10 +33,12 @@ pub struct UserInfoResponse {
 }
 
 /// WebDAV 配置保存请求
+///
+/// 地址固定为官方 WebDAV（`DEFAULT_URL`），不暴露给用户设置；url 字段可选（忽略）。
 #[derive(Deserialize)]
 pub struct WebdavSaveRequest {
-    /// WebDAV 基址（如 https://dav.kzwr.com/dav）
-    pub url: String,
+    #[serde(default)]
+    pub url: Option<String>,
     pub username: String,
     pub password: String,
 }
@@ -143,12 +145,12 @@ async fn webdav_save(
     State(state): State<AppState>,
     Json(body): Json<WebdavSaveRequest>,
 ) -> Json<WebdavSaveResponse> {
-    let url = body.url.trim().trim_end_matches('/').to_string();
-    if url.is_empty() || body.username.trim().is_empty() || body.password.is_empty() {
+    let url = crate::infra::target::webdav::DEFAULT_URL.to_string();
+    if body.username.trim().is_empty() || body.password.is_empty() {
         return Json(WebdavSaveResponse {
             success: false,
             url: None,
-            error: Some("地址、用户名、密码均不能为空".to_string()),
+            error: Some("用户名、密码均不能为空".to_string()),
         });
     }
 
