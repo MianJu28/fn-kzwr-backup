@@ -24,6 +24,9 @@ pub struct AppConfig {
     /// 通知配置（监控告警）
     #[serde(default)]
     pub notify: NotifyConfig,
+    /// 密钥配置（私钥备份状态）
+    #[serde(default)]
+    pub keys: KeyConfig,
 }
 
 /// 备份配置
@@ -90,6 +93,16 @@ pub struct NotifyConfig {
     /// 告警 Webhook 地址（空 = 不外发）
     #[serde(default)]
     pub webhook_url: Option<String>,
+}
+
+/// 密钥配置（age 私钥备份状态）
+///
+/// `backed_up` 表示用户是否已确认妥善保存私钥；未提供备份确认时 UI 会持续提示风险。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KeyConfig {
+    /// 用户是否已确认备份私钥
+    #[serde(default)]
+    pub backed_up: bool,
 }
 
 /// 配置管理器

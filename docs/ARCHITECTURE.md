@@ -497,10 +497,10 @@ fnos-backup/
 ### 待验证（需实际测试）
 
 1. ❌ **酷族 session token 对接**：**已作废**——属逆向 REST API 能力，随 ADR-009 从代码库移除（WebDAV 走 HTTP Basic 认证，无 session 复用/过期重登概念）
-2. ⏳ **config/resource 格式**：查阅飞牛文档确认共享目录声明的具体字段（.fpk 部署阶段）
-3. ⏳ **iframe 内 WebSocket**：WebSocket 本地已实测通过；飞牛 iframe CSP 是否允许 localhost WS 需部署验证
-4. ⏳ **大文件块级增量**：未引入块级 BLAKE3 哈希（当前整文件差分，块级留待 Phase 5 评估）
-5. 🔶 **飞牛 `.fpk` 打包部署**：打包结构 + 双架构构建工作流已完成（11.6），待飞牛设备实测安装
+2. ✅ **config/resource 格式**：共享目录声明（`data-share`）已在 x86 飞牛设备实测可用（授权目录读取正常）
+3. ✅ **iframe 内 WebSocket**：飞牛 iframe 内 localhost WebSocket 实测正常（2026-09-19 设备实测）
+4. ❌ **大文件块级增量**：**不做**（用户决策，2026-09-19）；维持整文件差分
+5. ✅ **飞牛 `.fpk` 打包部署**：x86 飞牛设备安装与运行实测通过（见 11.6）；aarch64 待测
 
 ---
 
@@ -545,6 +545,7 @@ fnos-backup/
 | **飞牛部署** | `.fpk` 打包 | ✅ | 完整包结构 + 生命周期脚本 + wizard + GitHub Actions 双架构构建（见 11.6） |
 | **监控告警** | 失败通知/告警 | ✅ | 备份/恢复失败与配置缺失生成告警：应用内横幅展示 + 可选 Webhook 外发（`domain/alerts.rs`、`/api/alerts`、`/api/notify/webhook`） |
 | **密钥管理** | age 密钥查看/更换 | ✅ | `GET/POST /api/keys`、`POST /api/keys/generate`；密钥热切换无需重启（设置页 KeySection） |
+| | 私钥备份/恢复 | ✅ | `POST /api/keys/export`（随时导出另存）、`POST /api/keys/backup-ack`（备份确认）；未确认备份时设置页持续提示「私钥丢失将无法恢复」 |
 | **多目标** | 备份到多个目标 | ❌ 放弃 | 按用户决策，保留策略实现，多目标不做 |
 
 ### 11.3 当前实际 Rust 源码结构
@@ -618,8 +619,8 @@ frontend/src/
 1. ✅ **飞牛生产环境回归**（WebDAV 模式）：`.fpk` 安装启动、WebDAV 凭据配置与热切换、备份/恢复/保留策略/定时全链路已在 x86 飞牛设备实测通过
 2. ✅ **飞牛 `.fpk` 打包 + GitHub Actions 双架构构建**（见 11.6）；x86 实测通过
 3. ✅ **监控告警**：备份/恢复失败与配置缺失生成告警，应用内横幅展示 + 可选 Webhook 外发
-4. **密钥丢失恢复流程**：私钥备份/恢复引导（Phase 5 备用）
-5. **大文件块级增量**：按需评估（Phase 5）
+4. ✅ **密钥丢失恢复流程**：设置页可随时「显示私钥」另存备份，并可「我已妥善保存」确认；未备份时持续提示丢失风险（`POST /api/keys/export`、`POST /api/keys/backup-ack`）
+5. ❌ **大文件块级增量**：**不做**（用户决策，2026-09-19）——维持整文件差分（mtime+size / 严格 BLAKE3），不引入块级哈希
 6. **aarch64 设备实测**：CI 已产出双架构包，需在 aarch64 飞牛设备上验证二进制可用性
 
 ### 11.6 飞牛应用打包实现（基于抓取到的飞牛开发文档）

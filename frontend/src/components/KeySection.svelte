@@ -1,20 +1,28 @@
 <script>
-  // age 密钥管理（ADR-003）：查看公钥 / 使用自定义私钥 / 自动生成并提醒保存
+  // age 密钥管理（ADR-003）：查看公钥 / 使用自定义私钥 / 自动生成 / 导出备份
   export let keyInfo = null; // { public_key }
   export let busy = false;
   // 首次启动自动生成的私钥（后端一次性下发，提醒用户保存）
   export let revealKey = '';
+  // 用户是否已确认备份私钥
+  export let backedUp = false;
   export let onSetKey = null; // (privateKey) => Promise<{success, error}>
   export let onGenerateKey = null; // () => Promise<{success, private_key, public_key, error}>
+  export let onExportKey = null; // () => Promise<{private_key, error}>
+  export let onBackupAck = null; // () => Promise<void>
 
   let privateKeyInput = '';
   let msg = '';
   let msgOk = false;
-  let generatedKey = revealKey || '';
+  let shownKey = revealKey || ''; // 当前展示的私钥（生成/导出）
+  let shownTag = revealKey ? 'new' : ''; // new=新生成；export=导出的当前私钥
   let copied = '';
-  let working = false; // 本地忙碌态（不改写传入的 busy）
+  let working = false;
 
-  $: if (revealKey) generatedKey = revealKey;
+  $: if (revealKey) {
+    shownKey = revealKey;
+    shownTag = 'new';
+  }
 
   async function copyText(text, tag) {
     if (!text) return;
@@ -22,7 +30,6 @@
       if (navigator.clipboard && window.isSecureContext) {
         await navigator.clipboard.writeText(text);
       } else {
-        // 非安全上下文（http）下的兜底
         const ta = document.createElement('textarea');
         ta.value = text;
         ta.style.position = 'fixed';
@@ -42,20 +49,16 @@
 
   async function saveCustom() {
     if (!privateKeyInput.trim()) return;
-    if (
-      !confirm(
-        '确定使用此私钥？\n\n更换私钥后，此前用旧公钥加密的备份数据将无法解密恢复！'
-      )
-    )
-      return;
+    if (!confirm('确定使用此私钥？\n\n更换私钥后，此前用旧公钥加密的备份数据将无法解密恢复！')) return;
     working = true;
     const r = await onSetKey(privateKeyInput.trim());
     working = false;
     if (r.success) {
-      msg = '私钥已更新并立即生效';
+      msg = '私钥已更新并立即生效（该私钥由你提供，已标记为已备份）';
       msgOk = true;
       privateKeyInput = '';
-      generatedKey = '';
+      shownKey = '';
+      shownTag = '';
     } else {
       msg = `设置失败: ${r.error}`;
       msgOk = false;
@@ -63,23 +66,43 @@
   }
 
   async function generate() {
-    if (
-      !confirm(
-        '将生成全新密钥对并替换当前密钥。\n\n此前备份的数据将无法解密恢复，确定继续？'
-      )
-    )
-      return;
+    if (!confirm('将生成全新密钥对并替换当前密钥。\n\n此前备份的数据将无法解密恢复，确定继续？')) return;
     working = true;
     const r = await onGenerateKey();
     working = false;
     if (r.success) {
-      generatedKey = r.private_key;
+      shownKey = r.private_key;
+      shownTag = 'new';
       msg = '已生成新密钥对，请立即保存下方私钥';
       msgOk = true;
     } else {
       msg = `生成失败: ${r.error}`;
       msgOk = false;
     }
+  }
+
+  async function exportKey() {
+    if (!confirm('将显示当前私钥明文。\n\n请勿在公共场所或截图中泄露，确认继续？')) return;
+    working = true;
+    const r = await onExportKey();
+    working = false;
+    if (r.private_key) {
+      shownKey = r.private_key;
+      shownTag = 'export';
+      msg = '已显示当前私钥，请妥善保存到安全位置';
+      msgOk = true;
+    } else {
+      msg = `导出失败: ${r.error}`;
+      msgOk = false;
+    }
+  }
+
+  async function ackBackup() {
+    working = true;
+    await onBackupAck();
+    working = false;
+    msg = '已记录：私钥备份确认';
+    msgOk = true;
   }
 </script>
 
@@ -88,6 +111,12 @@
   <p class="hint">
     备份用 age 公钥加密，恢复需对应私钥。私钥经应用口令加密存储于配置目录，<strong>请自行另存备份</strong>——口令与私钥同时丢失将无法恢复数据。
   </p>
+
+  {#if !backedUp}
+    <div class="risk">
+      ⚠️ 尚未确认备份私钥：私钥一旦丢失，已备份的数据将永久无法恢复。请先「显示私钥」保存到安全位置，再点「我已妥善保存」。
+    </div>
+  {/if}
 
   <label>当前公钥
     <div class="key-row">
@@ -103,21 +132,23 @@
   </label>
 
   <div class="btn-row">
-    <button on:click={saveCustom} disabled={busy || working || !privateKeyInput.trim()}>
-      {working ? '处理中...' : '使用此私钥'}
-    </button>
-    <button class="ghost" on:click={generate} disabled={busy || working}>
-      {working ? '处理中...' : '自动生成新密钥'}
+    <button on:click={saveCustom} disabled={busy || working || !privateKeyInput.trim()}>使用此私钥</button>
+    <button class="ghost" on:click={generate} disabled={busy || working}>自动生成新密钥</button>
+    <button class="ghost" on:click={exportKey} disabled={busy || working}>显示私钥</button>
+    <button class="ok" on:click={ackBackup} disabled={busy || working || backedUp}>
+      {backedUp ? '已确认备份' : '我已妥善保存'}
     </button>
   </div>
 
-  {#if generatedKey}
+  {#if shownKey}
     <div class="generated">
-      <p class="warn strong">⚠️ 请立即保存以下私钥（仅显示这一次）：</p>
+      <p class="warn strong">
+        ⚠️ {shownTag === 'new' ? '请立即保存以下私钥（仅显示这一次）：' : '当前私钥（请勿泄露，保存后关闭）：'}
+      </p>
       <div class="key-row">
-        <input readonly value={generatedKey} />
-        <button class="ghost" on:click={() => copyText(generatedKey, 'gen')}>
-          {copied === 'gen' ? '已复制' : '复制'}
+        <input readonly value={shownKey} />
+        <button class="ghost" on:click={() => copyText(shownKey, 'key')}>
+          {copied === 'key' ? '已复制' : '复制'}
         </button>
       </div>
     </div>
@@ -141,6 +172,16 @@
     font-size: 13px;
     line-height: 1.6;
     margin: 0 0 14px;
+  }
+  .risk {
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    color: #b91c1c;
+    border-radius: 8px;
+    padding: 12px 14px;
+    font-size: 13px;
+    line-height: 1.6;
+    margin-bottom: 14px;
   }
   label { display: block; margin: 14px 0 4px; font-size: 14px; color: #42526e; }
   .key-row { display: flex; gap: 8px; margin-top: 6px; }
@@ -169,11 +210,10 @@
     flex-shrink: 0;
   }
   button:disabled { background: #9db4e8; cursor: not-allowed; }
-  button.ghost {
-    background: #eef2ff;
-    color: #2563eb;
-    flex-shrink: 0;
-  }
+  button.ghost { background: #eef2ff; color: #2563eb; }
+  button.ghost:disabled { background: #eef2ff; color: #9db4e8; }
+  button.ok { background: #16a34a; }
+  button.ok:disabled { background: #86efac; cursor: default; }
   .generated {
     margin-top: 14px;
     padding: 14px;
