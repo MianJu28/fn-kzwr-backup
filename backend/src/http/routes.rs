@@ -66,6 +66,8 @@ pub struct ConfigResponse {
     pub webdav_url: Option<String>,
     /// 告警 Webhook 地址（空 = 不外发）
     pub webhook_url: Option<String>,
+    /// 用户是否已确认备份 age 私钥（未确认时 UI 提示丢失风险）
+    pub key_backed_up: bool,
     pub error: Option<String>,
 }
 
@@ -181,6 +183,20 @@ pub struct WebhookSaveResponse {
     pub error: Option<String>,
 }
 
+/// 私钥导出响应（敏感：供用户另存备份）
+#[derive(Serialize)]
+pub struct KeysExportResponse {
+    pub private_key: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 私钥备份确认响应
+#[derive(Serialize)]
+pub struct BackupAckResponse {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
 /// 记录一条告警；若配置了 Webhook 则异步尽力外发（不阻塞主流程）
 fn raise_alert(
     state: &AppState,
@@ -198,6 +214,20 @@ fn raise_alert(
     };
     if let Some(url) = webhook {
         tokio::spawn(crate::domain::alerts::dispatch_webhook(url, alert));
+    }
+}
+
+/// 更新「私钥已备份」标记（失败仅记日志，不影响主流程）
+fn set_key_backed_up(state: &AppState, backed_up: bool) {
+    let guard = state.config.lock().unwrap();
+    match guard.load() {
+        Ok(mut cfg) => {
+            cfg.keys.backed_up = backed_up;
+            if let Err(e) = guard.save(&cfg) {
+                tracing::warn!(err = %e, "更新私钥备份标记失败");
+            }
+        }
+        Err(e) => tracing::warn!(err = %e, "读取配置失败，未更新私钥备份标记"),
     }
 }
 
@@ -281,6 +311,7 @@ fn config_response(
         webdav_configured,
         webdav_url: cfg.webdav.url.clone(),
         webhook_url: cfg.notify.webhook_url.clone(),
+        key_backed_up: cfg.keys.backed_up,
         error,
     }
 }
@@ -304,6 +335,7 @@ async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
             webdav_configured: false,
             webdav_url: None,
             webhook_url: None,
+            key_backed_up: false,
             error: Some(format!("{:#}", e)),
         }),
     }
@@ -648,6 +680,8 @@ async fn keys_set(
     state
         .crypto
         .swap(crate::domain::crypto::CryptoSession::full(&keys));
+    // 用户粘贴了自己的私钥 ⇒ 其本人已持有，视为已备份
+    set_key_backed_up(&state, true);
     tracing::info!("已更换 age 密钥（用户自定义私钥）");
     Json(KeysChangeResponse {
         success: true,
@@ -674,6 +708,8 @@ async fn keys_generate(State(state): State<AppState>) -> Json<KeysChangeResponse
     state
         .crypto
         .swap(crate::domain::crypto::CryptoSession::full(&keys));
+    // 新生成的私钥用户尚未保存 ⇒ 重置备份标记，UI 持续提示风险
+    set_key_backed_up(&state, false);
     tracing::info!("已自动生成新的 age 密钥对");
     Json(KeysChangeResponse {
         success: true,
@@ -726,6 +762,30 @@ async fn webhook_save(
     }
 }
 
+/// 导出当前私钥明文（供用户另存备份；敏感操作，前端需二次确认）
+async fn keys_export(State(state): State<AppState>) -> Json<KeysExportResponse> {
+    let ks_path = crate::infra::keystore::keystore_path(&state.cfg_dir);
+    match crate::infra::keystore::load_keystore(&state.passphrase, &ks_path) {
+        Ok(keys) => Json(KeysExportResponse {
+            private_key: Some(keys.to_secret_key()),
+            error: None,
+        }),
+        Err(e) => Json(KeysExportResponse {
+            private_key: None,
+            error: Some(format!("读取密钥库失败: {:#}", e)),
+        }),
+    }
+}
+
+/// 确认已妥善备份私钥（消除 UI 的丢失风险提示）
+async fn keys_backup_ack(State(state): State<AppState>) -> Json<BackupAckResponse> {
+    set_key_backed_up(&state, true);
+    Json(BackupAckResponse {
+        success: true,
+        error: None,
+    })
+}
+
 /// 构建应用路由（不含 /api 前缀，由 main.rs nest("/api") 统一加前缀）
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -739,6 +799,8 @@ pub fn router(state: AppState) -> Router {
         .route("/restore/run", post(restore_run))
         .route("/keys", get(keys_get).post(keys_set))
         .route("/keys/generate", post(keys_generate))
+        .route("/keys/export", post(keys_export))
+        .route("/keys/backup-ack", post(keys_backup_ack))
         .route("/alerts", get(alerts_get).delete(alerts_clear))
         .route("/notify/webhook", post(webhook_save))
         .with_state(state)

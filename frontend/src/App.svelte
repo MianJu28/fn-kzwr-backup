@@ -37,6 +37,7 @@
   // 加密密钥（age 公钥展示 / 自定义私钥 / 自动生成后提醒保存）
   let keyInfo = null; // { public_key }
   let revealKey = ''; // 首次启动自动生成的私钥（后端一次性下发）
+  let keyBackedUp = false; // 用户是否已确认备份私钥
   // 监控告警
   let alerts = [];
   // 告警 Webhook 地址（通知设置）
@@ -118,6 +119,7 @@
       webdavConfigured = !!data.webdav_configured;
       webdavUrl = data.webdav_url || '';
       webhookUrl = data.webhook_url || '';
+      keyBackedUp = !!data.key_backed_up;
       if (data.error) error = data.error;
     } catch (e) {
       error = e.message;
@@ -161,6 +163,7 @@
     if (data.success) {
       keyInfo = { public_key: data.public_key };
       revealKey = '';
+      keyBackedUp = true; // 私钥由用户提供，视为已备份
     }
     return data;
   }
@@ -171,8 +174,21 @@
     const data = await res.json();
     if (data.success) {
       keyInfo = { public_key: data.public_key };
+      keyBackedUp = false; // 新生成的私钥尚未保存
     }
     return data;
+  }
+
+  // 导出当前私钥明文（用于另存备份）
+  async function handleExportKey() {
+    const res = await fetch('/api/keys/export', { method: 'POST' });
+    return res.json();
+  }
+
+  // 确认已妥善备份私钥
+  async function handleBackupAck() {
+    await fetch('/api/keys/backup-ack', { method: 'POST' });
+    keyBackedUp = true;
   }
 
   // 加载告警（监控：备份/恢复失败、配置缺失等）
@@ -377,10 +393,13 @@
           {userInfoError}
           {keyInfo}
           {revealKey}
+          {keyBackedUp}
           {webhookUrl}
           onSaveWebdav={handleSaveWebdav}
           onSetKey={handleSetKey}
           onGenerateKey={handleGenerateKey}
+          onExportKey={handleExportKey}
+          onBackupAck={handleBackupAck}
           onSaveWebhook={handleSaveWebhook}
         />
       {/if}
