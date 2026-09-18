@@ -2,7 +2,8 @@
   // 当前配置概览（从服务器读取）
   export let backupPaths = [];
   export let targetFolder = 'fn-backup';
-  export let loggedIn = false;
+  export let webdavConfigured = false;
+  export let webdavUrl = '';
   export let restoreFolders = [];
   export let scheduleCron = '';
   export let scheduleCronValid = true;
@@ -36,8 +37,14 @@
       </span>
     </div>
     <div class="ov-item">
-      <span class="ov-label">kzwr 登录</span>
-      <span class="ov-value">{loggedIn ? '✅ 已登录' : '⚠️ 未登录'}</span>
+      <span class="ov-label">WebDAV 目标</span>
+      <span class="ov-value">
+        {#if webdavConfigured}
+          ✅ 已配置{webdavUrl ? `：${webdavUrl}` : ''}
+        {:else}
+          <span class="muted">⚠️ 未配置</span>
+        {/if}
+      </span>
     </div>
     <div class="ov-item">
       <span class="ov-label">定时备份</span>

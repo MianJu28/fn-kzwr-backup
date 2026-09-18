@@ -1,16 +1,15 @@
 <script>
-  import LoginSection from '../components/LoginSection.svelte';
   import UserCard from '../components/UserCard.svelte';
+  import WebdavSection from '../components/WebdavSection.svelte';
 
-  export let loggedIn = false;
+  export let webdavConfigured = false;
+  export let webdavUrl = '';
   export let busy = false;
   export let userInfo = null;
   export let userInfoError = null;
-  export let onLogin = null; // (username, password) => Promise
-  export let loginDebug = false;
-  export let onToggleLoginDebug = null; // (bool) => Promise
+  export let onSaveWebdav = null; // (url, username, password) => Promise
 </script>
 
-<UserCard {userInfo} {userInfoError} />
+<UserCard {userInfo} {userInfoError} {webdavConfigured} />
 
-<LoginSection {loggedIn} {busy} {onLogin} {loginDebug} {onToggleLoginDebug} />
+<WebdavSection configured={webdavConfigured} configuredUrl={webdavUrl} {busy} onSave={onSaveWebdav} />

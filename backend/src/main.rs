@@ -1,6 +1,7 @@
 //! fnos 增量加密备份系统 · 主入口
 //!
 //! axum HTTP 服务启动，托管 REST API 与前端静态文件。
+//! 目标存储：kzwr 官方 WebDAV（ADR-009，逆向 REST API 已移除）。
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -38,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
         &var_dir.join("meta.db"),
     )?);
 
-    // 口令：用于敏感字段（kzwr 凭据、密钥库）加密
+    // 口令：用于敏感字段（WebDAV 凭据、密钥库）加密
     let passphrase = std::env::var("TRIM_PASSPHRASE").unwrap_or_else(|_| "change-me".to_string());
     let passphrase = infra::keystore::secret(&passphrase);
 
@@ -66,26 +67,10 @@ async fn main() -> anyhow::Result<()> {
         passphrase,
     )));
 
-    // kzwr 目标客户端（token 由认证服务管理）
-    let base_url = std::env::var("TRIM_KZWR_BASE_URL")
-        .unwrap_or_else(|_| "https://www.kzwr.com".to_string());
-    let kzwr_client = infra::target::kzwr::client::KzwrClient::new(&base_url, 30);
-    let token_store = kzwr_client.token_store();
-    // 用户信息/容量查询用（clone 共享同一 access_token）
-    let app_kzwr_client = Arc::new(kzwr_client.clone());
-    let target: Arc<dyn fnos_backup::infra::storage_trait::TargetStorage> =
-        Arc::new(infra::target::kzwr::storage::KzwrTarget::new(kzwr_client));
-
-    // 认证服务
-    let login_bin_dir = std::env::var("TRIM_LOGIN_BIN_DIR").unwrap_or_else(|_| ".".to_string());
-    let auth = Arc::new(infra::kzwr_auth::KzwrAuthService::new(
-        &std::path::PathBuf::from(&login_bin_dir),
-        &tmp_dir,
-        config_mgr.clone(),
-        token_store,
-    ));
-    // 启动时从配置加载已保存的 token（避免每次重启都重新登录）
-    auth.init_from_config();
+    // 目标存储：kzwr 官方 WebDAV（唯一目标，ADR-009）
+    let (target, backend_name, target_ready) = build_target(&config_mgr)?;
+    let target = Arc::new(infra::storage_trait::SwapTarget::new(target));
+    info!("目标存储后端: {}（ready={target_ready}）", backend_name);
 
     // 目标文件夹 + 任务 id（默认值，实际由配置决定）
     let target_folder = std::env::var("TRIM_KZWR_FOLDER")
@@ -102,12 +87,11 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState {
         target,
-        kzwr_client: app_kzwr_client,
+        target_ready,
         crypto,
         store,
         eventbus,
         config: config_mgr,
-        auth,
         target_folder,
         job_id,
         var_dir,
@@ -146,4 +130,58 @@ fn init_logging() -> anyhow::Result<()> {
         .unwrap_or_else(|_| EnvFilter::new("fnos_backup=info,tower_http=info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
     Ok(())
+}
+
+/// 构建目标存储：WebDAV 凭据来源优先级 TRIM_DAV_* 环境变量 > 加密配置 [webdav] 段。
+///
+/// 未配置时返回占位适配器（服务照常启动供 UI 配置，操作返回引导错误）。
+fn build_target(
+    config_mgr: &Arc<Mutex<infra::config::ConfigManager>>,
+) -> anyhow::Result<(
+    Arc<dyn infra::storage_trait::TargetStorage>,
+    String,
+    bool,
+)> {
+    // 1) 环境变量
+    let env_url = env_nonempty("TRIM_DAV_URL");
+    let env_user = env_nonempty("TRIM_DAV_USER");
+    let env_pass = env_nonempty("TRIM_DAV_PASS");
+
+    // 2) 加密配置
+    let (cfg_url, cfg_user, cfg_pass) = {
+        let mgr = config_mgr.lock().unwrap();
+        let (user, pass) = mgr.webdav_credentials().unwrap_or((None, None));
+        let url = mgr
+            .load()
+            .ok()
+            .and_then(|c| c.webdav.url)
+            .filter(|s| !s.is_empty());
+        (url, user, pass)
+    };
+
+    let url = env_url.or(cfg_url);
+    let user = env_user.or(cfg_user);
+    let pass = env_pass.or(cfg_pass);
+
+    match (url, user, pass) {
+        (Some(url), Some(user), Some(pass)) if !user.is_empty() && !pass.is_empty() => Ok((
+            Arc::new(infra::target::webdav::WebdavTarget::new(&url, user, pass)),
+            format!("WebDAV（{}）", url),
+            true,
+        )),
+        _ => {
+            let msg = "WebDAV 未配置，请在设置中填写 WebDAV 地址与凭据".to_string();
+            info!("{}", msg);
+            Ok((
+                Arc::new(infra::storage_trait::UnconfiguredTarget { message: msg }),
+                "未配置".to_string(),
+                false,
+            ))
+        }
+    }
+}
+
+/// 读取非空环境变量
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|s| !s.is_empty())
 }

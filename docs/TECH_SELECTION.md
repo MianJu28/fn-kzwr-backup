@@ -9,11 +9,27 @@
 
 ### 背景
 
-Target 适配器需将加密文件写入酷族网软（kzwr.com）。酷族是 Angular SPA，有自定义 REST API（v1/v2/v3），登录有 reCAPTCHA v2/Turnstile 验证，认证用 token（`access-token` Header）。**已确认酷族不支持 WebDAV**。登录与 API 已在参考项目 `kzwr`（`E:\Projects\Git\kzwr`）中实现。
+Target 适配器需将加密文件写入酷族网软（kzwr.com）。酷族最初为 Angular SPA + 自定义 REST API（v1/v2/v3），登录有 reCAPTCHA v2/Turnstile 验证，认证用 token（`access-token` Header），当时**确认不支持 WebDAV**，因此逆向 REST API 用 Rust 重写。
 
-### 确定方案：编译二进制登录 + Rust API 重写（已实现）
+> **修订（2026-09）**：酷族官方已支持 WebDAV。文件管理（上传/下载/删除/目录操作）**迁移至官方 WebDAV**，逆向 REST API **弃用**（决策详见 `ARCHITECTURE.md` ADR-009）。
 
-酷族无标准协议支持（WebDAV 已排除）。登录与 API 能力已就绪，直接复用：
+### 修订方案：官方 WebDAV（当前选型，已实施）
+
+- 文件管理（上传/下载/删除/列目录/建目录）全部走 kzwr 官方 WebDAV，Rust 侧以 reqwest 实现 WebDAV 客户端（`infra/target/webdav.rs`）
+- 认证方式**已验证（2026-09-18）**：HTTP Basic（WebDAV 专用账号密码）；`GET` 下载返回 302 → S3 风格 presigned URL（约 300s 有效），跟随重定向即可取回，无需二次认证
+- 逆向 REST API 的分块上传、presigned-url、SHA1/SHA256 哈希对齐逻辑随代码一并移除（sha1/sha2/zip 依赖已删）
+- 用户信息不再依赖 REST API（get_member 移除）；WebDAV 无配额属性，UI 仅展示本地配置账号
+- 登录二进制及其登录环境子系统（Xvfb/uBlock/Camoufox 下载）一并移除；凭据经 UI 配置（保存前 ping 验证、加密存储、`SwapTarget` 热切换）
+
+**迁移步骤**：
+1. ✅ 验证 WebDAV 端点、认证方式与流式 PUT/GET 行为（2026-09-18）
+2. ✅ 实现 `WebdavTarget` 适配器（`infra/target/webdav.rs`，实现既有 `TargetStorage` trait，核心逻辑零改动）
+3. ✅ 端到端测试（`bin/webdav_backup_test.rs`，真实服务器）：备份/增量/多级目录/下载解密校验通过
+4. ✅ 逆向 REST API 适配器与登录二进制相关代码已完全移除（2026-09-18）
+
+### 历史方案：编译二进制登录 + 逆向 REST API Rust 重写（已弃用，代码已移除，仅存档）
+
+酷族当时无标准协议支持（WebDAV 已排除），登录与 API 能力已在参考项目 `kzwr`（`E:\Projects\Git\kzwr`）中实现：
 
 **登录（编译二进制）**：
 - 登录实现位于参考项目 `kzwr/kzwr_login_turnstile.py`，用 CloakBrowser（反检测 Chromium）+ Playwright 模拟真人浏览器完成登录
@@ -270,7 +286,7 @@ jobs:
 
 | 选型项     | 确定方案                    | 关键理由                                      | Phase |
 | ------- | ----------------------- | ----------------------------------------- | ----- |
-| 酷族网软对接  | 编译二进制登录 + Rust API 重写  | 酷族不支持 WebDAV；登录用编译二进制模拟真人完成，API 已用 Rust 重写 | 1-2   |
+| 酷族网软对接  | 官方 WebDAV 文件管理（Basic 凭据；逆向 REST API 与登录二进制已移除） | 官方 WebDAV 为稳定标准协议，凭据简单可靠 | 1-2   |
 | 飞牛源访问   | 仅本地 FS（tokio::fs）       | 只需本地文件备份，不考虑 SMB/NFS，零依赖                  | 1     |
 | 双架构编译   | musl 静态 + cross 工具      | 无运行时依赖，避免 C 交叉编译                          | 1     |
 | 源目录授权   | config/resource + 运行时引导 | 飞牛标准机制，最小权限                               | 1     |
@@ -282,4 +298,4 @@ jobs:
 1. **避免 C 依赖**——所有库优先选纯 Rust 实现（rustls、rusqlite bundled、age），使 musl 静态交叉编译透明化
 2. **最小权限**——`run-as=package`，目录授权制，不碰 root
 3. **不自动化绕过验证码**——登录由编译二进制模拟真人完成，本系统只复用 session token，过期重登
-4. **登录/API 复用**——复用参考项目 `kzwr` 的编译二进制登录与 Rust API 重写成果
+4. **凭据最小化**——WebDAV 专用凭据加密存储，UI 保存前实测连通性；逆向 API 与登录二进制成果已弃用移除

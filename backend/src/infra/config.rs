@@ -18,8 +18,9 @@ pub const CONFIG_FILE: &str = "config.toml";
 pub struct AppConfig {
     #[serde(default)]
     pub backup: BackupConfig,
+    /// WebDAV 目标配置（ADR-009：官方 WebDAV，唯一文件管理通道）
     #[serde(default)]
-    pub kzwr: KzwrConfig,
+    pub webdav: WebdavConfig,
 }
 
 /// 备份配置
@@ -57,25 +58,25 @@ pub struct RetentionConfig {
     pub min_age_days: u64,
 }
 
-/// kzwr 认证配置（敏感字段加密存储）
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct KzwrConfig {
-    /// 登录用户名（加密存储，格式 "enc:<age密文>"）
-    #[serde(default)]
-    pub username_enc: Option<String>,
-    /// 登录密码（加密存储）
-    #[serde(default)]
-    pub password_enc: Option<String>,
-    /// 最近一次 access_token（加密存储，用于复用）
-    #[serde(default)]
-    pub token_enc: Option<String>,
-    /// 是否开启登录二进制 debug 日志（传 --debug 并写日志文件）
-    #[serde(default)]
-    pub login_debug: bool,
-}
-
 fn default_target_folder() -> String {
     "fn-backup".to_string()
+}
+
+/// WebDAV 目标配置（ADR-009）
+///
+/// 凭据加密存储（格式 "enc:<age密文>"）。
+/// 也可用环境变量 TRIM_DAV_URL / TRIM_DAV_USER / TRIM_DAV_PASS 覆盖（优先）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WebdavConfig {
+    /// WebDAV 基址（如 https://dav.kzwr.com/dav）
+    #[serde(default)]
+    pub url: Option<String>,
+    /// 用户名（加密存储）
+    #[serde(default)]
+    pub username_enc: Option<String>,
+    /// 密码（加密存储）
+    #[serde(default)]
+    pub password_enc: Option<String>,
 }
 
 /// 配置管理器
@@ -112,6 +113,29 @@ impl ConfigManager {
         let content = toml::to_string_pretty(config).context("序列化配置失败")?;
         std::fs::write(&self.path, content).context("写入配置文件失败")?;
         Ok(())
+    }
+
+    /// 读取 WebDAV 凭据（解密）
+    ///
+    /// 返回 (用户名, 密码)，任一缺失/为空则为 None。
+    pub fn webdav_credentials(&self) -> Result<(Option<String>, Option<String>)> {
+        let cfg = self.load()?;
+        let user = self
+            .decrypt_field(&cfg.webdav.username_enc)?
+            .filter(|s| !s.is_empty());
+        let pass = self
+            .decrypt_field(&cfg.webdav.password_enc)?
+            .filter(|s| !s.is_empty());
+        Ok((user, pass))
+    }
+
+    /// 保存 WebDAV 配置（url + 加密凭据）
+    pub fn save_webdav(&self, url: &str, username: &str, password: &str) -> Result<()> {
+        let mut cfg = self.load().unwrap_or_default();
+        cfg.webdav.url = Some(url.trim_end_matches('/').to_string());
+        cfg.webdav.username_enc = Some(self.encrypt_field(username)?);
+        cfg.webdav.password_enc = Some(self.encrypt_field(password)?);
+        self.save(&cfg)
     }
 
     /// 加密敏感字段（返回 "enc:<密文>"）

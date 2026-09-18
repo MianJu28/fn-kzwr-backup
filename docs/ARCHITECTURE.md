@@ -14,7 +14,7 @@
 | 资源 | NAS 硬件资源有限（CPU/内存敏感） |
 | 可用性 | 7×24 长期运行，需稳定可靠 |
 | 数据源 | 飞牛 NAS（本地 FS） |
-| 备份目标 | 酷族网软（自定义 REST API，不支持 WebDAV；登录用编译二进制，API 用 Rust 重写） |
+| 备份目标 | 酷族网软（官方 WebDAV，Basic 认证；逆向 REST API 与登录二进制已完全移除） |
 | 核心能力 | 增量备份 · age 公私钥加密 · GUI 管理 · 选择性恢复 |
 | 安全要求 | 私钥永不明文落盘；明文不落临时盘 |
 
@@ -81,7 +81,7 @@
 系统与四个外部实体交互：
 - **用户**：通过飞牛桌面入口（iframe）访问 Web UI，配置任务、监控状态、执行恢复
 - **飞牛 NAS**：数据源（只读），仅本地 FS；需用户授权目录访问
-- **酷族网软**：备份目标（读写），自定义 REST API（不支持 WebDAV）
+- **酷族网软**：备份目标（读写），官方 WebDAV 协议（逆向 REST API 已从代码库移除，ADR-009）
 - **fnos OS**：提供应用生命周期框架（`cmd/main` 脚本 start/stop/status）、桌面入口注册、权限模型（run-as=package）、标准目录结构、日志、`.fpk` 包管理
 
 ### 4.2 Level 2 · 模块化单体内部架构
@@ -113,7 +113,8 @@
                     (查上次快照 / 写新快照, 用于增量差分)
 
 加密管道内部: 文件流 → 分块64MB → age 公钥加密(每 chunk 独立) → age 密文
-登录/API: 编译二进制(kzwr_login)产出 session token → Rust API 客户端(reqwest) 调用酷族 REST API
+目标: Rust WebDAV 客户端(reqwest) 读写酷族官方 WebDAV
+      (HTTP Basic 凭据，UI 配置后加密存储并热切换生效；逆向 REST API 与登录二进制已移除，见 ADR-009)
 
 事件旁路(不阻塞主流程): FileSynced / BackupCompleted → 通知用户 / 审计日志
 ```
@@ -136,7 +137,7 @@
 | 数据库 | SQLite (rusqlite + WAL) | sled / 嵌入式 KV | 嵌入式零配置；SQL 表达力强；WAL 支持并发读写 |
 | 飞牛打包 | fnpack → `.fpk` | Docker 镜像 | 普通应用形态；原生访问文件系统；x86_64+aarch64 双架构 |
 | 源访问 | tokio::fs（本地 FS） | smb-rs / pavao | 仅需本地文件备份，不考虑 SMB/NFS，零依赖 |
-| 目标访问 | reqwest（HTTP 客户端） | rust-s3 | 酷族自定义 REST API 已用 Rust 重写实现适配器 |
+| 目标访问 | reqwest（WebDAV 客户端） | rust-s3 | 酷族官方 WebDAV（ADR-009）；逆向 REST API 已移除 |
 | 配置 | TOML + serde | YAML / JSON | 人类可读；Rust 生态一等支持 |
 | 日志 | tracing + tracing-subscriber | log + env_logger | 结构化日志；span 追踪；异步友好 |
 | 调度 | tokio-cron-scheduler | 系统 cron | 不依赖系统 cron，可移植；进程内调度 |
@@ -175,7 +176,7 @@
 - (+) axum 与 tokio 原生集成，WebSocket 支持状态推送
 - (-) Rust 学习曲线陡，开发速度慢于 Go
 - (-) 放弃 Tauri 的原生菜单/托盘等桌面集成能力（飞牛场景不需要）
-- (-) 酷族自定义 API 已用 Rust 重写实现适配器（无官方 SDK）
+- (-) 酷族对接需自建适配器（现已迁移官方 WebDAV，见 ADR-009）
 
 ### ADR-003：age 加密方案与分块策略
 
@@ -219,7 +220,7 @@
 
 **状态**：Accepted
 
-**背景**：源仅本地 FS（`tokio::fs`），目标为酷族自定义 REST API（不支持 WebDAV）。酷族登录已由编译二进制完成，API 已用 Rust 重写。酷族 API 的细节（分块上传、session 认证、token 刷新）不应污染核心同步逻辑。
+**背景**：源仅本地 FS（`tokio::fs`）。目标为酷族官方 WebDAV（ADR-009，逆向 REST API 已移除）。WebDAV 凭据管理不应污染核心同步逻辑。
 
 **决策**：定义统一的 `SourceStorage` 与 `TargetStorage` trait，位于领域层。基础设施层为每种协议实现适配器。核心逻辑只依赖 trait，不感知具体协议。新增协议只需实现 trait + 注册。
 
@@ -302,6 +303,41 @@ trait TargetStorage {
 - (-) x86_64 与 aarch64 需分别编译二进制或交叉编译
 - (-) 用户文件访问依赖授权机制，需设计清晰的授权引导 UI
 
+### ADR-009：kzwr 文件管理迁移至官方 WebDAV，弃用逆向 REST API
+
+**状态**：Accepted（已完全实施，2026-09-18：WebDAV 适配器上线，逆向 REST 适配器与登录二进制已从代码库完全移除）
+
+**背景**：项目初期酷族网软（kzwr.com）不支持标准协议，遂逆向其自定义 REST API（v1/v2/v3）用 Rust 重写了文件管理能力（分块上传/presigned-url/SHA1+SHA256 哈希对齐/session token 认证/两阶段物理删除/文件夹 CRUD）。该逆向 API 无稳定性保证，随前端版本演进可能变动，哈希对齐逻辑脆弱、维护成本高。**酷族官方现已支持 WebDAV**，提供稳定的标准协议。
+
+**决策**：
+- 文件管理（上传/下载/删除/列目录/建目录）全部迁移至 kzwr 官方 **WebDAV**
+- 逆向 REST API 适配器（`infra/target/kzwr/` client/storage/upload）**已从代码库完全移除**，无回退路径
+- 登录二进制（CloakBrowser/Camoufox + PyInstaller）及登录环境子系统（Xvfb/uBlock/镜像下载）**一并移除**；WebDAV 走独立专用凭据（HTTP Basic，已实测验证）
+- 用户信息不再依赖 REST API（get_member 移除）；WebDAV 无配额属性，UI 仅展示本地配置账号
+
+**验证记录（2026-09-18，WSL curl 实测）**：
+- HTTP Basic 认证可用：`PROPFIND`（Depth 0/1，207）、`MKCOL`（201）、`PUT`（201）、`DELETE`（204，文件/目录）全部通过
+- 下载链路：`GET /dav/<path>` 返回 **302** → `storage-na.kzwr.net` 的 S3 风格 presigned URL（约 300s 有效），**跟随重定向即可取回内容（200），无需二次认证**——Rust 侧 reqwest 需允许跨域重定向
+- WebDAV 专用凭据不落文档/代码/仓库，运行时经加密配置或密钥库提供
+
+**实现与端到端实测（2026-09-18，WSL）**：
+- 适配器：`infra/target/webdav.rs` `WebdavTarget`（实现 `TargetStorage`，核心逻辑零改动）；PUT 前逐级 MKCOL 确保父目录，下载跟随 302
+- 后端选择：`TRIM_DAV_*` 环境变量或加密配置 `[webdav]` 段；缺失时启动占位适配器（操作返回引导错误），UI 保存配置后经 `SwapTarget` 热切换生效（无需重启）
+- 端到端测试（`bin/webdav_backup_test.rs`，真实服务器）：ping ✓、多级目录+特殊字符文件名 roundtrip ✓、BackupJob 全量 4 上传/增量 0/修改 1 ✓、下载解密校验 4/4 ✓、清理 ✓
+
+**迁移步骤**：
+1. 验证 WebDAV 端点、认证方式与流式 PUT/GET 行为
+2. 实现 `WebdavTargetStorage` 适配器（实现既有 `TargetStorage` trait，核心同步/加密逻辑零改动）
+3. 端到端回归：备份/恢复/删除/多级文件夹/保留策略/定时备份
+4. ✅ 逆向 REST API 适配器与登录二进制相关代码已完全移除（2026-09-18，含 routes 登录环境子系统、packaging/CI 引用、sha1/sha2/zip 依赖）
+
+**后果**：
+- (+) 基于官方稳定协议，不再随前端版本漂移
+- (+) 大幅简化适配器：标准协议，去除哈希对齐/presigned 分片等脆弱逻辑
+- (+) trait 抽象（ADR-005）使替换 Target 适配器不影响核心逻辑
+- (-) 需重写 Target 适配器并完整回归测试
+- (-) WebDAV 认证方式与加密密文流式 PUT 的性能需实测（64MB 分块策略是否保留待验证）
+
 ---
 
 ## 7. 项目目录结构
@@ -337,8 +373,7 @@ fnos-backup/
 │   └── config
 ├── target/                     # Rust 编译产物 (开发期构建后拷入)
 │   └── bin/
-│       ├── fnos-backup         # 主二进制
-│       └── kzwr-login          # 酷族登录编译二进制 (源自 kzwr_login_turnstile.py, PyInstaller 产物)
+│       └── fnos-backup         # 主二进制
 ├── backend/                    # Rust 后端源码 (开发期)
 │   ├── Cargo.toml
 │   └── src/
@@ -355,11 +390,10 @@ fnos-backup/
 │       │   └── retention.rs    # 保留策略 (孤儿文件清理)
 │       ├── infra/              # 基础设施层 (ACL 适配器)
 │       │   ├── source/local/   # Source 适配器: local/ (仅本地FS)
-│       │   ├── target/kzwr/    # Target 适配器: kzwr/ (client/storage/upload)
+│       │   ├── target/webdav.rs # Target 适配器: WebdavTarget (官方 WebDAV)
 │       │   ├── persistence/    # snapshot.rs (SQLite 快照)
 │       │   ├── config.rs       # TOML 配置 (读 TRIM_PKGETC)
 │       │   ├── keystore.rs     # 密钥加密存储
-│       │   ├── kzwr_auth.rs    # 酷族登录认证服务
 │       │   └── storage_trait.rs
 │       ├── bin/                # 测试二进制 (开发期, 不入生产)
 │       └── eventbus.rs         # 内部事件总线
@@ -376,7 +410,7 @@ fnos-backup/
     └── TECH_SELECTION.md       # 技术选型分析
 ```
 
-**构建流程**：`cargo build --release` → 二进制入 `target/bin/`；酷族登录脚本（`kzwr_login_turnstile.py`）经 PyInstaller 编译为 `kzwr-login` 二进制（x86_64+aarch64）入 `target/bin/`；`cd frontend && npm run build` → 产物入 `app/www/`；`fnpack build` → 生成 `.fpk`。
+**构建流程**：`cargo build --release` → 二进制入 `target/bin/`；`cd frontend && npm run build` → 产物入 `app/www/`；`fnpack build` → 生成 `.fpk`。
 
 > 注：开发期通过 WSL 构建（`cargo build`），实际源码以 Windows 侧 `backend/src/` 为准，构建前用 `cp -r` 同步到 WSL `$HOME/fnos-backup/src`。
 
@@ -388,7 +422,7 @@ fnos-backup/
 
 | 阶段 | 交付物 | 状态 | 关键风险 | 可逆性 |
 |------|--------|------|----------|--------|
-| **Phase 1 · MVP** | 全量备份 · 单源单目标 · 基础 Web UI · 本地 FS 源 · 酷族自定义 API 目标 · 飞牛 `.fpk` 打包 | ✅ 核心完成（.fpk 打包待部署） | 酷族 session 对接（已解决）· 飞牛生命周期集成 | 完全可逆 |
+| **Phase 1 · MVP** | 全量备份 · 单源单目标 · 基础 Web UI · 本地 FS 源 · 酷族官方 WebDAV 目标（ADR-009） · 飞牛 `.fpk` 打包 | ✅ 核心完成（.fpk 打包待部署） | WebDAV 对接（已解决）· 飞牛生命周期集成 | 完全可逆 |
 | **Phase 2 · 增量加密** | mtime 差分 · age 加密 · 流式管道 · 64MB 分块 · SQLite 元数据 | ✅ 完成 | 私钥管理（已用密钥库解决）· 大文件内存 | 完全可逆 |
 | **Phase 3 · 恢复能力** | 选择性恢复 · 恢复向导 UI · 完整性校验 · BLAKE3 严格模式 | ✅ 完成 | 索引膨胀（结合保留策略缓解） | 部分可逆（元数据格式定型需迁移） |
 | **Phase 4 · 生产强化** | 多目标支持 · 保留策略 · 断点续传 · 监控告警 · fnos 服务化 | 🔶 保留策略✅ / 断点续传✅ / WebSocket 监控✅ / .fpk 打包✅；多目标已放弃，飞牛设备实测⏳ | 并发控制 · 资源争用 | 部分可逆 |
@@ -400,7 +434,8 @@ fnos-backup/
 - ✅ 增量加密备份（mtime+size 差分、age 加密、断点续传每文件即时快照）
 - ✅ BLAKE3 严格模式差分（内容哈希确认，ADR-004）
 - ✅ age 公私钥密钥库持久化（私钥被口令派生密钥加密存储）
-- ✅ kzwr API 全量 Rust 重写（分块上传/下载/删除/两阶段物理删除/文件夹 CRUD）
+- ✅ kzwr 官方 WebDAV Target 适配器（`WebdavTarget`：MKCOL/PUT/GET 302 跟随/DELETE/PROPFIND，ADR-009 端到端实测通过）
+- ❌ kzwr 逆向 REST API 适配器与登录二进制（分块上传/下载/删除、session 认证、Camoufox 登录环境）——**已从代码库完全移除**（ADR-009，2026-09-18）
 - ✅ 恢复编排（RestoreJob）+ 恢复到源路径 + 多路径多 job 快照
 - ✅ 备份/恢复 HTTP API + Svelte Web UI（登录页、多路径配置、恢复树形视图）
 - ✅ WebSocket 实时任务监控（ADR-007 事件总线）
@@ -447,7 +482,7 @@ fnos-backup/
 
 | 选型项 | 结论 | Phase | 状态 |
 |--------|------|-------|------|
-| 酷族网软对接 | 登录用编译二进制产出 session token；API 已用 Rust 重写实现 Target 适配器 | 1-2 | ✅ 已实现并实测 |
+| 酷族网软对接 | 官方 WebDAV（Basic 凭据，加密存储，保存时 ping 验证并热切换） | 1-2 | ✅ WebDAV 适配器已实现并端到端实测；REST 适配器与登录二进制已移除（ADR-009） |
 | 飞牛源访问 | 仅本地 FS（tokio::fs），不考虑 SMB/NFS | 1 | ✅ 已实现 |
 | 双架构编译 | musl 静态链接 + cross 工具，全纯 Rust 依赖，GitHub Actions matrix | 1 | ✅ 已实现（本地 musl 构建验证） |
 | 源目录授权 | config/resource 声明 + 运行时引导，弃 root 模式 | 1 | 🔶 开发期用环境变量；飞牛部署待验证 |
@@ -486,7 +521,7 @@ fnos-backup/
 | | 密钥库持久化 | ✅ | 私钥被口令派生密钥加密存储，跨重启可用 |
 | **恢复** | 恢复编排 | ✅ | `RestoreJob`，选择性恢复、恢复到源路径 |
 | | 完整性校验 | ✅ | age AEAD tag 自动验证；恢复后内容对比校验 |
-| **kzwr 目标** | Rust API 重写 | ✅ | 分块上传/下载/删除、session 认证、token 刷新 |
+| **kzwr 目标** | 官方 WebDAV 适配器 | ✅ | `WebdavTarget`：MKCOL/PUT/GET(302 跟随)/DELETE/PROPFIND；凭据加密存储，保存时 ping 验证并热切换（ADR-009） |
 | | 两阶段物理删除 | ✅ | 逻辑删除进回收站 + 回收站 purge（Pids/FolderIds） |
 | | 文件夹 CRUD | ✅ | 创建/逻辑删除/物理删除 |
 | **存储抽象** | Source/Target trait | ✅ | `storage_trait.rs`（ADR-005），ACL 防腐层 |
@@ -496,9 +531,9 @@ fnos-backup/
 | **Web UI** | Svelte 前端 | ✅ | 导航栏多页面（概览/备份/恢复/设置）；views+components 分层 |
 | | 用户信息 + 容量 | ✅ | 头像/用户名/邮箱/套餐 + 存储空间进度条（UserCard 组件） |
 | **HTTP API** | 备份/恢复/配置 | ✅ | `http/routes.rs`，axum 路由 |
-| | 用户信息 | ✅ | `/api/user/info`，调用 get_member 返回容量/已用/套餐 |
+| | 用户信息 | ✅ | `/api/user/info` 返回本地配置的 WebDAV 账号（WebDAV 无配额/套餐属性） |
 | **配置** | 加密 TOML 配置 | ✅ | kzwr 凭据/密码/token 加密存储（age scrypt） |
-| | 记录登录用户 | ✅ | 配置解密 username_enc，启动恢复；`current_username()` |
+| | 记录账号 | ✅ | 配置解密 username_enc（`webdav_credentials()`） |
 | **测试** | 端到端测试 | ✅ | 真实 kzwr 备份/恢复/删除/多级文件夹/物理删除/保留策略/定时触发 |
 | **飞牛部署** | `.fpk` 打包 | ✅ | 完整包结构 + 生命周期脚本 + wizard + GitHub Actions 双架构构建（见 11.6） |
 | **监控告警** | 失败通知/告警 | ⏳ | 规划中（当前仅 WebSocket 实时状态） |
@@ -528,9 +563,10 @@ backend/src/
 │   ├── source/local/    # LocalFsSource
 │   ├── target/kzwr/     # client.rs / storage.rs / upload.rs / mod.rs
 │   ├── persistence/snapshot.rs  # SnapshotStore (SQLite)
-│   ├── config.rs        # ConfigManager (TOML)
+│   ├── config.rs        # ConfigManager (TOML，含 WebDAV 凭据加解密)
 │   ├── keystore.rs      # 密钥库
-│   └── kzwr_auth.rs     # KzwrAuthService (登录/token/current_username)
+│   └── storage_trait.rs # TargetStorage trait + SwapTarget/UnconfiguredTarget
+│   └── target/webdav.rs # WebdavTarget (官方 WebDAV)
 ├── bin/                 # 测试二进制 (开发期)
 ├── eventbus.rs          # EventBus (tokio::broadcast)
 └── ...
@@ -545,12 +581,12 @@ frontend/src/
 │   ├── DashboardPage.svelte  # 概览：UserCard + LiveStatus + Overview
 │   ├── BackupPage.svelte     # 备份：配置 + 定时 + 执行
 │   ├── RestorePage.svelte    # 恢复
-│   └── SettingsPage.svelte   # 设置：UserCard + 登录
+│   └── SettingsPage.svelte   # 设置：UserCard + WebDAV 配置
 ├── components/             # 功能区块组件
 │   ├── LiveStatus.svelte      # 实时任务状态（WebSocket 进度）
 │   ├── OverviewSection.svelte # 配置概览（网格卡片）
 │   ├── UserCard.svelte        # 用户信息 + 存储容量
-│   ├── LoginSection.svelte    # kzwr 登录
+│   ├── WebdavSection.svelte   # WebDAV 凭据配置（ping 验证后加密保存）
 │   ├── BackupConfigSection.svelte # 备份路径 + 定时 cron
 │   ├── BackupSection.svelte   # 备份执行
 │   └── RestoreSection.svelte  # 恢复目录树
@@ -562,22 +598,23 @@ frontend/src/
 - **镜像一致而非多版本**：目标端与本地保持一致（`8ee9b0a` 移除版本树），不做多版本历史，简化恢复与保留语义
 - **保留策略语义**：因无多版本，保留策略聚焦"目标端孤儿文件清理"（不在任何 job 快照中的残留），防目标空间膨胀
 - **恢复目标**：支持恢复到配置源路径（原位置）或指定目录；目录用"新建/覆盖"按钮控制
-- **token 管理**：启动从配置加载已保存 token 避免重复登录，过期自动重登（`kzwr_auth.rs`）
+- **配置热切换**：UI 保存 WebDAV 凭据后 `SwapTarget` 即时切换目标实现，无需重启（`storage_trait.rs`）
 - **定时备份**：cron 表达式到点触发，运行中改配置热更新（`domain/scheduler.rs`）
-- **用户信息**：登录用户记录在配置（username_enc 解密），容量来自 kzwr get_member（`/api/user/info`）
+- **用户信息**：账号记录在配置（username_enc 解密），`/api/user/info` 返回本地账号；WebDAV 无套餐/容量接口
 
 ### 11.5 后续待办（按优先级）
 
-1. **飞牛 `.fpk` 打包 + GitHub Actions 双架构构建**（✅ 已完成，见 11.6；待飞牛设备实测）
-2. **监控告警**：备份失败/恢复失败的通知（fnos 通知或 Webhook）
-3. **密钥丢失恢复流程**：私钥备份/恢复引导（Phase 5 备用）
-4. **大文件块级增量**：按需评估（Phase 5）
+1. **飞牛生产环境回归**（WebDAV 模式，ADR-009 已完成代码侧迁移）：`.fpk` 安装 → 备份/恢复/保留策略/定时全链路验证
+2. **飞牛 `.fpk` 打包 + GitHub Actions 双架构构建**（✅ 已完成，见 11.6；待飞牛设备实测）
+3. **监控告警**：备份失败/恢复失败的通知（fnos 通知或 Webhook）
+4. **密钥丢失恢复流程**：私钥备份/恢复引导（Phase 5 备用）
+5. **大文件块级增量**：按需评估（Phase 5）
 
 ### 11.6 飞牛应用打包实现（基于抓取到的飞牛开发文档）
 
 > 已依据 `docs/fnnas-dev-docs/`（抓取自 developer.fnnas.com）完成 `.fpk` 打包结构。
 
-**打包源目录**：`packaging/fnos-backup-app/`（可提交，CI 与本地构建共用）；构建产物组装至 `bin/fnos-backup-app/`（gitignored）
+**打包源目录**：`packaging/fnos-backup-app/`（可提交，CI 与本地构建共用）；构建产物与 `.fpk` 输出至 `dist/fnos-backup-app/`（gitignored，脚本 `Scripts/build_fnos_app.sh`）
 
 ```
 packaging/fnos-backup-app/
@@ -586,7 +623,7 @@ packaging/fnos-backup-app/
 ├── app/                        # → $TRIM_APPDEST（安装后为 /var/apps/{appname}/target）
 │   ├── ui/config               # 桌面入口：iframe → http://localhost:8080/，allUsers=true
 │   ├── ui/images/              # 入口图标
-│   ├── bin/                    # fnos-backup（Rust）+ kzwr_login_turnstile-* 
+│   ├── bin/                    # fnos-backup（Rust）
 │   └── www/                    # 前端构建产物（Svelte dist）
 ├── cmd/                        # main/install/upgrade/uninstall/config 生命周期脚本
 ├── config/
@@ -608,7 +645,7 @@ packaging/fnos-backup-app/
 - **卸载**：默认保留数据；`wizard/uninstall` 勾选清除时删除
 
 **构建与 CI**：
-- 本地脚本 `bin/build_fnos_app.sh`：`cargo build --release` + `npm run build` + 组装包 + `fnpack build`
+- 本地脚本 `Scripts/build_fnos_app.sh`：`cargo build --release` + `npm run build` + 组装包 + `fnpack build`（产物输出至 `dist/`）
 - GitHub Actions `.github/workflows/build-fnos-app.yml`：`x86_64-unknown-linux-musl` + `aarch64-unknown-linux-musl` 双架构交叉编译、前端构建、fnpack 打包、artifact 上传
 
 **WSL 构建测试已通过（2026-08-22）**：
@@ -619,7 +656,7 @@ packaging/fnos-backup-app/
 
 **已知限制**：fnpack v1.2.3 校验 wizard 时**不支持 `checkbox`/`switch` 字段类型**（文档虽列出但实际打包会失败），需用 `radio`/`select` 替代。本应用卸载确认已改用 `select`（keep/purge）。
 
-**待实测**：飞牛设备安装 `.fpk`、iframe WebSocket、`run-as=package` 读授权目录权限、双架构二进制可用性（当前仅 x86_64 登录二进制，aarch64 需补）。
+**待实测**：飞牛设备安装 `.fpk`、iframe WebSocket、`run-as=package` 读授权目录权限、双架构二进制可用性。
 
 ---
 

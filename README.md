@@ -1,6 +1,6 @@
 # fnos-backup — 飞牛 NAS 增量加密备份
 
-基于酷族网软（kzwr.com）私有网盘的**增量加密备份**工具，运行于飞牛 fnOS。
+基于酷族网软（kzwr.com）官方 **WebDAV** 的**增量加密备份**工具，运行于飞牛 fnOS。
 
 将本地文件夹增量、加密备份至 kzwr 云盘，支持选择性恢复，并提供 Web 管理界面。
 
@@ -13,9 +13,8 @@
 - **保留策略**：备份后自动清理目标端孤儿文件，防空间膨胀
 - **定时备份**：cron 表达式定时自动触发，运行中热更新
 - **选择性恢复**：Web 端树形目录浏览，按文件/目录恢复
-- **kzwr API 全量 Rust 重写**：分块上传/下载/删除、session 认证、token 自动刷新
-- **物理删除**：两阶段删除（回收站 + purge），支持文件夹
-- **Web UI**：导航栏多页面，实时进度（WebSocket）、用户信息与存储容量展示
+- **kzwr 官方 WebDAV 目标**（ADR-009）：文件管理全部走官方 WebDAV（Basic 认证，下载 302 → presigned 跟随）；早期逆向 REST API 适配器与登录二进制已完全移除
+- **Web UI**：导航栏多页面，实时进度（WebSocket）、WebDAV 凭据配置（保存前自动实测连通性）
 
 ## 🏗️ 架构
 
@@ -37,8 +36,7 @@ eventbus/ 内部事件总线（tokio::broadcast）
 
 - 备份数据在本地用 age **公钥加密**后上传，kzwr 只存储密文
 - 恢复时用 **私钥解密**；私钥（`agekeys.txt`）被管理员口令派生密钥加密存储
-- kzwr 凭据/密码/token 均加密存储于配置（age scrypt）
-- 依赖 `kzwr_login_turnstile` 编译二进制登录换取 session token
+- WebDAV 凭据加密存储于配置（age scrypt），UI 保存前先实测连通性
 
 ## 🚀 快速开始
 
@@ -46,7 +44,6 @@ eventbus/ 内部事件总线（tokio::broadcast）
 
 - Rust（后端）
 - Node.js 20+（前端构建）
-- `kzwr_login_turnstile-linux-x64` 登录二进制（放在 `$TRIM_LOGIN_BIN_DIR`）
 
 ### 构建
 
@@ -66,10 +63,17 @@ cd frontend && npm install && npm run build
 export TRIM_PKGVAR=$HOME/rf-var      # 数据目录（SQLite/密钥库）
 export TRIM_PKGETC=$HOME/rf-cfg      # 配置目录（config.toml）
 export TRIM_PASSPHRASE=your-pass     # 密钥库口令
-export TRIM_LOGIN_BIN_DIR=$HOME/kzwr-test  # 登录二进制目录
 export TRIM_WWW_DIR=frontend/dist    # 前端产物
 export TRIM_HTTP_PORT=8098
 ./target/release/fnos-backup
+```
+
+WebDAV 凭据可在 Web 界面「设置」中配置，或用环境变量注入：
+
+```bash
+export TRIM_DAV_URL=https://dav.kzwr.com/dav
+export TRIM_DAV_USER=your-account
+export TRIM_DAV_PASS=your-password
 ```
 
 打开 `http://<nas>:8098` 进入 Web 界面。
@@ -85,9 +89,12 @@ target_folder = "fn-backup"
 enabled = true
 cleanup_unmanaged = true   # 备份后清理目标端孤儿文件
 min_age_days = 0
+schedule_cron = "0 2 * * *"  # 可选：定时备份
 
-[backup.schedule_cron]     # 可选：定时备份
-schedule_cron = "0 2 * * *"  # 每天 02:00
+[webdav]                   # WebDAV 凭据（UI 保存后自动生成，敏感字段已加密）
+url = "https://dav.kzwr.com/dav"
+username_enc = "enc:..."
+password_enc = "enc:..."
 ```
 
 ## 📄 文档
@@ -98,5 +105,5 @@ schedule_cron = "0 2 * * *"  # 每天 02:00
 ## 🗺️ 路线图
 
 - ✅ Phase 1-3：MVP、增量加密、恢复能力
-- 🔶 Phase 4：保留策略 / 断点续传 / WebSocket 监控 / 定时备份已完成；`.fpk` 打包部署待实现
+- 🔶 Phase 4：保留策略 / 断点续传 / WebSocket 监控 / 定时备份 / WebDAV 目标已完成；飞牛 `.fpk` 部署实测待完成
 - ⏳ Phase 5：监控告警、密钥轮换、异地恢复

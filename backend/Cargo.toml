@@ -32,10 +32,8 @@ age = "0.10"
 argon2 = "0.5"
 zeroize = { version = "1", features = ["derive"] }
 
-# 哈希（增量检测 + kzwr 上传对齐）
+# 哈希（增量检测）
 blake3 = "1"
-sha1 = "0.10"
-sha2 = "0.10"
 
 # base64（配置敏感字段编码）
 base64 = "0.22"
@@ -56,11 +54,8 @@ async-trait = "0.1"
 thiserror = "1"
 anyhow = "1"
 
-# 临时文件（kzwr 分片上传暂存）
+# 临时文件（WebDAV 上传前暂存密文）
 tempfile = "3"
-
-# zip 解压（uBlock xpi / Camoufox 浏览器 zip；纯 Rust，不依赖系统 unzip）
-zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # 定时备份调度（cron 解析 + 时间计算）
 croner = "2"

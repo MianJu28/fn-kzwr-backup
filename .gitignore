@@ -33,3 +33,7 @@ env/
 *.log
 
 .codebuddy/
+
+# ─── 打包产物 ────────────────────────────────
+# fnOS .fpk 打包输出（Scripts/build_fnos_app.sh 产物）
+/dist/

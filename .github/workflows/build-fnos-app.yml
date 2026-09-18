@@ -4,7 +4,6 @@ name: 构建飞牛应用 (.fpk)
 # 架构说明：
 #   - Rust 后端编译为 x86_64 与 aarch64（musl 静态链接，避免运行时依赖）
 #   - 前端 Svelte 一次构建，产物与架构无关
-#   - kzwr 登录二进制需按架构分别提供（本仓库当前含 x86_64 版）
 # 打包产物为单包（.fpk），安装时由 install_init 按 uname -m 选择对应二进制。
 
 on:
@@ -47,7 +46,7 @@ jobs:
       - name: 组装飞牛应用包
         run: |
           # 从可提交的打包源码目录复制骨架
-          PACK=bin/fnos-backup-app
+          PACK=dist/fnos-backup-app
           rm -rf $PACK
           mkdir -p $PACK
           cp -r packaging/fnos-backup-app/. $PACK/
@@ -59,13 +58,6 @@ jobs:
           rm -rf $PACK/app/www
           cp -r frontend/dist $PACK/app/www
           chmod +x $PACK/app/bin/fnos-backup
-          # kzwr 登录二进制：按架构匹配（存在则拷贝）
-          case "$ARCH" in
-            x86_64*) [ -f bin/kzwr_login_turnstile-linux-x64 ] && \
-              cp bin/kzwr_login_turnstile-linux-x64 $PACK/app/bin/ ;;
-            aarch64*) [ -f bin/kzwr_login_turnstile-linux-arm64 ] && \
-              cp bin/kzwr_login_turnstile-linux-arm64 $PACK/app/bin/ ;;
-          esac
 
       - name: 打包 .fpk
         run: |
@@ -83,4 +75,4 @@ jobs:
           name: fnos-backup-${{ matrix.target }}
           path: |
             *.fpk
-            bin/fnos-backup-app/app/bin/fnos-backup
+            dist/fnos-backup-app/app/bin/fnos-backup
