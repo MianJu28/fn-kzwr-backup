@@ -6,7 +6,8 @@
   export let liveStatus = null;
   export let backupPaths = [];
   export let targetFolder = 'fn-backup';
-  export let loggedIn = false;
+  export let webdavConfigured = false;
+  export let webdavUrl = '';
   export let restoreFolders = [];
   export let scheduleCron = '';
   export let scheduleCronValid = true;
@@ -14,8 +15,8 @@
   export let userInfoError = null;
 </script>
 
-<!-- 登录用户 + 存储容量 -->
-<UserCard {userInfo} {userInfoError} />
+<!-- 备份账号（WebDAV） -->
+<UserCard {userInfo} {userInfoError} configured={webdavConfigured} />
 
 <!-- 实时任务状态（WebSocket 推送） -->
 <LiveStatus {liveStatus} />
@@ -24,7 +25,8 @@
 <OverviewSection
   {backupPaths}
   {targetFolder}
-  {loggedIn}
+  {webdavConfigured}
+  {webdavUrl}
   {restoreFolders}
   {scheduleCron}
   {scheduleCronValid}

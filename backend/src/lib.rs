@@ -13,28 +13,24 @@ pub mod infra;
 use domain::crypto::CryptoSession;
 use eventbus::EventBus;
 use infra::config::ConfigManager;
-use infra::kzwr_auth::KzwrAuthService;
 use infra::persistence::snapshot::SnapshotStore;
-use infra::storage_trait::TargetStorage;
-use infra::target::kzwr::client::KzwrClient;
+use infra::storage_trait::SwapTarget;
 
 /// 应用全局共享状态
 #[derive(Clone)]
 pub struct AppState {
-    /// 目标存储适配器（kzwr 酷族网软）
-    pub target: Arc<dyn TargetStorage>,
-    /// kzwr 客户端（用户信息/容量查询；token 与 target 共享）
-    pub kzwr_client: Arc<KzwrClient>,
+    /// 目标存储适配器（kzwr 官方 WebDAV，ADR-009；配置保存后可热替换）
+    pub target: Arc<SwapTarget>,
+    /// 目标是否已配置（凭据就绪；未配置时 target 为占位适配器）
+    pub target_ready: bool,
     /// 加密会话（备份加密/恢复解密）
     pub crypto: CryptoSession,
     /// 内部事件总线（状态推送）
     pub eventbus: Arc<EventBus>,
     /// 元数据快照库
     pub store: Arc<SnapshotStore>,
-    /// 配置管理器（含多备份路径、kzwr 凭据）
+    /// 配置管理器（含多备份路径、WebDAV 凭据）
     pub config: Arc<Mutex<ConfigManager>>,
-    /// kzwr 认证服务（登录、token 自动重登）
-    pub auth: Arc<KzwrAuthService>,
     /// 目标根前缀（如 "fn-backup"，来自配置）
     pub target_folder: String,
     /// 备份任务 id

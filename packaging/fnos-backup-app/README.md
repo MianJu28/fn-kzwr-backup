@@ -2,7 +2,7 @@
 
 本目录为**可提交的飞牛应用包源码**，是 `.fpk` 打包的源。
 
-- 构建脚本 `../../bin/build_fnos_app.sh` 会：
+- 构建脚本 `../../Scripts/build_fnos_app.sh` 会：
   1. 构建后端（`cargo build --release`）
   2. 构建前端（`npm run build`）
   3. 将二进制拷入 `app/bin/`、前端产物拷入 `app/www/`
@@ -43,5 +43,5 @@ packaging/fnos-backup-app/
 ## 构建
 
 ```bash
-../../bin/build_fnos_app.sh
+../../Scripts/build_fnos_app.sh
 ```
