@@ -11,6 +11,7 @@ pub mod http;
 pub mod infra;
 
 use age::secrecy::SecretString;
+use domain::alerts::AlertSink;
 use domain::crypto::CryptoSession;
 use eventbus::EventBus;
 use infra::config::ConfigManager;
@@ -56,6 +57,8 @@ pub struct AppState {
     pub cfg_dir: PathBuf,
     /// 待一次性展示的自动生成私钥（首次启动自动生成时设置，读取后清空）
     pub pending_key_reveal: Arc<Mutex<Option<String>>>,
+    /// 告警汇聚点（备份/恢复失败等，供 UI 查询与 Webhook 外发）
+    pub alerts: Arc<AlertSink>,
     /// 内部事件总线（状态推送）
     pub eventbus: Arc<EventBus>,
     /// 元数据快照库

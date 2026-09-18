@@ -2,6 +2,7 @@
   import UserCard from '../components/UserCard.svelte';
   import WebdavSection from '../components/WebdavSection.svelte';
   import KeySection from '../components/KeySection.svelte';
+  import NotifySection from '../components/NotifySection.svelte';
 
   export let webdavConfigured = false;
   export let webdavUrl = '';
@@ -15,6 +16,10 @@
   export let revealKey = ''; // 首次启动自动生成的私钥（一次性展示）
   export let onSetKey = null; // (privateKey) => Promise
   export let onGenerateKey = null; // () => Promise
+
+  // 通知设置（监控告警）
+  export let webhookUrl = '';
+  export let onSaveWebhook = null; // (url) => Promise
 </script>
 
 <UserCard {userInfo} {userInfoError} configured={webdavConfigured} />
@@ -22,3 +27,5 @@
 <WebdavSection configured={webdavConfigured} configuredUrl={webdavUrl} {busy} onSave={onSaveWebdav} />
 
 <KeySection {keyInfo} {revealKey} {busy} {onSetKey} {onGenerateKey} />
+
+<NotifySection {webhookUrl} {busy} onSave={onSaveWebhook} />

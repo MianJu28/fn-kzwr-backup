@@ -21,6 +21,9 @@ pub struct AppConfig {
     /// WebDAV 目标配置（ADR-009：官方 WebDAV，唯一文件管理通道）
     #[serde(default)]
     pub webdav: WebdavConfig,
+    /// 通知配置（监控告警）
+    #[serde(default)]
+    pub notify: NotifyConfig,
 }
 
 /// 备份配置
@@ -77,6 +80,16 @@ pub struct WebdavConfig {
     /// 密码（加密存储）
     #[serde(default)]
     pub password_enc: Option<String>,
+}
+
+/// 通知配置（监控告警）
+///
+/// `webhook_url` 为空表示不外发，告警仅在应用内展示。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NotifyConfig {
+    /// 告警 Webhook 地址（空 = 不外发）
+    #[serde(default)]
+    pub webhook_url: Option<String>,
 }
 
 /// 配置管理器

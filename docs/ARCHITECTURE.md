@@ -430,7 +430,7 @@ fnos-backup/
 | **Phase 1 · MVP** | 全量备份 · 单源单目标 · 基础 Web UI · 本地 FS 源 · 酷族官方 WebDAV 目标（ADR-009） · 飞牛 `.fpk` 打包 | ✅ 核心完成（.fpk 打包待部署） | WebDAV 对接（已解决）· 飞牛生命周期集成 | 完全可逆 |
 | **Phase 2 · 增量加密** | mtime 差分 · age 加密 · 流式管道 · 64MB 分块 · SQLite 元数据 | ✅ 完成 | 私钥管理（已用密钥库解决）· 大文件内存 | 完全可逆 |
 | **Phase 3 · 恢复能力** | 选择性恢复 · 恢复向导 UI · 完整性校验 · BLAKE3 严格模式 | ✅ 完成 | 索引膨胀（结合保留策略缓解） | 部分可逆（元数据格式定型需迁移） |
-| **Phase 4 · 生产强化** | 多目标支持 · 保留策略 · 断点续传 · 监控告警 · fnos 服务化 | 🔶 保留策略✅ / 断点续传✅ / WebSocket 监控✅ / .fpk 打包✅；多目标已放弃，飞牛设备实测⏳ | 并发控制 · 资源争用 | 部分可逆 |
+| **Phase 4 · 生产强化** | 多目标支持 · 保留策略 · 断点续传 · 监控告警 · fnos 服务化 | ✅ 保留策略 / 断点续传 / WebSocket 监控 / `.fpk` 打包 / 监控告警 / 飞牛设备实测均已完成（多目标按用户决策放弃） | 并发控制 · 资源争用 | 部分可逆 |
 | **Phase 5 · 演进扩展** | 异地恢复 · 密钥轮换 · 插件化 · 可选分布式 | ⏳ 规划中 | 跨节点一致性 | 视需求启用 |
 
 **可逆性原则**：Phase 1-2 纯增量能力叠加，决策完全可逆；Phase 3-4 元数据格式定型后部分可逆（需写迁移脚本）；Phase 5 视实际需求启用，避免过早优化。
@@ -543,7 +543,8 @@ fnos-backup/
 | | 记录账号 | ✅ | 配置解密 username_enc（`webdav_credentials()`） |
 | **测试** | 端到端测试 | ✅ | 真实 kzwr 备份/恢复/删除/多级文件夹/物理删除/保留策略/定时触发 |
 | **飞牛部署** | `.fpk` 打包 | ✅ | 完整包结构 + 生命周期脚本 + wizard + GitHub Actions 双架构构建（见 11.6） |
-| **监控告警** | 失败通知/告警 | ⏳ | 规划中（当前仅 WebSocket 实时状态） |
+| **监控告警** | 失败通知/告警 | ✅ | 备份/恢复失败与配置缺失生成告警：应用内横幅展示 + 可选 Webhook 外发（`domain/alerts.rs`、`/api/alerts`、`/api/notify/webhook`） |
+| **密钥管理** | age 密钥查看/更换 | ✅ | `GET/POST /api/keys`、`POST /api/keys/generate`；密钥热切换无需重启（设置页 KeySection） |
 | **多目标** | 备份到多个目标 | ❌ 放弃 | 按用户决策，保留策略实现，多目标不做 |
 
 ### 11.3 当前实际 Rust 源码结构
@@ -558,6 +559,7 @@ backend/src/
 │   └── ws.rs            # WebSocket 状态推送
 ├── domain/
 │   ├── mod.rs
+│   ├── alerts.rs        # AlertSink / Alert（监控告警，含 Webhook 外发）
 │   ├── backup.rs        # BackupJob (备份调度 + 保留策略接入)
 │   ├── sync.rs          # SyncSession (差分)
 │   ├── crypto.rs        # CryptoSession (age 加密) + AgeKeys
@@ -594,6 +596,8 @@ frontend/src/
 │   ├── UserCard.svelte        # WebDAV 账号（WebDAV 无容量/套餐接口）
 │   ├── WebdavSection.svelte   # WebDAV 凭据配置（ping 验证后加密保存）
 │   ├── KeySection.svelte      # age 密钥管理（公钥展示 / 自定义私钥 / 自动生成并提醒保存）
+│   ├── AlertBanner.svelte     # 监控告警横幅（失败/异常列表 + 清空）
+│   ├── NotifySection.svelte   # 通知设置（告警 Webhook 地址）
 │   ├── BackupConfigSection.svelte # 备份路径 + 定时 cron
 │   ├── BackupSection.svelte   # 备份执行
 │   └── RestoreSection.svelte  # 恢复目录树
@@ -611,11 +615,12 @@ frontend/src/
 
 ### 11.5 后续待办（按优先级）
 
-1. **飞牛生产环境回归**（WebDAV 模式，ADR-009 已完成代码侧迁移）：`.fpk` 安装 → 备份/恢复/保留策略/定时全链路验证
-2. **飞牛 `.fpk` 打包 + GitHub Actions 双架构构建**（✅ 已完成，见 11.6；待飞牛设备实测）
-3. **监控告警**：备份失败/恢复失败的通知（fnos 通知或 Webhook）
+1. ✅ **飞牛生产环境回归**（WebDAV 模式）：`.fpk` 安装启动、WebDAV 凭据配置与热切换、备份/恢复/保留策略/定时全链路已在 x86 飞牛设备实测通过
+2. ✅ **飞牛 `.fpk` 打包 + GitHub Actions 双架构构建**（见 11.6）；x86 实测通过
+3. ✅ **监控告警**：备份/恢复失败与配置缺失生成告警，应用内横幅展示 + 可选 Webhook 外发
 4. **密钥丢失恢复流程**：私钥备份/恢复引导（Phase 5 备用）
 5. **大文件块级增量**：按需评估（Phase 5）
+6. **aarch64 设备实测**：CI 已产出双架构包，需在 aarch64 飞牛设备上验证二进制可用性
 
 ### 11.6 飞牛应用打包实现（基于抓取到的飞牛开发文档）
 
@@ -663,7 +668,9 @@ packaging/fnos-backup-app/
 
 **已知限制**：fnpack v1.2.3 校验 wizard 时**不支持 `checkbox`/`switch` 字段类型**（文档虽列出但实际打包会失败），需用 `radio`/`select` 替代。本应用卸载确认已改用 `select`（keep/purge）。
 
-**待实测**：飞牛设备安装 `.fpk`、iframe WebSocket、`run-as=package` 读授权目录权限、双架构二进制可用性。
+**设备实测结果（2026-09-19，x86 飞牛设备）**：`.fpk` 安装与启动正常；iframe 内 WebSocket 实时状态正常；WebDAV 凭据配置与热切换正常；备份/恢复/保留策略/定时触发全链路验证通过；`run-as=package` 读取授权目录正常。
+
+**待实测**：aarch64 架构二进制在对应飞牛设备上的可用性（GitHub Actions 已产出双架构包）。
 
 ---
 
