@@ -159,9 +159,13 @@ fn build_target(
         (url, user, pass)
     };
 
-    let url = env_url.or(cfg_url);
     let user = env_user.or(cfg_user);
     let pass = env_pass.or(cfg_pass);
+    // 地址：环境变量 > 配置 > 官方默认（凭据存在时）
+    let url = env_url.or(cfg_url).or_else(|| {
+        user.as_ref()
+            .map(|_| infra::target::webdav::DEFAULT_URL.to_string())
+    });
 
     match (url, user, pass) {
         (Some(url), Some(user), Some(pass)) if !user.is_empty() && !pass.is_empty() => Ok((

@@ -325,6 +325,11 @@ trait TargetStorage {
 - 后端选择：`TRIM_DAV_*` 环境变量或加密配置 `[webdav]` 段；缺失时启动占位适配器（操作返回引导错误），UI 保存配置后经 `SwapTarget` 热切换生效（无需重启）
 - 端到端测试（`bin/webdav_backup_test.rs`，真实服务器）：ping ✓、多级目录+特殊字符文件名 roundtrip ✓、BackupJob 全量 4 上传/增量 0/修改 1 ✓、下载解密校验 4/4 ✓、清理 ✓
 
+**大文件分片与地址固定（2026-09-18 补充）**：
+- 网站限制单次上传 100MB → 超过 `PART_SIZE`（默认 8MiB，`FNOS_DAV_PART_SIZE` 可覆盖）的密文文件自动拆分为 `<path>.part0001…` 依次 PUT；下载按序拼接、删除清理全部分片、列表将分片合并为逻辑文件（对核心逻辑透明）
+- WebDAV 地址固定为官方地址（`DEFAULT_URL`），UI 仅填用户名/密码；`TRIM_DAV_URL` 环境变量仍可用于开发覆盖
+- 实测坑：服务端/链路对长时 HTTP/2 上传不稳定（~20s 即 PROTOCOL_ERROR）→ 客户端强制 HTTP/1.1；PUT 带 30 分钟总超时 + 4 次重试（5xx/408/429/网络错误可重试）
+
 **迁移步骤**：
 1. 验证 WebDAV 端点、认证方式与流式 PUT/GET 行为
 2. 实现 `WebdavTargetStorage` 适配器（实现既有 `TargetStorage` trait，核心同步/加密逻辑零改动）

@@ -6,9 +6,14 @@
 //! - `GET` 下载返回 302 → S3 风格 presigned URL（约 300s 有效），
 //!   跟随重定向即可取回内容，无需二次认证（reqwest 默认跟随，跨域自动去凭据）
 //!
+//! 大文件分片（2026-09-18）：网站对单次上传限制 100MB，超过 `PART_SIZE`
+//! 的文件自动拆分为 `<path>.part0001`、`.part0002`… 依次 PUT；
+//! 下载按序拼接、删除清理全部分片、列表将分片合并为逻辑文件。
+//!
 //! 凭据永不硬编码，由调用方从加密配置或环境变量注入。
+//! WebDAV 地址固定为官方地址（`DEFAULT_URL`），UI 不暴露设置项。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -19,7 +24,34 @@ use crate::infra::storage_trait::{
     FileDescriptor, StorageError, StorageResult, TargetStorage,
 };
 
+/// 官方 WebDAV 地址（UI 固定使用，不提供设置项）
+pub const DEFAULT_URL: &str = "https://dav.kzwr.com/dav";
+
+/// 单分片大小：8 MiB（默认）
+///
+/// 网站限制单次上传 100MB，8MiB 留有充足余量；小分片在慢链路下
+/// 进度损失小、单请求耗时短，配合 HTTP/1.1 + 超时 + 重试最稳健。
+/// 默认分片大小：100MB 网站上传限制（Cloudflare 返回 413 Payload Too Large）的 90%，即 90 MiB。
+/// 单分片必须小于该限制才能绕过；可用环境变量 FNOS_DAV_PART_SIZE 覆盖（字节，供测试调小验证分片逻辑）。
+pub const PART_SIZE: u64 = 90 * 1024 * 1024;
+
+/// 读取生效的分片大小（环境变量 FNOS_DAV_PART_SIZE 可覆盖）
+pub fn part_size() -> u64 {
+    std::env::var("FNOS_DAV_PART_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(PART_SIZE)
+}
+
+/// 单次 PUT 的总超时（慢链路下单请求可能持续很久，放宽到 30 分钟）
+const PUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// PUT 最大尝试次数
+const PUT_MAX_ATTEMPTS: usize = 4;
+
 /// WebDAV 目标适配器
+#[derive(Clone)]
 pub struct WebdavTarget {
     client: Client,
     /// WebDAV 基址（如 https://dav.kzwr.com/dav，无尾斜杠）
@@ -37,6 +69,24 @@ struct DavEntry {
     size: u64,
 }
 
+/// 生成第 i 个分片的后缀（.part0001 起）
+fn part_suffix(i: usize) -> String {
+    format!(".part{:04}", i)
+}
+
+/// 识别分片文件名：`xxx.part0001` → (xxx, 1)；非分片返回 None
+fn split_part_name(name: &str) -> Option<(String, usize)> {
+    if name.len() < 10 || !name.is_char_boundary(name.len() - 9) {
+        return None;
+    }
+    let split = name.len() - 9;
+    let digits = name[split..].strip_prefix(".part")?;
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((name[..split].to_string(), digits.parse().ok()?))
+}
+
 impl WebdavTarget {
     /// 创建适配器。`base_url` 如 `https://dav.kzwr.com/dav`。
     pub fn new(base_url: &str, username: impl Into<String>, password: impl Into<String>) -> Self {
@@ -48,6 +98,9 @@ impl WebdavTarget {
             .unwrap_or_default();
         let client = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(15))
+            // 强制 HTTP/1.1：服务端/中间层对长时 HTTP/2 上传流不稳定
+            // （实测 ~21s 即 HTTP/2 PROTOCOL_ERROR 掐断）
+            .http1_only()
             .build()
             .expect("reqwest client 构建失败");
         Self {
@@ -141,6 +194,144 @@ impl WebdavTarget {
         Ok(parse_multistatus(&xml))
     }
 
+    /// PUT 内存数据（带总超时与重试：网络错误与 5xx/408/429 均可重试）
+    async fn put_bytes_retry(&self, url: &str, data: Vec<u8>) -> StorageResult<()> {
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            let resp = self
+                .request(Method::PUT, url)
+                .timeout(PUT_TIMEOUT)
+                .body(data.clone())
+                .send()
+                .await;
+            match resp {
+                Ok(r) => {
+                    let status = r.status();
+                    if status.is_success() {
+                        return Ok(());
+                    }
+                    let retryable = status.is_server_error()
+                        || status == StatusCode::REQUEST_TIMEOUT
+                        || status == StatusCode::TOO_MANY_REQUESTS;
+                    let body = r.text().await.unwrap_or_default();
+                    if retryable && attempt < PUT_MAX_ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
+                        continue;
+                    }
+                    return Err(StorageError::Protocol(format!(
+                        "PUT {} 返回 {}: {}",
+                        url, status, body
+                    )));
+                }
+                Err(e) => {
+                    if attempt < PUT_MAX_ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
+                        continue;
+                    }
+                    return Err(StorageError::Protocol(format!(
+                        "PUT {} 网络错误: {}",
+                        url, e
+                    )));
+                }
+            }
+        }
+    }
+
+    /// 删除单个原始路径（404 视为成功）
+    async fn delete_raw(&self, path: &Path) -> StorageResult<()> {
+        let url = self.url_for(&path.to_string_lossy());
+        let resp = self
+            .request(Method::DELETE, &url)
+            .send()
+            .await
+            .map_err(|e| StorageError::Protocol(format!("DELETE {} 失败: {}", url, e)))?;
+        match resp.status() {
+            s if s.is_success() => Ok(()),
+            StatusCode::NOT_FOUND => Ok(()),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                Err(StorageError::Auth(format!("DELETE {} 认证失败", url)))
+            }
+            s => {
+                let body = resp.text().await.unwrap_or_default();
+                Err(StorageError::Protocol(format!(
+                    "DELETE {} 返回 {}: {}",
+                    url, s, body
+                )))
+            }
+        }
+    }
+
+    /// 从 .part0001 起逐个删除分片，直到 404
+    async fn cleanup_parts(&self, path: &Path) -> StorageResult<()> {
+        for idx in 1.. {
+            let part = self.part_path(path, idx);
+            let url = self.url_for(&part.to_string_lossy());
+            let resp = match self.request(Method::DELETE, &url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    return Err(StorageError::Protocol(format!("DELETE {} 失败: {}", url, e)))
+                }
+            };
+            match resp.status() {
+                s if s.is_success() => continue,
+                StatusCode::NOT_FOUND => return Ok(()),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                    return Err(StorageError::Auth(format!("DELETE {} 认证失败", url)))
+                }
+                s => {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(StorageError::Protocol(format!(
+                        "DELETE {} 返回 {}: {}",
+                        url, s, body
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 第 idx 个分片的路径
+    fn part_path(&self, path: &Path, idx: usize) -> PathBuf {
+        let s = path.to_string_lossy();
+        PathBuf::from(format!("{}{}", s, part_suffix(idx)))
+    }
+
+    /// GET 单个路径，返回字节流（不跟随分片逻辑）
+    async fn get_stream_raw(
+        &self,
+        path: &Path,
+    ) -> StorageResult<Box<dyn Stream<Item = StorageResult<Bytes>> + Send + Unpin>> {
+        let url = self.url_for(&path.to_string_lossy());
+        let resp = self
+            .request(Method::GET, &url)
+            .send()
+            .await
+            .map_err(|e| StorageError::Protocol(format!("GET {} 失败: {}", url, e)))?;
+        let status = resp.status();
+        match status {
+            StatusCode::OK => {}
+            StatusCode::NOT_FOUND => {
+                return Err(StorageError::NotFound(path.to_string_lossy().into_owned()))
+            }
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                return Err(StorageError::Auth(format!("GET {} 认证失败", url)))
+            }
+            s => {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(StorageError::Protocol(format!(
+                    "GET {} 返回 {}: {}",
+                    url, s, body
+                )));
+            }
+        }
+        // 302 → presigned URL 由 reqwest 自动跟随（默认策略），此处已是最终 200 响应
+        let stream = resp
+            .bytes_stream()
+            .map(|r| r.map_err(|e| StorageError::Protocol(format!("下载中断: {}", e))));
+        Ok(Box::new(stream))
+    }
+
     /// 把服务端 href（如 /dav/fn-backup/a.txt）转为相对条目路径
     fn href_to_rel(&self, href: &str) -> Option<String> {
         let mut p = percent_decode_path(href);
@@ -175,94 +366,110 @@ impl TargetStorage for WebdavTarget {
         path: &Path,
         mut stream: Box<dyn Stream<Item = Bytes> + Send + Unpin>,
     ) -> StorageResult<()> {
-        // 与 KzwrTarget 一致：先落临时文件（密文），再整体 PUT。
-        // 避免服务器不接受 chunked 编码，且 PUT 带 Content-Length 更稳。
-        use std::io::Write;
+        // 暂存密文到临时文件（与分段上传解耦，且带 Content-Length 更稳）
+        use std::io::{Read, Write};
         let mut tmp = tempfile::NamedTempFile::new().map_err(StorageError::Io)?;
         while let Some(chunk) = stream.next().await {
             tmp.write_all(&chunk).map_err(StorageError::Io)?;
         }
         tmp.flush().map_err(StorageError::Io)?;
+        let size = tmp.as_file().metadata().map_err(StorageError::Io)?.len();
 
         self.ensure_parents(path).await?;
 
-        let url = self.url_for(&path.to_string_lossy());
-        let file = tokio::fs::File::open(tmp.path())
-            .await
-            .map_err(StorageError::Io)?;
-        let resp = self
-            .request(Method::PUT, &url)
-            .body(file)
-            .send()
-            .await
-            .map_err(|e| StorageError::Protocol(format!("PUT {} 失败: {}", url, e)))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(StorageError::Protocol(format!(
-                "PUT {} 返回 {}: {}",
-                url, status, body
-            )));
+        if size <= part_size() {
+            // 小文件：整体 PUT 到逻辑路径；顺带清理可能残留的旧分片
+            self.cleanup_parts(path).await?;
+            let url = self.url_for(&path.to_string_lossy());
+            let mut data = Vec::with_capacity(size as usize);
+            std::fs::File::open(tmp.path())
+                .map_err(StorageError::Io)?
+                .read_to_end(&mut data)
+                .map_err(StorageError::Io)?;
+            self.put_bytes_retry(&url, data).await
+        } else {
+            // 大文件：拆分为 .part0001… 依次上传；先删旧逻辑文件（覆盖小文件场景）
+            let _ = self.delete_raw(path).await;
+            let mut file = std::fs::File::open(tmp.path()).map_err(StorageError::Io)?;
+            let mut idx = 1usize;
+            loop {
+                let mut buf = Vec::with_capacity(part_size() as usize);
+                let mut take = part_size() as usize;
+                while take > 0 {
+                    let chunk = {
+                        let mut slice = vec![0u8; take.min(1024 * 1024)];
+                        let n = file.read(&mut slice).map_err(StorageError::Io)?;
+                        slice.truncate(n);
+                        slice
+                    };
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    take -= chunk.len();
+                    buf.extend_from_slice(&chunk);
+                }
+                if buf.is_empty() {
+                    break;
+                }
+                let part = self.part_path(path, idx);
+                let url = self.url_for(&part.to_string_lossy());
+                self.put_bytes_retry(&url, buf).await?;
+                idx += 1;
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     async fn read_stream(
         &self,
         path: &Path,
     ) -> StorageResult<Box<dyn Stream<Item = StorageResult<Bytes>> + Send + Unpin>> {
-        let url = self.url_for(&path.to_string_lossy());
-        let resp = self
-            .request(Method::GET, &url)
-            .send()
-            .await
-            .map_err(|e| StorageError::Protocol(format!("GET {} 失败: {}", url, e)))?;
-        let status = resp.status();
-        match status {
-            StatusCode::OK => {}
-            StatusCode::NOT_FOUND => {
-                return Err(StorageError::NotFound(path.to_string_lossy().into_owned()))
+        // 先尝试逻辑文件（小文件）；404 则按序拼接 .part0001… 分片
+        match self.get_stream_raw(path).await {
+            Ok(stream) => Ok(stream),
+            Err(StorageError::NotFound(_)) => {
+                let this = self.clone();
+                let path = path.to_path_buf();
+                let (tx, rx) = tokio::sync::mpsc::channel::<StorageResult<Bytes>>(4);
+                tokio::spawn(async move {
+                    for idx in 1.. {
+                        let part = this.part_path(&path, idx);
+                        match this.get_stream_raw(&part).await {
+                            Ok(mut st) => {
+                                while let Some(chunk) = st.next().await {
+                                    if tx.send(chunk).await.is_err() {
+                                        return; // 接收端已关闭
+                                    }
+                                }
+                            }
+                            Err(StorageError::NotFound(_)) => {
+                                if idx == 1 {
+                                    // 无逻辑文件也无分片：确为不存在
+                                    let _ = tx
+                                        .send(Err(StorageError::NotFound(
+                                            path.to_string_lossy().into_owned(),
+                                        )))
+                                        .await;
+                                }
+                                break;
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(e)).await;
+                                return;
+                            }
+                        }
+                    }
+                });
+                Ok(Box::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
             }
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                return Err(StorageError::Auth(format!("GET {} 认证失败", url)))
-            }
-            s => {
-                let body = resp.text().await.unwrap_or_default();
-                return Err(StorageError::Protocol(format!(
-                    "GET {} 返回 {}: {}",
-                    url, s, body
-                )));
-            }
+            Err(e) => Err(e),
         }
-        // 302 → presigned URL 由 reqwest 自动跟随（默认策略），此处已是最终 200 响应
-        let stream = resp
-            .bytes_stream()
-            .map(|r| r.map_err(|e| StorageError::Protocol(format!("下载中断: {}", e))));
-        Ok(Box::new(stream))
     }
 
     async fn delete(&self, path: &Path) -> StorageResult<()> {
-        let url = self.url_for(&path.to_string_lossy());
-        let resp = self
-            .request(Method::DELETE, &url)
-            .send()
-            .await
-            .map_err(|e| StorageError::Protocol(format!("DELETE {} 失败: {}", url, e)))?;
-        match resp.status() {
-            s if s.is_success() => Ok(()),
-            // 已不存在视为成功（镜像同步/保留策略语义）
-            StatusCode::NOT_FOUND => Ok(()),
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                Err(StorageError::Auth(format!("DELETE {} 认证失败", url)))
-            }
-            s => {
-                let body = resp.text().await.unwrap_or_default();
-                Err(StorageError::Protocol(format!(
-                    "DELETE {} 返回 {}: {}",
-                    url, s, body
-                )))
-            }
-        }
+        // 删除逻辑文件 + 全部分片（各自 404 均视为成功）
+        self.delete_raw(path).await?;
+        self.cleanup_parts(path).await
     }
 
     async fn list(&self, prefix: &str) -> StorageResult<Vec<FileDescriptor>> {
@@ -271,6 +478,8 @@ impl TargetStorage for WebdavTarget {
         let entries = self.propfind(dir, "1").await?;
         let self_rel = format!("{}/", dir);
         let mut out = Vec::new();
+        // 分片合并表：逻辑名 → 累计大小
+        let mut part_map: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
         for e in entries {
             let Some(rel) = self.href_to_rel(&e.href) else {
                 continue;
@@ -280,11 +489,39 @@ impl TargetStorage for WebdavTarget {
             if rel == self_rel.trim_end_matches('/') || rel.is_empty() {
                 continue; // 跳过目录自身
             }
+            if is_dir {
+                out.push(FileDescriptor {
+                    rel_path: rel,
+                    size: 0,
+                    modified: None,
+                    is_dir: true,
+                    digest: None,
+                });
+                continue;
+            }
+            // 分片文件合并进逻辑条目
+            if let Some((logical, _)) = split_part_name(&rel) {
+                *part_map.entry(logical).or_insert(0) += e.size;
+                continue;
+            }
             out.push(FileDescriptor {
                 rel_path: rel,
-                size: if is_dir { 0 } else { e.size },
+                size: e.size,
                 modified: None,
-                is_dir,
+                is_dir: false,
+                digest: None,
+            });
+        }
+        // 分片合并为逻辑文件（若同名逻辑文件已存在则以其为准，忽略残留分片）
+        for (logical, size) in part_map {
+            if out.iter().any(|f| f.rel_path == logical) {
+                continue;
+            }
+            out.push(FileDescriptor {
+                rel_path: logical,
+                size,
+                modified: None,
+                is_dir: false,
                 digest: None,
             });
         }
@@ -438,5 +675,32 @@ mod tests {
         assert_eq!(t.href_to_rel("/dav/fn-backup/a.age").as_deref(), Some("fn-backup/a.age"));
         assert_eq!(t.href_to_rel("/dav/"), None);
         assert_eq!(t.url_for("fn-backup/a b.age"), "https://dav.kzwr.com/dav/fn-backup/a%20b.age");
+    }
+
+    #[test]
+    fn test_split_part_name() {
+        assert_eq!(
+            split_part_name("data.age.part0001"),
+            Some(("data.age".to_string(), 1))
+        );
+        assert_eq!(
+            split_part_name("data.age.part0042"),
+            Some(("data.age".to_string(), 42))
+        );
+        assert_eq!(split_part_name("data.age"), None);
+        assert_eq!(split_part_name("data.age.part"), None);
+        assert_eq!(split_part_name("data.age.partabcd"), None);
+        assert_eq!(split_part_name("data.age.part12"), None);
+    }
+
+    #[test]
+    fn test_part_suffix_and_path() {
+        assert_eq!(part_suffix(1), ".part0001");
+        assert_eq!(part_suffix(42), ".part0042");
+        let t = WebdavTarget::new("https://dav.kzwr.com/dav", "u", "p");
+        assert_eq!(
+            t.part_path(Path::new("fn-backup/a.age"), 3),
+            PathBuf::from("fn-backup/a.age.part0003")
+        );
     }
 }

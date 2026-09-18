@@ -1,45 +1,43 @@
 <script>
   // WebDAV 凭据配置（ADR-009：官方 WebDAV，Basic 认证，凭据加密存储）
+  // 地址固定为官方 WebDAV，无需用户设置
   export let configured = false;
   export let configuredUrl = '';
   export let busy = false;
-  export let onSave = null; // (url, username, password) => Promise<string>
+  export let onSave = null; // (username, password) => Promise<string>
 
-  let url = '';
   let username = '';
   let password = '';
   let saveMsg = '';
 
   async function submit() {
-    const msg = await onSave(url, username, password);
+    const msg = await onSave(username, password);
     saveMsg = msg;
     if (msg && msg.startsWith('WebDAV 已配置')) {
       password = '';
-      configuredUrl = url.trim().replace(/\/+$/, '');
-      url = '';
     }
   }
 </script>
 
 <section>
   <h2>🌐 WebDAV 目标配置</h2>
-  <p class="hint">备份目标为酷族网软（kzwr）官方 WebDAV。凭据先实测连通性，通过后加密存储。</p>
+  <p class="hint">
+    备份目标为酷族网软（kzwr）官方 WebDAV：<code>{configuredUrl || 'https://dav.kzwr.com/dav'}</code>
+    <br />凭据保存前会先实测连通性，通过后加密存储；大文件自动分片上传。
+  </p>
   {#if configured}
-    <p class="ok">✅ 已配置：{configuredUrl || '（地址见配置文件）'}</p>
+    <p class="ok">✅ 已配置</p>
   {:else}
     <p class="warn">⚠️ 未配置，填写后才能执行备份/恢复</p>
   {/if}
-  <label>WebDAV 地址
-    <input bind:value={url} type="url" placeholder="https://dav.kzwr.com/dav" />
-  </label>
   <label>用户名
     <input bind:value={username} type="text" placeholder="账号或邮箱" autocomplete="off" />
   </label>
   <label>密码 / 应用密码
     <input bind:value={password} type="password" placeholder="••••••••" autocomplete="new-password" />
   </label>
-  <button on:click={submit} disabled={busy || !url || !username || !password}>
-    {busy ? '验证并保存中...' : (configured ? '更新配置' : '测试并保存')}
+  <button on:click={submit} disabled={busy || !username || !password}>
+    {busy ? '验证并保存中...' : (configured ? '更新凭据' : '测试并保存')}
   </button>
   {#if saveMsg}
     <p class:ok={saveMsg.startsWith('WebDAV 已配置')} class:warn={!saveMsg.startsWith('WebDAV 已配置')}>{saveMsg}</p>
@@ -54,7 +52,14 @@
     box-shadow: 0 1px 3px rgba(0,0,0,.06);
   }
   h2 { margin: 0 0 8px; font-size: 18px; }
-  .hint { color: #5a6a7a; font-size: 13px; margin: 0 0 10px; }
+  .hint { color: #5a6a7a; font-size: 13px; margin: 0 0 10px; line-height: 1.6; }
+  .hint code {
+    background: #eef2ff;
+    color: #2563eb;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 12px;
+  }
   .ok { color: #22a06b; }
   .warn { color: #b45309; }
   button {

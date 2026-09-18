@@ -124,22 +124,22 @@
     }
   }
 
-  // 保存 WebDAV 配置（后端先实测连通性，再加密存储；返回消息字符串）
-  async function handleSaveWebdav(url, username, password) {
+  // 保存 WebDAV 凭据（地址固定为官方地址，后端实测连通性后加密存储；返回消息字符串）
+  async function handleSaveWebdav(username, password) {
     busy = true;
     error = null;
     try {
       const res = await fetch('/api/webdav/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, username, password }),
+        body: JSON.stringify({ username, password }),
       });
       const data = await res.json();
       if (data.success) {
         webdavConfigured = true;
-        webdavUrl = data.url || url;
+        webdavUrl = data.url || 'https://dav.kzwr.com/dav';
         loadUserInfo();
-        return `WebDAV 已配置并验证通过: ${data.url}`;
+        return 'WebDAV 已配置并验证通过';
       }
       return `配置失败: ${data.error}`;
     } catch (e) {
