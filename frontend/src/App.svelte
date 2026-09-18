@@ -4,6 +4,7 @@
   import RestorePage from './views/RestorePage.svelte';
   import SettingsPage from './views/SettingsPage.svelte';
   import LiveStatus from './components/LiveStatus.svelte';
+  import AlertBanner from './components/AlertBanner.svelte';
 
   // 全局状态
   let health = '检查中...';
@@ -36,6 +37,10 @@
   // 加密密钥（age 公钥展示 / 自定义私钥 / 自动生成后提醒保存）
   let keyInfo = null; // { public_key }
   let revealKey = ''; // 首次启动自动生成的私钥（后端一次性下发）
+  // 监控告警
+  let alerts = [];
+  // 告警 Webhook 地址（通知设置）
+  let webhookUrl = '';
 
   const navItems = [
     { id: 'dashboard', label: '📊 概览' },
@@ -74,6 +79,10 @@
             if (data.status === 'completed') {
               loadRestoreFiles();
             }
+            // 任务失败后刷新告警（后端已记录告警）
+            if (data.status === 'failed') {
+              loadAlerts();
+            }
           }
         } catch (e) {}
       };
@@ -108,6 +117,7 @@
       scheduleCronValid = data.schedule_cron_valid !== false;
       webdavConfigured = !!data.webdav_configured;
       webdavUrl = data.webdav_url || '';
+      webhookUrl = data.webhook_url || '';
       if (data.error) error = data.error;
     } catch (e) {
       error = e.message;
@@ -162,6 +172,39 @@
     if (data.success) {
       keyInfo = { public_key: data.public_key };
     }
+    return data;
+  }
+
+  // 加载告警（监控：备份/恢复失败、配置缺失等）
+  async function loadAlerts() {
+    try {
+      const res = await fetch('/api/alerts');
+      const data = await res.json();
+      alerts = data.alerts || [];
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
+  // 清空告警
+  async function clearAlerts() {
+    try {
+      await fetch('/api/alerts', { method: 'DELETE' });
+      alerts = [];
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
+  // 保存告警 Webhook 地址（空串 = 关闭外发）
+  async function handleSaveWebhook(url) {
+    const res = await fetch('/api/notify/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ webhook_url: url }),
+    });
+    const data = await res.json();
+    if (data.success) webhookUrl = data.webhook_url || '';
     return data;
   }
 
@@ -266,6 +309,7 @@
   loadRestoreFiles();
   loadUserInfo();
   loadKeys();
+  loadAlerts();
   connectWS();
 </script>
 
@@ -291,6 +335,9 @@
   {#if error}
     <div class="error">⚠️ {error}</div>
   {/if}
+
+  <!-- 监控告警（备份/恢复失败等） -->
+  <AlertBanner {alerts} onClear={clearAlerts} />
 
   <!-- 主体内容 + 右侧常驻实时任务面板 -->
   <div class="layout">
@@ -330,9 +377,11 @@
           {userInfoError}
           {keyInfo}
           {revealKey}
+          {webhookUrl}
           onSaveWebdav={handleSaveWebdav}
           onSetKey={handleSetKey}
           onGenerateKey={handleGenerateKey}
+          onSaveWebhook={handleSaveWebhook}
         />
       {/if}
     </div>

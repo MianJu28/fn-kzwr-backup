@@ -88,6 +88,9 @@ async fn main() -> anyhow::Result<()> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| var_dir.join("restore"));
 
+    // 告警汇聚点（监控告警，最多保留 50 条）
+    let alerts = Arc::new(fnos_backup::domain::alerts::AlertSink::new(50));
+
     // 内部事件总线（状态推送）
     let eventbus = Arc::new(fnos_backup::eventbus::EventBus::new());
 
@@ -99,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
         cfg_dir,
         pending_key_reveal: pending_reveal,
         store,
+        alerts,
         eventbus,
         config: config_mgr,
         target_folder,

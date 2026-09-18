@@ -64,6 +64,8 @@ pub struct ConfigResponse {
     pub webdav_configured: bool,
     /// 已配置的 WebDAV 地址（非敏感）
     pub webdav_url: Option<String>,
+    /// 告警 Webhook 地址（空 = 不外发）
+    pub webhook_url: Option<String>,
     pub error: Option<String>,
 }
 
@@ -157,6 +159,48 @@ pub struct KeysChangeResponse {
     pub error: Option<String>,
 }
 
+/// 告警列表响应（监控告警）
+#[derive(Serialize)]
+pub struct AlertsResponse {
+    pub alerts: Vec<crate::domain::alerts::Alert>,
+    pub error: Option<String>,
+}
+
+/// Webhook 配置请求
+#[derive(Deserialize)]
+pub struct WebhookSaveRequest {
+    /// 告警 Webhook 地址（空 = 关闭外发）
+    pub webhook_url: String,
+}
+
+/// Webhook 配置响应
+#[derive(Serialize)]
+pub struct WebhookSaveResponse {
+    pub success: bool,
+    pub webhook_url: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 记录一条告警；若配置了 Webhook 则异步尽力外发（不阻塞主流程）
+fn raise_alert(
+    state: &AppState,
+    level: crate::domain::alerts::AlertLevel,
+    source: crate::domain::alerts::AlertSource,
+    message: String,
+) {
+    let alert = state.alerts.push(level, source, message);
+    let webhook = {
+        let mgr = state.config.lock().unwrap();
+        mgr.load()
+            .ok()
+            .and_then(|c| c.notify.webhook_url)
+            .filter(|s| !s.trim().is_empty())
+    };
+    if let Some(url) = webhook {
+        tokio::spawn(crate::domain::alerts::dispatch_webhook(url, alert));
+    }
+}
+
 // ── Handler ────────────────────────────────────
 
 async fn health(State(_state): State<AppState>) -> Json<HealthResponse> {
@@ -236,6 +280,7 @@ fn config_response(
         schedule_cron_valid: valid,
         webdav_configured,
         webdav_url: cfg.webdav.url.clone(),
+        webhook_url: cfg.notify.webhook_url.clone(),
         error,
     }
 }
@@ -258,6 +303,7 @@ async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
             schedule_cron_valid: true,
             webdav_configured: false,
             webdav_url: None,
+            webhook_url: None,
             error: Some(format!("{:#}", e)),
         }),
     }
@@ -338,6 +384,12 @@ pub async fn run_backup_now(state: &AppState) -> BackupResponse {
             mgr.load().map(|c| webdav_ready(&c)).unwrap_or(false)
         };
     if !configured {
+        raise_alert(
+            state,
+            crate::domain::alerts::AlertLevel::Warn,
+            crate::domain::alerts::AlertSource::Config,
+            "备份未执行：WebDAV 未配置".to_string(),
+        );
         return BackupResponse {
             uploaded: 0,
             uploaded_bytes: 0,
@@ -352,6 +404,12 @@ pub async fn run_backup_now(state: &AppState) -> BackupResponse {
     let (paths, target_folder, retention_cfg) = read_backup_config(state);
 
     if paths.is_empty() {
+        raise_alert(
+            state,
+            crate::domain::alerts::AlertLevel::Warn,
+            crate::domain::alerts::AlertSource::Backup,
+            "备份未执行：未配置备份路径".to_string(),
+        );
         return BackupResponse {
             uploaded: 0,
             uploaded_bytes: 0,
@@ -399,14 +457,23 @@ pub async fn run_backup_now(state: &AppState) -> BackupResponse {
             orphan_removed: summary.orphan_removed,
             error: None,
         },
-        Err(e) => BackupResponse {
-            uploaded: 0,
-            uploaded_bytes: 0,
-            deleted: 0,
-            unchanged: 0,
-            orphan_removed: 0,
-            error: Some(format!("{:#}", e)),
-        },
+        Err(e) => {
+            let msg = format!("{:#}", e);
+            raise_alert(
+                state,
+                crate::domain::alerts::AlertLevel::Error,
+                crate::domain::alerts::AlertSource::Backup,
+                format!("备份失败：{}", msg),
+            );
+            BackupResponse {
+                uploaded: 0,
+                uploaded_bytes: 0,
+                deleted: 0,
+                unchanged: 0,
+                orphan_removed: 0,
+                error: Some(msg),
+            }
+        }
     }
 }
 
@@ -475,6 +542,12 @@ async fn restore_run(
             mgr.load().map(|c| webdav_ready(&c)).unwrap_or(false)
         };
     if !configured {
+        raise_alert(
+            &state,
+            crate::domain::alerts::AlertLevel::Warn,
+            crate::domain::alerts::AlertSource::Config,
+            "恢复未执行：WebDAV 未配置".to_string(),
+        );
         return Json(RestoreResponse {
             restored: 0,
             restored_bytes: 0,
@@ -508,11 +581,20 @@ async fn restore_run(
             restored_bytes: summary.restored_bytes,
             error: None,
         }),
-        Err(e) => Json(RestoreResponse {
-            restored: 0,
-            restored_bytes: 0,
-            error: Some(format!("{:#}", e)),
-        }),
+        Err(e) => {
+            let msg = format!("{:#}", e);
+            raise_alert(
+                &state,
+                crate::domain::alerts::AlertLevel::Error,
+                crate::domain::alerts::AlertSource::Restore,
+                format!("恢复失败：{}", msg),
+            );
+            Json(RestoreResponse {
+                restored: 0,
+                restored_bytes: 0,
+                error: Some(msg),
+            })
+        }
     }
 }
 
@@ -601,6 +683,49 @@ async fn keys_generate(State(state): State<AppState>) -> Json<KeysChangeResponse
     })
 }
 
+/// 最近告警（监控告警：备份/恢复/配置异常）
+async fn alerts_get(State(state): State<AppState>) -> Json<AlertsResponse> {
+    Json(AlertsResponse {
+        alerts: state.alerts.list(),
+        error: None,
+    })
+}
+
+/// 清空告警
+async fn alerts_clear(State(state): State<AppState>) -> Json<AlertsResponse> {
+    state.alerts.clear();
+    Json(AlertsResponse {
+        alerts: Vec::new(),
+        error: None,
+    })
+}
+
+/// 保存告警 Webhook 地址（空串 = 关闭外发）
+async fn webhook_save(
+    State(state): State<AppState>,
+    Json(body): Json<WebhookSaveRequest>,
+) -> Json<WebhookSaveResponse> {
+    let url = body.webhook_url.trim().to_string();
+    let guard = state.config.lock().unwrap();
+    let mut cfg = match guard.load() {
+        Ok(c) => c,
+        Err(_) => crate::infra::config::AppConfig::default(),
+    };
+    cfg.notify.webhook_url = if url.is_empty() { None } else { Some(url) };
+    match guard.save(&cfg) {
+        Ok(_) => Json(WebhookSaveResponse {
+            success: true,
+            webhook_url: cfg.notify.webhook_url.clone(),
+            error: None,
+        }),
+        Err(e) => Json(WebhookSaveResponse {
+            success: false,
+            webhook_url: None,
+            error: Some(format!("{:#}", e)),
+        }),
+    }
+}
+
 /// 构建应用路由（不含 /api 前缀，由 main.rs nest("/api") 统一加前缀）
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -614,5 +739,7 @@ pub fn router(state: AppState) -> Router {
         .route("/restore/run", post(restore_run))
         .route("/keys", get(keys_get).post(keys_set))
         .route("/keys/generate", post(keys_generate))
+        .route("/alerts", get(alerts_get).delete(alerts_clear))
+        .route("/notify/webhook", post(webhook_save))
         .with_state(state)
 }
