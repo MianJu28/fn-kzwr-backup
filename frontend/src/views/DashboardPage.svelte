@@ -1,9 +1,7 @@
 <script>
-  import LiveStatus from '../components/LiveStatus.svelte';
   import OverviewSection from '../components/OverviewSection.svelte';
   import UserCard from '../components/UserCard.svelte';
 
-  export let liveStatus = null;
   export let backupPaths = [];
   export let targetFolder = 'fn-backup';
   export let webdavConfigured = false;
@@ -18,10 +16,7 @@
 <!-- 备份账号（WebDAV） -->
 <UserCard {userInfo} {userInfoError} configured={webdavConfigured} />
 
-<!-- 实时任务状态（WebSocket 推送） -->
-<LiveStatus {liveStatus} />
-
-<!-- 当前配置概览 -->
+<!-- 当前配置概览（实时任务已移到右侧常驻面板） -->
 <OverviewSection
   {backupPaths}
   {targetFolder}
@@ -30,4 +25,5 @@
   {restoreFolders}
   {scheduleCron}
   {scheduleCronValid}
+  {userInfo}
 />

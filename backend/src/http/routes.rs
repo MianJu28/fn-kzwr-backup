@@ -131,6 +131,32 @@ pub struct RestoreFilesResponse {
     pub error: Option<String>,
 }
 
+/// 密钥信息响应（永不回传私钥明文）
+#[derive(Serialize)]
+pub struct KeysInfoResponse {
+    /// age 公钥（"age1..."）
+    pub public_key: String,
+    /// 首次启动自动生成时的私钥（仅此一次返回，提醒用户保存；之后恒为 None）
+    pub private_key_once: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 设置自定义私钥请求
+#[derive(Deserialize)]
+pub struct KeysSetRequest {
+    /// age 私钥（"AGE-SECRET-KEY-1..."）
+    pub private_key: String,
+}
+
+/// 密钥变更响应（generate 成功时 private_key 仅此一次返回）
+#[derive(Serialize)]
+pub struct KeysChangeResponse {
+    pub success: bool,
+    pub public_key: Option<String>,
+    pub private_key: Option<String>,
+    pub error: Option<String>,
+}
+
 // ── Handler ────────────────────────────────────
 
 async fn health(State(_state): State<AppState>) -> Json<HealthResponse> {
@@ -358,7 +384,7 @@ pub async fn run_backup_now(state: &AppState) -> BackupResponse {
         account: webdav_username(state),
         source: Arc::new(crate::infra::source::local::LocalFsSource::new(&paths[0])),
         target: state.target.clone(),
-        crypto: state.crypto.clone(),
+        crypto: state.crypto.get(),
         store: state.store.clone(),
         target_prefix: Some(target_folder),
         eventbus: Some(state.eventbus.clone()),
@@ -472,7 +498,7 @@ async fn restore_run(
 
     let job = RestoreJob {
         target: state.target.clone(),
-        crypto: state.crypto.clone(),
+        crypto: state.crypto.get(),
         target_prefix: Some(state.target_folder.clone()),
         eventbus: Some(state.eventbus.clone()),
     };
@@ -490,6 +516,91 @@ async fn restore_run(
     }
 }
 
+/// 当前 age 公钥（用于展示；永不回传私钥）
+async fn keys_get(State(state): State<AppState>) -> Json<KeysInfoResponse> {
+    let public_key = state.crypto.get().recipient.to_string();
+    // 首次启动自动生成的私钥：一次性交给前端展示，读取后即清空
+    let private_key_once = state.pending_key_reveal.lock().unwrap().take();
+    Json(KeysInfoResponse {
+        public_key,
+        private_key_once,
+        error: None,
+    })
+}
+
+/// 更换密钥（用户自定义私钥）：校验格式 → 加密落盘密钥库 → 热切换加密会话
+async fn keys_set(
+    State(state): State<AppState>,
+    Json(body): Json<KeysSetRequest>,
+) -> Json<KeysChangeResponse> {
+    let trimmed = body.private_key.trim();
+    if trimmed.is_empty() {
+        return Json(KeysChangeResponse {
+            success: false,
+            public_key: None,
+            private_key: None,
+            error: Some("私钥不能为空".to_string()),
+        });
+    }
+    let keys = match crate::domain::crypto::AgeKeys::from_secret_key(trimmed) {
+        Ok(k) => k,
+        Err(e) => {
+            return Json(KeysChangeResponse {
+                success: false,
+                public_key: None,
+                private_key: None,
+                error: Some(format!("{:#}", e)),
+            })
+        }
+    };
+    let public_key = keys.recipient_str();
+    let ks_path = crate::infra::keystore::keystore_path(&state.cfg_dir);
+    if let Err(e) = crate::infra::keystore::save_keystore(&keys, &state.passphrase, &ks_path) {
+        return Json(KeysChangeResponse {
+            success: false,
+            public_key: Some(public_key),
+            private_key: None,
+            error: Some(format!("保存密钥库失败: {:#}", e)),
+        });
+    }
+    state
+        .crypto
+        .swap(crate::domain::crypto::CryptoSession::full(&keys));
+    tracing::info!("已更换 age 密钥（用户自定义私钥）");
+    Json(KeysChangeResponse {
+        success: true,
+        public_key: Some(public_key),
+        private_key: None,
+        error: None,
+    })
+}
+
+/// 自动生成新密钥对：加密落盘、热切换；私钥仅此一次返回（提醒用户保存）
+async fn keys_generate(State(state): State<AppState>) -> Json<KeysChangeResponse> {
+    let keys = crate::domain::crypto::AgeKeys::generate();
+    let public_key = keys.recipient_str();
+    let private_key = keys.to_secret_key();
+    let ks_path = crate::infra::keystore::keystore_path(&state.cfg_dir);
+    if let Err(e) = crate::infra::keystore::save_keystore(&keys, &state.passphrase, &ks_path) {
+        return Json(KeysChangeResponse {
+            success: false,
+            public_key: Some(public_key),
+            private_key: None,
+            error: Some(format!("保存密钥库失败: {:#}", e)),
+        });
+    }
+    state
+        .crypto
+        .swap(crate::domain::crypto::CryptoSession::full(&keys));
+    tracing::info!("已自动生成新的 age 密钥对");
+    Json(KeysChangeResponse {
+        success: true,
+        public_key: Some(public_key),
+        private_key: Some(private_key),
+        error: None,
+    })
+}
+
 /// 构建应用路由（不含 /api 前缀，由 main.rs nest("/api") 统一加前缀）
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -501,5 +612,7 @@ pub fn router(state: AppState) -> Router {
         .route("/backup/run", post(backup_run))
         .route("/restore/files", get(restore_files))
         .route("/restore/run", post(restore_run))
+        .route("/keys", get(keys_get).post(keys_set))
+        .route("/keys/generate", post(keys_generate))
         .with_state(state)
 }

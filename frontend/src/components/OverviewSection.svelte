@@ -7,6 +7,11 @@
   export let restoreFolders = [];
   export let scheduleCron = '';
   export let scheduleCronValid = true;
+  export let userInfo = null;
+
+  // WebDAV 目标展示账号用户名；后端取不到账号时回传占位「已配置」，需过滤掉
+  $: webdavAccount =
+    userInfo && userInfo.username && userInfo.username !== '已配置' ? userInfo.username : '';
 </script>
 
 <section class="overview">
@@ -40,7 +45,8 @@
       <span class="ov-label">WebDAV 目标</span>
       <span class="ov-value">
         {#if webdavConfigured}
-          ✅ 已配置{webdavUrl ? `：${webdavUrl}` : ''}
+          ✅ 已配置{#if webdavAccount}：{webdavAccount}{/if}
+          {#if webdavUrl}<span class="ov-sub">{webdavUrl}</span>{/if}
         {:else}
           <span class="muted">⚠️ 未配置</span>
         {/if}
@@ -104,6 +110,7 @@
     margin-bottom: 8px;
   }
   .ov-value { color: #1f2d3d; font-size: 14px; word-break: break-all; line-height: 1.6; }
+  .ov-sub { display: block; color: #8a94a6; font-size: 12px; margin-top: 4px; word-break: break-all; }
   .muted { color: #8a94a6; }
   .paths-list { display: flex; flex-wrap: wrap; gap: 6px; }
   .path-chip {

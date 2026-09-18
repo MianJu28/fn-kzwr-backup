@@ -3,6 +3,7 @@
 
   // 恢复
   export let restoreFolders = [];
+  export let backupPaths = [];
   export let busy = false;
   // onRestore(files: string[], label: string, sourcePath: string) => Promise<{restored, restored_bytes, error}>
   export let onRestore = null;
@@ -80,7 +81,13 @@
   <p class="hint">展开文件夹选择要恢复的文件，恢复到默认目录。</p>
 
   {#if restoreFolders.length === 0}
-    <p class="warn">尚未配置备份路径或没有备份数据</p>
+    <p class="warn">
+      {#if backupPaths.length === 0}
+        尚未配置备份路径：请先到「备份」页添加备份路径
+      {:else}
+        暂无备份数据：请先到「备份」页执行一次备份
+      {/if}
+    </p>
   {:else}
     <div class="folders">
       {#each restoreFolders as folder, i (folder.path)}

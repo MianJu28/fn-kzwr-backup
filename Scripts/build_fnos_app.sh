@@ -84,6 +84,10 @@ cp -r "$FRONTEND_DIR/dist" "$PACK_DIR/app/www"
 chmod +x "$PACK_DIR"/cmd/* 2>/dev/null || true
 chmod +x "$PACK_DIR/app/bin/"* 2>/dev/null || true
 
+# 4.5) 统一换行符为 LF（CRLF 会导致飞牛生命周期脚本 "bad interpreter"、manifest 解析值带 \r 报"不是有效 fpk"）
+find "$PACK_DIR" -type f \( -name manifest -o -path "*/cmd/*" -o -path "*/wizard/*" -o -path "*/config/*" -o -name config \) -print0 2>/dev/null \
+  | xargs -0 -r sed -i 's/\r$//' 2>/dev/null || true
+
 echo "==> [4/4] Package .fpk ..."
 if [ "$DO_FPK" = "1" ]; then
     ( cd "$PACK_DIR" && "$FNPACK" build )
