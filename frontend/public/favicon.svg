@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3b7bf0" />
+      <stop offset="100%" stop-color="#2a5cd8" />
+    </linearGradient>
+  </defs>
+  <rect width="48" height="48" rx="11" fill="url(#g)" />
+  <!-- 三级台阶（呼应飞牛台阶折线） -->
+  <path
+    d="M13.8 36H20.4V29.4H27V22.8H33.6"
+    fill="none"
+    stroke="#fff"
+    stroke-width="3"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <!-- 上升箭头：横跨三级台阶，与台阶留约有间隙 -->
+  <path
+    d="M14.2 17.8 24 11.6 33.8 17.8"
+    fill="none"
+    stroke="#fff"
+    stroke-width="3.4"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

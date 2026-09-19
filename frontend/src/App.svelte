@@ -5,16 +5,25 @@
   import SettingsPage from './views/SettingsPage.svelte';
   import LiveStatus from './components/LiveStatus.svelte';
   import AlertBanner from './components/AlertBanner.svelte';
+  import Toast from './components/Toast.svelte';
+  import ConfirmDialog from './components/ConfirmDialog.svelte';
+  import Icon from './components/Icon.svelte';
+  import Logo from './components/Logo.svelte';
 
-  // 全局状态
-  let health = '检查中...';
+  import { api } from './lib/api.js';
+  import { toast } from './lib/toast.js';
+  import { theme, initTheme, toggleTheme } from './lib/theme.js';
+
+  /* ── 全局状态 ─────────────────────────────────────────────── */
+  let health = ''; // 服务状态文本
+  let version = '';
+  let serviceOk = false;
   let error = null;
-  let busy = false;
 
-  // 当前页面（导航切换）
   let currentPage = 'dashboard';
+  let loading = true;
 
-  // WebDAV 配置状态（ADR-009：官方 WebDAV 为唯一目标）
+  // WebDAV 目标
   let webdavConfigured = false;
   let webdavUrl = '';
 
@@ -24,41 +33,134 @@
   let scheduleCron = '';
   let scheduleCronValid = true;
 
-  // 备份/恢复
+  // 备份 / 恢复
+  let busy = false;
   let backupResult = null;
-  // 可恢复文件（从 SQLite 查询）
   let restoreFolders = [];
-  // 实时任务状态（WebSocket 推送）
-  let liveStatus = null; // { kind, status, current_file, done, total }
+
+  // 实时任务（WebSocket）
+  let liveStatus = null;
   let wsConnected = false;
-  // 账号信息（WebDAV 用户名）
+
+  // 账号
   let userInfo = null;
   let userInfoError = null;
-  // 加密密钥（age 公钥展示 / 自定义私钥 / 自动生成后提醒保存）
-  let keyInfo = null; // { public_key }
-  let revealKey = ''; // 首次启动自动生成的私钥（后端一次性下发）
-  let keyBackedUp = false; // 用户是否已确认备份私钥
-  // 监控告警
+
+  // 密钥
+  let keyInfo = null;
+  let revealKey = '';
+  let keyBackedUp = false;
+
+  // 告警与通知
   let alerts = [];
-  // 告警 Webhook 配置（通知设置）
   let webhookUrl = '';
-  let webhookHeaders = []; // [{ name, value }]
+  let webhookHeaders = [];
   let webhookBody = '';
 
-  const navItems = [
-    { id: 'dashboard', label: '📊 概览' },
-    { id: 'backup', label: '⬆️ 备份' },
-    { id: 'restore', label: '⬇️ 恢复' },
-    { id: 'settings', label: '⚙️ 设置' },
+  const NAV = [
+    { id: 'dashboard', label: '概览', icon: 'grid' },
+    { id: 'backup', label: '备份', icon: 'upload' },
+    { id: 'restore', label: '恢复', icon: 'download' },
+    { id: 'settings', label: '设置', icon: 'sliders' },
   ];
 
-  // 切换页面；进入恢复页时刷新可恢复列表，避免展示过期数据
-  function go(page) {
-    currentPage = page;
-    if (page === 'restore') loadRestoreFiles();
+  const PAGE_META = {
+    dashboard: { title: '概览', desc: '备份状态、配置一览与实时任务进度' },
+    backup: { title: '备份', desc: '配置备份路径与定时任务，或立即执行一次增量备份' },
+    restore: { title: '恢复', desc: '浏览云端备份内容，按文件或目录恢复到原位置' },
+    settings: { title: '设置', desc: 'WebDAV 凭据、加密密钥、通知与配置迁移' },
+  };
+
+  $: page = PAGE_META[currentPage] || PAGE_META.dashboard;
+  $: alertsCount = alerts.length;
+  $: readyToRun = webdavConfigured && backupPaths.length > 0;
+
+  /* ── 数据加载 ─────────────────────────────────────────────── */
+
+  async function loadHealth() {
+    try {
+      const d = await api.health();
+      version = d.version || '';
+      health = d.status === 'ok' ? `服务正常` : `状态异常`;
+      serviceOk = d.status === 'ok';
+    } catch (e) {
+      health = '服务不可达';
+      serviceOk = false;
+    }
   }
 
-  // 连接 WebSocket 实时状态流
+  async function loadConfig() {
+    try {
+      const d = await api.config();
+      backupPaths = d.backup_paths || [];
+      targetFolder = d.target_folder || 'fn-backup';
+      scheduleCron = d.schedule_cron || '';
+      scheduleCronValid = d.schedule_cron_valid !== false;
+      webdavConfigured = !!d.webdav_configured;
+      webdavUrl = d.webdav_url || '';
+      webhookUrl = d.webhook_url || '';
+      webhookHeaders = d.webhook_headers || [];
+      webhookBody = d.webhook_body || '';
+      keyBackedUp = !!d.key_backed_up;
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
+  async function loadUserInfo() {
+    try {
+      const d = await api.userInfo();
+      userInfo = d;
+      userInfoError = d.error || null;
+    } catch (e) {
+      userInfoError = e.message;
+    }
+  }
+
+  async function loadKeys() {
+    try {
+      const d = await api.keys();
+      keyInfo = { public_key: d.public_key };
+      if (d.private_key_once) revealKey = d.private_key_once;
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
+  async function loadAlerts() {
+    try {
+      const d = await api.alerts();
+      alerts = d.alerts || [];
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
+  async function loadRestoreFiles() {
+    try {
+      const d = await api.restoreFiles();
+      restoreFolders = d.folders || [];
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
+  async function loadAll() {
+    loading = true;
+    await Promise.all([loadHealth(), loadConfig(), loadUserInfo(), loadKeys(), loadAlerts(), loadRestoreFiles()]);
+    loading = false;
+  }
+
+  /* ── 页面切换 ─────────────────────────────────────────────── */
+
+  function go(pageId) {
+    currentPage = pageId;
+    error = null;
+    if (pageId === 'restore') loadRestoreFiles();
+  }
+
+  /* ── WebSocket 实时状态 ───────────────────────────────────── */
+
   function connectWS() {
     try {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -69,480 +171,644 @@
       ws.onmessage = (evt) => {
         try {
           const data = JSON.parse(evt.data);
-          if (data.type === 'event') {
-            liveStatus = {
-              kind: data.kind,
-              status: data.status,
-              current_file: data.current_file,
-              done: data.done,
-              total: data.total,
-              bytes_done: data.bytes_done,
-              bytes_total: data.bytes_total,
-              elapsed_ms: data.elapsed_ms,
-              speed: data.speed,
-              at: Date.now(),
-              message: data.message,
-            };
-            // 任务结束（备份/恢复完成）后刷新可恢复列表，保证恢复页数据最新
-            if (data.status === 'completed') {
-              loadRestoreFiles();
-            }
-            // 任务失败后刷新告警（后端已记录告警）
-            if (data.status === 'failed') {
-              loadAlerts();
-            }
+          if (data.type !== 'event') return;
+          liveStatus = {
+            kind: data.kind,
+            status: data.status,
+            current_file: data.current_file,
+            done: data.done,
+            total: data.total,
+            bytes_done: data.bytes_done,
+            bytes_total: data.bytes_total,
+            elapsed_ms: data.elapsed_ms,
+            speed: data.speed,
+            at: Date.now(),
+            message: data.message,
+          };
+          if (data.status === 'completed') {
+            loadRestoreFiles();
+            if (data.kind === 'backup') toast.success(data.message || '备份任务已完成', '备份完成');
+            if (data.kind === 'restore') toast.success(data.message || '恢复任务已完成', '恢复完成');
           }
-        } catch (e) {}
+          if (data.status === 'failed') {
+            loadAlerts();
+            toast.error(data.message || '任务执行失败', '任务失败');
+          }
+        } catch (e) {
+          /* 忽略非法事件 */
+        }
       };
       ws.onclose = () => {
         wsConnected = false;
-        // 3 秒后重连
         setTimeout(connectWS, 3000);
       };
-      ws.onerror = () => {
-        ws.close();
-      };
-    } catch (e) {}
-  }
-
-  async function checkHealth() {
-    try {
-      const res = await fetch('/api/health');
-      const data = await res.json();
-      health = `服务正常 (v${data.version})`;
+      ws.onerror = () => ws.close();
     } catch (e) {
-      health = `服务异常: ${e.message}`;
+      /* 忽略 */
     }
   }
 
-  async function loadConfig() {
-    try {
-      const res = await fetch('/api/config');
-      const data = await res.json();
-      backupPaths = data.backup_paths || [];
-      targetFolder = data.target_folder || 'fn-backup';
-      scheduleCron = data.schedule_cron || '';
-      scheduleCronValid = data.schedule_cron_valid !== false;
-      webdavConfigured = !!data.webdav_configured;
-      webdavUrl = data.webdav_url || '';
-      webhookUrl = data.webhook_url || '';
-      webhookHeaders = data.webhook_headers || [];
-      webhookBody = data.webhook_body || '';
-      keyBackedUp = !!data.key_backed_up;
-      if (data.error) error = data.error;
-    } catch (e) {
-      error = e.message;
-    }
-  }
+  /* ── 操作：备份 ───────────────────────────────────────────── */
 
-  // 加载账号信息（WebDAV 用户名）
-  async function loadUserInfo() {
-    try {
-      const res = await fetch('/api/user/info');
-      const data = await res.json();
-      userInfo = data;
-      userInfoError = data.error || null;
-    } catch (e) {
-      userInfoError = e.message;
-    }
-  }
-
-  // 加载密钥信息（只回传公钥；首次自动生成的私钥会一次性返回）
-  async function loadKeys() {
-    try {
-      const res = await fetch('/api/keys');
-      const data = await res.json();
-      keyInfo = { public_key: data.public_key };
-      if (data.private_key_once) {
-        revealKey = data.private_key_once;
-      }
-    } catch (e) {
-      error = e.message;
-    }
-  }
-
-  // 使用自定义私钥（POST /api/keys）
-  async function handleSetKey(privateKey) {
-    const res = await fetch('/api/keys', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ private_key: privateKey }),
-    });
-    const data = await res.json();
-    if (data.success) {
-      keyInfo = { public_key: data.public_key };
-      revealKey = '';
-      keyBackedUp = true; // 私钥由用户提供，视为已备份
-    }
-    return data;
-  }
-
-  // 自动生成新密钥对（返回的私钥仅此一次展示，提醒用户保存）
-  async function handleGenerateKey() {
-    const res = await fetch('/api/keys/generate', { method: 'POST' });
-    const data = await res.json();
-    if (data.success) {
-      keyInfo = { public_key: data.public_key };
-      keyBackedUp = false; // 新生成的私钥尚未保存
-    }
-    return data;
-  }
-
-  // 导出当前私钥明文（用于另存备份；需管理员口令校验）
-  // 展示私钥后即视为「需重新确认备份」，重置标记使「我已妥善保存」可再次点击
-  async function handleExportKey(passphrase) {
-    const res = await fetch('/api/keys/export', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ passphrase }),
-    });
-    const data = await res.json();
-    if (data.private_key) keyBackedUp = false;
-    return data;
-  }
-
-  // 确认已妥善备份私钥
-  async function handleBackupAck() {
-    await fetch('/api/keys/backup-ack', { method: 'POST' });
-    keyBackedUp = true;
-  }
-
-  // 加载告警（监控：备份/恢复失败、配置缺失等）
-  async function loadAlerts() {
-    try {
-      const res = await fetch('/api/alerts');
-      const data = await res.json();
-      alerts = data.alerts || [];
-    } catch (e) {
-      error = e.message;
-    }
-  }
-
-  // 清空告警
-  async function clearAlerts() {
-    try {
-      await fetch('/api/alerts', { method: 'DELETE' });
-      alerts = [];
-    } catch (e) {
-      error = e.message;
-    }
-  }
-
-  // 保存告警 Webhook 配置（地址空串 = 关闭外发；可选自定义 headers/body 模板）
-  async function handleSaveWebhook(url, headers, bodyTemplate) {
-    const res = await fetch('/api/notify/webhook', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ webhook_url: url, headers, body_template: bodyTemplate }),
-    });
-    const data = await res.json();
-    if (data.success) {
-      webhookUrl = data.webhook_url || '';
-      webhookHeaders = data.headers || [];
-      webhookBody = data.body_template || '';
-    }
-    return data;
-  }
-
-  // 测试 Webhook 连通性（用当前表单配置直接发一条测试通知）
-  async function handleTestWebhook(url, headers, bodyTemplate) {
-    const res = await fetch('/api/notify/webhook/test', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ webhook_url: url, headers, body_template: bodyTemplate }),
-    });
-    return res.json();
-  }
-
-  // 导出配置（含 WebDAV 凭据与 age 私钥；需管理员口令）
-  async function handleExportConfig(passphrase) {
-    const res = await fetch('/api/config/export', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ passphrase }),
-    });
-    return res.json();
-  }
-
-  // 导入配置（覆盖配置并可恢复 age 私钥；需管理员口令）
-  async function handleImportConfig(passphrase, configText) {
-    const res = await fetch('/api/config/import', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ passphrase, config: configText }),
-    });
-    const data = await res.json();
-    if (data.success) {
-      // 配置已变更：刷新本地状态
-      await Promise.all([loadConfig(), loadKeys(), loadUserInfo(), loadRestoreFiles()]);
-    }
-    return data;
-  }
-
-  // 加载可恢复文件列表（从 SQLite 快照查询）
-  async function loadRestoreFiles() {
-    try {
-      const res = await fetch('/api/restore/files');
-      const data = await res.json();
-      restoreFolders = data.folders || [];
-      if (data.error) error = data.error;
-    } catch (e) {
-      error = e.message;
-    }
-  }
-
-  // 保存 WebDAV 凭据（地址固定为官方地址，后端实测连通性后加密存储；返回消息字符串）
-  async function handleSaveWebdav(username, password) {
-    busy = true;
-    error = null;
-    try {
-      const res = await fetch('/api/webdav/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password }),
-      });
-      const data = await res.json();
-      if (data.success) {
-        webdavConfigured = true;
-        webdavUrl = data.url || 'https://dav.kzwr.com/dav';
-        loadUserInfo();
-        return 'WebDAV 已配置并验证通过';
-      }
-      return `配置失败: ${data.error}`;
-    } catch (e) {
-      error = e.message;
-      return `配置失败: ${e.message}`;
-    } finally {
-      busy = false;
-    }
-  }
-
-  // 保存配置（供 BackupPage 调用）
   async function handleSaveConfig() {
     busy = true;
     error = null;
     try {
-      const res = await fetch('/api/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          backup_paths: backupPaths,
-          target_folder: targetFolder,
-          schedule_cron: scheduleCron.trim(),
-        }),
+      const d = await api.saveConfig({
+        backup_paths: backupPaths,
+        target_folder: targetFolder,
+        schedule_cron: scheduleCron.trim(),
       });
-      const data = await res.json();
-      scheduleCronValid = data.schedule_cron_valid !== false;
-      if (data.error) error = data.error;
-      else if (!scheduleCronValid) error = 'cron 表达式无效，已拒绝保存';
+      scheduleCronValid = d.schedule_cron_valid !== false;
+      if (d.error) {
+        error = d.error;
+        toast.error(d.error, '保存失败');
+      } else if (!scheduleCronValid) {
+        error = 'cron 表达式无效，已拒绝保存';
+        toast.error('cron 表达式无效，已拒绝保存');
+      } else {
+        toast.success('配置已保存并即时生效');
+      }
     } catch (e) {
       error = e.message;
+      toast.error(e.message);
     } finally {
       busy = false;
     }
   }
 
-  // 立即备份（供 BackupPage 调用）
   async function handleRunBackup() {
     busy = true;
     error = null;
     backupResult = null;
     try {
-      const res = await fetch('/api/backup/run', { method: 'POST' });
-      const data = await res.json();
-      backupResult = data;
-      if (data.error) {
-        error = data.error;
+      const d = await api.runBackup();
+      backupResult = d;
+      if (d.error) {
+        error = d.error;
+        if (d.skipped) toast.warn(d.error, '已跳过');
+        else toast.error(d.error, '备份失败');
       } else {
-        // 备份产生新快照，刷新可恢复列表
         await loadRestoreFiles();
+        toast.success(
+          `上传 ${d.uploaded} 个文件（${d.uploaded_bytes} 字节），未变化 ${d.unchanged}`,
+          '备份完成',
+        );
       }
     } catch (e) {
       error = e.message;
+      toast.error(e.message, '备份失败');
     } finally {
       busy = false;
     }
   }
 
-  // 恢复请求（供 RestorePage 调用，返回 {restored, restored_bytes, error}）
+  /* ── 操作：恢复 ───────────────────────────────────────────── */
+
   async function handleRestore(files, sourcePath) {
-    const body = { files, source_path: sourcePath };
-    const res = await fetch('/api/restore/run', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    return res.json();
+    return api.restore(files, sourcePath);
   }
 
-  checkHealth();
-  loadConfig();
-  loadRestoreFiles();
-  loadUserInfo();
-  loadKeys();
-  loadAlerts();
+  /* ── 操作：WebDAV / 密钥 / 通知 / 配置迁移 ───────────────── */
+
+  async function handleSaveWebdav(username, password) {
+    busy = true;
+    try {
+      const d = await api.saveWebdav(username, password);
+      if (d.success) {
+        webdavConfigured = true;
+        webdavUrl = d.url || webdavUrl;
+        await loadUserInfo();
+        toast.success('WebDAV 凭据已保存并验证通过');
+        return '';
+      }
+      toast.error(d.error || '凭据验证未通过');
+      return d.error || '配置失败';
+    } catch (e) {
+      toast.error(e.message);
+      return e.message;
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function handleSetKey(privateKey) {
+    const d = await api.setKey(privateKey);
+    if (d.success) {
+      keyInfo = { public_key: d.public_key };
+      revealKey = '';
+      keyBackedUp = true;
+      toast.success('私钥已更新并立即生效');
+    }
+    return d;
+  }
+
+  async function handleGenerateKey() {
+    const d = await api.generateKey();
+    if (d.success) {
+      keyInfo = { public_key: d.public_key };
+      keyBackedUp = false;
+      toast.warn('已生成新密钥对，请立即保存私钥', '密钥已轮换');
+    }
+    return d;
+  }
+
+  async function handleExportKey(passphrase) {
+    const d = await api.exportKey(passphrase);
+    if (d.private_key) keyBackedUp = false;
+    return d;
+  }
+
+  async function handleBackupAck() {
+    await api.backupAck();
+    keyBackedUp = true;
+    toast.success('已记录「私钥已妥善保存」', '风险提示已关闭');
+  }
+
+  async function handleSaveWebhook(url, headers, bodyTemplate) {
+    const d = await api.saveWebhook(url, headers, bodyTemplate);
+    if (d.success) {
+      webhookUrl = d.webhook_url || '';
+      webhookHeaders = d.headers || [];
+      webhookBody = d.body_template || '';
+    }
+    return d;
+  }
+
+  async function handleTestWebhook(url, headers, bodyTemplate) {
+    return api.testWebhook(url, headers, bodyTemplate);
+  }
+
+  async function handleExportConfig(passphrase) {
+    return api.exportConfig(passphrase);
+  }
+
+  async function handleImportConfig(passphrase, configText) {
+    const d = await api.importConfig(passphrase, configText);
+    if (d.success) {
+      await Promise.all([loadConfig(), loadKeys(), loadUserInfo(), loadRestoreFiles()]);
+      toast.success('配置已导入并即时生效');
+    }
+    return d;
+  }
+
+  async function clearAlerts() {
+    try {
+      await api.clearAlerts();
+      alerts = [];
+      toast.info('告警已清空');
+    } catch (e) {
+      toast.error(e.message);
+    }
+  }
+
+  /* ── 启动 ─────────────────────────────────────────────────── */
+
+  initTheme();
+  loadAll();
   connectWS();
 </script>
 
-<main>
-  <header>
-    <h1>🛡️ fnos 增量加密备份</h1>
-    <p class="health" class:ok={health.startsWith('服务正常')}>{health}</p>
-  </header>
-
-  <!-- 顶部导航栏 -->
-  <nav class="top-nav">
-    {#each navItems as item}
-      <button
-        class="nav-item"
-        class:active={currentPage === item.id}
-        on:click={() => go(item.id)}
-      >
-        {item.label}
-      </button>
-    {/each}
-  </nav>
-
-  {#if error}
-    <div class="error">⚠️ {error}</div>
-  {/if}
-
-  <!-- 监控告警（备份/恢复失败等） -->
-  <AlertBanner {alerts} onClear={clearAlerts} />
-
-  <!-- 主体内容 + 右侧常驻实时任务面板 -->
-  <div class="layout">
-    <div class="content">
-      <!-- 按功能切换页面 -->
-      {#if currentPage === 'dashboard'}
-        <DashboardPage
-          {backupPaths}
-          {targetFolder}
-          {webdavConfigured}
-          {webdavUrl}
-          {restoreFolders}
-          {scheduleCron}
-          {scheduleCronValid}
-          {userInfo}
-          {userInfoError}
-        />
-      {:else if currentPage === 'backup'}
-        <BackupPage
-          bind:backupPaths
-          bind:targetFolder
-          bind:scheduleCron
-          bind:scheduleCronValid
-          {busy}
-          {backupResult}
-          onSave={handleSaveConfig}
-          onRunBackup={handleRunBackup}
-        />
-      {:else if currentPage === 'restore'}
-        <RestorePage {restoreFolders} {backupPaths} {busy} onRestore={handleRestore} />
-      {:else if currentPage === 'settings'}
-        <SettingsPage
-          {webdavConfigured}
-          {webdavUrl}
-          {busy}
-          {userInfo}
-          {userInfoError}
-          {keyInfo}
-          {revealKey}
-          {keyBackedUp}
-          {webhookUrl}
-          {webhookHeaders}
-          {webhookBody}
-          onSaveWebdav={handleSaveWebdav}
-          onSetKey={handleSetKey}
-          onGenerateKey={handleGenerateKey}
-          onExportKey={handleExportKey}
-          onBackupAck={handleBackupAck}
-          onSaveWebhook={handleSaveWebhook}
-          onTestWebhook={handleTestWebhook}
-          onExportConfig={handleExportConfig}
-          onImportConfig={handleImportConfig}
-        />
-      {/if}
+<div class="app">
+  <!-- 侧边栏：品牌 + 导航 + 运行状态 -->
+  <aside class="sidebar">
+    <div class="brand">
+      <Logo size={36} />
+      <div class="brand-text">
+        <strong>酷族备份</strong>
+        <span>增量加密 · WebDAV</span>
+      </div>
     </div>
 
-    <!-- 实时任务：常驻右侧独立区域，无任务时展示空闲态 -->
-    <aside class="side">
-      <LiveStatus {liveStatus} {wsConnected} />
-    </aside>
-  </div>
+    <nav class="nav">
+      {#each NAV as item (item.id)}
+        <button
+          class="nav-item"
+          class:active={currentPage === item.id}
+          on:click={() => go(item.id)}
+        >
+          <Icon name={item.icon} size={17} />
+          <span class="nav-label">{item.label}</span>
+          {#if item.id === 'dashboard' && alertsCount > 0}
+            <span class="nav-badge">{alertsCount}</span>
+          {/if}
+        </button>
+      {/each}
+    </nav>
 
-  <footer>fnos-backup · age 加密 · WebDAV 增量备份</footer>
-</main>
+    <div class="sidebar-foot">
+      <div class="status-pill" class:ok={serviceOk}>
+        <span class="dot" class:on={serviceOk} class:off={!serviceOk}></span>
+        <span>{health || '检查中'}</span>
+        {#if version}<em>v{version}</em>{/if}
+      </div>
+      <div class="status-pill" class:ok={wsConnected}>
+        <span class="dot" class:on={wsConnected} class:off={!wsConnected}></span>
+        <span>{wsConnected ? '实时通道已连接' : '实时通道断开'}</span>
+      </div>
+      <button class="theme-btn" on:click={toggleTheme}>
+        <Icon name={$theme === 'dark' ? 'sun' : 'moon'} size={15} />
+        <span>{$theme === 'dark' ? '浅色模式' : '深色模式'}</span>
+      </button>
+    </div>
+  </aside>
+
+  <!-- 主区域 -->
+  <div class="main">
+    <header class="topbar">
+      <div class="titles">
+        <h1>{page.title}</h1>
+        <p>{page.desc}</p>
+      </div>
+      <div class="actions">
+        <button
+          class="btn btn-primary"
+          on:click={handleRunBackup}
+          disabled={busy || !webdavConfigured}
+          title={webdavConfigured ? '立即执行一次增量备份' : '请先在设置中配置 WebDAV 凭据'}
+        >
+          {#if busy}
+            <span class="spin"></span>执行中
+          {:else}
+            <Icon name="zap" size={15} />立即备份
+          {/if}
+        </button>
+      </div>
+    </header>
+
+    <div class="scroll">
+      {#if !webdavConfigured}
+        <div class="alert alert-warn" role="status">
+          <Icon name="alert" size={17} />
+          <div class="alert-body">
+            <div class="alert-title">尚未配置 WebDAV 凭据</div>
+            填写账号密码后才能执行备份与恢复。
+            <button class="btn btn-sm btn-soft inline" on:click={() => go('settings')}>
+              前往设置<Icon name="arrow-right" size={13} />
+            </button>
+          </div>
+        </div>
+      {/if}
+
+      {#if error}
+        <div class="alert alert-danger" role="alert">
+          <Icon name="alert" size={17} />
+          <div class="alert-body">{error}</div>
+          <button class="btn-icon btn-sm" on:click={() => (error = null)} aria-label="关闭">
+            <Icon name="x" size={15} />
+          </button>
+        </div>
+      {/if}
+
+      <AlertBanner {alerts} onClear={clearAlerts} />
+
+      <div class="columns">
+        <div class="content">
+          {#if loading}
+            <div class="card">
+              <div class="card-body loading-card">
+                <div class="skeleton" style="height: 18px; width: 38%"></div>
+                <div class="skeleton" style="height: 64px"></div>
+                <div class="skeleton" style="height: 64px"></div>
+              </div>
+            </div>
+          {:else if currentPage === 'dashboard'}
+            <DashboardPage
+              {backupPaths}
+              {targetFolder}
+              {webdavConfigured}
+              {webdavUrl}
+              {restoreFolders}
+              {scheduleCron}
+              {scheduleCronValid}
+              {userInfo}
+              {userInfoError}
+              {keyBackedUp}
+              onGoto={go}
+            />
+          {:else if currentPage === 'backup'}
+            <BackupPage
+              bind:backupPaths
+              bind:targetFolder
+              bind:scheduleCron
+              bind:scheduleCronValid
+              {busy}
+              {backupResult}
+              {webdavConfigured}
+              onSave={handleSaveConfig}
+              onRunBackup={handleRunBackup}
+              onGoto={go}
+            />
+          {:else if currentPage === 'restore'}
+            <RestorePage {restoreFolders} {backupPaths} {busy} onRestore={handleRestore} onGoto={go} />
+          {:else if currentPage === 'settings'}
+            <SettingsPage
+              {webdavConfigured}
+              {webdavUrl}
+              {busy}
+              {userInfo}
+              {userInfoError}
+              {keyInfo}
+              {revealKey}
+              {keyBackedUp}
+              {webhookUrl}
+              {webhookHeaders}
+              {webhookBody}
+              onSaveWebdav={handleSaveWebdav}
+              onSetKey={handleSetKey}
+              onGenerateKey={handleGenerateKey}
+              onExportKey={handleExportKey}
+              onBackupAck={handleBackupAck}
+              onSaveWebhook={handleSaveWebhook}
+              onTestWebhook={handleTestWebhook}
+              onExportConfig={handleExportConfig}
+              onImportConfig={handleImportConfig}
+            />
+          {/if}
+        </div>
+
+        <aside class="rail">
+          <LiveStatus {liveStatus} {wsConnected} />
+        </aside>
+      </div>
+    </div>
+  </div>
+</div>
+
+<Toast />
+<ConfirmDialog />
 
 <style>
-  :global(body) {
-    margin: 0;
-    font-family: system-ui, -apple-system, sans-serif;
-    background: #f5f6fa;
-    color: #1f2d3d;
-  }
-  main {
-    max-width: 1100px;
-    margin: 0 auto;
-    padding: 24px 16px 40px;
-  }
-  header { padding: 24px 0 12px; border-bottom: 1px solid #e0e4ea; }
-  h1 { margin: 0; font-size: 24px; }
-  .health { color: #5a6a7a; }
-  .health.ok { color: #22a06b; }
-
-  /* 顶部导航栏 */
-  .top-nav {
+  .app {
     display: flex;
-    gap: 4px;
-    padding: 12px 0;
-    border-bottom: 1px solid #e0e4ea;
+    min-height: 100vh;
+    background: var(--bg);
+  }
+
+  /* ── 侧边栏 ─────────────────────────────────────────────── */
+  .sidebar {
+    width: var(--sidebar-w);
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--s4);
+    padding: var(--s4) var(--s3);
+    background: var(--surface);
+    border-right: 1px solid var(--border);
     position: sticky;
     top: 0;
-    background: #f5f6fa;
-    z-index: 10;
+    height: 100vh;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: var(--s2) var(--s2) var(--s3);
+  }
+  .brand-text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .brand-text strong {
+    font-size: 14.5px;
+    font-weight: 680;
+    letter-spacing: -0.01em;
+  }
+  .brand-text span {
+    font-size: 11.5px;
+    color: var(--text-3);
+  }
+
+  .nav {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
   }
   .nav-item {
-    flex: 1;
-    background: transparent;
-    color: #5a6a7a;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 10px;
     border: none;
-    border-radius: 8px;
-    padding: 10px 12px;
-    margin: 0;
-    font-size: 14px;
-    font-weight: 500;
+    border-radius: var(--r-sm);
+    background: transparent;
+    color: var(--text-2);
+    font-family: inherit;
+    font-size: 13.5px;
+    font-weight: 550;
     cursor: pointer;
-    transition: background 0.2s, color 0.2s;
+    text-align: left;
+    transition: background var(--t-fast), color var(--t-fast);
   }
-  .nav-item:hover { background: #eef1f6; color: #1f2d3d; }
+  .nav-item:hover {
+    background: var(--surface-3);
+    color: var(--text);
+  }
   .nav-item.active {
-    background: #2563eb;
+    background: var(--primary-soft);
+    color: var(--primary);
+  }
+  .nav-label {
+    flex: 1;
+  }
+  .nav-badge {
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: var(--r-full);
+    background: var(--danger);
     color: #fff;
+    font-size: 11px;
+    font-weight: 650;
+    display: grid;
+    place-items: center;
   }
 
-  /* 主体 + 右侧面板 */
-  .layout {
+  .sidebar-foot {
+    margin-top: auto;
     display: flex;
-    gap: 20px;
+    flex-direction: column;
+    gap: 6px;
+    padding-top: var(--s3);
+    border-top: 1px solid var(--border);
+  }
+  .status-pill {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 6px 9px;
+    border-radius: var(--r-sm);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--text-3);
+    font-size: 11.5px;
+  }
+  .status-pill.ok {
+    color: var(--text-2);
+  }
+  .status-pill em {
+    margin-left: auto;
+    font-style: normal;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    color: var(--text-3);
+  }
+  .theme-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 9px;
+    border-radius: var(--r-sm);
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--text-2);
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    transition: background var(--t-fast), color var(--t-fast);
+  }
+  .theme-btn:hover {
+    background: var(--surface-3);
+    color: var(--text);
+  }
+
+  /* ── 主区域 ─────────────────────────────────────────────── */
+  .main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .topbar {
+    display: flex;
+    align-items: center;
+    gap: var(--s4);
+    padding: var(--s5) var(--s6);
+    border-bottom: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg) 82%, transparent);
+    backdrop-filter: blur(8px);
+    position: sticky;
+    top: 0;
+    z-index: 20;
+  }
+  .titles {
+    flex: 1;
+    min-width: 0;
+  }
+  .titles h1 {
+    font-size: 19px;
+    line-height: 1.3;
+  }
+  .titles p {
+    margin-top: 3px;
+    color: var(--text-3);
+    font-size: 12.5px;
+  }
+  .actions {
+    display: flex;
+    gap: var(--s2);
+  }
+
+  .scroll {
+    padding: var(--s5) var(--s6) var(--s8);
+    display: flex;
+    flex-direction: column;
+    gap: var(--s4);
+  }
+  .columns {
+    display: flex;
+    gap: var(--s5);
     align-items: flex-start;
   }
-  .content { flex: 1; min-width: 0; }
-  .side {
-    width: 300px;
+  .content {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--s4);
+  }
+  .rail {
+    width: var(--rail-w);
     flex-shrink: 0;
     position: sticky;
-    top: 60px;
+    top: 92px;
   }
-  @media (max-width: 900px) {
-    .layout { flex-direction: column; }
-    .side { width: 100%; position: static; }
+  .inline {
+    margin-left: 6px;
+  }
+  .loading-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s3);
+    padding: var(--s5);
   }
 
-  .error { background: #fef2f2; color: #b91c1c; padding: 12px; border-radius: 6px; margin-top: 12px; }
-  /* 全局 section 间距（统一卡片之间的留白） */
-  :global(.content > section) {
-    margin-top: 20px;
+  /* ── 响应式 ─────────────────────────────────────────────── */
+  @media (max-width: 1100px) {
+    .rail {
+      width: 290px;
+    }
   }
-  footer { text-align: center; color: #8a94a6; font-size: 13px; margin-top: 28px; }
+  @media (max-width: 900px) {
+    .app {
+      flex-direction: column;
+    }
+    .sidebar {
+      width: 100%;
+      height: auto;
+      position: static;
+      flex-direction: row;
+      align-items: center;
+      gap: var(--s3);
+      overflow-x: auto;
+      border-right: none;
+      border-bottom: 1px solid var(--border);
+      padding: var(--s2) var(--s3);
+    }
+    .brand {
+      padding: 0 var(--s2) 0 0;
+      flex-shrink: 0;
+    }
+    .nav {
+      flex-direction: row;
+      gap: 4px;
+      flex: 1;
+    }
+    .nav-item {
+      padding: 7px 11px;
+    }
+    .nav-label {
+      display: none;
+    }
+    .sidebar-foot {
+      margin-top: 0;
+      flex-direction: row;
+      border-top: none;
+      padding-top: 0;
+      flex-shrink: 0;
+    }
+    .sidebar-foot .status-pill span:not(.dot) {
+      display: none;
+    }
+    .status-pill em {
+      display: none;
+    }
+    .theme-btn span {
+      display: none;
+    }
+    .columns {
+      flex-direction: column;
+    }
+    .rail {
+      width: 100%;
+      position: static;
+    }
+    .topbar {
+      padding: var(--s4) var(--s4);
+    }
+    .scroll {
+      padding: var(--s4) var(--s4) var(--s7);
+    }
+  }
 </style>

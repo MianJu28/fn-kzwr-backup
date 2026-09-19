@@ -1,13 +1,14 @@
 <script>
-  // 通知设置（监控告警 Webhook：地址 + 自定义请求头 + 请求体模板）
+  // 通知设置（告警 Webhook：地址 + 自定义请求头 + 请求体模板）
+  import Icon from './Icon.svelte';
+  import { toast } from '../lib/toast.js';
+
   export let webhookUrl = '';
   export let webhookHeaders = []; // [{ name, value }]
   export let webhookBody = '';
   export let busy = false;
-  // onSave(url, headers, bodyTemplate) => Promise<{success, error}>
-  export let onSave = null;
-  // onTest(url, headers, bodyTemplate) => Promise<{success, status, error}>
-  export let onTest = null;
+  export let onSave = null; // (url, headers, bodyTemplate) => Promise<{success, error}>
+  export let onTest = null; // (url, headers, bodyTemplate) => Promise<{success, status, error}>
 
   let input = webhookUrl || '';
   let headers = [];
@@ -17,7 +18,7 @@
   let working = false;
   let testing = false;
 
-  $: if (webhookUrl !== undefined) input = webhookUrl;
+  $: input = webhookUrl || '';
   $: headers = (webhookHeaders || []).map((h) => ({ name: h.name, value: h.value }));
   $: body = webhookBody || '';
 
@@ -29,21 +30,24 @@
     headers = headers.filter((_, idx) => idx !== i);
   }
 
+  const clean = () => headers.filter((h) => h.name.trim() !== '');
+
   async function save() {
     working = true;
-    const cleanHeaders = headers.filter((h) => h.name.trim() !== '');
-    const r = await onSave(input.trim(), cleanHeaders, body);
+    msg = '';
+    const r = await onSave(input.trim(), clean(), body);
     working = false;
     if (r.success) {
-      msg = input.trim() ? 'Webhook 配置已保存，后续告警将按此配置外发' : '已关闭 Webhook 外发';
+      msg = input.trim() ? '已保存，后续告警将按此配置外发' : '已关闭 Webhook 外发';
       msgOk = true;
+      toast.success(msg);
     } else {
-      msg = `保存失败: ${r.error}`;
+      msg = `保存失败：${r.error}`;
       msgOk = false;
+      toast.error(msg);
     }
   }
 
-  // 测试连通性：用当前表单值直接发送一条测试通知
   async function test() {
     if (!input.trim()) {
       msg = '请先填写 Webhook 地址';
@@ -52,130 +56,131 @@
     }
     testing = true;
     msg = '';
-    const cleanHeaders = headers.filter((h) => h.name.trim() !== '');
-    const r = await onTest(input.trim(), cleanHeaders, body);
+    const r = await onTest(input.trim(), clean(), body);
     testing = false;
     if (r.success) {
       msg = `测试成功：服务器返回 ${r.status ?? 200}`;
       msgOk = true;
+      toast.success(msg, '连通性正常');
     } else {
-      msg = `测试失败: ${r.error}`;
+      msg = `测试失败：${r.error}`;
       msgOk = false;
+      toast.error(msg);
     }
   }
 </script>
 
-<section>
-  <h2>🔔 通知设置</h2>
-  <p class="hint">
-    备份/恢复失败或配置缺失时会生成告警并在页面顶部展示。填写 Webhook 地址后，告警会同时外发（超时 5 秒，失败不影响备份主流程）。
-  </p>
+<section class="card">
+  <div class="card-head">
+    <div class="icon-wrap"><Icon name="bell" size={18} /></div>
+    <div class="grow">
+      <h2 class="card-title">通知设置</h2>
+      <p class="card-desc">
+        备份/恢复失败或配置缺失会生成告警；填写 Webhook 后可同步外发（超时 5 秒，失败不影响主流程）
+      </p>
+    </div>
+    <span class="badge {webhookUrl ? 'badge-ok' : ''}">{webhookUrl ? '已启用' : '未启用'}</span>
+  </div>
 
-  <label>告警 Webhook 地址（留空则仅在应用内展示）
-    <input
-      bind:value={input}
-      type="text"
-      placeholder="https://example.com/hook"
-      autocomplete="off"
-    />
-  </label>
+  <div class="card-body">
+    <label class="field">
+      <span class="label">告警 Webhook 地址 <span class="opt">（留空则仅在应用内展示）</span></span>
+      <input
+        class="input mono"
+        bind:value={input}
+        type="text"
+        placeholder="https://example.com/hook"
+        autocomplete="off"
+      />
+    </label>
 
-  <div class="headers-block">
-    <h3>自定义请求头</h3>
-    <p class="hint sub">如 <code>Authorization: Bearer xxx</code>、<code>Content-Type: application/json</code>。</p>
+    <div class="divider-title">自定义请求头</div>
+    <p class="card-desc head-desc">
+      如 <code>Authorization: Bearer xxx</code>、<code>Content-Type: application/json</code>
+    </p>
     {#each headers as h, i}
       <div class="header-row">
-        <input class="h-name" bind:value={h.name} placeholder="Header 名称" autocomplete="off" />
-        <input class="h-value" bind:value={h.value} placeholder="值" autocomplete="off" />
-        <button class="remove" type="button" on:click={() => removeHeader(i)}>✕</button>
+        <input class="input mono h-name" bind:value={h.name} placeholder="Header 名称" autocomplete="off" />
+        <input class="input mono h-value" bind:value={h.value} placeholder="值" autocomplete="off" />
+        <button class="btn-icon" type="button" on:click={() => removeHeader(i)} aria-label="删除请求头">
+          <Icon name="trash" size={15} />
+        </button>
       </div>
     {/each}
-    <button class="ghost" type="button" on:click={addHeader}>+ 添加请求头</button>
+    <button class="btn btn-sm btn-ghost add" type="button" on:click={addHeader}>
+      <Icon name="plus" size={13} />添加请求头
+    </button>
+
+    <label class="field body-field">
+      <span class="label">请求体模板 <span class="opt">（留空则发送默认 JSON）</span></span>
+      <textarea
+        class="textarea mono"
+        rows="4"
+        bind:value={body}
+        placeholder={'{"text":"[{{level}}] {{source}}: {{message}}"}'}
+      ></textarea>
+      <span class="field-hint">
+        可用占位符：<code>&#123;&#123;message&#125;&#125;</code>
+        <code>&#123;&#123;level&#125;&#125;</code>
+        <code>&#123;&#123;source&#125;&#125;</code>
+        <code>&#123;&#123;ts&#125;&#125;</code>
+        <code>&#123;&#123;id&#125;&#125;</code>
+      </span>
+    </label>
+
+    {#if msg}
+      <div class="alert {msgOk ? 'alert-ok' : 'alert-danger'} msg">
+        <Icon name={msgOk ? 'check-circle' : 'x-circle'} size={15} />
+        <div class="alert-body">{msg}</div>
+      </div>
+    {/if}
   </div>
 
-  <label>请求体模板（留空则发送默认 JSON）
-    <textarea
-      rows="4"
-      bind:value={body}
-      placeholder={'{"text":"[{{level}}] {{source}}: {{message}}"}'}
-    ></textarea>
-  </label>
-  <p class="hint sub">
-    可用占位符：<code>&#123;&#123;message&#125;&#125;</code>
-    <code>&#123;&#123;level&#125;&#125;</code>
-    <code>&#123;&#123;source&#125;&#125;</code>
-    <code>&#123;&#123;ts&#125;&#125;</code>
-    <code>&#123;&#123;id&#125;&#125;</code>
-  </p>
-
-  <div class="btn-row">
-    <button on:click={save} disabled={busy || working || testing}>{working ? '保存中...' : '保存'}</button>
-    <button class="ghost" on:click={test} disabled={busy || working || testing}>
-      {testing ? '测试中...' : '测试连通性'}
+  <div class="card-foot foot">
+    <button class="btn btn-ghost" on:click={test} disabled={busy || working || testing}>
+      {#if testing}<span class="spin"></span>测试中…{:else}<Icon name="wifi" size={15} />测试连通性{/if}
+    </button>
+    <button class="btn btn-primary" on:click={save} disabled={busy || working || testing}>
+      {#if working}<span class="spin"></span>保存中…{:else}<Icon name="check" size={15} />保存{/if}
     </button>
   </div>
-
-  {#if msg}
-    <p class:ok={msgOk} class:warn={!msgOk}>{msg}</p>
-  {/if}
 </section>
 
 <style>
-  section {
-    background: #fff;
-    border-radius: 10px;
-    padding: 20px;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+  .grow {
+    flex: 1;
+    min-width: 0;
   }
-  h2 { margin: 0 0 8px; font-size: 18px; }
-  h3 { margin: 0 0 4px; font-size: 15px; }
-  .hint {
-    color: #5a6a7a;
-    font-size: 13px;
-    line-height: 1.6;
-    margin: 0 0 14px;
+  .head-desc {
+    margin-bottom: var(--s2);
   }
-  .hint.sub { margin: 4px 0 8px; font-size: 12px; }
-  label { display: block; margin: 4px 0 4px; font-size: 14px; color: #42526e; }
-  input,
-  textarea {
-    width: 100%;
-    padding: 8px 10px;
-    border: 1px solid #d0d7e2;
-    border-radius: 6px;
-    margin-top: 6px;
-    font-size: 13px;
-    font-family: monospace;
-    box-sizing: border-box;
+  .header-row {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+    margin-bottom: 6px;
   }
-  textarea { resize: vertical; }
-  code { background: #f1f5f9; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
-  .headers-block { margin-top: 16px; padding-top: 14px; border-top: 1px solid #eef1f6; }
-  .header-row { display: flex; gap: 8px; margin-top: 6px; align-items: center; }
-  .header-row input { margin: 0; }
-  .header-row .h-name { flex: 1; min-width: 0; }
-  .header-row .h-value { flex: 1.4; min-width: 0; }
-  button {
-    background: #2563eb;
-    color: #fff;
-    border: none;
-    border-radius: 6px;
-    padding: 9px 16px;
-    font-size: 14px;
-    cursor: pointer;
-    margin-top: 12px;
+  .header-row .h-name {
+    flex: 1;
+    min-width: 0;
   }
-  button:disabled { background: #9db4e8; cursor: not-allowed; }
-  button.ghost { background: #eef2ff; color: #2563eb; margin-top: 0; }
-  .btn-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
-  .btn-row button { margin-top: 0; }
-  button.remove {
-    background: transparent;
-    color: #b91c1c;
-    padding: 2px 8px;
-    margin: 0;
-    flex-shrink: 0;
+  .header-row .h-value {
+    flex: 1.4;
+    min-width: 0;
   }
-  .ok { color: #22a06b; font-size: 13px; }
-  .warn { color: #b45309; font-size: 13px; }
+  .add {
+    margin-top: 2px;
+  }
+  .body-field {
+    margin-top: var(--s5);
+  }
+  .msg {
+    margin-top: var(--s3);
+  }
+  .foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s3);
+  }
 </style>

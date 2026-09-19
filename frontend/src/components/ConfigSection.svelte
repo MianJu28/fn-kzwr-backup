@@ -1,5 +1,8 @@
 <script>
-  // 配置导入/导出（含 WebDAV 凭据与 age 私钥；需管理员口令）
+  // 配置导入 / 导出（含 WebDAV 凭据与 age 私钥，需管理员口令）
+  import Icon from './Icon.svelte';
+  import { confirmDialog } from '../lib/confirm.js';
+
   export let busy = false;
   export let onExportConfig = null; // (passphrase) => Promise<{success, config, error}>
   export let onImportConfig = null; // (passphrase, configText) => Promise<{success, error}>
@@ -11,62 +14,16 @@
   let msgOk = false;
   let working = false;
   let copied = false;
+  let fileName = '';
 
-  async function doExport() {
-    if (!passphrase.trim()) {
-      msg = '请先输入管理员口令';
-      msgOk = false;
-      return;
-    }
-    working = true;
-    msg = '';
-    const r = await onExportConfig(passphrase.trim());
-    working = false;
-    if (r.success) {
-      exportText = r.config || '';
-      msg = '配置已生成：请立即妥善保存（含 WebDAV 凭据与私钥）';
-      msgOk = true;
-    } else {
-      msg = `导出失败: ${r.error}`;
-      msgOk = false;
-    }
-  }
-
-  async function doImport() {
-    if (!passphrase.trim()) {
-      msg = '请先输入管理员口令';
-      msgOk = false;
-      return;
-    }
-    if (!importText.trim()) {
-      msg = '请粘贴或选择配置文件';
-      msgOk = false;
-      return;
-    }
-    if (!confirm('导入将覆盖当前备份路径 / 通知 / WebDAV 凭据（若含私钥也会一并恢复）。确定继续？')) return;
-    working = true;
-    msg = '';
-    const r = await onImportConfig(passphrase.trim(), importText.trim());
-    working = false;
-    if (r.success) {
-      msg = '配置已导入并立即生效';
-      msgOk = true;
-      importText = '';
-      exportText = '';
-    } else {
-      msg = `导入失败: ${r.error}`;
-      msgOk = false;
-    }
-  }
-
-  async function copyExport() {
-    if (!exportText) return;
+  async function copyText(text) {
+    if (!text) return;
     try {
       if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(exportText);
+        await navigator.clipboard.writeText(text);
       } else {
         const ta = document.createElement('textarea');
-        ta.value = exportText;
+        ta.value = text;
         ta.style.position = 'fixed';
         ta.style.opacity = '0';
         document.body.appendChild(ta);
@@ -82,129 +39,180 @@
     }
   }
 
+  async function doExport() {
+    if (!passphrase.trim()) {
+      msg = '请先输入管理员口令';
+      msgOk = false;
+      return;
+    }
+    working = true;
+    msg = '';
+    const r = await onExportConfig(passphrase.trim());
+    working = false;
+    if (r.success) {
+      exportText = r.config || '';
+      msg = '配置已生成，请立即妥善保存（含 WebDAV 凭据与私钥）';
+      msgOk = true;
+    } else {
+      msg = `导出失败：${r.error}`;
+      msgOk = false;
+    }
+  }
+
   function downloadExport() {
     if (!exportText) return;
     const blob = new Blob([exportText], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = 'fnos-backup-config.json';
+    a.download = 'fn-kzwr-backup-config.json';
     a.click();
     URL.revokeObjectURL(a.href);
+  }
+
+  async function doImport() {
+    if (!passphrase.trim()) {
+      msg = '请先输入管理员口令';
+      msgOk = false;
+      return;
+    }
+    if (!importText.trim()) {
+      msg = '请粘贴或选择配置文件';
+      msgOk = false;
+      return;
+    }
+    const yes = await confirmDialog({
+      title: '导入配置？',
+      message:
+        '导入将覆盖当前的备份路径、目标文件夹、定时任务与通知设置；若配置包内含 age 私钥，也会一并恢复。\n\n确定继续？',
+      confirmText: '导入并覆盖',
+      danger: true,
+    });
+    if (!yes) return;
+
+    working = true;
+    msg = '';
+    const r = await onImportConfig(passphrase.trim(), importText.trim());
+    working = false;
+    if (r.success) {
+      msg = '配置已导入并立即生效';
+      msgOk = true;
+      importText = '';
+      exportText = '';
+      fileName = '';
+    } else {
+      msg = `导入失败：${r.error}`;
+      msgOk = false;
+    }
   }
 
   function onFile(e) {
     const f = e.target.files && e.target.files[0];
     if (!f) return;
+    fileName = f.name;
     const reader = new FileReader();
     reader.onload = () => (importText = String(reader.result || ''));
     reader.readAsText(f);
   }
 </script>
 
-<section>
-  <h2>📦 配置备份 / 恢复</h2>
-  <p class="hint">
-    导出后可在重装或更换设备时一键恢复：备份路径、目标文件夹、定时、通知 Webhook、WebDAV 凭据，以及 age 私钥。<strong>导出内容含敏感信息，请妥善保管。</strong>
-  </p>
-
-  <label>管理员口令（导入/导出均需校验）
-    <input
-      type="password"
-      bind:value={passphrase}
-      autocomplete="off"
-      placeholder="安装时设置的管理员口令"
-    />
-  </label>
-
-  <div class="btn-row">
-    <button on:click={doExport} disabled={busy || working || !passphrase.trim()}>
-      {working ? '处理中...' : '导出配置'}
-    </button>
-    <button class="ghost" on:click={copyExport} disabled={!exportText}>复制</button>
-    <button class="ghost" on:click={downloadExport} disabled={!exportText}>下载 JSON</button>
-  </div>
-
-  {#if exportText}
-    <textarea rows="6" readonly value={exportText}></textarea>
-    {#if copied}<p class="ok">已复制到剪贴板</p>{/if}
-  {/if}
-
-  <div class="import-block">
-    <h3>导入配置</h3>
-    <p class="hint sub">粘贴配置 JSON，或选择之前导出的文件。</p>
-    <textarea rows="4" bind:value={importText} placeholder={'{\n  "version": 1, ...\n}'}></textarea>
-    <div class="btn-row">
-      <label class="file-btn">
-        选择文件
-        <input type="file" accept=".json,application/json" on:change={onFile} />
-      </label>
-      <button on:click={doImport} disabled={busy || working || !importText.trim()}>
-        {working ? '处理中...' : '导入配置'}
-      </button>
+<section class="card">
+  <div class="card-head">
+    <div class="icon-wrap"><Icon name="package" size={18} /></div>
+    <div class="grow">
+      <h2 class="card-title">配置备份 / 迁移</h2>
+      <p class="card-desc">
+        导出后可一键恢复：备份路径、定时任务、通知 Webhook、WebDAV 凭据与 age 私钥
+        <strong>（含敏感信息，请妥善保管）</strong>
+      </p>
     </div>
   </div>
 
-  {#if msg}
-    <p class:ok={msgOk} class:warn={!msgOk}>{msg}</p>
-  {/if}
+  <div class="card-body">
+    <label class="field">
+      <span class="label">管理员口令 <span class="opt">（导入 / 导出均需校验）</span></span>
+      <input
+        class="input"
+        type="password"
+        bind:value={passphrase}
+        autocomplete="off"
+        placeholder="安装时设置的管理员口令"
+      />
+    </label>
+
+    <div class="divider-title">导出</div>
+    <div class="row-wrap">
+      <button class="btn btn-primary" on:click={doExport} disabled={busy || working || !passphrase.trim()}>
+        {#if working}<span class="spin"></span>处理中…{:else}<Icon name="download" size={15} />导出配置{/if}
+      </button>
+      <button class="btn btn-ghost" on:click={() => copyText(exportText)} disabled={!exportText}>
+        <Icon name={copied ? 'check' : 'copy'} size={14} />{copied ? '已复制' : '复制'}
+      </button>
+      <button class="btn btn-ghost" on:click={downloadExport} disabled={!exportText}>
+        <Icon name="file" size={14} />下载 JSON
+      </button>
+    </div>
+
+    {#if exportText}
+      <textarea class="textarea mono out" rows="6" readonly value={exportText}></textarea>
+    {/if}
+
+    <div class="divider-title">导入</div>
+    <p class="card-desc head-desc">粘贴配置 JSON，或选择之前导出的文件。</p>
+    <textarea
+      class="textarea mono"
+      rows="4"
+      bind:value={importText}
+      placeholder={'{\n  "version": 1, ...\n}'}
+    ></textarea>
+
+    <div class="row-wrap import-actions">
+      <label class="btn btn-ghost file-btn">
+        <Icon name="folder-open" size={14} />选择文件
+        <input type="file" accept=".json,application/json" on:change={onFile} />
+      </label>
+      {#if fileName}
+        <span class="badge"><Icon name="file" size={11} />{fileName}</span>
+      {/if}
+      <button
+        class="btn btn-danger"
+        on:click={doImport}
+        disabled={busy || working || !importText.trim()}
+      >
+        {#if working}<span class="spin"></span>处理中…{:else}<Icon name="refresh" size={14} />导入并覆盖{/if}
+      </button>
+    </div>
+
+    {#if msg}
+      <div class="alert {msgOk ? 'alert-ok' : 'alert-danger'} msg">
+        <Icon name={msgOk ? 'check-circle' : 'x-circle'} size={15} />
+        <div class="alert-body">{msg}</div>
+      </div>
+    {/if}
+  </div>
 </section>
 
 <style>
-  section {
-    background: #fff;
-    border-radius: 10px;
-    padding: 20px;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+  .grow {
+    flex: 1;
+    min-width: 0;
   }
-  h2 { margin: 0 0 8px; font-size: 18px; }
-  h3 { margin: 0 0 4px; font-size: 15px; }
-  .hint {
-    color: #5a6a7a;
-    font-size: 13px;
-    line-height: 1.6;
-    margin: 0 0 14px;
+  .head-desc {
+    margin-bottom: var(--s2);
   }
-  .hint.sub { margin: 4px 0 8px; font-size: 12px; }
-  label { display: block; margin: 4px 0 4px; font-size: 14px; color: #42526e; }
-  input[type='password'],
-  textarea {
-    width: 100%;
-    padding: 8px 10px;
-    border: 1px solid #d0d7e2;
-    border-radius: 6px;
-    margin-top: 6px;
-    font-size: 13px;
-    font-family: monospace;
-    box-sizing: border-box;
+  .out {
+    margin-top: var(--s3);
+    background: var(--surface-3);
   }
-  textarea { resize: vertical; background: #fbfcfe; }
-  .btn-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; align-items: center; }
-  button {
-    background: #2563eb;
-    color: #fff;
-    border: none;
-    border-radius: 6px;
-    padding: 9px 16px;
-    font-size: 14px;
-    cursor: pointer;
-    margin: 0;
+  .import-actions {
+    margin-top: var(--s3);
   }
-  button:disabled { background: #9db4e8; cursor: not-allowed; }
-  button.ghost { background: #eef2ff; color: #2563eb; }
-  button.ghost:disabled { background: #eef2ff; color: #9db4e8; }
-  .import-block { margin-top: 16px; padding-top: 14px; border-top: 1px solid #eef1f6; }
   .file-btn {
-    display: inline-block;
-    background: #f1f5f9;
-    color: #334155;
-    border: 1px solid #e2e8f0;
-    border-radius: 6px;
-    padding: 9px 16px;
-    font-size: 14px;
     cursor: pointer;
-    margin: 0;
   }
-  .file-btn input { display: none; }
-  .ok { color: #22a06b; font-size: 13px; }
-  .warn { color: #b45309; font-size: 13px; }
+  .file-btn input {
+    display: none;
+  }
+  .msg {
+    margin-top: var(--s3);
+  }
 </style>
