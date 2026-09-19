@@ -9,7 +9,7 @@
 
 ### 背景
 
-Target 适配器需将加密文件写入酷族网软（kzwr.com）。酷族最初为 Angular SPA + 自定义 REST API（v1/v2/v3），登录有 reCAPTCHA v2/Turnstile 验证，认证用 token（`access-token` Header），当时**确认不支持 WebDAV**，因此逆向 REST API 用 Rust 重写。
+Target 适配器需将加密文件写入酷族网软（kzwr.com）。**（以下为历史背景；其中 REST/token/登录方案已弃用，详见下方修订）** 酷族最初为 Angular SPA + 自定义 REST API（v1/v2/v3），登录有 reCAPTCHA v2/Turnstile 验证，认证用 token（`access-token` Header），当时**确认不支持 WebDAV**，因此逆向 REST API 用 Rust 重写。
 
 > **修订（2026-09）**：酷族官方已支持 WebDAV。文件管理（上传/下载/删除/目录操作）**迁移至官方 WebDAV**，逆向 REST API **弃用**（决策详见 `ARCHITECTURE.md` ADR-009）。
 
@@ -20,6 +20,7 @@ Target 适配器需将加密文件写入酷族网软（kzwr.com）。酷族最�
 - 逆向 REST API 的分块上传、presigned-url、SHA1/SHA256 哈希对齐逻辑随代码一并移除（sha1/sha2/zip 依赖已删）
 - 用户信息不再依赖 REST API（get_member 移除）；WebDAV 无配额属性，UI 仅展示本地配置账号
 - 登录二进制及其登录环境子系统（Xvfb/uBlock/Camoufox 下载）一并移除；凭据经 UI 配置（保存前 ping 验证、加密存储、`SwapTarget` 热切换）
+- **大文件上传**：超过 `PART_SIZE`（默认 90MiB）自动拆分为 `.part0001…` 依次 PUT（规避站点 100MB 上限，`FNOS_DAV_PART_SIZE` 可覆盖）；分片 PUT 使用自定义 `http_body`（精确 `size_hint`），在**保留 `Content-Length`** 的同时按块上报传输进度（纯流式 body 会退化为 chunked，曾出现被网关以 413 拒绝的情况）
 
 **迁移步骤**：
 1. ✅ 验证 WebDAV 端点、认证方式与流式 PUT/GET 行为（2026-09-18）
@@ -44,11 +45,13 @@ Target 适配器需将加密文件写入酷族网软（kzwr.com）。酷族最�
 - 哈希对齐：文件 SHA1 + 首/尾 4MB SHA256 + 每分片前 64KB SHA256（与前端 chunk JS 一致）
 - 下载：`GET /api/v1/object?fid={flagName}&token={token}`
 
-### session token 处理
+### session token 处理（已作废，ADR-009）
 
-- session token 由登录二进制产出，存储于 `$TRIM_PKGETC`（加密），备份任务复用
-- token 过期（`TOKEN_EXPIRED`）时暂停任务，UI 提示用户重新触发登录二进制
-- Rust API 客户端直接读取会话 token，无需手动 reCAPTCHA
+> ⚠️ 本节属已移除的逆向 REST API / 登录二进制方案，**现行方案不存在 session 概念**：WebDAV 走 HTTP Basic，每次请求自带凭据，无 token 签发/复用/过期重登。以下内容仅作历史存档。
+
+- ~~session token 由登录二进制产出，存储于 `$TRIM_PKGETC`（加密），备份任务复用~~
+- ~~token 过期（`TOKEN_EXPIRED`）时暂停任务，UI 提示用户重新触发登录二进制~~
+- ~~Rust API 客户端直接读取会话 token，无需手动 reCAPTCHA~~
 
 ---
 
@@ -107,7 +110,7 @@ Source 适配器需读取飞牛 NAS 上的文件。**仅需支持本地文件备
 - `rusqlite` 启用 `bundled` 特性（静态编译 SQLite，无系统 libsqlite3）
 - HTTP 用 `reqwest` + `rustls`（非 native-tls/openssl）
 - 加密用 `age` crate（纯 Rust，内部基于 ChaCha20-Poly1305/X25519）
-- 私钥保护用 `argon2`（纯 Rust）
+- 私钥/配置口令保护用 age 内置 scrypt（纯 Rust，无需额外 KDF 依赖）
 
 CI 流程（GitHub Actions）：
 
@@ -202,12 +205,12 @@ jobs:
 - iframe 内 WebSocket 可正常工作（同源 localhost）
 - 应用自带管理员口令认证（wizard 安装时设置）
 
-**应用自身认证设计**：
+**应用自身认证设计（实际实现，2026-09）**：
 
-- 首次安装 wizard 收集管理员口令（Argon2id 哈希存储）
-- HTTP 请求需携带 JWT（登录后签发，存 sessionStorage）
-- axum 中间件校验 JWT，未认证返回 401
-- WebSocket 连接建立时校验 JWT
+- 首次安装向导收集管理员口令 → 写入 `$PKGETC/.passphrase`（权限 600），作为配置与 age 密钥库（`keystore.age`）的加密口令
+- **未采用 JWT / 全站登录**：应用仅在飞牛 iframe（同源 localhost）内访问，不引入登录态与鉴权中间件
+- **敏感操作校验口令**：显示/导出 age 私钥（`/api/keys/export`）、配置导入/导出（`/api/config/*`）需提交该口令，后端比对通过才执行
+- 备份/恢复/WebDAV 配置等常规接口不做鉴权，依赖飞牛应用访问边界控制暴露面
 
 **何时评估方案 B（统一网关）**：
 
@@ -217,9 +220,9 @@ jobs:
 
 ### 验证步骤
 
-1. 验证飞牛 iframe 内 WebSocket 连接（可能受 CSP 限制）
-2. 验证 localhost 端口在飞牛环境下的网络可访问性
-3. 测试 JWT 在 iframe sessionStorage 中的持久性
+1. ✅ 验证飞牛 iframe 内 WebSocket 连接（x86 设备实测正常，2026-09-19）
+2. ✅ 验证 localhost 端口在飞牛环境下的网络可访问性（桌面入口 iframe 加载正常）
+3. ❌ ~~测试 JWT 在 iframe sessionStorage 中的持久性~~（未采用 JWT，验证项作废）
 
 ---
 
@@ -237,7 +240,7 @@ jobs:
 | B. age + 口令保护私钥 | 备份用公钥加密；私钥被口令派生密钥加密后存 `$TRIM_PKGETC` | 支持（重新加密） | 口令遗忘则无法恢复 | 高     |
 | C. age + 口令 + 私钥备份 | 公钥加密 + 口令保护私钥 + 备份私钥副本离线保存 | 支持       | 备份私钥解密     | 高     |
 
-### 推荐：方案 B（age 公钥加密 + 口令保护私钥），可选 C
+### 推荐：方案 B（age 公钥加密 + 口令保护私钥）+ C（私钥导出另存，已实现）
 
 **密钥层次**：
 
@@ -245,40 +248,38 @@ jobs:
 备份:  明文 ──age 公钥──→ 密文 (每 chunk 独立文件密钥, age 标准 ephemeral key)
 恢复:  密文 ──age 私钥──→ 明文
 
-私钥保护: 用户口令 ──Argon2id──→ 密钥加密密钥(KEK)
+私钥保护: 管理员口令 ──age scrypt──→ 口令派生密钥
                                      └── 加密 age 私钥，存 $TRIM_PKGETC/keystore
 
-私钥备份(可选, C): 备份 age 私钥副本离线保存，用于口令遗忘时恢复
+私钥备份(C，已实现): 备份 age 私钥副本离线保存，用于口令遗忘或密钥库损坏时恢复
 ```
 
-**Argon2id 参数**（仅用于保护私钥，OWASP 推荐基线）：
+**口令派生实现（实际采用）**：直接用 age 内置的 **scrypt 口令加密**（`age::Encryptor::with_user_passphrase`），不自行实现 KDF；`infra/keystore.rs`（私钥库 `keystore.age`）与 `infra/config.rs`（配置敏感字段）共用同一口令。
 
-- memory: 256 MiB
-- iterations: 3
-- parallelism: 4
-- output: 32 bytes
+> 早期设想的 Argon2id KEK 方案**未采用**：`argon2` 依赖源码从未调用，已从 `backend/Cargo.toml` 移除（v0.1.9）。
 
 **操作流程**：
 
-1. **初始化**：wizard 生成 age 密钥对 → 导出公钥给备份任务 → 用户设口令派生 KEK → 加密 age 私钥存 keystore
+1. **初始化**：安装向导设管理员口令 → 首次启动若无密钥库则自动生成 age 密钥对 → 用该口令（age scrypt）加密私钥存 `$TRIM_PKGETC/keystore.age`
 2. **备份**：仅需公钥加密，无需口令（适合无人值守调度）
-3. **恢复**：用户输入口令 → 派生 KEK → 解密 age 私钥（仅存内存）→ 解密密文
-4. **轮换**：生成新 age 密钥对 → 后续备份用新公钥（旧私钥仍可解历史档）
-5. **恢复（可选 C）**：口令遗忘 → 用离线备份的私钥副本解密
+3. **恢复**：用口令解密 `keystore.age` 取回 age 私钥（仅存内存）→ 解密密文
+4. **轮换**：生成新 age 密钥对（或粘贴自定义私钥，`POST /api/keys`）→ 后续备份用新公钥（旧私钥仍可解历史档）；密钥热切换无需重启
+5. **C（已实现）**：口令遗忘或密钥库损坏 → 用离线另存的私钥副本粘贴恢复；未确认备份时设置页持续提示风险
 
 **安全保证**：
 
-- age 私钥永不明文落盘（口令派生 KEK 加密存储，`zeroize` 清零内存）
+- age 私钥永不明文落盘（口令加密存储于 `keystore.age`，`zeroize` 清零内存）
 - 备份侧仅需公钥，私钥本地私藏——目标存储即使泄露也无法解密
-- 口令哈希用 Argon2id（抗 GPU/ASIC 暴力破解）
+- 口令派生用 age 内置 scrypt（抗暴力破解；**未采用 Argon2id**）
 - 公钥可安全公开，甚至随备份元数据一并存储
+- 私钥导出需管理员口令二次校验，且导出后自动重置「已备份」状态以持续提醒
 
 ### 验证步骤
 
-1. 验证 `age` crate 在飞牛设备上流式加密/解密性能
-2. 验证 Argon2id 保护私钥的耗时（应 <2s）
-3. 测试私钥恢复流程的完整性与边界情况
-4. 验证 `zeroize` 在进程崩溃时不残留密钥
+1. ✅ `age` crate 在飞牛设备上的流式加密/解密（已随备份/恢复端到端验证）
+2. ❌ ~~验证 Argon2id 保护私钥的耗时（应 <2s）~~（未采用 Argon2id；age scrypt 解密耗时实测可接受）
+3. ✅ 私钥导出与备份确认流程（`POST /api/keys/export`、`POST /api/keys/backup-ack`）
+4. 🔶 `zeroize` 内存清零（依赖已引入；进程崩溃残留未做专项验证）
 
 ---
 
@@ -290,12 +291,12 @@ jobs:
 | 飞牛源访问   | 仅本地 FS（tokio::fs）       | 只需本地文件备份，不考虑 SMB/NFS，零依赖                  | 1     |
 | 双架构编译   | musl 静态 + cross 工具      | 无运行时依赖，避免 C 交叉编译                          | 1     |
 | 源目录授权   | config/resource + 运行时引导 | 飞牛标准机制，最小权限                               | 1     |
-| UI 暴露认证 | 端口服务 + JWT              | 简单独立，WebSocket 可用                         | 1     |
+| UI 暴露认证 | 端口服务 + 敏感操作口令校验              | 简单独立，WebSocket 可用                         | 1     |
 | 密钥管理    | age 公私钥 + 口令保护私钥       | 公钥加密/私钥解密，私钥口令保护，符合现代加密标准               | 2     |
 
 ### 贯穿性原则
 
 1. **避免 C 依赖**——所有库优先选纯 Rust 实现（rustls、rusqlite bundled、age），使 musl 静态交叉编译透明化
 2. **最小权限**——`run-as=package`，目录授权制，不碰 root
-3. **不自动化绕过验证码**——登录由编译二进制模拟真人完成，本系统只复用 session token，过期重登
+3. ~~**不自动化绕过验证码**——登录由编译二进制模拟真人完成，本系统只复用 session token，过期重登~~ **（已失效，ADR-009）**：现行目标端为官方 WebDAV（HTTP Basic 专用凭据），项目内不存在验证码/登录会话环节
 4. **凭据最小化**——WebDAV 专用凭据加密存储，UI 保存前实测连通性；逆向 API 与登录二进制成果已弃用移除

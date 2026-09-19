@@ -30,12 +30,12 @@ use crate::infra::storage_trait::{
 /// 官方 WebDAV 地址（UI 固定使用，不提供设置项）
 pub const DEFAULT_URL: &str = "https://dav.kzwr.com/dav";
 
-/// 单分片大小：8 MiB（默认）
+/// 单分片大小：90 MiB（默认）
 ///
-/// 网站限制单次上传 100MB，8MiB 留有充足余量；小分片在慢链路下
-/// 进度损失小、单请求耗时短，配合 HTTP/1.1 + 超时 + 重试最稳健。
-/// 默认分片大小：100MB 网站上传限制（Cloudflare 返回 413 Payload Too Large）的 90%，即 90 MiB。
-/// 单分片必须小于该限制才能绕过；可用环境变量 FNOS_DAV_PART_SIZE 覆盖（字节，供测试调小验证分片逻辑）。
+/// 网站限制单次上传 100MB（实测：不分片上传 120MB 被 Cloudflare 返回
+/// `413 Payload Too Large`）；默认取该限制的 90% 即 90 MiB，留有余量。
+/// 单分片必须小于该限制才能绕过；可用环境变量 `FNOS_DAV_PART_SIZE`（字节）
+/// 覆盖，便于测试时调小以验证分片拆分/合并/清理逻辑。
 pub const PART_SIZE: u64 = 90 * 1024 * 1024;
 
 /// 读取生效的分片大小（环境变量 FNOS_DAV_PART_SIZE 可覆盖）
