@@ -536,7 +536,7 @@ fn-kzwr-backup/
 
 ### 11.1 当前开发状态
 
-**核心备份/恢复主链路已完成并在 x86 飞牛设备实测通过**，Phase 4 生产强化收尾；当前功能版本 **v0.1.9**（提交 `54f1624`，0.1.4→0.1.9 的交互与能力补齐见 §11.5 #6）。构建与测试**统一通过 SSH 在飞牛 NAS 上进行**（WSL 已废弃：上行仅 ~4KB/s、后台进程随会话被回收）；源码从 Windows 侧经 `pscp`/tar 同步至 NAS 后执行 `Scripts/build_fnos_app.sh`，运行编译好的二进制或通过 HTTP API 测试。
+**核心备份/恢复主链路已完成并在 x86 飞牛设备实测通过**；当前功能版本 **v0.2.1**（0.2.0 起项目更名 `fn-kzwr-backup`；0.2.1 恢复页改为「聚合计数 + 按目录懒加载」，并新增「全部恢复」）。构建与测试**统一通过 SSH 在飞牛 NAS 上进行**（WSL 已废弃：上行仅 ~4KB/s、后台进程随会话被回收）；源码从 Windows 侧经 `pscp`/tar 同步至 NAS 后执行 `Scripts/build_fnos_app.sh`，运行编译好的二进制或通过 HTTP API 测试。
 
 ### 11.2 已实现功能（按模块）
 
@@ -554,6 +554,8 @@ fn-kzwr-backup/
 | **恢复** | 恢复编排 | ✅ | `RestoreJob`，选择性恢复、恢复到源路径（按备份源文件夹名还原目标子目录层级） |
 | | 完整性校验 | ✅ | age AEAD tag 自动验证；恢复后内容对比校验 |
 | | 恢复后防重传 | ✅ | 恢复写完文件后回写该文件快照（size + 实际 mtime），下次增量备份命中「未变化」不再重复上传 |
+| | 恢复树懒加载与聚合计数 | ✅ | `GET /api/restore/files` 返回每个备份文件夹的 `{file_count, dir_count, total_bytes}`（不再下发整棵树）；`GET /api/restore/tree?source&dir` 按目录返回**直接子项**（目录附递归统计），前端展开时才加载。目录树由后端从快照推导（`snapshot_aggregate`/`snapshot_children`），不依赖快照行序、不怕缺目录条目 |
+| | 全部恢复 | ✅ | `POST /api/restore/run` 支持 `all` 与 `dir`：`all=true` 用快照全部文件（`dir` 可限定子目录前缀），实现「全部恢复」与「恢复整个目录」一次请求 |
 | **kzwr 目标** | 官方 WebDAV 适配器 | ✅ | `WebdavTarget`：MKCOL/PUT/GET(302 跟随)/DELETE/PROPFIND；凭据加密存储，保存时 ping 验证并热切换（ADR-009） |
 | | 大文件分片上传 | ✅ | 超过 `PART_SIZE`（默认 90MiB = 100MB 网站限制的 90%）自动拆分为 `.part0001…` 依次 PUT；`FNOS_DAV_PART_SIZE` 可覆盖 |
 | | 带长度的流式请求体 | ✅ | 分片 PUT 使用自定义 `http_body`（精确 `size_hint`）——保留 `Content-Length` 的同时按 256KiB 分块上报进度；修复「分片请求误用整文件长度导致 Cloudflare 413」 |
@@ -634,8 +636,8 @@ frontend/src/
 │   ├── ConfigSection.svelte   # 配置备份/恢复（导出/复制/下载 JSON；粘贴或选文件导入）
 │   ├── BackupConfigSection.svelte # 备份路径（增删即自动保存）+ 定时 cron（手动保存）
 │   ├── BackupSection.svelte   # 备份执行
-│   └── RestoreSection.svelte  # 恢复目录树
-└── TreeNode.svelte          # 目录树递归节点
+│   └── RestoreSection.svelte  # 恢复：文件夹概况 + 「全部恢复」+ 懒加载目录树
+└── TreeNode.svelte          # 目录树节点（子项由父级懒加载后经 cache 传入；目录显示文件数/文件夹数与直接恢复按钮）
 ```
 
 ### 11.4 关键决策落地说明
