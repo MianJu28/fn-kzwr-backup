@@ -128,10 +128,10 @@ impl WebdavTarget {
             .basic_auth(&self.username, Some(&self.password))
     }
 
-    /// 逐级 MKCOL 确保父目录存在（已存在视为成功）
-    async fn ensure_parents(&self, path: &Path) -> StorageResult<()> {
+    /// 逐级 MKCOL 创建路径上的所有目录（从根到叶子；已存在视为成功）
+    async fn mkcol_chain(&self, path: &Path) -> StorageResult<()> {
         let mut cur = String::new();
-        for comp in path.parent().into_iter().flat_map(|p| p.components()) {
+        for comp in path.components() {
             let name = comp.as_os_str().to_string_lossy();
             if name.is_empty() || name == "/" {
                 continue;
@@ -161,6 +161,14 @@ impl WebdavTarget {
             }
         }
         Ok(())
+    }
+
+    /// 逐级 MKCOL 确保父目录存在（已存在视为成功）
+    async fn ensure_parents(&self, path: &Path) -> StorageResult<()> {
+        match path.parent() {
+            Some(p) => self.mkcol_chain(p).await,
+            None => Ok(()),
+        }
     }
 
     /// PROPFIND 列目录（不存在返回空列表）
@@ -526,6 +534,10 @@ impl TargetStorage for WebdavTarget {
             });
         }
         Ok(out)
+    }
+
+    async fn ensure_dir(&self, path: &Path) -> StorageResult<()> {
+        self.mkcol_chain(path).await
     }
 
     async fn ping(&self) -> StorageResult<()> {

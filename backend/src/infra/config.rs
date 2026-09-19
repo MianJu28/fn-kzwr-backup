@@ -88,11 +88,27 @@ pub struct WebdavConfig {
 /// 通知配置（监控告警）
 ///
 /// `webhook_url` 为空表示不外发，告警仅在应用内展示。
+/// 支持自定义请求头（`webhook_headers`）与请求体模板（`webhook_body`）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NotifyConfig {
     /// 告警 Webhook 地址（空 = 不外发）
     #[serde(default)]
     pub webhook_url: Option<String>,
+    /// 自定义请求头（如 Authorization、Content-Type）
+    #[serde(default)]
+    pub webhook_headers: Vec<WebhookHeader>,
+    /// 自定义请求体模板（支持占位符 {{message}}/{{level}}/{{source}}/{{ts}}/{{id}}；
+    /// 留空则发送默认 JSON）
+    #[serde(default)]
+    pub webhook_body: Option<String>,
+}
+
+/// Webhook 自定义请求头（键值对）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookHeader {
+    pub name: String,
+    #[serde(default)]
+    pub value: String,
 }
 
 /// 密钥配置（age 私钥备份状态）

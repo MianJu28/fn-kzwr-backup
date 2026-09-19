@@ -1,5 +1,5 @@
 appname               = fnos-backup
-version               = 0.1.2
+version               = 0.1.3
 display_name          = fnOS 备份
 desc                  = 飞牛 NAS 增量加密备份工具，支持断点续传、保留策略、定时备份、实时状态监控与选择性恢复，备份目标为酷族网软（kzwr）WebDAV。
 platform              = x86

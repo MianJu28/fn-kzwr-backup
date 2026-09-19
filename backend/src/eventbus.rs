@@ -43,6 +43,12 @@ pub struct DomainEvent {
     pub done: u64,
     /// 总文件数
     pub total: u64,
+    /// 已处理字节数（明文）
+    pub bytes_done: u64,
+    /// 总字节数（明文；未知为 0）
+    pub bytes_total: u64,
+    /// 任务已耗时（毫秒）
+    pub elapsed_ms: u64,
     /// 消息（错误信息等）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -79,6 +85,7 @@ impl EventBus {
     }
 
     /// 便捷发布：备份/恢复任务状态
+    #[allow(clippy::too_many_arguments)]
     pub fn task_event(
         &self,
         kind: TaskKind,
@@ -87,6 +94,9 @@ impl EventBus {
         current_file: Option<String>,
         done: u64,
         total: u64,
+        bytes_done: u64,
+        bytes_total: u64,
+        elapsed_ms: u64,
         message: Option<String>,
     ) {
         let ts = std::time::SystemTime::now()
@@ -100,6 +110,9 @@ impl EventBus {
             current_file,
             done,
             total,
+            bytes_done,
+            bytes_total,
+            elapsed_ms,
             message,
             ts,
         });

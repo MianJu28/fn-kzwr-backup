@@ -58,6 +58,9 @@ async fn handle_socket(mut socket: WebSocket, eventbus: Arc<EventBus>) {
                             "current_file": event.current_file,
                             "done": event.done,
                             "total": event.total,
+                            "bytes_done": event.bytes_done,
+                            "bytes_total": event.bytes_total,
+                            "elapsed_ms": event.elapsed_ms,
                             "message": event.message,
                             "ts": event.ts,
                         });

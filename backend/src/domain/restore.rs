@@ -2,9 +2,13 @@
 //!
 //! 从目标存储读取加密数据 → age 解密 → 写回本地目录。
 //! 支持选择性恢复（只恢复指定的文件）。
+//!
+//! 目标端布局：`/<target_prefix>/<source_root_name>/<rel>`，其中 `source_root_name`
+//! 为备份源文件夹名（与备份侧 `run_multi` 的分目录策略对应）。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -21,11 +25,35 @@ pub struct RestoreJob {
     pub crypto: CryptoSession,
     /// 目标根前缀（备份时写入的前缀，如 "fn-backup"），与备份对应
     pub target_prefix: Option<String>,
+    /// 备份源文件夹名（备份时在目标前缀下多分的目录，如 "Photos"）
+    pub source_root_name: Option<String>,
     /// 内部事件总线（进度推送，可选）
     pub eventbus: Option<Arc<crate::eventbus::EventBus>>,
 }
 
 impl RestoreJob {
+    /// 目标端根路径：`/<prefix>[/<source_root_name>]`
+    fn base_path(&self) -> String {
+        let mut segs: Vec<String> = Vec::new();
+        if let Some(p) = &self.target_prefix {
+            let p = p.trim_matches('/');
+            if !p.is_empty() {
+                segs.push(p.to_string());
+            }
+        }
+        if let Some(r) = &self.source_root_name {
+            let r = r.trim_matches('/');
+            if !r.is_empty() {
+                segs.push(r.to_string());
+            }
+        }
+        if segs.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", segs.join("/"))
+        }
+    }
+
     /// 执行恢复
     ///
     /// - `rel_files`: 要恢复的文件相对路径列表（选择性恢复）。空列表 = 恢复全部已备份文件。
@@ -40,11 +68,15 @@ impl RestoreJob {
         };
         let total = files_to_restore.iter().filter(|r| !r.trim().is_empty()).count() as u64;
 
+        let started = Instant::now();
         self.publish(
             crate::eventbus::TaskStatus::Started,
             None,
             0,
             total,
+            0,
+            0,
+            0,
             None,
         );
 
@@ -62,6 +94,9 @@ impl RestoreJob {
                 Some(rel.clone()),
                 restored as u64,
                 total,
+                restored_bytes,
+                0,
+                started.elapsed().as_millis() as u64,
                 None,
             );
             info!("已恢复: {} ({n} B)", rel);
@@ -72,6 +107,9 @@ impl RestoreJob {
             None,
             restored as u64,
             total,
+            restored_bytes,
+            0,
+            started.elapsed().as_millis() as u64,
             None,
         );
 
@@ -82,12 +120,16 @@ impl RestoreJob {
     }
 
     /// 发布进度事件（事件总线可选）
+    #[allow(clippy::too_many_arguments)]
     fn publish(
         &self,
         status: crate::eventbus::TaskStatus,
         current_file: Option<String>,
         done: u64,
         total: u64,
+        bytes_done: u64,
+        bytes_total: u64,
+        elapsed_ms: u64,
         message: Option<String>,
     ) {
         if let Some(eb) = &self.eventbus {
@@ -98,6 +140,9 @@ impl RestoreJob {
                 current_file,
                 done,
                 total,
+                bytes_done,
+                bytes_total,
+                elapsed_ms,
                 message,
             );
         }
@@ -105,14 +150,12 @@ impl RestoreJob {
 
     /// 恢复单个文件：目标读密文 → age 解密 → 写本地
     async fn restore_one(&self, rel: &str, restore_dir: &Path) -> Result<u64> {
-        // 目标路径 = prefix + rel（统一带前导斜杠，如 "/fn-backup/xxx"）
-        let target_path = match &self.target_prefix {
-            Some(p) if !p.trim().is_empty() => PathBuf::from(format!(
-                "/{}/{}",
-                p.trim_matches('/'),
-                rel.trim_start_matches('/')
-            )),
-            _ => PathBuf::from(rel),
+        // 目标路径 = base_path + rel（统一带前导斜杠，如 "/fn-backup/Photos/xxx"）
+        let base = self.base_path();
+        let target_path = if base == "/" {
+            PathBuf::from(rel)
+        } else {
+            PathBuf::from(format!("{}/{}", base, rel.trim_start_matches('/')))
         };
 
         // 1) 从目标读取密文
@@ -141,23 +184,19 @@ impl RestoreJob {
         Ok(plain.len() as u64)
     }
 
-    /// 列出目标前缀下的所有文件（递归），返回相对路径
+    /// 列出目标前缀下的所有文件（递归），返回相对路径（相对 base_path）
     async fn list_target_files(&self) -> Result<Vec<String>> {
-        // 目标存储 key 为带前导斜杠格式，如 "/fn-backup/xxx"
-        let root = match &self.target_prefix {
-            Some(p) if !p.trim().is_empty() => format!("/{}", p.trim_matches('/')),
-            _ => "/".to_string(),
-        };
+        let base = self.base_path();
 
         let mut files = Vec::new();
-        let mut stack = vec![root];
+        let mut stack = vec![base.clone()];
         while let Some(dir) = stack.pop() {
             let entries = self.target.list(&dir).await?;
             for e in entries {
                 if e.is_dir {
                     stack.push(format!("/{}", e.rel_path.trim_start_matches('/')));
                 } else {
-                    files.push(strip_prefix(&e.rel_path, &self.target_prefix));
+                    files.push(strip_base(&e.rel_path, &base));
                 }
             }
         }
@@ -165,22 +204,19 @@ impl RestoreJob {
     }
 }
 
-/// 从路径中去掉目标前缀，得到相对路径（兼容带/不带前导斜杠）
-fn strip_prefix(path: &str, prefix: &Option<String>) -> String {
-    match prefix {
-        Some(p) if !p.trim().is_empty() => {
-            let name = p.trim_matches('/');
-            // 兼容 "/fn-backup/..." 与 "fn-backup/..." 两种存储格式
-            let variants = [format!("/{}/", name), format!("{}/", name)];
-            for v in &variants {
-                if let Some(rest) = path.strip_prefix(v.as_str()) {
-                    return rest.to_string();
-                }
-            }
-            path.trim_start_matches('/').to_string()
-        }
-        _ => path.trim_start_matches('/').to_string(),
+/// 从路径中去掉 base 前缀，得到相对路径
+fn strip_base(path: &str, base: &str) -> String {
+    let base = base.trim_matches('/');
+    if base.is_empty() {
+        return path.trim_start_matches('/').to_string();
     }
+    let variants = [format!("/{}/", base), format!("{}/", base)];
+    for v in &variants {
+        if let Some(rest) = path.strip_prefix(v.as_str()) {
+            return rest.to_string();
+        }
+    }
+    path.trim_start_matches('/').to_string()
 }
 
 /// 恢复结果摘要

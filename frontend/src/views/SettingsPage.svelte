@@ -17,12 +17,14 @@
   export let keyBackedUp = false; // 用户是否已确认备份私钥
   export let onSetKey = null; // (privateKey) => Promise
   export let onGenerateKey = null; // () => Promise
-  export let onExportKey = null; // () => Promise<{private_key, error}>
+  export let onExportKey = null; // (passphrase) => Promise<{private_key, error}>
   export let onBackupAck = null; // () => Promise<void>
 
   // 通知设置（监控告警）
   export let webhookUrl = '';
-  export let onSaveWebhook = null; // (url) => Promise
+  export let webhookHeaders = []; // [{ name, value }]
+  export let webhookBody = '';
+  export let onSaveWebhook = null; // (url, headers, bodyTemplate) => Promise
 </script>
 
 <UserCard {userInfo} {userInfoError} configured={webdavConfigured} />
@@ -40,4 +42,4 @@
   {onBackupAck}
 />
 
-<NotifySection {webhookUrl} {busy} onSave={onSaveWebhook} />
+<NotifySection {webhookUrl} {webhookHeaders} {webhookBody} {busy} onSave={onSaveWebhook} />

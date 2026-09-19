@@ -12,6 +12,7 @@
   export let onBackupAck = null; // () => Promise<void>
 
   let privateKeyInput = '';
+  let adminPassphrase = ''; // 管理员口令（显示私钥等敏感操作需校验）
   let msg = '';
   let msgOk = false;
   let shownKey = revealKey || ''; // 当前展示的私钥（生成/导出）
@@ -82,9 +83,14 @@
   }
 
   async function exportKey() {
+    if (!adminPassphrase.trim()) {
+      msg = '请先输入管理员口令';
+      msgOk = false;
+      return;
+    }
     if (!confirm('将显示当前私钥明文。\n\n请勿在公共场所或截图中泄露，确认继续？')) return;
     working = true;
-    const r = await onExportKey();
+    const r = await onExportKey(adminPassphrase.trim());
     working = false;
     if (r.private_key) {
       shownKey = r.private_key;
@@ -129,6 +135,15 @@
 
   <label>自定义私钥（AGE-SECRET-KEY-1…，留空则沿用当前/自动生成的密钥）
     <textarea rows="2" bind:value={privateKeyInput} placeholder="AGE-SECRET-KEY-1..."></textarea>
+  </label>
+
+  <label>管理员口令（显示私钥等敏感操作需校验）
+    <input
+      type="password"
+      bind:value={adminPassphrase}
+      autocomplete="off"
+      placeholder="安装时设置的管理员口令"
+    />
   </label>
 
   <div class="btn-row">
@@ -198,6 +213,7 @@
     background: #fbfcfe;
   }
   textarea { width: 100%; resize: vertical; }
+  input[type='password'] { width: 100%; }
   .btn-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
   button {
     background: #2563eb;
@@ -212,8 +228,8 @@
   button:disabled { background: #9db4e8; cursor: not-allowed; }
   button.ghost { background: #eef2ff; color: #2563eb; }
   button.ghost:disabled { background: #eef2ff; color: #9db4e8; }
-  button.ok { background: #16a34a; }
-  button.ok:disabled { background: #86efac; cursor: default; }
+  button.ok { background: #16a34a; color: #fff; }
+  button.ok:disabled { background: #d1fae5; color: #047857; cursor: default; }
   .generated {
     margin-top: 14px;
     padding: 14px;

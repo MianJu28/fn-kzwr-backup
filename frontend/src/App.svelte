@@ -40,8 +40,10 @@
   let keyBackedUp = false; // 用户是否已确认备份私钥
   // 监控告警
   let alerts = [];
-  // 告警 Webhook 地址（通知设置）
+  // 告警 Webhook 配置（通知设置）
   let webhookUrl = '';
+  let webhookHeaders = []; // [{ name, value }]
+  let webhookBody = '';
 
   const navItems = [
     { id: 'dashboard', label: '📊 概览' },
@@ -74,6 +76,9 @@
               current_file: data.current_file,
               done: data.done,
               total: data.total,
+              bytes_done: data.bytes_done,
+              bytes_total: data.bytes_total,
+              elapsed_ms: data.elapsed_ms,
               message: data.message,
             };
             // 任务结束（备份/恢复完成）后刷新可恢复列表，保证恢复页数据最新
@@ -119,6 +124,8 @@
       webdavConfigured = !!data.webdav_configured;
       webdavUrl = data.webdav_url || '';
       webhookUrl = data.webhook_url || '';
+      webhookHeaders = data.webhook_headers || [];
+      webhookBody = data.webhook_body || '';
       keyBackedUp = !!data.key_backed_up;
       if (data.error) error = data.error;
     } catch (e) {
@@ -179,9 +186,13 @@
     return data;
   }
 
-  // 导出当前私钥明文（用于另存备份）
-  async function handleExportKey() {
-    const res = await fetch('/api/keys/export', { method: 'POST' });
+  // 导出当前私钥明文（用于另存备份；需管理员口令校验）
+  async function handleExportKey(passphrase) {
+    const res = await fetch('/api/keys/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ passphrase }),
+    });
     return res.json();
   }
 
@@ -212,15 +223,19 @@
     }
   }
 
-  // 保存告警 Webhook 地址（空串 = 关闭外发）
-  async function handleSaveWebhook(url) {
+  // 保存告警 Webhook 配置（地址空串 = 关闭外发；可选自定义 headers/body 模板）
+  async function handleSaveWebhook(url, headers, bodyTemplate) {
     const res = await fetch('/api/notify/webhook', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ webhook_url: url }),
+      body: JSON.stringify({ webhook_url: url, headers, body_template: bodyTemplate }),
     });
     const data = await res.json();
-    if (data.success) webhookUrl = data.webhook_url || '';
+    if (data.success) {
+      webhookUrl = data.webhook_url || '';
+      webhookHeaders = data.headers || [];
+      webhookBody = data.body_template || '';
+    }
     return data;
   }
 
@@ -395,6 +410,8 @@
           {revealKey}
           {keyBackedUp}
           {webhookUrl}
+          {webhookHeaders}
+          {webhookBody}
           onSaveWebdav={handleSaveWebdav}
           onSetKey={handleSetKey}
           onGenerateKey={handleGenerateKey}
