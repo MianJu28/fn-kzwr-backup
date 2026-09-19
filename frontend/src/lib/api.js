@@ -1,0 +1,66 @@
+/**
+ * 后端 API 客户端（所有 HTTP 调用集中于此，组件不直接拼 URL）
+ *
+ * 约定：后端统一返回 200 + JSON（错误放在 `error` 字段），
+ * 因此这里只做网络层异常抛出与 JSON 解析，业务错误由调用方判断。
+ */
+
+async function req(path, options = {}) {
+  const res = await fetch(path, options);
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    throw new Error(`响应解析失败（HTTP ${res.status}）`);
+  }
+  if (!res.ok && data && data.error === undefined) {
+    throw new Error(`请求失败（HTTP ${res.status}）`);
+  }
+  return data;
+}
+
+const get = (path) => req(path);
+
+const post = (path, body) =>
+  req(path, {
+    method: 'POST',
+    headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+
+export const api = {
+  // 健康检查
+  health: () => get('/api/health'),
+
+  // 配置（备份路径 / 目标文件夹 / 定时）
+  config: () => get('/api/config'),
+  saveConfig: (cfg) => post('/api/config', cfg),
+
+  // WebDAV 凭据（地址固定，后端保存前实测连通性）
+  saveWebdav: (username, password) => post('/api/webdav/config', { username, password }),
+  userInfo: () => get('/api/user/info'),
+
+  // age 密钥
+  keys: () => get('/api/keys'),
+  setKey: (private_key) => post('/api/keys', { private_key }),
+  generateKey: () => post('/api/keys/generate'),
+  exportKey: (passphrase) => post('/api/keys/export', { passphrase }),
+  backupAck: () => post('/api/keys/backup-ack'),
+
+  // 告警与通知
+  alerts: () => get('/api/alerts'),
+  clearAlerts: () => req('/api/alerts', { method: 'DELETE' }),
+  saveWebhook: (webhook_url, headers, body_template) =>
+    post('/api/notify/webhook', { webhook_url, headers, body_template }),
+  testWebhook: (webhook_url, headers, body_template) =>
+    post('/api/notify/webhook/test', { webhook_url, headers, body_template }),
+
+  // 配置导入 / 导出（需管理员口令）
+  exportConfig: (passphrase) => post('/api/config/export', { passphrase }),
+  importConfig: (passphrase, config) => post('/api/config/import', { passphrase, config }),
+
+  // 备份 / 恢复
+  runBackup: () => post('/api/backup/run'),
+  restoreFiles: () => get('/api/restore/files'),
+  restore: (files, source_path) => post('/api/restore/run', { files, source_path }),
+};

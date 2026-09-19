@@ -1,6 +1,7 @@
 <script>
-  // WebDAV 凭据配置（ADR-009：官方 WebDAV，Basic 认证，凭据加密存储）
-  // 地址固定为官方 WebDAV，无需用户设置
+  // WebDAV 凭据配置（地址固定为官方地址，保存前实测连通性后加密存储）
+  import Icon from './Icon.svelte';
+
   export let configured = false;
   export let configuredUrl = '';
   export let busy = false;
@@ -9,78 +10,137 @@
   let username = '';
   let password = '';
   let saveMsg = '';
+  let saveOk = false;
+  let showPassword = false;
+
+  const DEFAULT_URL = 'https://dav.kzwr.com/dav';
 
   async function submit() {
+    saveMsg = '';
     const msg = await onSave(username, password);
-    saveMsg = msg;
-    if (msg && msg.startsWith('WebDAV 已配置')) {
-      password = '';
-    }
+    saveMsg = msg || '';
+    saveOk = !msg;
+    if (!msg) password = '';
   }
 </script>
 
-<section>
-  <h2>🌐 WebDAV 目标配置</h2>
-  <p class="hint">
-    备份目标为酷族网软（kzwr）官方 WebDAV：<code>{configuredUrl || 'https://dav.kzwr.com/dav'}</code>
-    <br />凭据保存前会先实测连通性，通过后加密存储；大文件自动分片上传。
-  </p>
-  {#if configured}
-    <p class="ok">✅ 已配置</p>
-  {:else}
-    <p class="warn">⚠️ 未配置，填写后才能执行备份/恢复</p>
-  {/if}
-  <label>用户名
-    <input bind:value={username} type="text" placeholder="账号或邮箱" autocomplete="off" />
-  </label>
-  <label>密码 / 应用密码
-    <input bind:value={password} type="password" placeholder="••••••••" autocomplete="new-password" />
-  </label>
-  <button on:click={submit} disabled={busy || !username || !password}>
-    {busy ? '验证并保存中...' : (configured ? '更新凭据' : '测试并保存')}
-  </button>
-  {#if saveMsg}
-    <p class:ok={saveMsg.startsWith('WebDAV 已配置')} class:warn={!saveMsg.startsWith('WebDAV 已配置')}>{saveMsg}</p>
-  {/if}
+<section class="card">
+  <div class="card-head">
+    <div class="icon-wrap"><Icon name="cloud" size={18} /></div>
+    <div class="grow">
+      <h2 class="card-title">WebDAV 目标</h2>
+      <p class="card-desc">
+        固定使用 kzwr 官方 WebDAV：<code>{configuredUrl || DEFAULT_URL}</code>
+      </p>
+    </div>
+    <span class="badge {configured ? 'badge-ok' : 'badge-warn'}">
+      <span class="dot" class:on={configured} class:off={!configured}></span>
+      {configured ? '已配置' : '未配置'}
+    </span>
+  </div>
+
+  <div class="card-body">
+    <div class="grid2">
+      <label class="field">
+        <span class="label">用户名 / 账号</span>
+        <input
+          class="input"
+          bind:value={username}
+          type="text"
+          placeholder="账号或邮箱"
+          autocomplete="off"
+        />
+      </label>
+
+      <label class="field">
+        <span class="label">密码 / 应用密码</span>
+        <div class="pwd">
+          <input
+            class="input"
+            type={showPassword ? 'text' : 'password'}
+            value={password}
+            on:input={(e) => (password = e.currentTarget.value)}
+            placeholder="••••••••"
+            autocomplete="new-password"
+          />
+          <button
+            class="btn-icon reveal"
+            type="button"
+            on:click={() => (showPassword = !showPassword)}
+            aria-label={showPassword ? '隐藏密码' : '显示密码'}
+          >
+            <Icon name={showPassword ? 'eye-off' : 'eye'} size={15} />
+          </button>
+        </div>
+      </label>
+    </div>
+
+    <div class="alert alert-info">
+      <Icon name="info" size={15} />
+      <div class="alert-body">
+        保存前会先实测连通性；通过后凭据加密存储并热切换目标，无需重启服务。大文件会自动分片上传。
+      </div>
+    </div>
+
+    {#if saveMsg}
+      <div class="alert {saveOk ? 'alert-ok' : 'alert-danger'} msg">
+        <Icon name={saveOk ? 'check-circle' : 'x-circle'} size={15} />
+        <div class="alert-body">{saveMsg}</div>
+      </div>
+    {/if}
+  </div>
+
+  <div class="card-foot foot">
+    <span class="foot-hint">凭据仅保存在本机配置目录（age 加密）</span>
+    <button class="btn btn-primary" on:click={submit} disabled={busy || !username || !password}>
+      {#if busy}
+        <span class="spin"></span>验证中…
+      {:else}
+        <Icon name="link" size={15} />{configured ? '更新凭据' : '测试并保存'}
+      {/if}
+    </button>
+  </div>
 </section>
 
 <style>
-  section {
-    background: #fff;
-    border-radius: 10px;
-    padding: 20px;
-    box-shadow: 0 1px 3px rgba(0,0,0,.06);
+  .grow {
+    flex: 1;
+    min-width: 0;
   }
-  h2 { margin: 0 0 8px; font-size: 18px; }
-  .hint { color: #5a6a7a; font-size: 13px; margin: 0 0 10px; line-height: 1.6; }
-  .hint code {
-    background: #eef2ff;
-    color: #2563eb;
-    border-radius: 4px;
-    padding: 1px 6px;
+  .grid2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--s3);
+  }
+  @media (max-width: 640px) {
+    .grid2 {
+      grid-template-columns: 1fr;
+    }
+  }
+  .pwd {
+    position: relative;
+  }
+  .pwd .input {
+    padding-right: 38px;
+  }
+  .reveal {
+    position: absolute;
+    right: 4px;
+    top: 50%;
+    transform: translateY(-50%);
+  }
+  .msg {
+    margin-top: var(--s3);
+  }
+  .foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s3);
+    flex-wrap: wrap;
+  }
+  .foot-hint {
+    color: var(--text-3);
     font-size: 12px;
-  }
-  .ok { color: #22a06b; }
-  .warn { color: #b45309; }
-  button {
-    background: #2563eb;
-    color: #fff;
-    border: none;
-    border-radius: 6px;
-    padding: 10px 20px;
-    font-size: 15px;
-    cursor: pointer;
-    margin-top: 12px;
-  }
-  button:disabled { background: #9db4e8; cursor: not-allowed; }
-  label { display: block; margin: 12px 0 4px; font-size: 14px; color: #42526e; }
-  input {
-    width: 100%;
-    padding: 8px 10px;
-    border: 1px solid #d0d7e2;
-    border-radius: 6px;
-    margin-top: 4px;
-    font-size: 14px;
-    box-sizing: border-box;
   }
 </style>

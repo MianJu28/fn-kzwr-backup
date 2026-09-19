@@ -1,178 +1,204 @@
 <script>
+  // 实时任务面板（WebSocket 推送）：常驻展示，空闲时展示引导态
   import { onDestroy } from 'svelte';
-  // 实时任务状态（WebSocket 推送）；面板常驻显示，无任务时展示空闲态
-  export let liveStatus = null; // { kind, status, current_file, done, total, bytes_done, bytes_total, elapsed_ms, speed, at, message }
+  import Icon from './Icon.svelte';
+  import { fmtBytes, fmtBps, fmtDuration, pctOf, fmtInt } from '../lib/format.js';
+
+  export let liveStatus = null;
   export let wsConnected = false;
 
-  // 每秒刷新一次，使速度/用时连续更新（不必等下一个文件事件）
+  // 每秒刷新，使「用时」在两次事件之间也能连续走动
   let now = Date.now();
   const ticker = setInterval(() => (now = Date.now()), 1000);
   onDestroy(() => clearInterval(ticker));
 
-  function statusText(s) {
-    const map = {
-      started: '开始',
-      progress: '进行中',
-      completed: '完成',
-      failed: '失败',
-    };
-    return map[s] || s;
-  }
+  const STATUS = {
+    started: { text: '已启动', icon: 'play' },
+    progress: { text: '进行中', icon: 'activity' },
+    completed: { text: '已完成', icon: 'check-circle' },
+    failed: { text: '已失败', icon: 'x-circle' },
+  };
 
-  // 字节数可读格式化
-  function fmtBytes(n) {
-    if (n === null || n === undefined || isNaN(n)) return '—';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    let v = Number(n);
-    let i = 0;
-    while (v >= 1024 && i < units.length - 1) {
-      v /= 1024;
-      i++;
-    }
-    return `${i === 0 ? v : v.toFixed(1)} ${units[i]}`;
-  }
-
-  // 时长格式化（mm:ss 或 h:mm:ss）
-  function fmtDuration(ms) {
-    if (!ms || ms < 0) return '0s';
-    const total = Math.floor(ms / 1000);
-    const h = Math.floor(total / 3600);
-    const m = Math.floor((total % 3600) / 60);
-    const s = total % 60;
-    const pad = (x) => String(x).padStart(2, '0');
-    return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
-  }
-
-  // 速度直接由后端下发（字节/秒），前端只做格式化
-  function fmtBps(bps) {
-    if (!bps) return '—';
-    return `${fmtBytes(bps)}/s`;
-  }
-
-  $: pct =
-    liveStatus && liveStatus.total
-      ? Math.min(100, Math.round((liveStatus.done / liveStatus.total) * 100))
-      : 0;
-
-  // 仅「上传/下载进行中」才按秒推进；完成/失败后冻结为后端最终耗时，不再变化
-  $: isRunning =
-    !!liveStatus && (liveStatus.status === 'started' || liveStatus.status === 'progress');
-
-  // 已耗时 = 后端上报的耗时 +（进行中时）距上次事件的时间
-  $: liveElapsed = liveStatus
-    ? isRunning
+  $: status = liveStatus ? STATUS[liveStatus.status] || { text: liveStatus.status, icon: 'info' } : null;
+  $: running = !!liveStatus && (liveStatus.status === 'started' || liveStatus.status === 'progress');
+  $: failed = !!liveStatus && liveStatus.status === 'failed';
+  $: done = !!liveStatus && liveStatus.status === 'completed';
+  $: pct = liveStatus ? pctOf(liveStatus.done, liveStatus.total) : 0;
+  $: elapsed = liveStatus
+    ? running
       ? (liveStatus.elapsed_ms || 0) + Math.max(0, now - (liveStatus.at || now))
       : liveStatus.elapsed_ms || 0
     : 0;
-
-  // 速度由后端按实际传输时段计量后下发；此处仅展示（空闲/完成后不变化）
-  $: speedText = fmtBps(liveStatus ? liveStatus.speed : 0);
+  $: kindIcon = liveStatus && liveStatus.kind === 'restore' ? 'download' : 'upload';
+  $: kindText = liveStatus && liveStatus.kind === 'restore' ? '恢复' : '备份';
 </script>
 
-<section class="live-status" class:idle={!liveStatus}>
-  <h2>{liveStatus ? (liveStatus.kind === 'backup' ? '⬆️' : '⬇️') : '⚡'} 实时任务</h2>
-  <div class="conn" class:on={wsConnected}>
-    <span class="dot"></span>{wsConnected ? '实时连接正常' : '实时连接中断'}
+<section class="card live" class:active={running} class:done class:failed>
+  <div class="card-head">
+    {#if liveStatus}
+      <div class="icon-wrap {running ? '' : failed ? 'danger' : 'ok'}">
+        <Icon name={kindIcon} size={18} />
+      </div>
+    {:else}
+      <div class="icon-wrap"><Icon name="activity" size={18} /></div>
+    {/if}
+    <div class="grow">
+      <h2 class="card-title">实时任务</h2>
+      <p class="card-desc">
+        {#if liveStatus}{kindText}任务 · {status.text}{:else}通过 WebSocket 推送进度{/if}
+      </p>
+    </div>
   </div>
 
-  {#if !liveStatus}
-    <p class="idle-text">当前没有进行中的任务</p>
-  {:else}
-    <div class="ls-row">
-      <span class="ls-label">状态</span>
-      <span class="ls-value">{statusText(liveStatus.status)}</span>
-    </div>
-    {#if liveStatus.current_file}
-      <div class="ls-row">
-        <span class="ls-label">当前文件</span>
-        <span class="ls-value file">{liveStatus.current_file}</span>
+  <div class="card-body">
+    {#if !liveStatus}
+      <div class="empty">
+        <div class="icon-wrap"><Icon name="clock" size={19} /></div>
+        <strong>当前没有进行中的任务</strong>
+        在「备份」页执行备份，或等待定时任务触发
       </div>
+    {:else}
+      <div class="progress-head">
+        <span class="badge {running ? 'badge-info' : failed ? 'badge-danger' : 'badge-ok'}">
+          <Icon name={status.icon} size={12} />{status.text}
+        </span>
+        {#if liveStatus.total}
+          <span class="count mono">{liveStatus.done} / {liveStatus.total}</span>
+        {/if}
+      </div>
+
+      <div class="progress">
+        <div
+          class="progress-fill {failed ? 'danger' : done ? 'ok' : ''} {!liveStatus.total && running
+            ? 'indeterminate'
+            : ''}"
+          style="width: {pct}%"
+        ></div>
+      </div>
+
+      {#if liveStatus.current_file}
+        <div class="file" title={liveStatus.current_file}>
+          <Icon name="file" size={13} />
+          <span class="mono">{liveStatus.current_file}</span>
+        </div>
+      {/if}
+
+      <div class="metrics">
+        <div class="metric">
+          <span class="metric-label">大小</span>
+          <span class="metric-value mono">
+            {fmtBytes(liveStatus.bytes_done)}{liveStatus.bytes_total > 0
+              ? ` / ${fmtBytes(liveStatus.bytes_total)}`
+              : ''}
+          </span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">速度</span>
+          <span class="metric-value mono">{running ? fmtBps(liveStatus.speed) : '—'}</span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">用时</span>
+          <span class="metric-value mono">{fmtDuration(elapsed)}</span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">文件</span>
+          <span class="metric-value mono">{fmtInt(liveStatus.done)}</span>
+        </div>
+      </div>
+
+      {#if liveStatus.message}
+        <div class="alert {failed ? 'alert-danger' : done ? 'alert-ok' : 'alert-info'} msg">
+          <Icon name={failed ? 'alert' : done ? 'check-circle' : 'info'} size={15} />
+          <div class="alert-body">{liveStatus.message}</div>
+        </div>
+      {/if}
     {/if}
-    {#if liveStatus.total > 0}
-      <div class="ls-row">
-        <span class="ls-label">进度</span>
-        <span class="ls-value">{liveStatus.done} / {liveStatus.total}（{pct}%）</span>
-      </div>
-      <div class="progress-bar">
-        <div class="progress-fill" style="width: {pct}%"></div>
-      </div>
-    {/if}
-    <div class="ls-row">
-      <span class="ls-label">大小</span>
-      <span class="ls-value">
-        {fmtBytes(liveStatus.bytes_done)}{liveStatus.bytes_total > 0
-          ? ` / ${fmtBytes(liveStatus.bytes_total)}`
-          : ''}
-      </span>
-    </div>
-    <div class="ls-row">
-      <span class="ls-label">速度</span>
-      <span class="ls-value">{speedText}</span>
-    </div>
-    <div class="ls-row">
-      <span class="ls-label">用时</span>
-      <span class="ls-value">{fmtDuration(liveElapsed)}</span>
-    </div>
-    {#if liveStatus.message}
-      <div class="ls-row">
-        <span class="ls-label">信息</span>
-        <span class="ls-value">{liveStatus.message}</span>
-      </div>
-    {/if}
-  {/if}
+  </div>
+
+  <div class="card-foot conn">
+    <span class="dot" class:on={wsConnected} class:off={!wsConnected} class:pulse={wsConnected}></span>
+    <span>{wsConnected ? '实时通道已连接' : '实时通道断开，正在重连…'}</span>
+  </div>
 </section>
 
 <style>
-  .live-status {
-    background: #fff;
-    border: 1px solid #e0e4ea;
-    border-radius: 10px;
-    padding: 22px 20px;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+  .live.active {
+    border-color: var(--primary-soft-border);
   }
-  .live-status:not(.idle) {
-    background: #f0fdf4;
-    border-color: #bbf7d0;
+  .live.failed {
+    border-color: var(--danger-border);
   }
-  h2 { margin: 0 0 16px; font-size: 16px; line-height: 1.4; }
+  .grow {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .progress-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s2);
+    margin-bottom: var(--s2);
+  }
+  .count {
+    color: var(--text-2);
+    font-size: 12px;
+  }
+
+  .file {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin-top: var(--s3);
+    padding: 7px 9px;
+    border-radius: var(--r-sm);
+    background: var(--surface-3);
+    border: 1px solid var(--border);
+    color: var(--text-2);
+    font-size: 11.5px;
+    overflow: hidden;
+  }
+  .file span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .metrics {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--s2);
+    margin-top: var(--s3);
+  }
+  .metric {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 9px 10px;
+    border-radius: var(--r-sm);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+  }
+  .metric-label {
+    font-size: 11px;
+    color: var(--text-3);
+  }
+  .metric-value {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text);
+    word-break: break-all;
+  }
+  .msg {
+    margin-top: var(--s3);
+    font-size: 12.5px;
+  }
   .conn {
     display: flex;
     align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    color: #8a94a6;
-    margin-bottom: 16px;
-  }
-  .dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: #d1d5db;
-    flex-shrink: 0;
-  }
-  .conn.on .dot { background: #22c55e; }
-  .idle-text { color: #8a94a6; font-size: 13px; margin: 0; }
-  .ls-row {
-    display: flex;
-    gap: 12px;
-    padding: 7px 0;
-    font-size: 13px;
-    border-bottom: 1px solid #e9f9ef;
-  }
-  .ls-row:last-child { border-bottom: none; }
-  .ls-label { color: #42526e; font-weight: 600; width: 68px; flex-shrink: 0; }
-  .ls-value { color: #1f2d3d; word-break: break-all; min-width: 0; }
-  .ls-value.file { font-family: monospace; }
-  .progress-bar {
-    height: 8px;
-    background: #e5e7eb;
-    border-radius: 4px;
-    overflow: hidden;
-    margin: 8px 0;
-  }
-  .progress-fill {
-    height: 100%;
-    background: #22c55e;
-    transition: width 0.3s;
+    gap: 8px;
+    color: var(--text-3);
+    font-size: 11.5px;
+    padding: var(--s3) var(--s5);
   }
 </style>

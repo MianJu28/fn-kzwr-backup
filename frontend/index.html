@@ -3,7 +3,24 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>fnos 备份</title>
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#4f46e5" />
+    <meta
+      name="description"
+      content="酷族备份 · 飞牛 NAS 指定文件夹增量 age 加密备份至酷族网软（kzwr）官方 WebDAV，支持定时、实时进度与选择性恢复"
+    />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>酷族备份 · 增量加密</title>
+    <script>
+      // 首屏前应用主题，避免浅色闪烁（与 lib/theme.js 使用同一存储键）
+      try {
+        var t = localStorage.getItem('fn-kzwr-backup.theme');
+        if (t !== 'light' && t !== 'dark') {
+          t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        }
+        document.documentElement.setAttribute('data-theme', t);
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="app"></div>

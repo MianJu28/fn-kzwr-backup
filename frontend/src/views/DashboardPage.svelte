@@ -11,12 +11,14 @@
   export let scheduleCronValid = true;
   export let userInfo = null;
   export let userInfoError = null;
+  export let keyBackedUp = false;
+  export let onGoto = null; // (pageId) => void
 </script>
 
 <!-- 备份账号（WebDAV） -->
 <UserCard {userInfo} {userInfoError} configured={webdavConfigured} />
 
-<!-- 当前配置概览（实时任务已移到右侧常驻面板） -->
+<!-- 配置概览（实时任务在右侧常驻面板） -->
 <OverviewSection
   {backupPaths}
   {targetFolder}
@@ -26,4 +28,6 @@
   {scheduleCron}
   {scheduleCronValid}
   {userInfo}
+  {keyBackedUp}
+  {onGoto}
 />
