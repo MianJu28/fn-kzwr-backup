@@ -4,6 +4,8 @@
 
   export let configured = false;
   export let configuredUrl = '';
+  /** 已保存的账号（非敏感，回填方便修改；密码永不回显） */
+  export let configuredUsername = '';
   export let busy = false;
   export let onSave = null; // (username, password) => Promise<string>
 
@@ -14,6 +16,15 @@
   let showPassword = false;
 
   const DEFAULT_URL = 'https://dav.kzwr.com/dav';
+
+  // 仅在「后端回显值变化」时回填，避免用户输入被覆盖
+  let lastUser = null;
+  function syncUsername(u) {
+    if (u === lastUser) return;
+    lastUser = u;
+    username = u || '';
+  }
+  $: syncUsername(configuredUsername || '');
 
   async function submit() {
     saveMsg = '';
@@ -50,6 +61,9 @@
           placeholder="账号或邮箱"
           autocomplete="off"
         />
+        {#if configuredUsername}
+          <span class="field-hint">当前已保存：<code>{configuredUsername}</code>，可直接沿用</span>
+        {/if}
       </label>
 
       <label class="field">
@@ -72,6 +86,9 @@
             <Icon name={showPassword ? 'eye-off' : 'eye'} size={15} />
           </button>
         </div>
+        {#if configured}
+          <span class="field-hint">出于安全不回显已保存密码；仅修改账号时仍需重新输入一次</span>
+        {/if}
       </label>
     </div>
 
