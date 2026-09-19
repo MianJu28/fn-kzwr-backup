@@ -140,6 +140,7 @@ async fn main() -> Result<()> {
         target: target.clone(),
         crypto: crypto.clone(),
         target_prefix: Some(PREFIX.to_string()),
+        source_root_name: None,
         eventbus: None,
     };
     let r1 = restore_job.run(&[], &restore_dir1).await?;

@@ -12,6 +12,8 @@
   let pathInput = '';
   let pathMsg = '';
   let inTrimHost = isInTrimHost();
+  let savedHint = ''; // 自动保存提示
+  let saveTimer = null;
   const cronPresets = [
     { label: '每天 00:00', value: '0 0 * * *' },
     { label: '每天 06:00', value: '0 6 * * *' },
@@ -21,11 +23,21 @@
     { label: '每周一 02:00', value: '0 2 * * 1' },
   ];
 
+  // 立即保存（用于增删路径：备份路径改动即自动保存）
+  async function saveNow() {
+    if (!onSave) return;
+    clearTimeout(saveTimer);
+    await onSave();
+    savedHint = '备份路径已自动保存';
+    setTimeout(() => (savedHint = ''), 1800);
+  }
+
   function addPath() {
     const p = pathInput.trim();
     if (p && !backupPaths.includes(p)) {
       backupPaths = [...backupPaths, p];
       pathInput = '';
+      saveNow();
     }
   }
 
@@ -45,6 +57,7 @@
           }
         }
         pathMsg = added.length > 0 ? `✅ 已选择 ${added.length} 个目录` : '这些目录已在列表中';
+        if (added.length > 0) await saveNow();
       } else {
         pathMsg = '已取消选择';
       }
@@ -55,17 +68,19 @@
 
   function removePath(i) {
     backupPaths = backupPaths.filter((_, idx) => idx !== i);
+    saveNow();
   }
 
   function applyCronPreset(val) {
     scheduleCron = val;
     scheduleCronValid = true;
+    saveNow();
   }
 </script>
 
 <section>
   <h2>📁 备份路径配置</h2>
-  <p class="hint">设置要备份的文件夹路径，支持多个。</p>
+  <p class="hint">设置要备份的文件夹路径，支持多个。<strong>增删路径后会自动保存。</strong></p>
   <label>目标文件夹
     <input bind:value={targetFolder} placeholder="fn-backup" />
   </label>
@@ -116,6 +131,10 @@
   <button on:click={onSave} disabled={busy}>
     {busy ? '保存中...' : '保存配置'}
   </button>
+
+  {#if savedHint}
+    <p class="saved">✅ {savedHint}</p>
+  {/if}
 </section>
 
 <style>
@@ -129,6 +148,7 @@
   h2 { margin: 0 0 8px; font-size: 18px; }
   .hint { color: #5a6a7a; font-size: 13px; margin: 0 0 10px; }
   .warn { color: #b45309; }
+  .saved { color: #16a34a; font-size: 13px; margin: 12px 0 0; }
   button {
     background: #2563eb;
     color: #fff;

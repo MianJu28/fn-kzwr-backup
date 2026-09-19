@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use age::secrecy::ExposeSecret;
 use axum::extract::State;
 use axum::response::Json;
 use axum::routing::{get, post};
@@ -66,6 +67,10 @@ pub struct ConfigResponse {
     pub webdav_url: Option<String>,
     /// 告警 Webhook 地址（空 = 不外发）
     pub webhook_url: Option<String>,
+    /// Webhook 自定义请求头
+    pub webhook_headers: Vec<crate::infra::config::WebhookHeader>,
+    /// Webhook 自定义请求体模板（空 = 默认 JSON）
+    pub webhook_body: Option<String>,
     /// 用户是否已确认备份 age 私钥（未确认时 UI 提示丢失风险）
     pub key_backed_up: bool,
     pub error: Option<String>,
@@ -173,6 +178,12 @@ pub struct AlertsResponse {
 pub struct WebhookSaveRequest {
     /// 告警 Webhook 地址（空 = 关闭外发）
     pub webhook_url: String,
+    /// 自定义请求头
+    #[serde(default)]
+    pub headers: Vec<crate::infra::config::WebhookHeader>,
+    /// 自定义请求体模板（空 = 默认 JSON）
+    #[serde(default)]
+    pub body_template: Option<String>,
 }
 
 /// Webhook 配置响应
@@ -180,7 +191,17 @@ pub struct WebhookSaveRequest {
 pub struct WebhookSaveResponse {
     pub success: bool,
     pub webhook_url: Option<String>,
+    pub headers: Vec<crate::infra::config::WebhookHeader>,
+    pub body_template: Option<String>,
     pub error: Option<String>,
+}
+
+/// 私钥导出请求（需管理员口令校验）
+#[derive(Deserialize)]
+pub struct KeysExportRequest {
+    /// 管理员口令（安装向导设置的应用口令）
+    #[serde(default)]
+    pub passphrase: String,
 }
 
 /// 私钥导出响应（敏感：供用户另存备份）
@@ -205,15 +226,24 @@ fn raise_alert(
     message: String,
 ) {
     let alert = state.alerts.push(level, source, message);
-    let webhook = {
+    let notify = {
         let mgr = state.config.lock().unwrap();
-        mgr.load()
-            .ok()
-            .and_then(|c| c.notify.webhook_url)
-            .filter(|s| !s.trim().is_empty())
+        mgr.load().ok().map(|c| c.notify)
     };
-    if let Some(url) = webhook {
-        tokio::spawn(crate::domain::alerts::dispatch_webhook(url, alert));
+    if let Some(n) = notify {
+        if let Some(url) = n.webhook_url.filter(|s| !s.trim().is_empty()) {
+            let headers: Vec<(String, String)> = n
+                .webhook_headers
+                .iter()
+                .map(|h| (h.name.clone(), h.value.clone()))
+                .collect();
+            tokio::spawn(crate::domain::alerts::dispatch_webhook(
+                url,
+                headers,
+                n.webhook_body.clone(),
+                alert,
+            ));
+        }
     }
 }
 
@@ -311,6 +341,8 @@ fn config_response(
         webdav_configured,
         webdav_url: cfg.webdav.url.clone(),
         webhook_url: cfg.notify.webhook_url.clone(),
+        webhook_headers: cfg.notify.webhook_headers.clone(),
+        webhook_body: cfg.notify.webhook_body.clone(),
         key_backed_up: cfg.keys.backed_up,
         error,
     }
@@ -335,6 +367,8 @@ async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
             webdav_configured: false,
             webdav_url: None,
             webhook_url: None,
+            webhook_headers: Vec::new(),
+            webhook_body: None,
             key_backed_up: false,
             error: Some(format!("{:#}", e)),
         }),
@@ -601,10 +635,16 @@ async fn restore_run(
         ),
     };
 
+    // 备份时每个源目录在目标端以其文件夹名分目录存放，恢复需还原该层级
+    let source_root_name = std::path::Path::new(&restore_root)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned());
+
     let job = RestoreJob {
         target: state.target.clone(),
         crypto: state.crypto.get(),
         target_prefix: Some(state.target_folder.clone()),
+        source_root_name,
         eventbus: Some(state.eventbus.clone()),
     };
     match job.run(&files, std::path::Path::new(&restore_root)).await {
@@ -736,34 +776,65 @@ async fn alerts_clear(State(state): State<AppState>) -> Json<AlertsResponse> {
     })
 }
 
-/// 保存告警 Webhook 地址（空串 = 关闭外发）
+/// 保存告警 Webhook 配置（地址/自定义请求头/请求体模板；地址空 = 关闭外发）
 async fn webhook_save(
     State(state): State<AppState>,
     Json(body): Json<WebhookSaveRequest>,
 ) -> Json<WebhookSaveResponse> {
     let url = body.webhook_url.trim().to_string();
+    // 过滤空请求头
+    let headers: Vec<crate::infra::config::WebhookHeader> = body
+        .headers
+        .into_iter()
+        .filter(|h| !h.name.trim().is_empty())
+        .map(|h| crate::infra::config::WebhookHeader {
+            name: h.name.trim().to_string(),
+            value: h.value,
+        })
+        .collect();
+    let body_template = body
+        .body_template
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     let guard = state.config.lock().unwrap();
     let mut cfg = match guard.load() {
         Ok(c) => c,
         Err(_) => crate::infra::config::AppConfig::default(),
     };
     cfg.notify.webhook_url = if url.is_empty() { None } else { Some(url) };
+    cfg.notify.webhook_headers = headers;
+    cfg.notify.webhook_body = body_template;
     match guard.save(&cfg) {
         Ok(_) => Json(WebhookSaveResponse {
             success: true,
             webhook_url: cfg.notify.webhook_url.clone(),
+            headers: cfg.notify.webhook_headers.clone(),
+            body_template: cfg.notify.webhook_body.clone(),
             error: None,
         }),
         Err(e) => Json(WebhookSaveResponse {
             success: false,
             webhook_url: None,
+            headers: Vec::new(),
+            body_template: None,
             error: Some(format!("{:#}", e)),
         }),
     }
 }
 
-/// 导出当前私钥明文（供用户另存备份；敏感操作，前端需二次确认）
-async fn keys_export(State(state): State<AppState>) -> Json<KeysExportResponse> {
+/// 导出当前私钥明文（敏感操作：需管理员口令校验 + 前端二次确认）
+async fn keys_export(
+    State(state): State<AppState>,
+    Json(body): Json<KeysExportRequest>,
+) -> Json<KeysExportResponse> {
+    // 校验管理员口令（安装向导设置的应用口令）
+    if body.passphrase.as_str() != state.passphrase.expose_secret().as_str() {
+        return Json(KeysExportResponse {
+            private_key: None,
+            error: Some("管理员口令错误".to_string()),
+        });
+    }
     let ks_path = crate::infra::keystore::keystore_path(&state.cfg_dir);
     match crate::infra::keystore::load_keystore(&state.passphrase, &ks_path) {
         Ok(keys) => Json(KeysExportResponse {

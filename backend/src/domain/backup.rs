@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -60,27 +61,163 @@ impl BackupJob {
     }
 
     /// 多路径备份：遍历多个源目录，各自增量备份到目标
+    ///
+    /// 关键行为：
+    /// - 每个源路径在目标端以其**文件夹名**分目录存放（如 `/fn-backup/Photos/...`），
+    ///   既避免多路径在同一层互相覆盖，也保证「所选文件夹」本身在网盘被创建；
+    /// - 进度统计以**全部文件夹合并计算**（总文件数/总字节数），不再逐文件夹重置；
+    /// - 显式创建所有目录（含空目录），使空的子文件夹也能出现在网盘。
     pub async fn run_multi(&self, roots: &[std::path::PathBuf]) -> Result<BackupSummary> {
-        let mut total = BackupSummary::default();
-        let mut job_ids: Vec<String> = Vec::new();
-        for (i, root) in roots.iter().enumerate() {
-            // 每个源路径对应独立 job 快照（用序号作 job_id 后缀，避免快照互相覆盖）
-            let job_id = format!("{}-{}", self.job_id, i);
-            let source = crate::infra::source::local::LocalFsSource::new(root);
-            let sub = self.run_inner(&source, root, &job_id, false).await?;
-            total.uploaded += sub.uploaded;
-            total.uploaded_bytes += sub.uploaded_bytes;
-            total.deleted += sub.deleted;
-            total.unchanged += sub.unchanged;
-            job_ids.push(job_id);
-            info!(root = %root.display(), "子路径备份完成");
+        /// 单个已预扫描的子任务
+        struct Prepared {
+            job_id: String,
+            source: Arc<dyn SourceStorage>,
+            current: Vec<FileDescriptor>,
+            changeset: crate::domain::sync::ChangeSet,
+            target_prefix: Option<String>,
         }
+
+        // 1) 预扫描 + 差分：汇总全部路径的总文件数与总字节数（用于合并的进度统计）
+        let mut prepared: Vec<Prepared> = Vec::new();
+        let mut grand_total_files: u64 = 0;
+        let mut grand_total_bytes: u64 = 0;
+        for (i, root) in roots.iter().enumerate() {
+            let job_id = format!("{}-{}", self.job_id, i);
+            let source: Arc<dyn SourceStorage> =
+                Arc::new(crate::infra::source::local::LocalFsSource::new(root));
+            let current = scan_all(&*source, root).await?;
+            let last = self.store.load_snapshot(&job_id, self.account())?;
+            let changeset = SyncSession::diff(&current, &last);
+            grand_total_files += changeset.upload.iter().filter(|fd| !fd.is_dir).count() as u64;
+            grand_total_bytes += changeset
+                .upload
+                .iter()
+                .filter(|fd| !fd.is_dir)
+                .map(|fd| fd.size)
+                .sum::<u64>();
+            let root_name = root
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let target_prefix = self.join_root_prefix(&root_name);
+            prepared.push(Prepared {
+                job_id,
+                source,
+                current,
+                changeset,
+                target_prefix,
+            });
+        }
+
+        let started = Instant::now();
+        self.publish(
+            &self.job_id,
+            crate::eventbus::TaskStatus::Started,
+            None,
+            0,
+            grand_total_files,
+            0,
+            grand_total_bytes,
+            0,
+            None,
+        );
+
+        let mut done: u64 = 0;
+        let mut bytes_done: u64 = 0;
+        let mut summary = BackupSummary::default();
+        let mut job_ids: Vec<String> = Vec::new();
+
+        for p in prepared {
+            // 1) 显式创建目标端目录结构（含空目录），保证「所选文件夹」及其各级子目录存在
+            //    - 根目录（所选文件夹名）始终创建；
+            //    - 被子文件覆盖的目录会随文件上传自动创建，仅需补建「无文件」的空目录。
+            let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for fd in p.current.iter().filter(|e| !e.is_dir) {
+                let mut rel = fd.rel_path.as_str();
+                while let Some(idx) = rel.rfind('/') {
+                    rel = &rel[..idx];
+                    covered.insert(rel.to_string());
+                }
+            }
+            if let Some(prefix) = &p.target_prefix {
+                let root_path = PathBuf::from(format!("/{}", prefix.trim_matches('/')));
+                let _ = self.target.ensure_dir(&root_path).await;
+            }
+            for dir in p.current.iter().filter(|e| e.is_dir) {
+                if covered.contains(&dir.rel_path) {
+                    continue; // 会被文件上传时的父目录创建覆盖
+                }
+                let tp = target_path_with(p.target_prefix.as_deref(), &dir.rel_path);
+                let _ = self.target.ensure_dir(&tp).await;
+            }
+
+            // 2) 上传新增/修改文件（断点续传：每上传完一个文件即时保存其快照）
+            for fd in &p.changeset.upload {
+                if fd.is_dir {
+                    continue;
+                }
+                let n = self
+                    .upload_one(&*p.source, &fd.rel_path, p.target_prefix.as_deref())
+                    .await?;
+                summary.uploaded += 1;
+                summary.uploaded_bytes += n;
+                done += 1;
+                bytes_done += n;
+                self.store
+                    .save_entry(&p.job_id, self.account(), &SnapshotEntry::from_fd(fd))?;
+                self.publish(
+                    &self.job_id,
+                    crate::eventbus::TaskStatus::Progress,
+                    Some(fd.rel_path.clone()),
+                    done,
+                    grand_total_files,
+                    bytes_done,
+                    grand_total_bytes,
+                    started.elapsed().as_millis() as u64,
+                    None,
+                );
+                info!("已上传: {} ({n} B)", fd.rel_path);
+            }
+
+            // 3) 删除目标中已不存在的文件
+            for rel in &p.changeset.delete {
+                let target_path = target_path_with(p.target_prefix.as_deref(), rel);
+                match self.target.delete(&target_path).await {
+                    Ok(()) => {
+                        summary.deleted += 1;
+                        info!("已删除: {}", rel);
+                    }
+                    Err(StorageError::NotFound(_)) => {}
+                    Err(e) => info!(err = %e, "删除失败(跳过): {}", rel),
+                }
+            }
+
+            // 4) 保存该路径的新快照
+            let snapshot: Vec<SnapshotEntry> =
+                p.current.iter().map(SnapshotEntry::from_fd).collect();
+            self.store
+                .save_snapshot(&p.job_id, self.account(), &snapshot)?;
+            summary.unchanged += p.changeset.unchanged;
+            job_ids.push(p.job_id);
+        }
+
+        self.publish(
+            &self.job_id,
+            crate::eventbus::TaskStatus::Completed,
+            None,
+            done,
+            grand_total_files,
+            bytes_done,
+            grand_total_bytes,
+            started.elapsed().as_millis() as u64,
+            None,
+        );
 
         // 保留策略：备份完成后清理目标端孤儿文件
         if let Some(rt) = &self.retention {
             let managed = self.managed_paths(&job_ids)?;
             let report = rt.cleanup_unmanaged(&managed).await?;
-            total.orphan_removed += report.removed;
+            summary.orphan_removed += report.removed;
             info!(
                 removed = report.removed,
                 failed = report.failed,
@@ -89,7 +226,7 @@ impl BackupJob {
             );
         }
 
-        Ok(total)
+        Ok(summary)
     }
 
     /// 汇总多个 job 的快照，构造受管理的相对路径集合（用于保留策略）
@@ -103,6 +240,22 @@ impl BackupJob {
             }
         }
         Ok(set)
+    }
+
+    /// 在目标根前缀下追加「所选文件夹名」，作为该路径的独立目标目录
+    ///
+    /// 例：target_prefix = "fn-backup"、root_name = "Photos" → "fn-backup/Photos"。
+    fn join_root_prefix(&self, root_name: &str) -> Option<String> {
+        let name = root_name.trim_matches('/');
+        if name.is_empty() {
+            return self.target_prefix.clone();
+        }
+        match self.target_prefix.as_deref() {
+            Some(base) if !base.trim_matches('/').is_empty() => {
+                Some(format!("{}/{}", base.trim_matches('/'), name))
+            }
+            _ => Some(name.to_string()),
+        }
     }
 
     /// 备份核心实现
@@ -149,12 +302,22 @@ impl BackupJob {
         // 3) 上传新增/修改文件（目录不实际上传，仅记录）
         //    断点续传：每上传完一个文件即时保存其快照，中断后下次可从断点继续
         let total_upload = changeset.upload.iter().filter(|fd| !fd.is_dir).count() as u64;
+        let total_bytes: u64 = changeset
+            .upload
+            .iter()
+            .filter(|fd| !fd.is_dir)
+            .map(|fd| fd.size)
+            .sum();
+        let started = Instant::now();
         self.publish(
             job_id,
             crate::eventbus::TaskStatus::Started,
             None,
             0,
             total_upload,
+            0,
+            total_bytes,
+            0,
             None,
         );
 
@@ -164,7 +327,7 @@ impl BackupJob {
             if fd.is_dir {
                 continue;
             }
-            let n = self.upload_one(source, &fd.rel_path).await?;
+            let n = self.upload_one(source, &fd.rel_path, self.target_prefix.as_deref()).await?;
             uploaded += 1;
             uploaded_bytes += n;
             // 即时记录已上传文件的快照（断点续传关键）
@@ -176,6 +339,9 @@ impl BackupJob {
                 Some(fd.rel_path.clone()),
                 uploaded as u64,
                 total_upload,
+                uploaded_bytes,
+                total_bytes,
+                started.elapsed().as_millis() as u64,
                 None,
             );
             info!("已上传: {} ({n} B)", fd.rel_path);
@@ -184,7 +350,7 @@ impl BackupJob {
         // 4) 删除目标中已不存在的文件
         let mut deleted = 0usize;
         for rel in &changeset.delete {
-            let target_path = self.target_path(rel);
+            let target_path = target_path_with(self.target_prefix.as_deref(), rel);
             match self.target.delete(&target_path).await {
                 Ok(()) => {
                     deleted += 1;
@@ -205,6 +371,9 @@ impl BackupJob {
             None,
             uploaded as u64,
             total_upload,
+            uploaded_bytes,
+            total_bytes,
+            started.elapsed().as_millis() as u64,
             None,
         );
 
@@ -218,6 +387,7 @@ impl BackupJob {
     }
 
     /// 发布进度事件（事件总线可选）
+    #[allow(clippy::too_many_arguments)]
     fn publish(
         &self,
         job_id: &str,
@@ -225,6 +395,9 @@ impl BackupJob {
         current_file: Option<String>,
         done: u64,
         total: u64,
+        bytes_done: u64,
+        bytes_total: u64,
+        elapsed_ms: u64,
         message: Option<String>,
     ) {
         if let Some(eb) = &self.eventbus {
@@ -235,13 +408,21 @@ impl BackupJob {
                 current_file,
                 done,
                 total,
+                bytes_done,
+                bytes_total,
+                elapsed_ms,
                 message,
             );
         }
     }
 
     /// 上传单个文件：源流 → age 加密 → 目标
-    async fn upload_one(&self, source: &dyn SourceStorage, rel_path: &str) -> Result<u64> {
+    async fn upload_one(
+        &self,
+        source: &dyn SourceStorage,
+        rel_path: &str,
+        prefix: Option<&str>,
+    ) -> Result<u64> {
         let src = PathBuf::from(rel_path);
         let mut stream = source.read_stream(&src).await?;
 
@@ -265,24 +446,24 @@ impl BackupJob {
         // 写入目标（带 target_prefix）
         let bytes = Bytes::from(encrypted);
         let stream = Box::new(futures::stream::iter(vec![bytes]));
-        let target_path = self.target_path(rel_path);
+        let target_path = target_path_with(prefix, rel_path);
         self.target.write_stream(&target_path, stream).await?;
         Ok(plain_len as u64)
     }
+}
 
-    /// 计算目标路径：把相对路径拼上 target_prefix 前缀（统一带前导斜杠，如 "/fn-backup/xxx"）
-    fn target_path(&self, rel_path: &str) -> PathBuf {
-        match &self.target_prefix {
-            Some(prefix) => {
-                let prefix = prefix.trim_matches('/');
-                if prefix.is_empty() {
-                    PathBuf::from(rel_path)
-                } else {
-                    PathBuf::from(format!("/{}/{}", prefix, rel_path.trim_start_matches('/')))
-                }
+/// 计算目标路径：把相对路径拼上前缀（统一带前导斜杠，如 "/fn-backup/Photos/xxx"）
+fn target_path_with(prefix: Option<&str>, rel_path: &str) -> PathBuf {
+    match prefix {
+        Some(prefix) => {
+            let prefix = prefix.trim_matches('/');
+            if prefix.is_empty() {
+                PathBuf::from(rel_path)
+            } else {
+                PathBuf::from(format!("/{}/{}", prefix, rel_path.trim_start_matches('/')))
             }
-            None => PathBuf::from(rel_path),
         }
+        None => PathBuf::from(rel_path),
     }
 }
 

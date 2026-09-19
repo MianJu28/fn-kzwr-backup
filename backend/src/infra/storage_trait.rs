@@ -100,6 +100,14 @@ pub trait TargetStorage: Send + Sync {
     /// 按前缀列出文件
     async fn list(&self, prefix: &str) -> StorageResult<Vec<FileDescriptor>>;
 
+    /// 确保目录存在（含空目录；默认无操作，WebDAV 实现为逐级 MKCOL）。
+    ///
+    /// 用于保证「所选文件夹」本身及其空子目录在目标端被创建，而不仅仅依赖
+    /// 上传文件时的父目录自动创建。
+    async fn ensure_dir(&self, _path: &Path) -> StorageResult<()> {
+        Ok(())
+    }
+
     /// 测试连接与凭证是否有效
     async fn ping(&self) -> StorageResult<()>;
 }
@@ -190,6 +198,10 @@ impl TargetStorage for SwapTarget {
 
     async fn list(&self, prefix: &str) -> StorageResult<Vec<FileDescriptor>> {
         self.current().list(prefix).await
+    }
+
+    async fn ensure_dir(&self, path: &Path) -> StorageResult<()> {
+        self.current().ensure_dir(path).await
     }
 
     async fn ping(&self) -> StorageResult<()> {

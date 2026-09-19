@@ -1,6 +1,6 @@
 <script>
   // 实时任务状态（WebSocket 推送）；面板常驻显示，无任务时展示空闲态
-  export let liveStatus = null; // { kind, status, current_file, done, total, message }
+  export let liveStatus = null; // { kind, status, current_file, done, total, bytes_done, bytes_total, elapsed_ms, message }
   export let wsConnected = false;
 
   function statusText(s) {
@@ -12,6 +12,41 @@
     };
     return map[s] || s;
   }
+
+  // 字节数可读格式化
+  function fmtBytes(n) {
+    if (n === null || n === undefined || isNaN(n)) return '—';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let v = Number(n);
+    let i = 0;
+    while (v >= 1024 && i < units.length - 1) {
+      v /= 1024;
+      i++;
+    }
+    return `${i === 0 ? v : v.toFixed(1)} ${units[i]}`;
+  }
+
+  // 时长格式化（mm:ss 或 h:mm:ss）
+  function fmtDuration(ms) {
+    if (!ms || ms < 0) return '0s';
+    const total = Math.floor(ms / 1000);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    const pad = (x) => String(x).padStart(2, '0');
+    return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+  }
+
+  // 速度 = 已传字节 / 已耗时
+  function fmtSpeed(bytes, ms) {
+    if (!bytes || !ms) return '—';
+    return `${fmtBytes(bytes / (ms / 1000))}/s`;
+  }
+
+  $: pct =
+    liveStatus && liveStatus.total
+      ? Math.min(100, Math.round((liveStatus.done / liveStatus.total) * 100))
+      : 0;
 </script>
 
 <section class="live-status" class:idle={!liveStatus}>
@@ -36,15 +71,28 @@
     {#if liveStatus.total > 0}
       <div class="ls-row">
         <span class="ls-label">进度</span>
-        <span class="ls-value">{liveStatus.done} / {liveStatus.total}</span>
+        <span class="ls-value">{liveStatus.done} / {liveStatus.total}（{pct}%）</span>
       </div>
       <div class="progress-bar">
-        <div
-          class="progress-fill"
-          style="width: {liveStatus.total ? (liveStatus.done / liveStatus.total * 100) : 0}%"
-        ></div>
+        <div class="progress-fill" style="width: {pct}%"></div>
       </div>
     {/if}
+    <div class="ls-row">
+      <span class="ls-label">大小</span>
+      <span class="ls-value">
+        {fmtBytes(liveStatus.bytes_done)}{liveStatus.bytes_total > 0
+          ? ` / ${fmtBytes(liveStatus.bytes_total)}`
+          : ''}
+      </span>
+    </div>
+    <div class="ls-row">
+      <span class="ls-label">速度</span>
+      <span class="ls-value">{fmtSpeed(liveStatus.bytes_done, liveStatus.elapsed_ms)}</span>
+    </div>
+    <div class="ls-row">
+      <span class="ls-label">用时</span>
+      <span class="ls-value">{fmtDuration(liveStatus.elapsed_ms)}</span>
+    </div>
     {#if liveStatus.message}
       <div class="ls-row">
         <span class="ls-label">信息</span>

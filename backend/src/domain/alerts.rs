@@ -98,7 +98,16 @@ fn now_ms() -> i64 {
 }
 
 /// 外发告警到 Webhook（尽力而为：失败仅记录日志）
-pub async fn dispatch_webhook(url: String, alert: Alert) {
+///
+/// - `headers`：自定义请求头（键值对，空键忽略）
+/// - `body_template`：自定义请求体模板，支持占位符 `{{message}}`/`{{level}}`/
+///   `{{source}}`/`{{ts}}`/`{{id}}`；留空则发送默认 JSON
+pub async fn dispatch_webhook(
+    url: String,
+    headers: Vec<(String, String)>,
+    body_template: Option<String>,
+    alert: Alert,
+) {
     let client = match reqwest::Client::builder().timeout(Duration::from_secs(5)).build() {
         Ok(c) => c,
         Err(e) => {
@@ -106,19 +115,70 @@ pub async fn dispatch_webhook(url: String, alert: Alert) {
             return;
         }
     };
-    let payload = serde_json::json!({
-        "id": alert.id,
-        "level": alert.level,
-        "source": alert.source,
-        "message": alert.message,
-        "ts": alert.ts,
-    });
-    match client.post(&url).json(&payload).send().await {
+
+    let mut req = client.post(&url);
+    let mut has_content_type = false;
+    for (name, value) in &headers {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("content-type") {
+            has_content_type = true;
+        }
+        req = req.header(name, value);
+    }
+
+    let template = body_template.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let body = match template {
+        Some(t) => render_template(t, &alert),
+        None => serde_json::json!({
+            "id": alert.id,
+            "level": alert.level,
+            "source": alert.source,
+            "message": alert.message,
+            "ts": alert.ts,
+        })
+        .to_string(),
+    };
+    if !has_content_type {
+        req = req.header("Content-Type", "application/json; charset=utf-8");
+    }
+
+    match req.body(body).send().await {
         Ok(resp) => {
             if !resp.status().is_success() {
                 tracing::warn!(status = %resp.status(), "Webhook 返回非成功状态");
             }
         }
         Err(e) => tracing::warn!(err = %e, "Webhook 外发失败"),
+    }
+}
+
+/// 渲染请求体模板：替换内置占位符
+fn render_template(template: &str, alert: &Alert) -> String {
+    template
+        .replace("{{message}}", &alert.message)
+        .replace("{{level}}", level_name(alert.level))
+        .replace("{{source}}", source_name(alert.source))
+        .replace("{{ts}}", &alert.ts.to_string())
+        .replace("{{id}}", &alert.id.to_string())
+}
+
+/// 告警级别短名（与序列化保持一致）
+fn level_name(level: AlertLevel) -> &'static str {
+    match level {
+        AlertLevel::Error => "error",
+        AlertLevel::Warn => "warn",
+    }
+}
+
+/// 告警来源短名（与序列化保持一致）
+fn source_name(source: AlertSource) -> &'static str {
+    match source {
+        AlertSource::Backup => "backup",
+        AlertSource::Restore => "restore",
+        AlertSource::Scheduler => "scheduler",
+        AlertSource::Config => "config",
     }
 }
