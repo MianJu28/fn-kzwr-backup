@@ -97,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         target,
         target_ready,
+        backup_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         crypto,
         passphrase: passphrase.clone(),
         cfg_dir,

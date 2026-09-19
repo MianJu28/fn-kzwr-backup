@@ -141,7 +141,7 @@
 | 大文件上传 | 自定义 `http_body`（精确 `size_hint`） | 纯流式 body（chunked） | 分片 PUT 保留 `Content-Length` 的同时按块上报进度；chunked 可能被站点/网关拒绝（413） |
 | 配置 | TOML + serde | YAML / JSON | 人类可读；Rust 生态一等支持 |
 | 日志 | tracing + tracing-subscriber | log + env_logger | 结构化日志；span 追踪；异步友好 |
-| 调度 | tokio-cron-scheduler | 系统 cron | 不依赖系统 cron，可移植；进程内调度 |
+| 调度 | `croner`（cron 解析）+ 自建 tokio 轮询循环 | tokio-cron-scheduler / 系统 cron | 不依赖系统 cron，可移植；进程内调度，便于中途检测配置热更新 |
 
 ---
 
@@ -547,7 +547,7 @@ fnos-backup/
 | | 多路径备份 | ✅ | 每个源路径独立 job_id 快照，共享 target_prefix |
 | | 目标端分层与空目录 | ✅ | 每个源文件夹在目标端以其**文件夹名**建目录（`/目标文件夹/<源文件夹名>/…`），并显式创建该目录及其空子目录（ADR-010） |
 | | 保留策略（孤儿清理） | ✅ | `domain/retention.rs`，备份后自动清理目标端孤儿文件 |
-| | 定时备份（cron） | ✅ | `domain/scheduler.rs`，cron 表达式到点触发，配置热更新、防重入 |
+| | 定时备份（cron） | ✅ | `domain/scheduler.rs`（`croner` 解析），cron 表达式到点触发、配置热更新；**全局运行互斥**（`AppState.backup_running` CAS），已有备份在跑时跳过本次触发 |
 | **增量同步** | 双策略差分 | ✅ | 快速 mtime+size / 严格 BLAKE3（ADR-004） |
 | **加密** | age 公私钥加密 | ✅ | 64MB 分块，公钥加密/私钥解密（ADR-003） |
 | | 密钥库持久化 | ✅ | 私钥被口令派生密钥加密存储，跨重启可用 |
@@ -644,7 +644,8 @@ frontend/src/
 - **保留策略语义**：因无多版本，保留策略聚焦"目标端孤儿文件清理"（不在任何 job 快照中的残留），防目标空间膨胀
 - **恢复目标**：支持恢复到配置源路径（原位置）或指定目录；目录用"新建/覆盖"按钮控制
 - **配置热切换**：UI 保存 WebDAV 凭据后 `SwapTarget` 即时切换目标实现，无需重启（`storage_trait.rs`）
-- **定时备份**：cron 表达式到点触发，运行中改配置热更新（`domain/scheduler.rs`）
+- **定时备份**：cron 表达式到点触发，运行中改配置热更新（`domain/scheduler.rs`）；调度循环 await 备份完成后才排下一轮
+- **备份运行互斥**：定时调度与手动触发共用 `AppState.backup_running`（`AtomicBool`，`run_backup_now` 入口 CAS 抢占 + RAII 守卫复位），已有备份在执行时第二次触发立即返回 `skipped = true` 与提示文案，避免并发备份争抢带宽与快照写入
 - **用户信息**：账号记录在配置（username_enc 解密），`/api/user/info` 返回本地账号；WebDAV 无套餐/容量接口
 - **备份目标布局**（ADR-010）：每个所选源文件夹在目标端以其**文件夹名**分目录存放，避免多路径在同一层互相覆盖，并保证「所选文件夹」本身在网盘可见
 - **进度口径**：上传/下载的「大小」按**明文**展示（总量来自扫描/快照），完成数在**单个文件传输完成后**才 +1
