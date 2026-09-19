@@ -204,6 +204,89 @@ pub struct KeysExportRequest {
     pub passphrase: String,
 }
 
+/// Webhook 连通性测试请求（可直接用表单中的当前值测试，无需先保存）
+#[derive(Deserialize)]
+pub struct WebhookTestRequest {
+    #[serde(default)]
+    pub webhook_url: String,
+    #[serde(default)]
+    pub headers: Vec<crate::infra::config::WebhookHeader>,
+    #[serde(default)]
+    pub body_template: Option<String>,
+}
+
+/// Webhook 测试响应
+#[derive(Serialize)]
+pub struct WebhookTestResponse {
+    pub success: bool,
+    pub status: Option<u16>,
+    pub error: Option<String>,
+}
+
+/// 配置导出/导入包（含敏感项，导出需管理员口令）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigBundle {
+    pub version: u32,
+    #[serde(default)]
+    pub exported_at: i64,
+    #[serde(default)]
+    pub backup_paths: Vec<String>,
+    #[serde(default)]
+    pub target_folder: String,
+    #[serde(default)]
+    pub schedule_cron: Option<String>,
+    #[serde(default)]
+    pub retention: Option<crate::infra::config::RetentionConfig>,
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    #[serde(default)]
+    pub webhook_headers: Vec<crate::infra::config::WebhookHeader>,
+    #[serde(default)]
+    pub webhook_body: Option<String>,
+    #[serde(default)]
+    pub webdav_url: Option<String>,
+    #[serde(default)]
+    pub webdav_username: Option<String>,
+    #[serde(default)]
+    pub webdav_password: Option<String>,
+    /// age 私钥（恢复配置后可继续解密既有备份）
+    #[serde(default)]
+    pub age_private_key: Option<String>,
+    #[serde(default)]
+    pub key_backed_up: bool,
+}
+
+/// 配置导出请求（需管理员口令）
+#[derive(Deserialize)]
+pub struct ConfigExportRequest {
+    #[serde(default)]
+    pub passphrase: String,
+}
+
+/// 配置导出响应
+#[derive(Serialize)]
+pub struct ConfigExportResponse {
+    pub success: bool,
+    /// 配置 JSON 文本
+    pub config: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 配置导入请求（需管理员口令）
+#[derive(Deserialize)]
+pub struct ConfigImportRequest {
+    #[serde(default)]
+    pub passphrase: String,
+    pub config: String,
+}
+
+/// 配置导入响应
+#[derive(Serialize)]
+pub struct ConfigImportResponse {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
 /// 私钥导出响应（敏感：供用户另存备份）
 #[derive(Serialize)]
 pub struct KeysExportResponse {
@@ -640,12 +723,47 @@ async fn restore_run(
         .file_name()
         .map(|s| s.to_string_lossy().into_owned());
 
+    // 定位该源路径对应的备份快照：优先精确路径匹配，其次按目录名匹配
+    let paths = read_backup_config(&state).0;
+    let root = std::path::Path::new(&restore_root);
+    let idx = paths
+        .iter()
+        .position(|p| p.as_path() == root)
+        .or_else(|| {
+            root.file_name()
+                .and_then(|n| paths.iter().position(|p| p.file_name() == Some(n)))
+        });
+
+    // 读取快照元数据：rel_path -> (明文大小, 原始 mtime 秒)
+    // 用途：① 展示恢复总大小；② 恢复后回写快照，避免下次备份重复上传
+    let mut meta: std::collections::HashMap<String, (u64, i64)> =
+        std::collections::HashMap::new();
+    let mut snapshot_target = None;
+    if let Some(idx) = idx {
+        let account = webdav_username(&state).unwrap_or_default();
+        let job_id = format!("{}-{}", state.job_id, idx);
+        if let Ok(entries) = state.store.load_snapshot(&job_id, &account) {
+            for e in entries {
+                if !e.is_dir {
+                    meta.insert(e.rel_path.clone(), (e.size, e.mtime_secs));
+                }
+            }
+        }
+        snapshot_target = Some(crate::domain::restore::RestoreSnapshotTarget {
+            store: state.store.clone(),
+            job_id,
+            account,
+        });
+    }
+
     let job = RestoreJob {
         target: state.target.clone(),
         crypto: state.crypto.get(),
         target_prefix: Some(state.target_folder.clone()),
         source_root_name,
         eventbus: Some(state.eventbus.clone()),
+        meta,
+        snapshot_target,
     };
     match job.run(&files, std::path::Path::new(&restore_root)).await {
         Ok(summary) => Json(RestoreResponse {
@@ -837,10 +955,14 @@ async fn keys_export(
     }
     let ks_path = crate::infra::keystore::keystore_path(&state.cfg_dir);
     match crate::infra::keystore::load_keystore(&state.passphrase, &ks_path) {
-        Ok(keys) => Json(KeysExportResponse {
-            private_key: Some(keys.to_secret_key()),
-            error: None,
-        }),
+        Ok(keys) => {
+            // 展示私钥即视为「需重新确认备份」：重置标记，使「我已妥善保存」按钮可再次点击
+            set_key_backed_up(&state, false);
+            Json(KeysExportResponse {
+                private_key: Some(keys.to_secret_key()),
+                error: None,
+            })
+        }
         Err(e) => Json(KeysExportResponse {
             private_key: None,
             error: Some(format!("读取密钥库失败: {:#}", e)),
@@ -857,6 +979,243 @@ async fn keys_backup_ack(State(state): State<AppState>) -> Json<BackupAckRespons
     })
 }
 
+/// 测试 Webhook 连通性：用请求中的当前表单配置发送一条测试告警
+async fn webhook_test(Json(body): Json<WebhookTestRequest>) -> Json<WebhookTestResponse> {
+    let url = body.webhook_url.trim().to_string();
+    if url.is_empty() {
+        return Json(WebhookTestResponse {
+            success: false,
+            status: None,
+            error: Some("请先填写 Webhook 地址".to_string()),
+        });
+    }
+    let headers: Vec<(String, String)> = body
+        .headers
+        .into_iter()
+        .filter(|h| !h.name.trim().is_empty())
+        .map(|h| (h.name.trim().to_string(), h.value))
+        .collect();
+    let body_template = body
+        .body_template
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let alert = crate::domain::alerts::Alert {
+        id: 0,
+        level: crate::domain::alerts::AlertLevel::Warn,
+        source: crate::domain::alerts::AlertSource::Config,
+        message: "测试通知：fnos-backup Webhook 连通性测试".to_string(),
+        ts,
+    };
+    match crate::domain::alerts::send_webhook(url, headers, body_template, alert).await {
+        Ok(status) => Json(WebhookTestResponse {
+            success: true,
+            status: Some(status),
+            error: None,
+        }),
+        Err(e) => Json(WebhookTestResponse {
+            success: false,
+            status: None,
+            error: Some(e),
+        }),
+    }
+}
+
+/// 导出配置（含 WebDAV 凭据明文与 age 私钥；需管理员口令校验）
+async fn config_export(
+    State(state): State<AppState>,
+    Json(body): Json<ConfigExportRequest>,
+) -> Json<ConfigExportResponse> {
+    if body.passphrase.as_str() != state.passphrase.expose_secret().as_str() {
+        return Json(ConfigExportResponse {
+            success: false,
+            config: None,
+            error: Some("管理员口令错误".to_string()),
+        });
+    }
+    let (cfg, creds) = {
+        let mgr = state.config.lock().unwrap();
+        let cfg = mgr.load().unwrap_or_default();
+        let creds = mgr.webdav_credentials().unwrap_or((None, None));
+        (cfg, creds)
+    };
+    let ks_path = crate::infra::keystore::keystore_path(&state.cfg_dir);
+    let age_private_key = crate::infra::keystore::load_keystore(&state.passphrase, &ks_path)
+        .ok()
+        .map(|k| k.to_secret_key());
+    let exported_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let bundle = ConfigBundle {
+        version: 1,
+        exported_at,
+        backup_paths: cfg.backup.paths.clone(),
+        target_folder: cfg.backup.target_folder.clone(),
+        schedule_cron: cfg.backup.schedule_cron.clone(),
+        retention: Some(cfg.backup.retention.clone()),
+        webhook_url: cfg.notify.webhook_url.clone(),
+        webhook_headers: cfg.notify.webhook_headers.clone(),
+        webhook_body: cfg.notify.webhook_body.clone(),
+        webdav_url: cfg.webdav.url.clone(),
+        webdav_username: creds.0,
+        webdav_password: creds.1,
+        age_private_key,
+        key_backed_up: cfg.keys.backed_up,
+    };
+    match serde_json::to_string_pretty(&bundle) {
+        Ok(text) => Json(ConfigExportResponse {
+            success: true,
+            config: Some(text),
+            error: None,
+        }),
+        Err(e) => Json(ConfigExportResponse {
+            success: false,
+            config: None,
+            error: Some(format!("序列化配置失败: {e}")),
+        }),
+    }
+}
+
+/// 导入配置（覆盖备份/通知/WebDAV 凭据，可选恢复 age 私钥；需管理员口令校验）
+async fn config_import(
+    State(state): State<AppState>,
+    Json(body): Json<ConfigImportRequest>,
+) -> Json<ConfigImportResponse> {
+    if body.passphrase.as_str() != state.passphrase.expose_secret().as_str() {
+        return Json(ConfigImportResponse {
+            success: false,
+            error: Some("管理员口令错误".to_string()),
+        });
+    }
+    let bundle: ConfigBundle = match serde_json::from_str(&body.config) {
+        Ok(b) => b,
+        Err(e) => {
+            return Json(ConfigImportResponse {
+                success: false,
+                error: Some(format!("配置解析失败: {e}")),
+            })
+        }
+    };
+
+    // 1) 更新配置（保留未提供的字段；WebDAV 凭据用当前口令重新加密）
+    {
+        let mgr = state.config.lock().unwrap();
+        let mut cfg = mgr.load().unwrap_or_default();
+        cfg.backup.paths = bundle.backup_paths.clone();
+        if !bundle.target_folder.trim().is_empty() {
+            cfg.backup.target_folder = bundle.target_folder.clone();
+        }
+        cfg.backup.schedule_cron = bundle
+            .schedule_cron
+            .clone()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(r) = bundle.retention.clone() {
+            cfg.backup.retention = r;
+        }
+        cfg.notify.webhook_url = bundle
+            .webhook_url
+            .clone()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        cfg.notify.webhook_headers = bundle.webhook_headers.clone();
+        cfg.notify.webhook_body = bundle
+            .webhook_body
+            .clone()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        cfg.keys.backed_up = bundle.key_backed_up;
+        if let (Some(u), Some(p)) = (
+            bundle.webdav_username.as_ref().filter(|s| !s.is_empty()),
+            bundle.webdav_password.as_ref().filter(|s| !s.is_empty()),
+        ) {
+            match (mgr.encrypt_field(u), mgr.encrypt_field(p)) {
+                (Ok(eu), Ok(ep)) => {
+                    cfg.webdav.username_enc = Some(eu);
+                    cfg.webdav.password_enc = Some(ep);
+                }
+                _ => {
+                    return Json(ConfigImportResponse {
+                        success: false,
+                        error: Some("WebDAV 凭据加密失败".to_string()),
+                    })
+                }
+            }
+        }
+        if let Some(url) = bundle
+            .webdav_url
+            .as_ref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            cfg.webdav.url = Some(url.trim_end_matches('/').to_string());
+        }
+        if let Err(e) = mgr.save(&cfg) {
+            return Json(ConfigImportResponse {
+                success: false,
+                error: Some(format!("保存配置失败: {:#}", e)),
+            });
+        }
+    }
+
+    // 2) 可选：恢复 age 私钥（热切换，无需重启）
+    if let Some(pk) = bundle
+        .age_private_key
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        match crate::domain::crypto::AgeKeys::from_secret_key(pk.trim()) {
+            Ok(keys) => {
+                let ks_path = crate::infra::keystore::keystore_path(&state.cfg_dir);
+                if let Err(e) =
+                    crate::infra::keystore::save_keystore(&keys, &state.passphrase, &ks_path)
+                {
+                    return Json(ConfigImportResponse {
+                        success: false,
+                        error: Some(format!("保存密钥库失败: {:#}", e)),
+                    });
+                }
+                state
+                    .crypto
+                    .swap(crate::domain::crypto::CryptoSession::full(&keys));
+                tracing::info!("已从导入配置恢复 age 密钥");
+            }
+            Err(e) => {
+                return Json(ConfigImportResponse {
+                    success: false,
+                    error: Some(format!("私钥无效: {:#}", e)),
+                })
+            }
+        }
+    }
+
+    // 3) 热切换 WebDAV 目标
+    if let (Some(u), Some(p)) = (
+        bundle.webdav_username.clone().filter(|s| !s.is_empty()),
+        bundle.webdav_password.clone().filter(|s| !s.is_empty()),
+    ) {
+        let url = bundle
+            .webdav_url
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| crate::infra::target::webdav::DEFAULT_URL.to_string());
+        state
+            .target
+            .swap(Arc::new(crate::infra::target::webdav::WebdavTarget::new(
+                &url, u, p,
+            )));
+        tracing::info!("已从导入配置切换 WebDAV 目标");
+    }
+
+    Json(ConfigImportResponse {
+        success: true,
+        error: None,
+    })
+}
+
 /// 构建应用路由（不含 /api 前缀，由 main.rs nest("/api") 统一加前缀）
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -865,6 +1224,8 @@ pub fn router(state: AppState) -> Router {
         .route("/webdav/config", post(webdav_save))
         .route("/user/info", get(user_info))
         .route("/config", get(config_get).post(config_save))
+        .route("/config/export", post(config_export))
+        .route("/config/import", post(config_import))
         .route("/backup/run", post(backup_run))
         .route("/restore/files", get(restore_files))
         .route("/restore/run", post(restore_run))
@@ -874,5 +1235,6 @@ pub fn router(state: AppState) -> Router {
         .route("/keys/backup-ack", post(keys_backup_ack))
         .route("/alerts", get(alerts_get).delete(alerts_clear))
         .route("/notify/webhook", post(webhook_save))
+        .route("/notify/webhook/test", post(webhook_test))
         .with_state(state)
 }

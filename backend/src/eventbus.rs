@@ -49,6 +49,8 @@ pub struct DomainEvent {
     pub bytes_total: u64,
     /// 任务已耗时（毫秒）
     pub elapsed_ms: u64,
+    /// 实时传输速度（字节/秒；仅统计实际传输时段，空闲不变化）
+    pub speed: u64,
     /// 消息（错误信息等）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -97,6 +99,7 @@ impl EventBus {
         bytes_done: u64,
         bytes_total: u64,
         elapsed_ms: u64,
+        speed: u64,
         message: Option<String>,
     ) {
         let ts = std::time::SystemTime::now()
@@ -113,6 +116,7 @@ impl EventBus {
             bytes_done,
             bytes_total,
             elapsed_ms,
+            speed,
             message,
             ts,
         });

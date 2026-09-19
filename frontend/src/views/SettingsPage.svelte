@@ -3,6 +3,7 @@
   import WebdavSection from '../components/WebdavSection.svelte';
   import KeySection from '../components/KeySection.svelte';
   import NotifySection from '../components/NotifySection.svelte';
+  import ConfigSection from '../components/ConfigSection.svelte';
 
   export let webdavConfigured = false;
   export let webdavUrl = '';
@@ -25,6 +26,11 @@
   export let webhookHeaders = []; // [{ name, value }]
   export let webhookBody = '';
   export let onSaveWebhook = null; // (url, headers, bodyTemplate) => Promise
+  export let onTestWebhook = null; // (url, headers, bodyTemplate) => Promise
+
+  // 配置导入/导出
+  export let onExportConfig = null; // (passphrase) => Promise<{success, config, error}>
+  export let onImportConfig = null; // (passphrase, configText) => Promise<{success, error}>
 </script>
 
 <UserCard {userInfo} {userInfoError} configured={webdavConfigured} />
@@ -34,7 +40,7 @@
 <KeySection
   {keyInfo}
   {revealKey}
-  {keyBackedUp}
+  backedUp={keyBackedUp}
   {busy}
   {onSetKey}
   {onGenerateKey}
@@ -42,4 +48,6 @@
   {onBackupAck}
 />
 
-<NotifySection {webhookUrl} {webhookHeaders} {webhookBody} {busy} onSave={onSaveWebhook} />
+<NotifySection {webhookUrl} {webhookHeaders} {webhookBody} {busy} onSave={onSaveWebhook} onTest={onTestWebhook} />
+
+<ConfigSection {busy} {onExportConfig} {onImportConfig} />

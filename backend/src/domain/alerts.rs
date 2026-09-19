@@ -108,13 +108,26 @@ pub async fn dispatch_webhook(
     body_template: Option<String>,
     alert: Alert,
 ) {
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(5)).build() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(err = %e, "构建 Webhook 客户端失败");
-            return;
-        }
-    };
+    match send_webhook(url, headers, body_template, alert).await {
+        Ok(_) => {}
+        Err(e) => tracing::warn!(err = %e, "Webhook 外发失败"),
+    }
+}
+
+/// 实际发送 Webhook 请求，返回 HTTP 状态码（供 /notify/webhook/test 反馈连通性）
+pub async fn send_webhook(
+    url: String,
+    headers: Vec<(String, String)>,
+    body_template: Option<String>,
+    alert: Alert,
+) -> Result<u16, String> {
+    if url.trim().is_empty() {
+        return Err("Webhook 地址为空".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("构建 Webhook 客户端失败: {e}"))?;
 
     let mut req = client.post(&url);
     let mut has_content_type = false;
@@ -145,14 +158,16 @@ pub async fn dispatch_webhook(
         req = req.header("Content-Type", "application/json; charset=utf-8");
     }
 
-    match req.body(body).send().await {
-        Ok(resp) => {
-            if !resp.status().is_success() {
-                tracing::warn!(status = %resp.status(), "Webhook 返回非成功状态");
-            }
-        }
-        Err(e) => tracing::warn!(err = %e, "Webhook 外发失败"),
+    let resp = req
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("请求失败: {e}"))?;
+    let status = resp.status().as_u16();
+    if !resp.status().is_success() {
+        return Err(format!("服务器返回 {}", status));
     }
+    Ok(status)
 }
 
 /// 渲染请求体模板：替换内置占位符

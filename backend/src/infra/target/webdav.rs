@@ -14,14 +14,17 @@
 //! WebDAV 地址固定为官方地址（`DEFAULT_URL`），UI 不暴露设置项。
 
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+use http_body::{Body as HttpBody, Frame, SizeHint};
 use reqwest::{Client, Method, StatusCode};
 
 use crate::infra::storage_trait::{
-    FileDescriptor, StorageError, StorageResult, TargetStorage,
+    FileDescriptor, ProgressCb, StorageError, StorageResult, TargetStorage,
 };
 
 /// 官方 WebDAV 地址（UI 固定使用，不提供设置项）
@@ -49,6 +52,63 @@ const PUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
 
 /// PUT 最大尝试次数
 const PUT_MAX_ATTEMPTS: usize = 4;
+
+/// 进度上报的块大小（256 KiB）：兼顾粒度与事件频率
+const PROGRESS_CHUNK: usize = 256 * 1024;
+
+/// 带精确长度的流式请求体：边发送边回调进度
+///
+/// 实现 `http_body::Body` 并给出精确 `size_hint`，使 reqwest 仍以
+/// `Content-Length` 发送（而非 chunked），同时按块上报已写字节。
+///
+/// 注意：`len` 必须是**本请求体自身的长度**（多分片时即分片大小），
+/// 否则 Content-Length 会被设成整个文件大小而触发 413。
+struct ProgressBody {
+    chunks: std::vec::IntoIter<Bytes>,
+    /// 本请求体总长度（供 size_hint / Content-Length 使用）
+    len: u64,
+    /// 本次请求已发送的字节数
+    sent: u64,
+    /// 本请求之前的累计字节（多分片时用于拼接整体进度）
+    offset: u64,
+    /// 进度总量（整文件大小，仅用于上报）
+    total: u64,
+    /// 本请求开始发送的时刻（用于上报请求内耗时）
+    started: std::time::Instant,
+    on_progress: ProgressCb,
+}
+
+impl HttpBody for ProgressBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match this.chunks.next() {
+            Some(b) => {
+                this.sent += b.len() as u64;
+                (this.on_progress)(
+                    this.offset + this.sent,
+                    this.total,
+                    this.started.elapsed().as_millis() as u64,
+                );
+                Poll::Ready(Some(Ok(Frame::data(b))))
+            }
+            None => Poll::Ready(None),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.chunks.len() == 0
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.len)
+    }
+}
 
 /// WebDAV 目标适配器
 #[derive(Clone)]
@@ -202,21 +262,58 @@ impl WebdavTarget {
         Ok(parse_multistatus(&xml))
     }
 
-    /// PUT 内存数据（带总超时与重试：网络错误与 5xx/408/429 均可重试）
-    async fn put_bytes_retry(&self, url: &str, data: Vec<u8>) -> StorageResult<()> {
+    /// PUT 数据（带总超时与重试：网络错误与 5xx/408/429 均可重试）
+    ///
+    /// `progress` 为 `(回调, 偏移, 总字节)`；非空时以带精确长度的流式 body 发送，
+    /// 按块回调进度（仍保留 Content-Length，不走 chunked）。
+    async fn put_bytes_retry(
+        &self,
+        url: &str,
+        data: Vec<u8>,
+        progress: Option<(ProgressCb, u64, u64)>,
+    ) -> StorageResult<()> {
         let mut attempt = 0usize;
         loop {
             attempt += 1;
+            // 本次请求的起始时刻（body 内进度与「响应后补报」都用它计时）
+            let req_started = std::time::Instant::now();
+            let body = match &progress {
+                Some((cb, offset, total)) => {
+                    let chunks: Vec<Bytes> = data
+                        .chunks(PROGRESS_CHUNK)
+                        .map(Bytes::copy_from_slice)
+                        .collect();
+                    reqwest::Body::wrap(ProgressBody {
+                        chunks: chunks.into_iter(),
+                        len: data.len() as u64,
+                        sent: 0,
+                        offset: *offset,
+                        total: *total,
+                        started: req_started,
+                        on_progress: cb.clone(),
+                    })
+                }
+                None => reqwest::Body::from(data.clone()),
+            };
             let resp = self
                 .request(Method::PUT, url)
                 .timeout(PUT_TIMEOUT)
-                .body(data.clone())
+                .body(body)
                 .send()
                 .await;
             match resp {
                 Ok(r) => {
                     let status = r.status();
                     if status.is_success() {
+                        // 补一次「整次请求耗时」的观测：小文件被本地缓冲时，
+                        // body 会在极短时间写完，只有到这里才能拿到真实耗时。
+                        if let Some((cb, offset, total)) = &progress {
+                            cb(
+                                offset + data.len() as u64,
+                                *total,
+                                req_started.elapsed().as_millis() as u64,
+                            );
+                        }
                         return Ok(());
                     }
                     let retryable = status.is_server_error()
@@ -243,6 +340,73 @@ impl WebdavTarget {
                     )));
                 }
             }
+        }
+    }
+
+    /// 写入核心实现：`progress` 非空时按块上报上传进度（保留 Content-Length）
+    async fn write_inner(
+        &self,
+        path: &Path,
+        mut stream: Box<dyn Stream<Item = Bytes> + Send + Unpin>,
+        progress: Option<ProgressCb>,
+    ) -> StorageResult<()> {
+        // 暂存密文到临时文件（与分段上传解耦，且带 Content-Length 更稳）
+        use std::io::{Read, Write};
+        let mut tmp = tempfile::NamedTempFile::new().map_err(StorageError::Io)?;
+        while let Some(chunk) = stream.next().await {
+            tmp.write_all(&chunk).map_err(StorageError::Io)?;
+        }
+        tmp.flush().map_err(StorageError::Io)?;
+        let size = tmp.as_file().metadata().map_err(StorageError::Io)?.len();
+
+        self.ensure_parents(path).await?;
+
+        if size <= part_size() {
+            // 小文件：整体 PUT 到逻辑路径；顺带清理可能残留的旧分片
+            self.cleanup_parts(path).await?;
+            let url = self.url_for(&path.to_string_lossy());
+            let mut data = Vec::with_capacity(size as usize);
+            std::fs::File::open(tmp.path())
+                .map_err(StorageError::Io)?
+                .read_to_end(&mut data)
+                .map_err(StorageError::Io)?;
+            let prog = progress.map(|cb| (cb, 0u64, size));
+            self.put_bytes_retry(&url, data, prog).await
+        } else {
+            // 大文件：拆分为 .part0001… 依次上传；先删旧逻辑文件（覆盖小文件场景）
+            let _ = self.delete_raw(path).await;
+            let mut file = std::fs::File::open(tmp.path()).map_err(StorageError::Io)?;
+            let mut idx = 1usize;
+            let mut written: u64 = 0;
+            loop {
+                let mut buf = Vec::with_capacity(part_size() as usize);
+                let mut take = part_size() as usize;
+                while take > 0 {
+                    let chunk = {
+                        let mut slice = vec![0u8; take.min(1024 * 1024)];
+                        let n = file.read(&mut slice).map_err(StorageError::Io)?;
+                        slice.truncate(n);
+                        slice
+                    };
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    take -= chunk.len();
+                    buf.extend_from_slice(&chunk);
+                }
+                if buf.is_empty() {
+                    break;
+                }
+                let part_bytes = buf.len() as u64;
+                let part = self.part_path(path, idx);
+                let url = self.url_for(&part.to_string_lossy());
+                // 每个分片的进度偏移 = 之前已上传字节，总长 = 文件总大小
+                let prog = progress.as_ref().map(|cb| (cb.clone(), written, size));
+                self.put_bytes_retry(&url, buf, prog).await?;
+                written += part_bytes;
+                idx += 1;
+            }
+            Ok(())
         }
     }
 
@@ -372,60 +536,18 @@ impl TargetStorage for WebdavTarget {
     async fn write_stream(
         &self,
         path: &Path,
-        mut stream: Box<dyn Stream<Item = Bytes> + Send + Unpin>,
+        stream: Box<dyn Stream<Item = Bytes> + Send + Unpin>,
     ) -> StorageResult<()> {
-        // 暂存密文到临时文件（与分段上传解耦，且带 Content-Length 更稳）
-        use std::io::{Read, Write};
-        let mut tmp = tempfile::NamedTempFile::new().map_err(StorageError::Io)?;
-        while let Some(chunk) = stream.next().await {
-            tmp.write_all(&chunk).map_err(StorageError::Io)?;
-        }
-        tmp.flush().map_err(StorageError::Io)?;
-        let size = tmp.as_file().metadata().map_err(StorageError::Io)?.len();
+        self.write_inner(path, stream, None).await
+    }
 
-        self.ensure_parents(path).await?;
-
-        if size <= part_size() {
-            // 小文件：整体 PUT 到逻辑路径；顺带清理可能残留的旧分片
-            self.cleanup_parts(path).await?;
-            let url = self.url_for(&path.to_string_lossy());
-            let mut data = Vec::with_capacity(size as usize);
-            std::fs::File::open(tmp.path())
-                .map_err(StorageError::Io)?
-                .read_to_end(&mut data)
-                .map_err(StorageError::Io)?;
-            self.put_bytes_retry(&url, data).await
-        } else {
-            // 大文件：拆分为 .part0001… 依次上传；先删旧逻辑文件（覆盖小文件场景）
-            let _ = self.delete_raw(path).await;
-            let mut file = std::fs::File::open(tmp.path()).map_err(StorageError::Io)?;
-            let mut idx = 1usize;
-            loop {
-                let mut buf = Vec::with_capacity(part_size() as usize);
-                let mut take = part_size() as usize;
-                while take > 0 {
-                    let chunk = {
-                        let mut slice = vec![0u8; take.min(1024 * 1024)];
-                        let n = file.read(&mut slice).map_err(StorageError::Io)?;
-                        slice.truncate(n);
-                        slice
-                    };
-                    if chunk.is_empty() {
-                        break;
-                    }
-                    take -= chunk.len();
-                    buf.extend_from_slice(&chunk);
-                }
-                if buf.is_empty() {
-                    break;
-                }
-                let part = self.part_path(path, idx);
-                let url = self.url_for(&part.to_string_lossy());
-                self.put_bytes_retry(&url, buf).await?;
-                idx += 1;
-            }
-            Ok(())
-        }
+    async fn write_stream_progress(
+        &self,
+        path: &Path,
+        stream: Box<dyn Stream<Item = Bytes> + Send + Unpin>,
+        progress: ProgressCb,
+    ) -> StorageResult<()> {
+        self.write_inner(path, stream, Some(progress)).await
     }
 
     async fn read_stream(

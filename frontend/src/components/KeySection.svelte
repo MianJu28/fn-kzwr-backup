@@ -8,11 +8,12 @@
   export let backedUp = false;
   export let onSetKey = null; // (privateKey) => Promise<{success, error}>
   export let onGenerateKey = null; // () => Promise<{success, private_key, public_key, error}>
-  export let onExportKey = null; // () => Promise<{private_key, error}>
+  export let onExportKey = null; // (passphrase) => Promise<{private_key, error}>
   export let onBackupAck = null; // () => Promise<void>
 
   let privateKeyInput = '';
-  let adminPassphrase = ''; // 管理员口令（显示私钥等敏感操作需校验）
+  let adminPassphrase = ''; // 显示私钥时输入的管理员口令
+  let showExportBox = false; // 是否展开「显示私钥」的口令输入
   let msg = '';
   let msgOk = false;
   let shownKey = revealKey || ''; // 当前展示的私钥（生成/导出）
@@ -82,9 +83,21 @@
     }
   }
 
+  // 点击「显示私钥」：展开口令输入框（要求先输入管理员口令）
+  function startExport() {
+    msg = '';
+    showExportBox = true;
+  }
+
+  function cancelExport() {
+    showExportBox = false;
+    adminPassphrase = '';
+  }
+
+  // 口令校验通过后展示私钥
   async function exportKey() {
     if (!adminPassphrase.trim()) {
-      msg = '请先输入管理员口令';
+      msg = '请输入管理员口令';
       msgOk = false;
       return;
     }
@@ -95,6 +108,8 @@
     if (r.private_key) {
       shownKey = r.private_key;
       shownTag = 'export';
+      showExportBox = false;
+      adminPassphrase = '';
       msg = '已显示当前私钥，请妥善保存到安全位置';
       msgOk = true;
     } else {
@@ -103,11 +118,16 @@
     }
   }
 
+  // 确认已妥善保存：隐藏风险提醒与已展示的私钥
   async function ackBackup() {
     working = true;
     await onBackupAck();
     working = false;
-    msg = '已记录：私钥备份确认';
+    shownKey = '';
+    shownTag = '';
+    showExportBox = false;
+    adminPassphrase = '';
+    msg = '已确认保存，风险提醒已关闭';
     msgOk = true;
   }
 </script>
@@ -137,28 +157,39 @@
     <textarea rows="2" bind:value={privateKeyInput} placeholder="AGE-SECRET-KEY-1..."></textarea>
   </label>
 
-  <label>管理员口令（显示私钥等敏感操作需校验）
-    <input
-      type="password"
-      bind:value={adminPassphrase}
-      autocomplete="off"
-      placeholder="安装时设置的管理员口令"
-    />
-  </label>
-
   <div class="btn-row">
     <button on:click={saveCustom} disabled={busy || working || !privateKeyInput.trim()}>使用此私钥</button>
     <button class="ghost" on:click={generate} disabled={busy || working}>自动生成新密钥</button>
-    <button class="ghost" on:click={exportKey} disabled={busy || working}>显示私钥</button>
+    <button class="ghost" on:click={startExport} disabled={busy || working}>显示私钥</button>
     <button class="ok" on:click={ackBackup} disabled={busy || working || backedUp}>
-      {backedUp ? '已确认备份' : '我已妥善保存'}
+      {backedUp ? '✓ 已确认备份' : '我已妥善保存'}
     </button>
   </div>
+
+  {#if showExportBox}
+    <div class="export-box">
+      <p class="warn strong">显示私钥需先验证管理员口令：</p>
+      <label>管理员口令
+        <input
+          type="password"
+          bind:value={adminPassphrase}
+          autocomplete="off"
+          placeholder="安装时设置的管理员口令"
+        />
+      </label>
+      <div class="btn-row">
+        <button on:click={exportKey} disabled={working || !adminPassphrase.trim()}>
+          {working ? '校验中...' : '确认显示'}
+        </button>
+        <button class="ghost" on:click={cancelExport} disabled={working}>取消</button>
+      </div>
+    </div>
+  {/if}
 
   {#if shownKey}
     <div class="generated">
       <p class="warn strong">
-        ⚠️ {shownTag === 'new' ? '请立即保存以下私钥（仅显示这一次）：' : '当前私钥（请勿泄露，保存后关闭）：'}
+        ⚠️ {shownTag === 'new' ? '请立即保存以下私钥（仅显示这一次）：' : '当前私钥（请勿泄露，保存后点「我已妥善保存」关闭）：'}
       </p>
       <div class="key-row">
         <input readonly value={shownKey} />
@@ -228,8 +259,23 @@
   button:disabled { background: #9db4e8; cursor: not-allowed; }
   button.ghost { background: #eef2ff; color: #2563eb; }
   button.ghost:disabled { background: #eef2ff; color: #9db4e8; }
-  button.ok { background: #16a34a; color: #fff; }
-  button.ok:disabled { background: #d1fae5; color: #047857; cursor: default; }
+  /* 「我已妥善保存」按钮：两态都保持高对比 */
+  button.ok { background: #15803d; color: #ffffff; font-weight: 600; }
+  button.ok:disabled {
+    background: #f0fdf4;
+    color: #166534;
+    border: 1px solid #86efac;
+    font-weight: 600;
+    cursor: default;
+  }
+  .export-box {
+    margin-top: 14px;
+    padding: 14px;
+    background: #f8fafc;
+    border: 1px solid #dbe3ef;
+    border-radius: 8px;
+  }
+  .export-box p { margin: 0 0 8px; font-size: 13px; }
   .generated {
     margin-top: 14px;
     padding: 14px;
