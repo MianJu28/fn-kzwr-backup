@@ -1024,7 +1024,7 @@ async fn webhook_test(Json(body): Json<WebhookTestRequest>) -> Json<WebhookTestR
         id: 0,
         level: crate::domain::alerts::AlertLevel::Warn,
         source: crate::domain::alerts::AlertSource::Config,
-        message: "测试通知：fnos-backup Webhook 连通性测试".to_string(),
+        message: "测试通知：fn-kzwr-backup Webhook 连通性测试".to_string(),
         ts,
     };
     match crate::domain::alerts::send_webhook(url, headers, body_template, alert).await {

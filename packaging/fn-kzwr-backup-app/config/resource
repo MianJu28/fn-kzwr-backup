@@ -1,11 +1,11 @@
 {
-  "api-scope": [
+  "authorization": [
     "trim.file.userAccess"
   ],
   "data-share": {
     "shares": [
       {
-        "name": "fnos-backup/restore"
+        "name": "fn-kzwr-backup/restore"
       }
     ]
   }

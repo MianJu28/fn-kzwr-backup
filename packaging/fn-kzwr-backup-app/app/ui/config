@@ -1,7 +1,7 @@
 {
   ".url": {
-    "fnos-backup.Application": {
-      "title": "fnOS 备份",
+    "fn-kzwr-backup.Application": {
+      "title": "酷族备份",
       "icon": "images/ICON_256.PNG",
       "type": "iframe",
       "protocol": "http",

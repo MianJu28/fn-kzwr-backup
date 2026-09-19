@@ -372,7 +372,7 @@ trait TargetStorage {
 > 以下为**目标结构**（飞牛应用部署形态）。开发期 `backend/` 与 `frontend/` 独立演进，打包时合入飞牛目录。**当前实际 Rust 源码结构**见文末"项目进度"一节。
 
 ```
-fnos-backup/
+fn-kzwr-backup/
 ├── manifest                    # 飞牛应用元数据 (appname/version/platform/ctl_stop)
 ├── ICON.PNG / ICON_256.PNG     # 应用图标
 ├── app/
@@ -398,7 +398,7 @@ fnos-backup/
 │   └── config
 ├── target/                     # Rust 编译产物 (开发期构建后拷入)
 │   └── bin/
-│       └── fnos-backup         # 主二进制
+│       └── fn-kzwr-backup         # 主二进制
 ├── backend/                    # Rust 后端源码 (开发期)
 │   ├── Cargo.toml
 │   └── src/
@@ -666,21 +666,21 @@ frontend/src/
 
 > 已依据 `docs/fnnas-dev-docs/`（抓取自 developer.fnnas.com）完成 `.fpk` 打包结构。
 
-**打包源目录**：`packaging/fnos-backup-app/`（可提交，CI 与本地构建共用）；构建产物与 `.fpk` 输出至 `dist/fnos-backup-app/`（gitignored，脚本 `Scripts/build_fnos_app.sh`）
+**打包源目录**：`packaging/fn-kzwr-backup-app/`（可提交，CI 与本地构建共用）；构建产物与 `.fpk` 输出至 `dist/fn-kzwr-backup-app/`（gitignored，脚本 `Scripts/build_fnos_app.sh`）
 
 ```
-packaging/fnos-backup-app/
+packaging/fn-kzwr-backup-app/
 ├── manifest                    # 元数据：platform=x86, ctl_stop=true, service_port=8080
 ├── ICON.PNG / ICON_256.PNG     # 128/256 图标
 ├── app/                        # → $TRIM_APPDEST（安装后为 /var/apps/{appname}/target）
 │   ├── ui/config               # 桌面入口：iframe → http://localhost:8080/，allUsers=true
 │   ├── ui/images/              # 入口图标
-│   ├── bin/                    # fnos-backup（Rust）
+│   ├── bin/                    # fn-kzwr-backup（Rust）
 │   └── www/                    # 前端构建产物（Svelte dist）
 ├── cmd/                        # main/install/upgrade/uninstall/config 生命周期脚本
 ├── config/
 │   ├── privilege               # run-as=package, user/group=fnosbackup
-│   └── resource                # data-share: fnos-backup/restore
+│   └── resource                # data-share: fn-kzwr-backup/restore
 └── wizard/                     # install/config/upgrade/uninstall（JSON 步骤数组）
 ```
 
@@ -704,7 +704,7 @@ packaging/fnos-backup-app/
 - 后端 `cargo build --release` 编译成功（2m02s，4 个 warning）
 - 前端 `vite build` 产物生成（52KB JS + 10.6KB CSS）
 - 后端运行实测：`/api/health`、`/api/config`、`/api/user/info` 返回 200；前端 SPA 静态托管正常；WebSocket `/api/ws` 握手 `101 Switching Protocols`
-- `fnpack build` 生成 `fnos-backup.fpk`（gzip 格式，3.6MB），包内 manifest/cmd/config/wizard/app.tgz 结构完整、脚本可执行
+- `fnpack build` 生成 `fn-kzwr-backup.fpk`（gzip 格式，3.6MB），包内 manifest/cmd/config/wizard/app.tgz 结构完整、脚本可执行
 
 **已知限制**：fnpack v1.2.3 校验 wizard 时**不支持 `checkbox`/`switch` 字段类型**（文档虽列出但实际打包会失败），需用 `radio`/`select` 替代。本应用卸载确认已改用 `select`（keep/purge）。
 

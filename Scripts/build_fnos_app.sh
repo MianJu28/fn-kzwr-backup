@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Build and package fnos-backup fnOS application (.fpk)
+# Build and package fn-kzwr-backup fnOS application (.fpk)
 #
 # Steps:
 #   1. Build Rust backend (--release)
@@ -13,8 +13,8 @@
 #   ./Scripts/build_fnos_app.sh --no-fpk # assemble only, skip fnpack
 #
 # Output:
-#   dist/fnos-backup-app/     assembled package (gitignored)
-#   dist/fnos-backup-app/*.fpk  final package
+#   dist/fn-kzwr-backup-app/     assembled package (gitignored)
+#   dist/fn-kzwr-backup-app/*.fpk  final package
 #
 # Dependencies:
 #   - cargo / rust (backend)
@@ -25,9 +25,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Package source dir (committed: manifest/config/cmd/wizard/app/ui)
-PACK_SRC="$ROOT/packaging/fnos-backup-app"
+PACK_SRC="$ROOT/packaging/fn-kzwr-backup-app"
 # Assembled build dir + .fpk output (gitignored)
-PACK_DIR="$ROOT/dist/fnos-backup-app"
+PACK_DIR="$ROOT/dist/fn-kzwr-backup-app"
 BACKEND_DIR="$ROOT/backend"
 FRONTEND_DIR="$ROOT/frontend"
 FNPACK="${FNPACK:-fnpack}"
@@ -45,10 +45,10 @@ if [ "${MUSL_TARGET:-1}" = "1" ]; then
         rustup target add x86_64-unknown-linux-musl 2>&1 | tail -1
     fi
     ( cd "$BACKEND_DIR" && cargo build --release --target x86_64-unknown-linux-musl )
-    BIN_REL="$BACKEND_DIR/target/x86_64-unknown-linux-musl/release/fnos-backup"
+    BIN_REL="$BACKEND_DIR/target/x86_64-unknown-linux-musl/release/fn-kzwr-backup"
 else
     ( cd "$BACKEND_DIR" && cargo build --release )
-    BIN_REL="$BACKEND_DIR/target/release/fnos-backup"
+    BIN_REL="$BACKEND_DIR/target/release/fn-kzwr-backup"
 fi
 
 echo "==> [2/4] Build frontend ..."
@@ -70,7 +70,7 @@ if [ ! -f "$BIN_REL" ]; then
     exit 1
 fi
 mkdir -p "$PACK_DIR/app/bin"
-cp -f "$BIN_REL" "$PACK_DIR/app/bin/fnos-backup"
+cp -f "$BIN_REL" "$PACK_DIR/app/bin/fn-kzwr-backup"
 
 # 3) Frontend dist -> app/www
 if [ ! -d "$FRONTEND_DIR/dist" ]; then

@@ -5,7 +5,7 @@
 # 当前版本无破坏性迁移，仅确保目录就绪。
 # 注意：不使用 set -e，避免任一命令非零退出导致飞牛判定"执行脚本出错"。
 
-APPDEST="${TRIM_APPDEST:-/var/apps/fnos-backup/target}"
+APPDEST="${TRIM_APPDEST:-/var/apps/fn-kzwr-backup/target}"
 PKGVAR="${TRIM_PKGVAR:-$APPDEST/var}"
 PKGETC="${TRIM_PKGETC:-$APPDEST/etc}"
 APP_USER="${TRIM_USERNAME:-fnosbackup}"

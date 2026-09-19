@@ -129,7 +129,7 @@ jobs:
       - uses: actions/setup-node@v4
       - run: cd frontend && npm ci && npm run build
       - run: cp frontend/dist/* app/www/
-      - run: cp target/*/release/fnos-backup target/bin/
+      - run: cp target/*/release/fn-kzwr-backup target/bin/
       - run: fnpack build  # 产出 .fpk
 ```
 
@@ -141,7 +141,7 @@ jobs:
 ### 验证步骤
 
 1. 本地用 `cross build --target aarch64-unknown-linux-musl` 验证编译
-2. `file target/.../fnos-backup` 确认 ELF aarch64
+2. `file target/.../fn-kzwr-backup` 确认 ELF aarch64
 3. 在飞牛 aarch64 测试设备安装 `.fpk` 验证运行
 
 ---

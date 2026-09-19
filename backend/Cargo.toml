@@ -1,6 +1,6 @@
 [package]
-name = "fnos-backup"
-version = "0.1.9"
+name = "fn-kzwr-backup"
+version = "0.2.0"
 edition = "2021"
 description = "飞牛 NAS 增量加密备份系统（备份至酷族网软）"
 license = "MIT"
@@ -10,7 +10,7 @@ name = "fnos_backup"
 path = "src/lib.rs"
 
 [[bin]]
-name = "fnos-backup"
+name = "fn-kzwr-backup"
 path = "src/main.rs"
 
 [dependencies]

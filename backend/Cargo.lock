@@ -601,8 +601,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "fnos-backup"
-version = "0.1.9"
+name = "fn-kzwr-backup"
+version = "0.2.0"
 dependencies = [
  "age",
  "anyhow",
