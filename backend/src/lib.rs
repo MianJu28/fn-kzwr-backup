@@ -3,6 +3,7 @@
 //! 作为 lib 导出模块，供 `src/bin/` 下的独立二进制与集成测试复用。
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 
 pub mod domain;
@@ -49,6 +50,8 @@ pub struct AppState {
     pub target: Arc<SwapTarget>,
     /// 目标是否已配置（凭据就绪；未配置时 target 为占位适配器）
     pub target_ready: bool,
+    /// 备份运行标志（定时调度与手动触发共用：true = 有备份正在执行，并发触发直接跳过）
+    pub backup_running: Arc<AtomicBool>,
     /// 加密会话（备份加密/恢复解密；密钥变更后可热替换）
     pub crypto: Arc<CryptoSwap>,
     /// 应用口令（密钥库/配置敏感字段加密；更换密钥时需复用它重新加密落盘）

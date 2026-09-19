@@ -86,7 +86,7 @@ pub struct ConfigSaveRequest {
 }
 
 /// 备份响应
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct BackupResponse {
     pub uploaded: usize,
     pub uploaded_bytes: u64,
@@ -94,6 +94,8 @@ pub struct BackupResponse {
     pub unchanged: usize,
     /// 保留策略清理的孤儿文件数
     pub orphan_removed: usize,
+    /// 因已有备份正在执行而跳过本次触发（`error` 同时给出原因）
+    pub skipped: bool,
     pub error: Option<String>,
 }
 
@@ -522,10 +524,37 @@ async fn backup_run(State(state): State<AppState>) -> Json<BackupResponse> {
     Json(run_backup_now(&state).await)
 }
 
+/// 备份运行标志的 RAII 守卫：离开作用域时复位（覆盖提前 return 与 panic 展开）
+struct BackupRunFlag<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for BackupRunFlag<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// 执行一次备份（可被 HTTP handler 与定时调度器复用）
 ///
-/// 返回 BackupResponse（含 uploaded/deleted/orphan_removed/error）。
+/// 返回 BackupResponse（含 uploaded/deleted/orphan_removed/skipped/error）。
+///
+/// **并发互斥**：定时调度与手动触发共用 `AppState.backup_running`，
+/// 同一时刻只允许一个备份执行；已有备份在跑时立即返回 `skipped = true`。
 pub async fn run_backup_now(state: &AppState) -> BackupResponse {
+    // 0) 抢占运行标志（CAS）；失败说明已有备份在执行，直接跳过
+    use std::sync::atomic::Ordering;
+    if state
+        .backup_running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return BackupResponse {
+            skipped: true,
+            error: Some("已有备份任务正在执行，本次触发已跳过".to_string()),
+            ..Default::default()
+        };
+    }
+    let _running = BackupRunFlag(&state.backup_running);
+
     // 1) 检查 WebDAV 是否已配置（未配置时 target 为占位适配器，会返回引导错误）
     let configured = state.target_ready
         || {
@@ -540,12 +569,8 @@ pub async fn run_backup_now(state: &AppState) -> BackupResponse {
             "备份未执行：WebDAV 未配置".to_string(),
         );
         return BackupResponse {
-            uploaded: 0,
-            uploaded_bytes: 0,
-            deleted: 0,
-            unchanged: 0,
-            orphan_removed: 0,
             error: Some("WebDAV 未配置，请先在设置中填写 WebDAV 地址与凭据".to_string()),
+            ..Default::default()
         };
     }
 
@@ -560,12 +585,8 @@ pub async fn run_backup_now(state: &AppState) -> BackupResponse {
             "备份未执行：未配置备份路径".to_string(),
         );
         return BackupResponse {
-            uploaded: 0,
-            uploaded_bytes: 0,
-            deleted: 0,
-            unchanged: 0,
-            orphan_removed: 0,
             error: Some("未配置备份路径".to_string()),
+            ..Default::default()
         };
     }
 
@@ -604,7 +625,7 @@ pub async fn run_backup_now(state: &AppState) -> BackupResponse {
             deleted: summary.deleted,
             unchanged: summary.unchanged,
             orphan_removed: summary.orphan_removed,
-            error: None,
+            ..Default::default()
         },
         Err(e) => {
             let msg = format!("{:#}", e);
@@ -615,12 +636,8 @@ pub async fn run_backup_now(state: &AppState) -> BackupResponse {
                 format!("备份失败：{}", msg),
             );
             BackupResponse {
-                uploaded: 0,
-                uploaded_bytes: 0,
-                deleted: 0,
-                unchanged: 0,
-                orphan_removed: 0,
                 error: Some(msg),
+                ..Default::default()
             }
         }
     }

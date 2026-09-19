@@ -11,9 +11,6 @@ use tracing::{info, warn};
 
 use crate::AppState;
 
-/// 配置变更轮询间隔（cron 为空/无效时用）
-const POLL_INTERVAL: Duration = Duration::from_secs(30);
-
 /// 启动定时备份调度器（后台 tokio 任务）
 ///
 /// `interval`：cron 触发时间粒度（秒），用于轮询是否到点，
@@ -28,7 +25,6 @@ pub fn spawn_scheduler(state: AppState, interval_secs: u64) {
 /// 调度主循环
 async fn scheduler_loop(state: AppState, interval_secs: u64) {
     let tick = Duration::from_secs(interval_secs.max(10));
-    let mut running = false;
 
     loop {
         // 1) 读取当前 cron 配置（支持热更新）
@@ -89,16 +85,15 @@ async fn scheduler_loop(state: AppState, interval_secs: u64) {
             tokio::time::sleep(remaining).await;
         }
 
-        // 4) 到点触发备份（防重入：若上次备份仍在运行则跳过本次）
-        if running {
-            warn!("上次定时备份仍在运行，跳过本次触发");
-            continue;
-        }
-        running = true;
+        // 4) 到点触发备份
+        //
+        // 运行互斥由 `run_backup_now` 内的全局标志（`AppState.backup_running`）保证：
+        // 若手动触发或上一轮备份仍在执行，本次返回 `skipped`，不会并发跑两份备份。
         info!("定时备份触发，开始执行");
         let resp = crate::http::routes::run_backup_now(&state).await;
-        running = false;
-        if let Some(err) = &resp.error {
+        if resp.skipped {
+            warn!("已有备份正在执行，跳过本次定时触发");
+        } else if let Some(err) = &resp.error {
             warn!(err = %err, "定时备份执行失败");
         } else {
             info!(
