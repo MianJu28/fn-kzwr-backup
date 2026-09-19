@@ -46,18 +46,18 @@ jobs:
       - name: 组装飞牛应用包
         run: |
           # 从可提交的打包源码目录复制骨架
-          PACK=dist/fnos-backup-app
+          PACK=dist/fn-kzwr-backup-app
           rm -rf $PACK
           mkdir -p $PACK
-          cp -r packaging/fnos-backup-app/. $PACK/
+          cp -r packaging/fn-kzwr-backup-app/. $PACK/
           ARCH="${{ matrix.target }}"
           # 拷贝对应架构后端二进制
           mkdir -p $PACK/app/bin
-          cp backend/target/$ARCH/release/fnos-backup $PACK/app/bin/fnos-backup
+          cp backend/target/$ARCH/release/fn-kzwr-backup $PACK/app/bin/fn-kzwr-backup
           # 拷贝前端产物
           rm -rf $PACK/app/www
           cp -r frontend/dist $PACK/app/www
-          chmod +x $PACK/app/bin/fnos-backup
+          chmod +x $PACK/app/bin/fn-kzwr-backup
 
       - name: 打包 .fpk
         run: |
@@ -65,14 +65,14 @@ jobs:
           curl -sSL -o /usr/local/bin/fnpack \
             https://static2.fnnas.com/fnpack/fnpack-1.2.3-linux-amd64
           chmod +x /usr/local/bin/fnpack
-          cd bin/fnos-backup-app
+          cd bin/fn-kzwr-backup-app
           fnpack build
           cp ./*.fpk "$GITHUB_WORKSPACE/"
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: fnos-backup-${{ matrix.target }}
+          name: fn-kzwr-backup-${{ matrix.target }}
           path: |
             *.fpk
-            dist/fnos-backup-app/app/bin/fnos-backup
+            dist/fn-kzwr-backup-app/app/bin/fn-kzwr-backup

@@ -131,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
         );
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
-    info!("fnos-backup 服务启动: http://{addr}");
+    info!("酷族备份（fn-kzwr-backup）服务启动: http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())

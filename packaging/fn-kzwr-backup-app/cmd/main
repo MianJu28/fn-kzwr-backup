@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# fnos-backup 飞牛应用生命周期脚本（start/stop/status/restart）
+# 酷族备份（fn-kzwr-backup）飞牛应用生命周期脚本（start/stop/status/restart）
 #
 # 飞牛 fnOS 在启动/停止/查询应用时调用本脚本。
 # 所有路径使用飞牛注入的 TRIM_* 环境变量，禁止硬编码。
@@ -20,7 +20,7 @@
 # 退出码：0=成功/running；1=失败；3=status 时未运行。
 
 # 缺失环境变量时回退（仅用于本地开发，生产环境由飞牛注入）
-APPDEST="${TRIM_APPDEST:-/var/apps/fnos-backup/target}"
+APPDEST="${TRIM_APPDEST:-/var/apps/fn-kzwr-backup/target}"
 PKGETC="${TRIM_PKGETC:-$APPDEST/etc}"
 PKGVAR="${TRIM_PKGVAR:-$APPDEST/var}"
 APPTMP="${TRIM_PKGTMP:-$APPDEST/tmp}"
@@ -34,12 +34,12 @@ APP_GROUP="${TRIM_GROUPNAME:-fnosbackup}"
 
 # 飞牛注入的 TRIM_TEMP_LOGFILE 是用户可见错误日志路径（飞牛UI会展示此文件内容）
 # 统一应用日志与生命周期日志到同一个文件，便于用户查看真实错误
-LOG_FILE="${TRIM_TEMP_LOGFILE:-$APPTMP/fnos-backup.log}"
+LOG_FILE="${TRIM_TEMP_LOGFILE:-$APPTMP/fn-kzwr-backup.log}"
 APP_LOG="$LOG_FILE"
 
 BIN_DIR="$APPDEST/bin"
-DAEMON="$BIN_DIR/fnos-backup"
-PID_FILE="$APPTMP/fnos-backup.pid"
+DAEMON="$BIN_DIR/fn-kzwr-backup"
+PID_FILE="$APPTMP/fn-kzwr-backup.pid"
 
 # 前端静态资源目录（后端 axum 托管；package app/ → $TRIM_APPDEST）
 WWW_DIR="${TRIM_WWW_DIR:-$APPDEST/www}"
@@ -50,7 +50,7 @@ if [ -f "$PASSPHRASE_FILE" ]; then
     PASSPHRASE="$(cat "$PASSPHRASE_FILE")"
 else
     # 开发回退：未初始化时使用固定值（生产不会走到这）
-    PASSPHRASE="fnos-backup-dev"
+    PASSPHRASE="fn-kzwr-backup-dev"
 fi
 
 mkdir -p "$PKGETC" "$PKGVAR" "$APPTMP" "$WWW_DIR" "$BIN_DIR"
@@ -58,7 +58,7 @@ mkdir -p "$PKGETC" "$PKGVAR" "$APPTMP" "$WWW_DIR" "$BIN_DIR"
 chown -R "$APP_USER:$APP_GROUP" "$PKGETC" "$PKGVAR" "$APPTMP" 2>/dev/null || true
 
 log_err() {
-    echo "[fnos-backup] $*" >"$LOG_FILE"
+    echo "[fn-kzwr-backup] $*" >"$LOG_FILE"
 }
 
 is_running() {
@@ -70,13 +70,13 @@ is_running() {
 
 do_start() {
     if is_running; then
-        echo "fnos-backup 已在运行 (pid $(cat "$PID_FILE"))"
+        echo "酷族备份 已在运行 (pid $(cat "$PID_FILE"))"
         exit 0
     fi
 
     # 记录启动诊断信息到用户可见日志
     {
-        echo "===== fnos-backup 启动 ====="
+        echo "===== 酷族备份 启动 ====="
         echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
         echo "APP_USER=$APP_USER APP_GROUP=$APP_GROUP"
         echo "DAEMON=$DAEMON"
@@ -99,7 +99,7 @@ do_start() {
     file_arch="$(file -b "$DAEMON" 2>/dev/null | head -1)"
     echo "二进制: $file_arch" >>"$LOG_FILE"
 
-    echo "启动 fnos-backup (port=$SERVICE_PORT) ..." | tee -a "$LOG_FILE"
+    echo "启动 酷族备份 (port=$SERVICE_PORT) ..." | tee -a "$LOG_FILE"
     echo "当前执行用户: $(id -un 2>/dev/null) (uid=$(id -u 2>/dev/null))" | tee -a "$LOG_FILE"
 
     # 直接以当前用户身份启动后端进程（飞牛生命周期脚本默认以应用用户执行，无需降权）
@@ -138,13 +138,13 @@ do_start() {
 
 do_stop() {
     if ! is_running; then
-        echo "fnos-backup 未运行"
+        echo "酷族备份 未运行"
         rm -f "$PID_FILE"
         exit 0
     fi
     local pid
     pid="$(cat "$PID_FILE")"
-    echo "停止 fnos-backup (pid $pid) ..."
+    echo "停止 酷族备份 (pid $pid) ..."
     kill -TERM "$pid" 2>/dev/null || true
     # 等待优雅退出
     for _ in $(seq 1 10); do

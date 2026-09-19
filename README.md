@@ -1,4 +1,4 @@
-# fnos-backup — 飞牛 NAS 增量加密备份
+# fn-kzwr-backup — 飞牛 NAS 增量加密备份
 
 基于酷族网软（kzwr.com）官方 **WebDAV** 的**增量加密备份**工具，运行于飞牛 fnOS。
 
@@ -69,7 +69,7 @@ export TRIM_PKGETC=$HOME/rf-cfg      # 配置目录（config.toml）
 export TRIM_PASSPHRASE=your-pass     # 密钥库口令
 export TRIM_WWW_DIR=frontend/dist    # 前端产物
 export TRIM_HTTP_PORT=8098
-./target/release/fnos-backup
+./target/release/fn-kzwr-backup
 ```
 
 WebDAV 凭据可在 Web 界面「设置」中配置，或用环境变量注入：

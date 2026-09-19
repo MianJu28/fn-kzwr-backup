@@ -6,7 +6,7 @@
 # 注意：不使用 set -e，避免任一命令非零退出导致飞牛判定"执行脚本出错"。
 
 # 停止应用进程（如果飞牛未自动停止）
-APPDEST="${TRIM_APPDEST:-/var/apps/fnos-backup/target}"
+APPDEST="${TRIM_APPDEST:-/var/apps/fn-kzwr-backup/target}"
 if [ -x "$APPDEST/cmd/main" ]; then
     "$APPDEST/cmd/main" stop >/dev/null 2>&1 || true
 fi
