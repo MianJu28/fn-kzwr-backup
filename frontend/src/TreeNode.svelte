@@ -1,74 +1,66 @@
 <script>
-  // 目录树节点（递归）：目录可展开、可整目录恢复；文件可单文件恢复
+  // 恢复树节点（懒加载：子项由父级按需拉取后经 cache 传入）
   import Icon from './components/Icon.svelte';
   import { fmtBytes } from './lib/format.js';
 
   export let node;
-  export let expandedSet = new Set();
+  /** 展开状态：{ [rel_path]: true } */
+  export let expanded = {};
+  /** 子项缓存：{ [rel_path]: nodes[] | 'loading' } */
+  export let cache = {};
   export let busy = false;
-  export let onToggleDir = () => {};
-  export let onRestore = () => {};
-  export let onRestoreDir = () => {};
+  export let onToggle = () => {}; // (node) => void
+  export let onRestoreFile = () => {}; // (node) => void
+  export let onRestoreDir = () => {}; // (node) => void
 
-  const byName = (a, b) => a.name.localeCompare(b.name);
-
-  $: dirs = node.children ? Object.values(node.children).filter((c) => c.is_dir).sort(byName) : [];
-  $: files = node.children ? Object.values(node.children).filter((c) => !c.is_dir).sort(byName) : [];
-
-  // 递归收集当前目录下所有文件的相对路径
-  function collectDirFiles(n) {
-    const out = [];
-    const walk = (cur) => {
-      if (!cur.children) return;
-      for (const child of Object.values(cur.children)) {
-        if (child.is_dir) walk(child);
-        else out.push(child.rel_path);
-      }
-    };
-    walk(n);
-    return out;
-  }
+  $: isOpen = !!expanded[node.rel_path];
+  $: raw = cache[node.rel_path];
+  $: loading = raw === 'loading';
+  $: children = Array.isArray(raw) ? raw : [];
 </script>
 
 {#if node.is_dir}
   <div class="dir">
     <div class="tree-row">
-      <button class="toggle" on:click={() => onToggleDir(node.rel_path)} aria-expanded={expandedSet.has(node.rel_path)}>
-        <Icon
-          name={expandedSet.has(node.rel_path) ? 'chevron_down' : 'chevron_right'}
-          size={14}
-        />
+      <button
+        class="toggle"
+        on:click={() => onToggle(node)}
+        aria-expanded={isOpen}
+        aria-label={isOpen ? '收起' : '展开'}
+      >
+        <Icon name={isOpen ? 'chevron_down' : 'chevron_right'} size={14} />
       </button>
-      <Icon name={expandedSet.has(node.rel_path) ? 'folder-open' : 'folder'} size={14} />
+      <Icon name={isOpen ? 'folder-open' : 'folder'} size={14} />
       <span class="name">{node.name}</span>
-      <button class="btn btn-sm btn-soft" on:click={() => onRestoreDir(collectDirFiles(node))} disabled={busy}>
-        恢复目录
+      <span class="badge badge-info nowrap">{node.file_count} 文件</span>
+      <span class="badge nowrap">{node.dir_count} 文件夹</span>
+      <span class="size">{fmtBytes(node.total_bytes)}</span>
+      <button class="btn btn-sm btn-soft" on:click={() => onRestoreDir(node)} disabled={busy}>
+        恢复
       </button>
     </div>
 
-    {#if expandedSet.has(node.rel_path)}
+    {#if isOpen}
       <div class="children">
-        {#each dirs as child (child.rel_path)}
-          <svelte:self
-            node={child}
-            {expandedSet}
-            {busy}
-            {onToggleDir}
-            {onRestore}
-            {onRestoreDir}
-          />
-        {/each}
-        {#each files as f (f.rel_path)}
-          <div class="tree-row">
-            <span class="indent"></span>
-            <Icon name="file" size={14} />
-            <span class="name">{f.name}</span>
-            <span class="size">{fmtBytes(f.size)}</span>
-            <button class="btn btn-sm btn-ghost" on:click={() => onRestore(f.rel_path)} disabled={busy}>
-              恢复
-            </button>
+        {#if loading}
+          <div class="tree-state">
+            <span class="spin"></span>加载中…
           </div>
-        {/each}
+        {:else if children.length === 0}
+          <div class="tree-state">（空文件夹）</div>
+        {:else}
+          {#each children as child (child.rel_path)}
+            <svelte:self
+              node={child}
+              {expanded}
+              {cache}
+              {busy}
+              {onToggle}
+              {onRestoreFile}
+              {onRestoreDir}
+            />
+          {/each}
+        {/if}
       </div>
     {/if}
   </div>
@@ -78,13 +70,17 @@
     <Icon name="file" size={14} />
     <span class="name">{node.name}</span>
     <span class="size">{fmtBytes(node.size)}</span>
-    <button class="btn btn-sm btn-ghost" on:click={() => onRestore(node.rel_path)} disabled={busy}>
+    <button class="btn btn-sm btn-ghost" on:click={() => onRestoreFile(node)} disabled={busy}>
       恢复
     </button>
   </div>
 {/if}
 
 <style>
+  .tree-row {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
   .toggle {
     display: grid;
     place-items: center;
@@ -112,5 +108,26 @@
   }
   .tree-row .name {
     font-size: 12.5px;
+  }
+  .tree-state {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 7px 10px;
+    color: var(--text-3);
+    font-size: 12.5px;
+  }
+  .spin {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: 2px solid var(--text-3);
+    border-right-color: transparent;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 </style>
