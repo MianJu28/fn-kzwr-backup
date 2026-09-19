@@ -1,5 +1,5 @@
 appname               = fn-kzwr-backup
-version               = 0.2.0
+version               = 0.2.1
 display_name          = 酷族备份
 desc                  = 在飞牛 NAS 上把指定文件夹增量、age 加密备份到酷族网软（kzwr）官方 WebDAV：断点续传、大文件自动分片、cron 定时、实时进度与速度、保留策略，并支持按文件或目录选择性恢复。
 platform              = x86
@@ -15,4 +15,4 @@ service_port          = 8080
 checkport             = true
 disable_authorization_path = false
 micro_app             = true
-changelog             = 更名「酷族备份」（appname: fn-kzwr-backup）；全新管理界面（暗色主题、实时任务面板、告警与通知设置、配置导入导出）；修复备份目录层级与并发触发互斥。
+changelog             = 恢复页重构：目录树改为按需懒加载（大备份秒开，不再一次性下发整棵树），文件夹与子目录均显示「文件数 / 文件夹数 / 大小」并可就地恢复，新增「全部恢复」一键恢复所有已备份文件夹；修复子目录不显示文件的问题；同步更新应用图标。
