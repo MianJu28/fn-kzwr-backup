@@ -61,6 +61,12 @@ export const api = {
 
   // 备份 / 恢复
   runBackup: () => post('/api/backup/run'),
+  /** 备份文件夹概况（文件数/文件夹数/总大小） */
   restoreFiles: () => get('/api/restore/files'),
-  restore: (files, source_path) => post('/api/restore/run', { files, source_path }),
+  /** 按目录懒加载：只取一层子项（目录附递归统计） */
+  restoreTree: (source, dir = '') =>
+    get(`/api/restore/tree?source=${encodeURIComponent(source)}&dir=${encodeURIComponent(dir)}`),
+  /** 恢复：all=true 时恢复该源路径（可用 dir 限定子目录）下的全部文件 */
+  restore: (files, source_path, all = false, dir = '') =>
+    post('/api/restore/run', { files, source_path, all, dir }),
 };

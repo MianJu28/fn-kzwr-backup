@@ -16,7 +16,8 @@
   // 后端在取不到账号时回传占位「已配置」，此处过滤
   $: account =
     userInfo && userInfo.username && userInfo.username !== '已配置' ? userInfo.username : '';
-  $: fileCount = restoreFolders.reduce((sum, f) => sum + ((f.files || []).length || 0), 0);
+  $: fileCount = restoreFolders.reduce((sum, f) => sum + (f.file_count || 0), 0);
+  $: dirCount = restoreFolders.reduce((sum, f) => sum + (f.dir_count || 0), 0);
   $: cronText = scheduleCron ? scheduleCron : '';
 </script>
 
@@ -73,7 +74,7 @@
         <div class="stat">
           <div class="stat-label"><Icon name="database" size={13} />云端可恢复</div>
           <div class="stat-value">{restoreFolders.length}</div>
-          <div class="stat-sub">{fileCount} 个文件快照</div>
+          <div class="stat-sub">{fileCount} 个文件 · {dirCount} 个文件夹</div>
         </div>
 
         <div class="stat">

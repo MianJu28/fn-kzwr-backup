@@ -106,6 +106,12 @@ pub struct RestoreRequest {
     pub files: Option<Vec<String>>,
     /// 恢复目标根目录（未传则用配置的备份源路径，恢复到原位置）
     pub source_path: Option<String>,
+    /// 「全部恢复」：忽略 `files`，取该源路径快照中的全部文件
+    #[serde(default)]
+    pub all: bool,
+    /// 与 `all` 搭配：只恢复该相对目录（含子目录）下的文件；空 = 整个源路径
+    #[serde(default)]
+    pub dir: Option<String>,
 }
 
 /// 恢复响应
@@ -116,29 +122,58 @@ pub struct RestoreResponse {
     pub error: Option<String>,
 }
 
-/// 可恢复文件条目
-#[derive(Serialize)]
-pub struct RestorableFile {
-    pub rel_path: String,
-    pub size: u64,
-    pub is_dir: bool,
-}
-
-/// 一个备份文件夹及其可恢复文件
+/// 一个备份文件夹的可恢复概况（文件明细改为按目录懒加载）
 #[derive(Serialize)]
 pub struct RestorableFolder {
     /// 备份源路径（本地目录）
     pub path: String,
     /// 是否已有备份数据（SQLite 快照）
     pub has_backup: bool,
-    /// 文件列表
-    pub files: Vec<RestorableFile>,
+    /// 递归文件总数（不含目录）
+    pub file_count: usize,
+    /// 递归子目录总数
+    pub dir_count: usize,
+    /// 递归明文总字节数
+    pub total_bytes: u64,
 }
 
 /// 恢复文件列表响应
 #[derive(Serialize)]
 pub struct RestoreFilesResponse {
     pub folders: Vec<RestorableFolder>,
+    pub error: Option<String>,
+}
+
+/// 目录树查询参数（懒加载：一次只取一层）
+#[derive(Deserialize)]
+pub struct RestoreTreeQuery {
+    /// 备份源路径（本地目录，须在备份配置中）
+    pub source: String,
+    /// 要展开的目录相对路径（空 / 缺省 = 根层级）
+    #[serde(default)]
+    pub dir: String,
+}
+
+/// 目录树节点（目录带递归统计，便于前端直接展示「N 文件 / M 文件夹」）
+#[derive(Serialize)]
+pub struct RestoreNode {
+    pub name: String,
+    pub rel_path: String,
+    pub is_dir: bool,
+    /// 文件：明文大小；目录：0（看 `total_bytes`）
+    pub size: u64,
+    /// 目录：递归文件数；文件：0
+    pub file_count: usize,
+    /// 目录：递归子目录数；文件：0
+    pub dir_count: usize,
+    /// 目录：递归明文总字节；文件：0
+    pub total_bytes: u64,
+}
+
+/// 目录树响应（指定目录的直接子项）
+#[derive(Serialize)]
+pub struct RestoreTreeResponse {
+    pub nodes: Vec<RestoreNode>,
     pub error: Option<String>,
 }
 
@@ -663,7 +698,94 @@ fn read_backup_config(
     }
 }
 
-/// 列出配置的备份文件夹及其可恢复文件（从 SQLite 快照查询）
+/// 统计某前缀（`""` = 整棵快照，`"dir/"` = 某目录）下的递归文件数、子目录数、明文总字节
+///
+/// 快照条目来自 SQLite（可能缺目录条目、且顺序不定），故按路径自行推导层级，
+/// 用 `BTreeSet` 去重目录，避免「同一目录被多条深层文件重复计数」。
+fn snapshot_aggregate(
+    entries: &[crate::infra::persistence::snapshot::SnapshotEntry],
+    prefix: &str,
+) -> (usize, usize, u64) {
+    let mut files = 0usize;
+    let mut dirs = std::collections::BTreeSet::new();
+    let mut bytes = 0u64;
+    for e in entries {
+        let Some(rest) = e.rel_path.strip_prefix(prefix) else {
+            continue;
+        };
+        if rest.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = rest.split('/').collect();
+        // 目录条目：自身 + 各级祖先；文件：各级祖先（文件本身计入 files）
+        let take = if e.is_dir {
+            parts.len()
+        } else {
+            files += 1;
+            bytes += e.size;
+            parts.len().saturating_sub(1)
+        };
+        let mut acc = String::new();
+        for p in parts.iter().take(take) {
+            if !acc.is_empty() {
+                acc.push('/');
+            }
+            acc.push_str(p);
+            dirs.insert(acc.clone());
+        }
+    }
+    (files, dirs.len(), bytes)
+}
+
+/// 列出某前缀下的直接子项（名称 + 是否目录），目录优先、其余按名称排序
+fn snapshot_children(
+    entries: &[crate::infra::persistence::snapshot::SnapshotEntry],
+    prefix: &str,
+) -> Vec<(String, bool)> {
+    let mut map: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+    for e in entries {
+        let Some(rest) = e.rel_path.strip_prefix(prefix) else {
+            continue;
+        };
+        if rest.is_empty() {
+            continue;
+        }
+        let (name, is_dir) = match rest.split_once('/') {
+            Some((head, _)) => (head.to_string(), true),
+            None => (rest.to_string(), e.is_dir),
+        };
+        map.entry(name).and_modify(|d| *d = *d || is_dir).or_insert(is_dir);
+    }
+    let mut out: Vec<(String, bool)> = map.into_iter().collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// 按备份源路径取出其快照条目（精确路径匹配优先，其次按目录名匹配）
+fn snapshot_entries_for_source(
+    state: &AppState,
+    source: &str,
+) -> Result<Vec<crate::infra::persistence::snapshot::SnapshotEntry>, String> {
+    let paths = read_backup_config(state).0;
+    let root = std::path::Path::new(source);
+    let idx = paths
+        .iter()
+        .position(|p| p.as_path() == root)
+        .or_else(|| {
+            root.file_name()
+                .and_then(|n| paths.iter().position(|p| p.file_name() == Some(n)))
+        })
+        .ok_or_else(|| "该路径不在备份配置中".to_string())?;
+    // 只展示当前账号的备份记录；未配置账号时归入默认 ''（旧数据）
+    let account = webdav_username(state).unwrap_or_default();
+    let job_id = format!("{}-{}", state.job_id, idx);
+    state
+        .store
+        .load_snapshot(&job_id, &account)
+        .map_err(|e| format!("读取备份快照失败: {:#}", e))
+}
+
+/// 列出配置的备份文件夹及其可恢复概况（计数来自 SQLite 快照，文件明细按需懒加载）
 async fn restore_files(State(state): State<AppState>) -> Json<RestoreFilesResponse> {
     let paths = read_backup_config(&state).0;
     // 只展示当前账号的备份记录；未配置账号时归入默认 ''（旧数据）
@@ -673,28 +795,83 @@ async fn restore_files(State(state): State<AppState>) -> Json<RestoreFilesRespon
     for (i, path) in paths.iter().enumerate() {
         // 多路径备份时，每个路径的 job_id = "{base}-{i}"
         let job_id = format!("{}-{}", state.job_id, i);
-        let entries = state.store.load_snapshot(&job_id, &account);
-
-        let files = match entries {
-            Ok(entries) => entries
-                .iter()
-                .map(|e| RestorableFile {
-                    rel_path: e.rel_path.clone(),
-                    size: e.size,
-                    is_dir: e.is_dir,
-                })
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+        let entries = state.store.load_snapshot(&job_id, &account).unwrap_or_default();
+        let (file_count, dir_count, total_bytes) = snapshot_aggregate(&entries, "");
 
         folders.push(RestorableFolder {
             path: path.to_string_lossy().into_owned(),
-            has_backup: !files.is_empty(),
-            files,
+            has_backup: file_count > 0,
+            file_count,
+            dir_count,
+            total_bytes,
         });
     }
 
     Json(RestoreFilesResponse { folders, error: None })
+}
+
+/// 按目录懒加载恢复树：只返回指定目录的**直接子项**，目录附递归统计
+///
+/// 前端展开某个文件夹/子目录时才调用，避免一次性下发整棵树（大备份下可达数万条）。
+async fn restore_tree(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<RestoreTreeQuery>,
+) -> Json<RestoreTreeResponse> {
+    let entries = match snapshot_entries_for_source(&state, &q.source) {
+        Ok(e) => e,
+        Err(msg) => {
+            return Json(RestoreTreeResponse {
+                nodes: Vec::new(),
+                error: Some(msg),
+            })
+        }
+    };
+
+    let dir = q.dir.trim_matches('/').to_string();
+    let prefix = if dir.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", dir)
+    };
+
+    let mut nodes = Vec::new();
+    for (name, is_dir) in snapshot_children(&entries, &prefix) {
+        let rel_path = if dir.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{}", dir, name)
+        };
+        if is_dir {
+            let (file_count, dir_count, total_bytes) =
+                snapshot_aggregate(&entries, &format!("{}/", rel_path));
+            nodes.push(RestoreNode {
+                name,
+                rel_path,
+                is_dir: true,
+                size: 0,
+                file_count,
+                dir_count,
+                total_bytes,
+            });
+        } else {
+            let size = entries
+                .iter()
+                .find(|e| !e.is_dir && e.rel_path == rel_path)
+                .map(|e| e.size)
+                .unwrap_or(0);
+            nodes.push(RestoreNode {
+                name,
+                rel_path,
+                is_dir: false,
+                size,
+                file_count: 0,
+                dir_count: 0,
+                total_bytes: 0,
+            });
+        }
+    }
+
+    Json(RestoreTreeResponse { nodes, error: None })
 }
 
 /// 触发恢复
@@ -722,16 +899,22 @@ async fn restore_run(
     }
 
     // 恢复目标根：优先用前端传入的 source_path（备份源路径，恢复到原位置），否则用默认目录
-    let (files, restore_root) = match body {
+    let (mut files, restore_root, restore_all, restore_dir) = match body {
         Some(Json(req)) => (
             req.files.unwrap_or_default(),
             req.source_path
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| state.default_restore_dir.to_string_lossy().into_owned()),
+            req.all,
+            req.dir
+                .map(|d| d.trim_matches('/').to_string())
+                .filter(|d| !d.is_empty()),
         ),
         None => (
             Vec::new(),
             state.default_restore_dir.to_string_lossy().into_owned(),
+            false,
+            None,
         ),
     };
 
@@ -771,6 +954,43 @@ async fn restore_run(
             job_id,
             account,
         });
+    }
+
+    // 「全部恢复」：忽略前端传入的文件列表，取该源路径（可限定子目录）快照中的全部文件
+    if restore_all {
+        if idx.is_none() {
+            return Json(RestoreResponse {
+                restored: 0,
+                restored_bytes: 0,
+                error: Some("未找到该路径的备份快照，请先执行一次备份".to_string()),
+            });
+        }
+        let prefix = restore_dir.as_ref().map(|d| format!("{}/", d));
+        files = meta
+            .keys()
+            .filter(|p| match &prefix {
+                Some(pfx) => p.starts_with(pfx.as_str()),
+                None => true,
+            })
+            .cloned()
+            .collect();
+        files.sort();
+        if files.is_empty() {
+            return Json(RestoreResponse {
+                restored: 0,
+                restored_bytes: 0,
+                error: Some(match &restore_dir {
+                    Some(d) => format!("目录 {d} 下暂无可恢复的文件"),
+                    None => "该路径暂无可恢复的文件".to_string(),
+                }),
+            });
+        }
+        tracing::info!(
+            "全部恢复：源 {}，目录 {}，共 {} 个文件",
+            restore_root,
+            restore_dir.as_deref().unwrap_or("(根)"),
+            files.len()
+        );
     }
 
     let job = RestoreJob {
@@ -1245,6 +1465,7 @@ pub fn router(state: AppState) -> Router {
         .route("/config/import", post(config_import))
         .route("/backup/run", post(backup_run))
         .route("/restore/files", get(restore_files))
+        .route("/restore/tree", get(restore_tree))
         .route("/restore/run", post(restore_run))
         .route("/keys", get(keys_get).post(keys_set))
         .route("/keys/generate", post(keys_generate))

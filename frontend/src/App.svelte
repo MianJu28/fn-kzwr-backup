@@ -265,8 +265,14 @@
 
   /* ── 操作：恢复 ───────────────────────────────────────────── */
 
-  async function handleRestore(files, sourcePath) {
-    return api.restore(files, sourcePath);
+  /** 恢复：all=true 时按 sourcePath（可用 dir 限定子目录）全量恢复 */
+  async function handleRestore(files, sourcePath, all = false, dir = '') {
+    return api.restore(files, sourcePath, all, dir);
+  }
+
+  /** 恢复树懒加载：展开目录时按需拉取一层 */
+  async function handleLoadTree(source, dir) {
+    return api.restoreTree(source, dir);
   }
 
   /* ── 操作：WebDAV / 密钥 / 通知 / 配置迁移 ───────────────── */
@@ -500,7 +506,14 @@
               onGoto={go}
             />
           {:else if currentPage === 'restore'}
-            <RestorePage {restoreFolders} {backupPaths} {busy} onRestore={handleRestore} onGoto={go} />
+            <RestorePage
+              {restoreFolders}
+              {backupPaths}
+              {busy}
+              onRestore={handleRestore}
+              onLoadTree={handleLoadTree}
+              onGoto={go}
+            />
           {:else if currentPage === 'settings'}
             <SettingsPage
               {webdavConfigured}
