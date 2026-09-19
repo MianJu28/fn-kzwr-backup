@@ -5,6 +5,7 @@
 pub mod alerts;
 pub mod backup;
 pub mod crypto;
+pub mod pace;
 pub mod restore;
 pub mod retention;
 pub mod scheduler;

@@ -35,6 +35,12 @@ pub enum StorageError {
 /// 存储层通用结果
 pub type StorageResult<T> = Result<T, StorageError>;
 
+/// 传输进度回调：参数为 (已写入字节, 总字节, 本请求已用时毫秒)
+///
+/// 用于文件内实时字节进度（如大文件上传时按块上报）。`total` 为 0 表示未知；
+/// `elapsed_ms` 为**当前请求**从开始发送到此刻的毫秒数（用于剔除空闲间隔计算速度）。
+pub type ProgressCb = Arc<dyn Fn(u64, u64, u64) + Send + Sync>;
+
 /// 文件描述符：扫描/列表返回的条目
 #[derive(Debug, Clone)]
 pub struct FileDescriptor {
@@ -106,6 +112,20 @@ pub trait TargetStorage: Send + Sync {
     /// 上传文件时的父目录自动创建。
     async fn ensure_dir(&self, _path: &Path) -> StorageResult<()> {
         Ok(())
+    }
+
+    /// 带进度的流式写入（默认忽略进度，直接调用 `write_stream`）。
+    ///
+    /// WebDAV 实现会在传输过程中按块回调 `progress(已写字节, 总字节)`，
+    /// 用于文件内实时字节进度展示。
+    async fn write_stream_progress(
+        &self,
+        path: &Path,
+        stream: Box<dyn Stream<Item = Bytes> + Send + Unpin>,
+        progress: ProgressCb,
+    ) -> StorageResult<()> {
+        let _ = progress;
+        self.write_stream(path, stream).await
     }
 
     /// 测试连接与凭证是否有效
@@ -202,6 +222,15 @@ impl TargetStorage for SwapTarget {
 
     async fn ensure_dir(&self, path: &Path) -> StorageResult<()> {
         self.current().ensure_dir(path).await
+    }
+
+    async fn write_stream_progress(
+        &self,
+        path: &Path,
+        stream: Box<dyn Stream<Item = Bytes> + Send + Unpin>,
+        progress: ProgressCb,
+    ) -> StorageResult<()> {
+        self.current().write_stream_progress(path, stream, progress).await
     }
 
     async fn ping(&self) -> StorageResult<()> {

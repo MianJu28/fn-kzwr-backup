@@ -1,7 +1,13 @@
 <script>
+  import { onDestroy } from 'svelte';
   // 实时任务状态（WebSocket 推送）；面板常驻显示，无任务时展示空闲态
-  export let liveStatus = null; // { kind, status, current_file, done, total, bytes_done, bytes_total, elapsed_ms, message }
+  export let liveStatus = null; // { kind, status, current_file, done, total, bytes_done, bytes_total, elapsed_ms, speed, at, message }
   export let wsConnected = false;
+
+  // 每秒刷新一次，使速度/用时连续更新（不必等下一个文件事件）
+  let now = Date.now();
+  const ticker = setInterval(() => (now = Date.now()), 1000);
+  onDestroy(() => clearInterval(ticker));
 
   function statusText(s) {
     const map = {
@@ -37,16 +43,30 @@
     return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
   }
 
-  // 速度 = 已传字节 / 已耗时
-  function fmtSpeed(bytes, ms) {
-    if (!bytes || !ms) return '—';
-    return `${fmtBytes(bytes / (ms / 1000))}/s`;
+  // 速度直接由后端下发（字节/秒），前端只做格式化
+  function fmtBps(bps) {
+    if (!bps) return '—';
+    return `${fmtBytes(bps)}/s`;
   }
 
   $: pct =
     liveStatus && liveStatus.total
       ? Math.min(100, Math.round((liveStatus.done / liveStatus.total) * 100))
       : 0;
+
+  // 仅「上传/下载进行中」才按秒推进；完成/失败后冻结为后端最终耗时，不再变化
+  $: isRunning =
+    !!liveStatus && (liveStatus.status === 'started' || liveStatus.status === 'progress');
+
+  // 已耗时 = 后端上报的耗时 +（进行中时）距上次事件的时间
+  $: liveElapsed = liveStatus
+    ? isRunning
+      ? (liveStatus.elapsed_ms || 0) + Math.max(0, now - (liveStatus.at || now))
+      : liveStatus.elapsed_ms || 0
+    : 0;
+
+  // 速度由后端按实际传输时段计量后下发；此处仅展示（空闲/完成后不变化）
+  $: speedText = fmtBps(liveStatus ? liveStatus.speed : 0);
 </script>
 
 <section class="live-status" class:idle={!liveStatus}>
@@ -87,11 +107,11 @@
     </div>
     <div class="ls-row">
       <span class="ls-label">速度</span>
-      <span class="ls-value">{fmtSpeed(liveStatus.bytes_done, liveStatus.elapsed_ms)}</span>
+      <span class="ls-value">{speedText}</span>
     </div>
     <div class="ls-row">
       <span class="ls-label">用时</span>
-      <span class="ls-value">{fmtDuration(liveStatus.elapsed_ms)}</span>
+      <span class="ls-value">{fmtDuration(liveElapsed)}</span>
     </div>
     {#if liveStatus.message}
       <div class="ls-row">

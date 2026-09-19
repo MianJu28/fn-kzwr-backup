@@ -1,6 +1,6 @@
 [package]
 name = "fnos-backup"
-version = "0.1.3"
+version = "0.1.9"
 edition = "2021"
 description = "飞牛 NAS 增量加密备份系统（备份至酷族网软）"
 license = "MIT"
@@ -23,6 +23,8 @@ serde_json = "1"
 
 # HTTP 客户端（Rust 重写 kzwr API 用）
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+# 自定义请求体（带精确 size_hint 的流式上传，保留 Content-Length 同时上报进度）
+http-body = "1"
 
 # 数据库
 rusqlite = { version = "0.31", features = ["bundled"] }

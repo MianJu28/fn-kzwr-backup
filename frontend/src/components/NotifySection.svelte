@@ -6,6 +6,8 @@
   export let busy = false;
   // onSave(url, headers, bodyTemplate) => Promise<{success, error}>
   export let onSave = null;
+  // onTest(url, headers, bodyTemplate) => Promise<{success, status, error}>
+  export let onTest = null;
 
   let input = webhookUrl || '';
   let headers = [];
@@ -13,6 +15,7 @@
   let msg = '';
   let msgOk = false;
   let working = false;
+  let testing = false;
 
   $: if (webhookUrl !== undefined) input = webhookUrl;
   $: headers = (webhookHeaders || []).map((h) => ({ name: h.name, value: h.value }));
@@ -36,6 +39,27 @@
       msgOk = true;
     } else {
       msg = `保存失败: ${r.error}`;
+      msgOk = false;
+    }
+  }
+
+  // 测试连通性：用当前表单值直接发送一条测试通知
+  async function test() {
+    if (!input.trim()) {
+      msg = '请先填写 Webhook 地址';
+      msgOk = false;
+      return;
+    }
+    testing = true;
+    msg = '';
+    const cleanHeaders = headers.filter((h) => h.name.trim() !== '');
+    const r = await onTest(input.trim(), cleanHeaders, body);
+    testing = false;
+    if (r.success) {
+      msg = `测试成功：服务器返回 ${r.status ?? 200}`;
+      msgOk = true;
+    } else {
+      msg = `测试失败: ${r.error}`;
       msgOk = false;
     }
   }
@@ -84,7 +108,12 @@
     <code>&#123;&#123;id&#125;&#125;</code>
   </p>
 
-  <button on:click={save} disabled={busy || working}>{working ? '保存中...' : '保存'}</button>
+  <div class="btn-row">
+    <button on:click={save} disabled={busy || working || testing}>{working ? '保存中...' : '保存'}</button>
+    <button class="ghost" on:click={test} disabled={busy || working || testing}>
+      {testing ? '测试中...' : '测试连通性'}
+    </button>
+  </div>
 
   {#if msg}
     <p class:ok={msgOk} class:warn={!msgOk}>{msg}</p>
@@ -137,7 +166,9 @@
     margin-top: 12px;
   }
   button:disabled { background: #9db4e8; cursor: not-allowed; }
-  button.ghost { background: #eef2ff; color: #2563eb; margin-top: 8px; }
+  button.ghost { background: #eef2ff; color: #2563eb; margin-top: 0; }
+  .btn-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+  .btn-row button { margin-top: 0; }
   button.remove {
     background: transparent;
     color: #b91c1c;

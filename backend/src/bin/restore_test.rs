@@ -142,6 +142,8 @@ async fn main() -> Result<()> {
         target_prefix: Some(PREFIX.to_string()),
         source_root_name: None,
         eventbus: None,
+        meta: std::collections::HashMap::new(),
+        snapshot_target: None,
     };
     let r1 = restore_job.run(&[], &restore_dir1).await?;
     println!("[+] 恢复: restored={} bytes={}", r1.restored, r1.restored_bytes);

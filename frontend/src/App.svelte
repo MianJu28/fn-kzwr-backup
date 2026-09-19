@@ -79,6 +79,8 @@
               bytes_done: data.bytes_done,
               bytes_total: data.bytes_total,
               elapsed_ms: data.elapsed_ms,
+              speed: data.speed,
+              at: Date.now(),
               message: data.message,
             };
             // 任务结束（备份/恢复完成）后刷新可恢复列表，保证恢复页数据最新
@@ -187,13 +189,16 @@
   }
 
   // 导出当前私钥明文（用于另存备份；需管理员口令校验）
+  // 展示私钥后即视为「需重新确认备份」，重置标记使「我已妥善保存」可再次点击
   async function handleExportKey(passphrase) {
     const res = await fetch('/api/keys/export', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ passphrase }),
     });
-    return res.json();
+    const data = await res.json();
+    if (data.private_key) keyBackedUp = false;
+    return data;
   }
 
   // 确认已妥善备份私钥
@@ -235,6 +240,41 @@
       webhookUrl = data.webhook_url || '';
       webhookHeaders = data.headers || [];
       webhookBody = data.body_template || '';
+    }
+    return data;
+  }
+
+  // 测试 Webhook 连通性（用当前表单配置直接发一条测试通知）
+  async function handleTestWebhook(url, headers, bodyTemplate) {
+    const res = await fetch('/api/notify/webhook/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ webhook_url: url, headers, body_template: bodyTemplate }),
+    });
+    return res.json();
+  }
+
+  // 导出配置（含 WebDAV 凭据与 age 私钥；需管理员口令）
+  async function handleExportConfig(passphrase) {
+    const res = await fetch('/api/config/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ passphrase }),
+    });
+    return res.json();
+  }
+
+  // 导入配置（覆盖配置并可恢复 age 私钥；需管理员口令）
+  async function handleImportConfig(passphrase, configText) {
+    const res = await fetch('/api/config/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ passphrase, config: configText }),
+    });
+    const data = await res.json();
+    if (data.success) {
+      // 配置已变更：刷新本地状态
+      await Promise.all([loadConfig(), loadKeys(), loadUserInfo(), loadRestoreFiles()]);
     }
     return data;
   }
@@ -418,6 +458,9 @@
           onExportKey={handleExportKey}
           onBackupAck={handleBackupAck}
           onSaveWebhook={handleSaveWebhook}
+          onTestWebhook={handleTestWebhook}
+          onExportConfig={handleExportConfig}
+          onImportConfig={handleImportConfig}
         />
       {/if}
     </div>
