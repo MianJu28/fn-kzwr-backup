@@ -53,6 +53,9 @@
 
   // 告警与通知
   let alerts = [];
+  // 非敏感配置回显：WebDAV 用户名（密码永不返回）与保留策略
+  let webdavUsername = '';
+  let retention = { enabled: false, cleanup_unmanaged: false, min_age_days: 0 };
   let webhookUrl = '';
   let webhookHeaders = [];
   let webhookBody = '';
@@ -98,6 +101,8 @@
       scheduleCronValid = d.schedule_cron_valid !== false;
       webdavConfigured = !!d.webdav_configured;
       webdavUrl = d.webdav_url || '';
+      webdavUsername = d.webdav_username || '';
+      retention = d.retention || { enabled: false, cleanup_unmanaged: false, min_age_days: 0 };
       webhookUrl = d.webhook_url || '';
       webhookHeaders = d.webhook_headers || [];
       webhookBody = d.webhook_body || '';
@@ -232,6 +237,33 @@
     } catch (e) {
       error = e.message;
       toast.error(e.message);
+    } finally {
+      busy = false;
+    }
+  }
+
+  /** 保存保留策略：只提交保留策略（不提交 cron，避免被无效表达式阻塞） */
+  async function handleSaveRetention(next) {
+    busy = true;
+    error = null;
+    try {
+      const d = await api.saveConfig({
+        backup_paths: backupPaths,
+        target_folder: targetFolder,
+        retention_enabled: next.enabled,
+        retention_cleanup_unmanaged: next.cleanup_unmanaged,
+        retention_min_age_days: next.min_age_days,
+      });
+      if (d.error) {
+        error = d.error;
+        return { error: d.error };
+      }
+      // 用后端返回值回写，保证页面与磁盘一致
+      retention = d.retention || next;
+      return {};
+    } catch (e) {
+      error = e.message;
+      return { error: e.message };
     } finally {
       busy = false;
     }
@@ -518,6 +550,8 @@
             <SettingsPage
               {webdavConfigured}
               {webdavUrl}
+              {webdavUsername}
+              {retention}
               {busy}
               {userInfo}
               {userInfoError}
@@ -532,6 +566,7 @@
               onGenerateKey={handleGenerateKey}
               onExportKey={handleExportKey}
               onBackupAck={handleBackupAck}
+              onSaveRetention={handleSaveRetention}
               onSaveWebhook={handleSaveWebhook}
               onTestWebhook={handleTestWebhook}
               onExportConfig={handleExportConfig}

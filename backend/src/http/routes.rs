@@ -65,6 +65,10 @@ pub struct ConfigResponse {
     pub webdav_configured: bool,
     /// 已配置的 WebDAV 地址（非敏感）
     pub webdav_url: Option<String>,
+    /// 已配置的 WebDAV 用户名（非敏感，供设置页回显；密码永不返回）
+    pub webdav_username: Option<String>,
+    /// 保留策略（目标端孤儿文件清理，非敏感）
+    pub retention: RetentionView,
     /// 告警 Webhook 地址（空 = 不外发）
     pub webhook_url: Option<String>,
     /// Webhook 自定义请求头
@@ -76,6 +80,27 @@ pub struct ConfigResponse {
     pub error: Option<String>,
 }
 
+/// 保留策略视图（非敏感，供设置页回显与修改）
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct RetentionView {
+    /// 是否启用保留策略
+    pub enabled: bool,
+    /// 清理目标端不在任何快照中的孤儿文件
+    pub cleanup_unmanaged: bool,
+    /// 仅清理早于该天数的文件（0 = 不限制）
+    pub min_age_days: u64,
+}
+
+impl From<&crate::infra::config::RetentionConfig> for RetentionView {
+    fn from(r: &crate::infra::config::RetentionConfig) -> Self {
+        Self {
+            enabled: r.enabled,
+            cleanup_unmanaged: r.cleanup_unmanaged,
+            min_age_days: r.min_age_days,
+        }
+    }
+}
+
 /// 配置保存请求
 #[derive(Deserialize)]
 pub struct ConfigSaveRequest {
@@ -83,6 +108,13 @@ pub struct ConfigSaveRequest {
     pub target_folder: Option<String>,
     /// 定时备份 cron 表达式（空 = 关闭定时）
     pub schedule_cron: Option<String>,
+    /// 保留策略：以下三项不传则保持原值不变
+    #[serde(default)]
+    pub retention_enabled: Option<bool>,
+    #[serde(default)]
+    pub retention_cleanup_unmanaged: Option<bool>,
+    #[serde(default)]
+    pub retention_min_age_days: Option<u64>,
 }
 
 /// 备份响应
@@ -449,6 +481,7 @@ async fn webdav_save(
 fn config_response(
     cfg: &crate::infra::config::AppConfig,
     webdav_configured: bool,
+    webdav_username: Option<String>,
     error: Option<String>,
 ) -> ConfigResponse {
     let schedule = cfg.backup.schedule_cron.clone().unwrap_or_default();
@@ -460,6 +493,8 @@ fn config_response(
         schedule_cron_valid: valid,
         webdav_configured,
         webdav_url: cfg.webdav.url.clone(),
+        webdav_username,
+        retention: RetentionView::from(&cfg.backup.retention),
         webhook_url: cfg.notify.webhook_url.clone(),
         webhook_headers: cfg.notify.webhook_headers.clone(),
         webhook_body: cfg.notify.webhook_body.clone(),
@@ -476,9 +511,11 @@ fn webdav_ready(cfg: &crate::infra::config::AppConfig) -> bool {
 }
 
 async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
+    // 注意：webdav_username 内部会锁 config，故须在下面加锁前先取，避免同一 Mutex 重入死锁
+    let wuser = webdav_username(&state);
     let cfg_guard = state.config.lock().unwrap();
     match cfg_guard.load() {
-        Ok(c) => Json(config_response(&c, webdav_ready(&c), None)),
+        Ok(c) => Json(config_response(&c, webdav_ready(&c), wuser, None)),
         Err(e) => Json(ConfigResponse {
             backup_paths: Vec::new(),
             target_folder: state.target_folder.clone(),
@@ -486,6 +523,8 @@ async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
             schedule_cron_valid: true,
             webdav_configured: false,
             webdav_url: None,
+            webdav_username: None,
+            retention: RetentionView::default(),
             webhook_url: None,
             webhook_headers: Vec::new(),
             webhook_body: None,
@@ -500,6 +539,8 @@ async fn config_save(
     State(state): State<AppState>,
     Json(body): Json<ConfigSaveRequest>,
 ) -> Json<ConfigResponse> {
+    // 同 config_get：先取账号再锁配置，避免 Mutex 重入死锁
+    let wuser = webdav_username(&state);
     let cfg_guard = state.config.lock().unwrap();
     let mut cfg = match cfg_guard.load() {
         Ok(c) => c,
@@ -511,11 +552,21 @@ async fn config_save(
             cfg.backup.target_folder = folder;
         }
     }
+    // 保留策略：仅更新传入的字段（未传保持原值）
+    if let Some(v) = body.retention_enabled {
+        cfg.backup.retention.enabled = v;
+    }
+    if let Some(v) = body.retention_cleanup_unmanaged {
+        cfg.backup.retention.cleanup_unmanaged = v;
+    }
+    if let Some(v) = body.retention_min_age_days {
+        cfg.backup.retention.min_age_days = v;
+    }
     // 定时 cron：校验合法性；空串视为关闭
     if let Some(cron) = body.schedule_cron {
         let cron = cron.trim().to_string();
         if let Err(e) = crate::domain::scheduler::validate_cron(&cron) {
-            let resp = config_response(&cfg, webdav_ready(&cfg), Some(e.to_string()));
+            let resp = config_response(&cfg, webdav_ready(&cfg), wuser, Some(e.to_string()));
             return Json(resp);
         }
         if cron.is_empty() {
@@ -525,8 +576,8 @@ async fn config_save(
         }
     }
     match cfg_guard.save(&cfg) {
-        Ok(_) => Json(config_response(&cfg, webdav_ready(&cfg), None)),
-        Err(e) => Json(config_response(&cfg, false, Some(format!("{:#}", e)))),
+        Ok(_) => Json(config_response(&cfg, webdav_ready(&cfg), wuser, None)),
+        Err(e) => Json(config_response(&cfg, false, wuser, Some(format!("{:#}", e)))),
     }
 }
 

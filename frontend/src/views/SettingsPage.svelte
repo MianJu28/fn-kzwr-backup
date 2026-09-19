@@ -1,16 +1,22 @@
 <script>
   import UserCard from '../components/UserCard.svelte';
   import WebdavSection from '../components/WebdavSection.svelte';
+  import RetentionSection from '../components/RetentionSection.svelte';
   import KeySection from '../components/KeySection.svelte';
   import NotifySection from '../components/NotifySection.svelte';
   import ConfigSection from '../components/ConfigSection.svelte';
 
   export let webdavConfigured = false;
   export let webdavUrl = '';
+  export let webdavUsername = '';
   export let busy = false;
   export let userInfo = null;
   export let userInfoError = null;
   export let onSaveWebdav = null; // (username, password) => Promise
+
+  // 保留策略（非敏感配置，回显后可就地修改）
+  export let retention = null; // { enabled, cleanup_unmanaged, min_age_days }
+  export let onSaveRetention = null; // (retention) => Promise<{error?}>
 
   // 加密密钥（age）
   export let keyInfo = null; // { public_key }
@@ -35,7 +41,15 @@
 
 <UserCard {userInfo} {userInfoError} configured={webdavConfigured} />
 
-<WebdavSection configured={webdavConfigured} configuredUrl={webdavUrl} {busy} onSave={onSaveWebdav} />
+<WebdavSection
+  configured={webdavConfigured}
+  configuredUrl={webdavUrl}
+  configuredUsername={webdavUsername}
+  {busy}
+  onSave={onSaveWebdav}
+/>
+
+<RetentionSection {retention} {busy} onSave={onSaveRetention} />
 
 <KeySection
   {keyInfo}
