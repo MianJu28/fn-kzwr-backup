@@ -138,6 +138,7 @@
 | 飞牛打包 | fnpack → `.fpk` | Docker 镜像 | 普通应用形态；原生访问文件系统；x86_64+aarch64 双架构 |
 | 源访问 | tokio::fs（本地 FS） | smb-rs / pavao | 仅需本地文件备份，不考虑 SMB/NFS，零依赖 |
 | 目标访问 | reqwest（WebDAV 客户端） | rust-s3 | 酷族官方 WebDAV（ADR-009）；逆向 REST API 已移除 |
+| 大文件上传 | 自定义 `http_body`（精确 `size_hint`） | 纯流式 body（chunked） | 分片 PUT 保留 `Content-Length` 的同时按块上报进度；chunked 可能被站点/网关拒绝（413） |
 | 配置 | TOML + serde | YAML / JSON | 人类可读；Rust 生态一等支持 |
 | 日志 | tracing + tracing-subscriber | log + env_logger | 结构化日志；span 追踪；异步友好 |
 | 调度 | tokio-cron-scheduler | 系统 cron | 不依赖系统 cron，可移植；进程内调度 |
@@ -180,7 +181,7 @@
 
 ### ADR-003：age 加密方案与分块策略
 
-**状态**：Accepted（修订：原 Picocrypt/XChaCha20-Poly1305 + Argon2id 方案已废弃，改为 age 公私钥）
+**状态**：Accepted（修订：原 Picocrypt/XChaCha20-Poly1305 + Argon2id 主密钥方案已废弃，改为 age 公私钥；私钥保护改用 age 内置 scrypt）
 
 **背景**：用户指定加密改为 age（X25519 公私钥 + ChaCha20-Poly1305 AEAD）。需支持大文件流式加密与选择性恢复（随机访问特定 chunk 解密）。采用 age 后无需口令派生，改用标准公钥加密。
 
@@ -188,7 +189,7 @@
 - 文件按 64MB 分块，每块用 age 公钥独立加密（每块生成独立文件密钥，age 标准头部含 ephemeral key，无碰撞风险）
 - 加密方只持有 `age` 公钥即可备份；恢复方需 `age` 私钥
 - 流式管道：`Source 流 → Chunker → Encryptor(age) → Target 流`，明文仅在内存当前 chunk
-- `age` 私钥本身可被用户口令派生的密钥（Argon2id）再次加密后存密钥库，实现口令保护
+- `age` 私钥本身可被管理员口令（**age 内置 scrypt** 派生密钥）再次加密后存密钥库（`keystore.age`），实现口令保护
 - Rust crate：`age`（纯 Rust 实现，支持 musl 静态编译）
 
 **后果**：
@@ -197,7 +198,7 @@
 - (+) age 为现代标准，纯 Rust 实现，避免 C 依赖；公钥加密免口令派生，加密侧更轻量
 - (+) 公钥可安全公开，配合备份目标实现"只写不可读"（目标侧仅公钥加密，私钥本地私藏）
 - (-) 64MB 分块在小文件场景有空间放大（需 padding 策略或小文件单独处理）
-- (-) 私钥丢失则无法恢复，需私钥备份/恢复机制（Phase 5）
+- (-) ~~私钥丢失则无法恢复，需私钥备份/恢复机制（Phase 5）~~ → **已缓解（2026-09-19）**：设置页可口令校验后导出私钥另存，并「我已妥善保存」确认；未确认时持续提示丢失风险
 
 ### ADR-004：增量检测双策略
 
@@ -208,11 +209,11 @@
 **决策**：提供双策略，按任务可配置：
 - **快速策略**（默认）：比较 `mtime + size`，命中即跳过。O(1)，覆盖 99% 场景。
 - **严格策略**：对 mtime/size 变化的文件再算 BLAKE3 内容哈希确认。防 mtime 欺骗、支持跨文件去重。
-- 大文件（>1GB）始终走严格策略 + 分块哈希，支持块级增量。
+- ~~大文件（>1GB）始终走严格策略 + 分块哈希，支持块级增量~~ → **块级增量不做**（用户决策，2026-09-19）：维持整文件差分，严格策略仅按任务配置启用、不按文件大小强制。
 
 **后果**：
 - (+) 默认场景高性能；需要时切严格模式
-- (+) BLAKE3 树形哈希支持块级增量与并行计算
+- (+) BLAKE3 树形哈希支持流式/并行计算（块级增量未采用，见上）
 - (-) 双策略增加实现复杂度
 - (-) 严格策略下首次全量哈希计算耗时
 
@@ -341,7 +342,26 @@ trait TargetStorage {
 - (+) 大幅简化适配器：标准协议，去除哈希对齐/presigned 分片等脆弱逻辑
 - (+) trait 抽象（ADR-005）使替换 Target 适配器不影响核心逻辑
 - (-) 需重写 Target 适配器并完整回归测试
-- (-) WebDAV 认证方式与加密密文流式 PUT 的性能需实测（64MB 分块策略是否保留待验证）
+- (-) ~~WebDAV 认证方式与加密密文流式 PUT 的性能需实测（64MB 分块策略是否保留待验证）~~ → **已解除**：HTTP Basic 与密文流式 PUT 端到端实测通过；>90MiB 密文自动分片上传（`PART_SIZE`，见上「大文件分片与地址固定」），64MB 加密分块策略保持不变
+
+---
+
+### ADR-010：备份目标端按源文件夹名分层
+
+**背景**：早期实现把多个源目录直接平铺到目标前缀下（`/目标文件夹/<相对路径>`）。配置多个源文件夹时，不同源目录中的同名文件/目录会在同一层互相覆盖；且「所选文件夹」本身在网盘不可见（只存在其内容），用户难以把网盘目录对应回本地来源。
+
+**决策**：每个源目录在目标端以其**文件夹名**单独建目录，即 `/目标文件夹/<源文件夹名>/<相对路径>`；备份时显式创建该目录及其空子目录。
+
+**实现**：
+- 备份：`BackupJob::run_multi` 用 `join_root_prefix()` 为每个源目录生成独立 `target_prefix`；`TargetStorage::ensure_dir`（WebDAV 实现为逐级 `MKCOL`）创建目录，空目录也会创建
+- 恢复：`RestoreJob.source_root_name` 还原同一层级（`/目标文件夹/<源文件夹名>/…`），并按该源路径对应的快照展示总大小
+- 事件：`run_multi` 以基准 `job_id` 发布**合并后**的整体进度
+
+**后果**：
+- (+) 多源目录互不干扰，网盘目录结构与本地来源一一对应
+- (+) 空文件夹也能在网盘保留
+- (-) 与 v0.1.3 之前的目标布局不兼容：旧备份需重新执行一次备份（或手工整理目录）
+- (-) 目录创建会多出少量 `MKCOL` 请求（已对「会被文件上传覆盖的父目录」跳过）
 
 ---
 
@@ -392,6 +412,7 @@ fnos-backup/
 │       │   ├── sync.rs         # 增量同步 (SyncSession 聚合)
 │       │   ├── crypto.rs       # 加密 (CryptoSession 聚合)
 │       │   ├── restore.rs      # 恢复编排 (RestoreJob 聚合)
+│       │   ├── pace.rs         # 传输速度计量 (SpeedMeter)
 │       │   └── retention.rs    # 保留策略 (孤儿文件清理)
 │       ├── infra/              # 基础设施层 (ACL 适配器)
 │       │   ├── source/local/   # Source 适配器: local/ (仅本地FS)
@@ -427,7 +448,7 @@ fnos-backup/
 
 | 阶段 | 交付物 | 状态 | 关键风险 | 可逆性 |
 |------|--------|------|----------|--------|
-| **Phase 1 · MVP** | 全量备份 · 单源单目标 · 基础 Web UI · 本地 FS 源 · 酷族官方 WebDAV 目标（ADR-009） · 飞牛 `.fpk` 打包 | ✅ 核心完成（.fpk 打包待部署） | WebDAV 对接（已解决）· 飞牛生命周期集成 | 完全可逆 |
+| **Phase 1 · MVP** | 全量备份 · 单源单目标 · 基础 Web UI · 本地 FS 源 · 酷族官方 WebDAV 目标（ADR-009） · 飞牛 `.fpk` 打包 | ✅ 完成（x86 飞牛设备安装/运行实测通过；aarch64 待测） | WebDAV 对接（已解决）· 飞牛生命周期集成 | 完全可逆 |
 | **Phase 2 · 增量加密** | mtime 差分 · age 加密 · 流式管道 · 64MB 分块 · SQLite 元数据 | ✅ 完成 | 私钥管理（已用密钥库解决）· 大文件内存 | 完全可逆 |
 | **Phase 3 · 恢复能力** | 选择性恢复 · 恢复向导 UI · 完整性校验 · BLAKE3 严格模式 | ✅ 完成 | 索引膨胀（结合保留策略缓解） | 部分可逆（元数据格式定型需迁移） |
 | **Phase 4 · 生产强化** | 多目标支持 · 保留策略 · 断点续传 · 监控告警 · fnos 服务化 | ✅ 保留策略 / 断点续传 / WebSocket 监控 / `.fpk` 打包 / 监控告警 / 飞牛设备实测均已完成（多目标按用户决策放弃） | 并发控制 · 资源争用 | 部分可逆 |
@@ -442,10 +463,15 @@ fnos-backup/
 - ✅ kzwr 官方 WebDAV Target 适配器（`WebdavTarget`：MKCOL/PUT/GET 302 跟随/DELETE/PROPFIND，ADR-009 端到端实测通过）
 - ❌ kzwr 逆向 REST API 适配器与登录二进制（分块上传/下载/删除、session 认证、Camoufox 登录环境）——**已从代码库完全移除**（ADR-009，2026-09-18）
 - ✅ 恢复编排（RestoreJob）+ 恢复到源路径 + 多路径多 job 快照
-- ✅ 备份/恢复 HTTP API + Svelte Web UI（登录页、多路径配置、恢复树形视图）
-- ✅ WebSocket 实时任务监控（ADR-007 事件总线）
+- ✅ 备份/恢复 HTTP API + Svelte Web UI（多路径配置、恢复树形视图；登录页随登录二进制一并移除，前端无登录态）
+- ✅ WebSocket 实时任务监控（ADR-007 事件总线）：多路径进度合并统计、**上传/下载完成后才计数**、后端计量的实时速度（仅统计实际传输时段）、明文总量与已传量展示
 - ✅ 保留策略：目标端孤儿文件清理（Phase 4）
-- 🔶 飞牛 `.fpk` 打包部署（待验证）
+- ✅ 备份目标端**按源文件夹名分层**（`/目标文件夹/<源文件夹名>/…`，含空目录显式创建，ADR-010）
+- ✅ 大文件分片上传/下载与清理；分片请求使用**自定义带精确长度的流式请求体**（保留 `Content-Length` 且可上报进度）
+- ✅ 配置导入/导出（`/api/config/export`、`/api/config/import`，含 WebDAV 凭据与 age 私钥，需管理员口令）
+- ✅ 监控告警 Webhook 自定义（请求头 + 请求体模板 + 连通性测试）
+- ✅ 恢复后回写快照（size + 实际 mtime），**避免下次增量备份重复上传**
+- 🔶 飞牛 `.fpk` 打包部署：x86 设备实测通过；aarch64 待测
 
 ---
 
@@ -490,9 +516,9 @@ fnos-backup/
 | 酷族网软对接 | 官方 WebDAV（Basic 凭据，加密存储，保存时 ping 验证并热切换） | 1-2 | ✅ WebDAV 适配器已实现并端到端实测；REST 适配器与登录二进制已移除（ADR-009） |
 | 飞牛源访问 | 仅本地 FS（tokio::fs），不考虑 SMB/NFS | 1 | ✅ 已实现 |
 | 双架构编译 | musl 静态链接 + cross 工具，全纯 Rust 依赖，GitHub Actions matrix | 1 | ✅ 已实现（本地 musl 构建验证） |
-| 源目录授权 | config/resource 声明 + 运行时引导，弃 root 模式 | 1 | 🔶 开发期用环境变量；飞牛部署待验证 |
-| UI 暴露认证 | 端口服务 + JWT（wizard 设管理员口令），WebSocket 状态推送 | 1 | 🔶 WebSocket✅；JWT 认证待部署 |
-| 密钥管理 | age 公私钥（X25519）；备份用公钥加密、恢复用私钥解密；私钥可被口令派生密钥加密存储 | 2 | ✅ 已实现（keystore 加密持久化） |
+| 源目录授权 | config/resource 声明（`data-share`）+ 运行时引导，弃 root 模式 | 1 | ✅ `config/resource` 声明 + `disable_authorization_path=false`；x86 实测授权目录可读（`run-as=package`） |
+| UI 暴露认证 | 端口服务 + **敏感操作口令校验**（未采用 JWT/全站登录） | 1 | ✅ 端口服务与 iframe 内 WebSocket 已在 x86 实测；导私钥/配置导入导出等敏感操作校验管理员口令；**不做全站登录** |
+| 密钥管理 | age 公私钥（X25519）；备份用公钥加密、恢复用私钥解密；私钥可被管理员口令（age scrypt）加密存储 | 2 | ✅ 已实现（`keystore.age` 加密持久化，口令热切换） |
 
 ### 待验证（需实际测试）
 
@@ -510,7 +536,7 @@ fnos-backup/
 
 ### 11.1 当前开发状态
 
-**核心备份/恢复主链路已完成并实测通过**，进入 Phase 4 生产强化收尾阶段。构建与测试**统一通过 SSH 在飞牛 NAS 上进行**（WSL 已废弃：上行仅 ~4KB/s、后台进程随会话被回收）；源码从 Windows 侧经 `pscp`/tar 同步至 NAS 后 `cargo build`，运行编译好的二进制或通过 HTTP API 测试。
+**核心备份/恢复主链路已完成并在 x86 飞牛设备实测通过**，Phase 4 生产强化收尾；当前功能版本 **v0.1.9**（提交 `54f1624`，0.1.4→0.1.9 的交互与能力补齐见 §11.5 #6）。构建与测试**统一通过 SSH 在飞牛 NAS 上进行**（WSL 已废弃：上行仅 ~4KB/s、后台进程随会话被回收）；源码从 Windows 侧经 `pscp`/tar 同步至 NAS 后执行 `Scripts/build_fnos_app.sh`，运行编译好的二进制或通过 HTTP API 测试。
 
 ### 11.2 已实现功能（按模块）
 
@@ -519,33 +545,38 @@ fnos-backup/
 | **备份调度** | 增量备份（mtime+size 差分） | ✅ | `BackupJob::run` / `run_strict` / `run_multi` |
 | | 断点续传 | ✅ | 每文件上传后即时存快照，中断可续 |
 | | 多路径备份 | ✅ | 每个源路径独立 job_id 快照，共享 target_prefix |
+| | 目标端分层与空目录 | ✅ | 每个源文件夹在目标端以其**文件夹名**建目录（`/目标文件夹/<源文件夹名>/…`），并显式创建该目录及其空子目录（ADR-010） |
 | | 保留策略（孤儿清理） | ✅ | `domain/retention.rs`，备份后自动清理目标端孤儿文件 |
 | | 定时备份（cron） | ✅ | `domain/scheduler.rs`，cron 表达式到点触发，配置热更新、防重入 |
 | **增量同步** | 双策略差分 | ✅ | 快速 mtime+size / 严格 BLAKE3（ADR-004） |
 | **加密** | age 公私钥加密 | ✅ | 64MB 分块，公钥加密/私钥解密（ADR-003） |
 | | 密钥库持久化 | ✅ | 私钥被口令派生密钥加密存储，跨重启可用 |
-| **恢复** | 恢复编排 | ✅ | `RestoreJob`，选择性恢复、恢复到源路径 |
+| **恢复** | 恢复编排 | ✅ | `RestoreJob`，选择性恢复、恢复到源路径（按备份源文件夹名还原目标子目录层级） |
 | | 完整性校验 | ✅ | age AEAD tag 自动验证；恢复后内容对比校验 |
+| | 恢复后防重传 | ✅ | 恢复写完文件后回写该文件快照（size + 实际 mtime），下次增量备份命中「未变化」不再重复上传 |
 | **kzwr 目标** | 官方 WebDAV 适配器 | ✅ | `WebdavTarget`：MKCOL/PUT/GET(302 跟随)/DELETE/PROPFIND；凭据加密存储，保存时 ping 验证并热切换（ADR-009） |
 | | 大文件分片上传 | ✅ | 超过 `PART_SIZE`（默认 90MiB = 100MB 网站限制的 90%）自动拆分为 `.part0001…` 依次 PUT；`FNOS_DAV_PART_SIZE` 可覆盖 |
+| | 带长度的流式请求体 | ✅ | 分片 PUT 使用自定义 `http_body`（精确 `size_hint`）——保留 `Content-Length` 的同时按 256KiB 分块上报进度；修复「分片请求误用整文件长度导致 Cloudflare 413」 |
 | | 分片下载拼接与清理 | ✅ | 读取时逻辑文件 404 则按序拼接分片；删除同时清理逻辑文件与全部分片；列表将分片合并为逻辑文件 |
 | | 目录与删除 | ✅ | 写入前逐级 `MKCOL` 确保父目录；`DELETE` 直接删除（无回收站，两阶段物理删除已随 REST 移除） |
 | **存储抽象** | Source/Target trait | ✅ | `storage_trait.rs`（ADR-005），ACL 防腐层 |
 | **元数据** | SQLite 快照 | ✅ | `sync_snapshots` 表，WAL 模式（ADR-006） |
 | **事件总线** | 内部事件总线 | ✅ | tokio::broadcast，备份/恢复进度事件（ADR-007） |
-| **WebSocket** | 实时状态推送 | ✅ | `/api/ws`，前端实时进度条，断线重连 |
+| **WebSocket** | 实时状态推送 | ✅ | `/api/ws`，前端实时进度条，断线重连；事件携带 `bytes_done`/`bytes_total`/`elapsed_ms`/`speed` |
 | **Web UI** | Svelte 前端 | ✅ | 导航栏多页面（概览/备份/恢复/设置）；views+components 分层 |
 | | 用户信息 | ✅ | WebDAV 账号卡片（UserCard 组件；WebDAV 无套餐/容量接口，不展示容量条） |
 | **HTTP API** | 备份/恢复/配置 | ✅ | `http/routes.rs`，axum 路由 |
 | | 用户信息 | ✅ | `/api/user/info` 返回本地配置的 WebDAV 账号（WebDAV 无配额/套餐属性） |
 | | 密钥管理 | ✅ | `GET/POST /api/keys`（查公钥 / 自定义私钥）、`POST /api/keys/generate`（自动生成并一次性回传私钥；密钥热切换无需重启） |
-| **配置** | 加密 TOML 配置 | ✅ | kzwr 凭据/密码/token 加密存储（age scrypt） |
+| **配置** | 加密 TOML 配置 | ✅ | WebDAV 用户名/密码以 `enc:<age密文>` 形式加密存储（age scrypt 口令派生；REST 时代的密码/token 字段已不存在） |
 | | 记录账号 | ✅ | 配置解密 username_enc（`webdav_credentials()`） |
+| | 导入/导出 | ✅ | `POST /api/config/export`、`POST /api/config/import`（均需管理员口令）：导出备份路径/定时/通知/WebDAV 凭据/age 私钥为 JSON；导入后重新加密凭据并热切换密钥与目标 |
 | **测试** | 端到端测试 | ✅ | 真实 kzwr 备份/恢复/删除/多级文件夹/物理删除/保留策略/定时触发 |
 | **飞牛部署** | `.fpk` 打包 | ✅ | 完整包结构 + 生命周期脚本 + wizard + GitHub Actions 双架构构建（见 11.6） |
 | **监控告警** | 失败通知/告警 | ✅ | 备份/恢复失败与配置缺失生成告警：应用内横幅展示 + 可选 Webhook 外发（`domain/alerts.rs`、`/api/alerts`、`/api/notify/webhook`） |
+| | Webhook 自定义 | ✅ | 支持自定义请求头与请求体模板（占位符 `{{message}}`/`{{level}}`/`{{source}}`/`{{ts}}`/`{{id}}`）；`POST /api/notify/webhook/test` 可用当前表单值直接测连通性 |
 | **密钥管理** | age 密钥查看/更换 | ✅ | `GET/POST /api/keys`、`POST /api/keys/generate`；密钥热切换无需重启（设置页 KeySection） |
-| | 私钥备份/恢复 | ✅ | `POST /api/keys/export`（随时导出另存）、`POST /api/keys/backup-ack`（备份确认）；未确认备份时设置页持续提示「私钥丢失将无法恢复」 |
+| | 私钥备份/恢复 | ✅ | `POST /api/keys/export`（**需管理员口令校验**后导出另存，导出即重置为未确认）、`POST /api/keys/backup-ack`（备份确认）；未确认备份时设置页持续提示「私钥丢失将无法恢复」 |
 | **多目标** | 备份到多个目标 | ❌ 放弃 | 按用户决策，保留策略实现，多目标不做 |
 
 ### 11.3 当前实际 Rust 源码结构
@@ -564,7 +595,8 @@ backend/src/
 │   ├── backup.rs        # BackupJob (备份调度 + 保留策略接入)
 │   ├── sync.rs          # SyncSession (差分)
 │   ├── crypto.rs        # CryptoSession (age 加密) + AgeKeys
-│   ├── restore.rs       # RestoreJob (恢复编排)
+│   ├── pace.rs          # SpeedMeter（传输速度计量：累计实际字节/实际传输耗时）
+│   ├── restore.rs       # RestoreJob (恢复编排 + 恢复后回写快照)
 │   ├── retention.rs     # RetentionPolicy (孤儿文件清理)
 │   └── scheduler.rs     # Scheduler (cron 定时备份调度)
 ├── infra/
@@ -590,16 +622,17 @@ frontend/src/
 │   ├── DashboardPage.svelte  # 概览：UserCard + Overview（实时任务为右侧常驻面板）
 │   ├── BackupPage.svelte     # 备份：配置 + 定时 + 执行
 │   ├── RestorePage.svelte    # 恢复
-│   └── SettingsPage.svelte   # 设置：UserCard + WebDAV 配置 + 密钥管理
+│   └── SettingsPage.svelte   # 设置：UserCard + WebDAV 配置 + 密钥管理 + 通知 + 配置备份/恢复
 ├── components/             # 功能区块组件
-│   ├── LiveStatus.svelte      # 实时任务状态（右侧常驻面板，WebSocket 进度 + 空闲态）
+│   ├── LiveStatus.svelte      # 实时任务状态（右侧常驻面板：文件进度/明文大小/速度/用时 + 空闲态）
 │   ├── OverviewSection.svelte # 配置概览（网格卡片）
 │   ├── UserCard.svelte        # WebDAV 账号（WebDAV 无容量/套餐接口）
 │   ├── WebdavSection.svelte   # WebDAV 凭据配置（ping 验证后加密保存）
-│   ├── KeySection.svelte      # age 密钥管理（公钥展示 / 自定义私钥 / 自动生成并提醒保存）
+│   ├── KeySection.svelte      # age 密钥管理（公钥展示 / 自定义私钥 / 自动生成 / 口令校验后显示私钥 / 备份确认）
 │   ├── AlertBanner.svelte     # 监控告警横幅（失败/异常列表 + 清空）
-│   ├── NotifySection.svelte   # 通知设置（告警 Webhook 地址）
-│   ├── BackupConfigSection.svelte # 备份路径 + 定时 cron
+│   ├── NotifySection.svelte   # 通知设置（Webhook 地址 + 自定义请求头/请求体模板 + 连通性测试）
+│   ├── ConfigSection.svelte   # 配置备份/恢复（导出/复制/下载 JSON；粘贴或选文件导入）
+│   ├── BackupConfigSection.svelte # 备份路径（增删即自动保存）+ 定时 cron（手动保存）
 │   ├── BackupSection.svelte   # 备份执行
 │   └── RestoreSection.svelte  # 恢复目录树
 └── TreeNode.svelte          # 目录树递归节点
@@ -613,6 +646,10 @@ frontend/src/
 - **配置热切换**：UI 保存 WebDAV 凭据后 `SwapTarget` 即时切换目标实现，无需重启（`storage_trait.rs`）
 - **定时备份**：cron 表达式到点触发，运行中改配置热更新（`domain/scheduler.rs`）
 - **用户信息**：账号记录在配置（username_enc 解密），`/api/user/info` 返回本地账号；WebDAV 无套餐/容量接口
+- **备份目标布局**（ADR-010）：每个所选源文件夹在目标端以其**文件夹名**分目录存放，避免多路径在同一层互相覆盖，并保证「所选文件夹」本身在网盘可见
+- **进度口径**：上传/下载的「大小」按**明文**展示（总量来自扫描/快照），完成数在**单个文件传输完成后**才 +1
+- **速度口径**：由后端 `domain/pace.rs::SpeedMeter` 计量（累计实际传输字节 ÷ 累计实际传输耗时），文件/请求之间的空闲不计入，前端只展示不重算
+- **恢复防重传**：恢复写盘后回写该文件快照（size + 实际 mtime），下次增量差分命中「未变化」，避免恢复后又全量重传
 
 ### 11.5 后续待办（按优先级）
 
@@ -621,7 +658,8 @@ frontend/src/
 3. ✅ **监控告警**：备份/恢复失败与配置缺失生成告警，应用内横幅展示 + 可选 Webhook 外发
 4. ✅ **密钥丢失恢复流程**：设置页可随时「显示私钥」另存备份，并可「我已妥善保存」确认；未备份时持续提示丢失风险（`POST /api/keys/export`、`POST /api/keys/backup-ack`）
 5. ❌ **大文件块级增量**：**不做**（用户决策，2026-09-19）——维持整文件差分（mtime+size / 严格 BLAKE3），不引入块级哈希
-6. **aarch64 设备实测**：CI 已产出双架构包，需在 aarch64 飞牛设备上验证二进制可用性
+6. ✅ **交互与能力补齐（v0.1.4 → v0.1.9）**：备份目标按源文件夹名分层（ADR-010）、实时任务合并统计与后端计量速度、上传/下载显示明文总量与已传量、Webhook 自定义请求头/请求体模板与连通性测试、配置导入/导出、显示私钥需管理员口令校验、恢复后回写快照防重复上传、修复分片请求 413
+7. **aarch64 设备实测**：CI 已产出双架构包，需在 aarch64 飞牛设备上验证二进制可用性（**当前唯一遗留项**）
 
 ### 11.6 飞牛应用打包实现（基于抓取到的飞牛开发文档）
 
@@ -661,7 +699,7 @@ packaging/fnos-backup-app/
 - 本地脚本 `Scripts/build_fnos_app.sh`：`cargo build --release` + `npm run build` + 组装包 + `fnpack build`（产物输出至 `dist/`）
 - GitHub Actions `.github/workflows/build-fnos-app.yml`：`x86_64-unknown-linux-musl` + `aarch64-unknown-linux-musl` 双架构交叉编译、前端构建、fnpack 打包、artifact 上传
 
-**WSL 构建测试已通过（2026-08-22）**：
+**早期 WSL 构建测试（2026-08-22，构建环境已废弃，仅存档）**：
 - 后端 `cargo build --release` 编译成功（2m02s，4 个 warning）
 - 前端 `vite build` 产物生成（52KB JS + 10.6KB CSS）
 - 后端运行实测：`/api/health`、`/api/config`、`/api/user/info` 返回 200；前端 SPA 静态托管正常；WebSocket `/api/ws` 握手 `101 Switching Protocols`
