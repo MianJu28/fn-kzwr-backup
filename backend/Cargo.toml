@@ -21,7 +21,7 @@ tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# HTTP 客户端（Rust 重写 kzwr API 用）
+# HTTP 客户端（WebDAV 目标适配器，ADR-009）
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 # 自定义请求体（带精确 size_hint 的流式上传，保留 Content-Length 同时上报进度）
 http-body = "1"
@@ -29,9 +29,8 @@ http-body = "1"
 # 数据库
 rusqlite = { version = "0.31", features = ["bundled"] }
 
-# 加密（age 公私钥）
+# 加密（age 公私钥；私钥/配置口令加密用 age 内置 scrypt，不引入额外 KDF 依赖）
 age = "0.10"
-argon2 = "0.5"
 zeroize = { version = "1", features = ["derive"] }
 
 # 哈希（增量检测）
