@@ -30,6 +30,10 @@ pub struct AppConfig {
     /// kzwr REST API 增强功能配置（可选，非备份通道）
     #[serde(default)]
     pub kzwr: KzwrConfig,
+    /// 调试日志：开启后输出详细日志（请求/响应明细等），便于问题定位。
+    /// 运行时切换即时生效（日志过滤器热更新），并持久化到配置。
+    #[serde(default)]
+    pub debug: bool,
 }
 
 /// kzwr REST API 增强功能配置（可选）
@@ -183,6 +187,12 @@ pub struct ConfigManager {
     path: PathBuf,
     /// 加密口令（派生密钥加密敏感字段）
     passphrase: SecretString,
+    /// 解密结果缓存（键 = 密文全文）
+    ///
+    /// age scrypt 解密单次耗时可达数百毫秒，而 `webdav_username`/`kzwr_token`
+    /// 在每个请求热路径上都会解密。以**密文本身**作缓存键：用户保存新凭据时
+    /// 密文随之改变、旧键自然失效，无需手动清理。
+    cache: std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
 }
 
 impl ConfigManager {
@@ -191,6 +201,7 @@ impl ConfigManager {
         Self {
             path: cfg_dir.join(CONFIG_FILE),
             passphrase,
+            cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -262,15 +273,23 @@ impl ConfigManager {
         Ok(format!("enc:{}", base64(&encrypted)))
     }
 
-    /// 解密敏感字段（支持 "enc:xxx" 或明文）
+    /// 解密敏感字段（支持 "enc:xxx" 或明文；enc 结果按密文缓存，避免重复 scrypt）
     pub fn decrypt_field(&self, field: &Option<String>) -> Result<Option<String>> {
         match field {
             None => Ok(None),
             Some(f) => {
                 if let Some(rest) = f.strip_prefix("enc:") {
+                    if let Some(hit) = self.cache.lock().unwrap().get(f) {
+                        return Ok(hit.clone());
+                    }
                     let data = decode_base64(rest)?;
                     let plain = self.decrypt(&data)?;
-                    Ok(Some(String::from_utf8(plain).context("解密结果非 UTF-8")?))
+                    let s = String::from_utf8(plain).context("解密结果非 UTF-8")?;
+                    self.cache
+                        .lock()
+                        .unwrap()
+                        .insert(f.clone(), Some(s.clone()));
+                    Ok(Some(s))
                 } else {
                     // 明文（旧配置或未加密）
                     Ok(Some(f.clone()))

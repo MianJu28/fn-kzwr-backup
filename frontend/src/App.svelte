@@ -57,6 +57,7 @@
   let alerts = [];
   // 非敏感配置回显：WebDAV 用户名（密码永不返回）与保留策略
   let webdavUsername = '';
+  let debugOn = false;
   let retention = {
     enabled: false,
     cleanup_unmanaged: false,
@@ -130,6 +131,7 @@
       webhookHeaders = d.webhook_headers || [];
       webhookBody = d.webhook_body || '';
       keyBackedUp = !!d.key_backed_up;
+      debugOn = !!d.debug;
     } catch (e) {
       error = e.message;
     }
@@ -145,6 +147,19 @@
       kzwrUser = await api.kzwrUser();
     } catch (e) {
       kzwrUser = { error: e.message };
+    }
+  }
+
+  /** 侧栏账号卡手动刷新 */
+  let refreshingKzwr = false;
+  async function handleRailRefresh() {
+    if (refreshingKzwr) return;
+    refreshingKzwr = true;
+    try {
+      await loadUserInfo();
+      await loadKzwrUser();
+    } finally {
+      refreshingKzwr = false;
     }
   }
 
@@ -389,6 +404,29 @@
     }
   }
 
+  /** 切换调试日志：立即生效并持久化 */
+  async function handleSaveDebug(enabled) {
+    busy = true;
+    try {
+      const d = await api.saveConfig({
+        backup_paths: backupPaths,
+        target_folder: targetFolder,
+        debug: enabled,
+      });
+      if (d.error) {
+        error = d.error;
+        return { error: d.error };
+      }
+      debugOn = !!d.debug;
+      return {};
+    } catch (e) {
+      error = e.message;
+      return { error: e.message };
+    } finally {
+      busy = false;
+    }
+  }
+
   async function handleRunBackup() {
     busy = true;
     error = null;
@@ -425,6 +463,13 @@
   /** 恢复树懒加载：展开目录时按需拉取一层 */
   async function handleLoadTree(source, dir) {
     return api.restoreTree(source, dir);
+  }
+
+  /** 清理快照中云端已不存在的文件记录；完成后刷新概况 */
+  async function handlePruneMissing(sourcePath) {
+    const r = await api.pruneMissing(sourcePath);
+    if (!r || !r.error) await loadRestoreFiles();
+    return r;
   }
 
   /* ── 操作：WebDAV / 密钥 / 通知 / 配置迁移 ───────────────── */
@@ -642,10 +687,7 @@
               {restoreFolders}
               {scheduleCron}
               {scheduleCronValid}
-              {userInfo}
-              {userInfoError}
               {keyBackedUp}
-              kzwr={kzwrUser}
               {setupResult}
               {busy}
               onSetupCheck={handleSetupCheck}
@@ -672,6 +714,7 @@
               {busy}
               onRestore={handleRestore}
               onLoadTree={handleLoadTree}
+              onPrune={handlePruneMissing}
               onGoto={go}
             />
           {:else if currentPage === 'audit'}
@@ -687,8 +730,6 @@
               {kzwrUser}
               {kzwrQuotaWarnPercent}
               {busy}
-              {userInfo}
-              {userInfoError}
               {keyInfo}
               {revealKey}
               {keyBackedUp}
@@ -708,6 +749,8 @@
               onTestWebhook={handleTestWebhook}
               onExportConfig={handleExportConfig}
               onImportConfig={handleImportConfig}
+              debug={debugOn}
+              onSaveDebug={handleSaveDebug}
             />
           {/if}
         </div>
@@ -718,6 +761,8 @@
             configured={webdavConfigured}
             kzwr={kzwrUser}
             onGoto={go}
+            onRefresh={handleRailRefresh}
+            refreshing={refreshingKzwr}
           />
           <LiveStatus {liveStatus} {wsConnected} />
         </aside>

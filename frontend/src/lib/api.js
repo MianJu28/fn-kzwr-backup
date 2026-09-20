@@ -69,6 +69,8 @@ export const api = {
   /** 恢复：all=true 时恢复该源路径（可用 dir 限定子目录）下的全部文件 */
   restore: (files, source_path, all = false, dir = '') =>
     post('/api/restore/run', { files, source_path, all, dir }),
+  /** 清理快照中云端已不存在的文件记录（只动快照，不删云端文件） */
+  pruneMissing: (source_path) => post('/api/restore/prune', { source_path }),
 
   // kzwr REST 增强功能（可选，需 access-token）
   /** 账号信息（存储空间/套餐；未配置 token 时返回 configured:false + 指引） */
