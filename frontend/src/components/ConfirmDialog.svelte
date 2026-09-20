@@ -1,18 +1,32 @@
 <script>
   // 全局确认弹窗（由 lib/confirm.js 的 confirmDialog() 驱动）
   // input 模式：显示口令/文本输入框，确认时把输入值回传给 confirmDialog 的 Promise
+  //
+  // ⚠️ 不要写成 `$: state = $confirmState;` + `$: if (state) inputValue = '';`：
+  //    当绑定变量（inputValue）被响应式语句写入时，Svelte 会在输入回调里**连带把该语句
+  //    的依赖（state、$confirmState）置脏**，于是「重置输入」在每次按键后重跑，
+  //    用户刚敲进去的字符立刻被清空（症状：口令框完全输入不了字符）。
+  //    改法：显式订阅 store，只在弹窗状态真正变化时重置输入并聚焦。
+  import { onDestroy, tick } from 'svelte';
   import { confirmState, answerConfirm } from '../lib/confirm.js';
   import Icon from './Icon.svelte';
 
   let confirmBtn = null;
   let inputEl = null;
+  let state = null;
   let inputValue = '';
 
-  $: state = $confirmState;
-  $: if (state && state.input && inputEl) inputEl.focus();
-  $: if (state && !state.input && confirmBtn) confirmBtn.focus();
-  // 每次打开重置输入
-  $: if (state) inputValue = '';
+  const unsub = confirmState.subscribe((s) => {
+    state = s;
+    inputValue = '';
+    if (s) {
+      tick().then(() => {
+        if (s.input) inputEl?.focus();
+        else confirmBtn?.focus();
+      });
+    }
+  });
+  onDestroy(unsub);
 
   function onKey(e) {
     if (!state) return;
