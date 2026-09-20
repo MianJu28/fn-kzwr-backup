@@ -7,6 +7,8 @@
   /** 已保存的账号（非敏感，回填方便修改；密码永不回显） */
   export let configuredUsername = '';
   export let busy = false;
+  /** 保存后的提醒（如与 access-token 所属账号不一致） */
+  export let warning = '';
   export let onSave = null; // (username, password) => Promise<string>
 
   let username = '';
@@ -92,6 +94,33 @@
       </label>
     </div>
 
+    <details class="guide" open={!configured}>
+      <summary>如何创建应用密码？（推荐：永不过期 + 读写权限）</summary>
+      <ol>
+        <li>
+          浏览器打开
+          <a href="https://www.kzwr.com/account/apps" target="_blank" rel="noreferrer">
+            https://www.kzwr.com/account/apps <Icon name="external" size={11} />
+          </a>
+          并登录你的酷族账号
+        </li>
+        <li>点击「创建应用」/「新增应用密码」</li>
+        <li><strong>权限选择「读写」</strong>（只读会导致上传备份失败）</li>
+        <li><strong>有效期选择「永不过期」</strong>（否则密码到期后备份会中断）</li>
+        <li>复制生成的密码，粘贴到上方「密码 / 应用密码」输入框，用户名填写同一个酷族账号</li>
+      </ol>
+      <p class="guide-note">
+        提示：这里不要填账号登录密码，应用密码可随时在同一个页面吊销，更安全。
+      </p>
+    </details>
+
+    {#if warning}
+      <div class="alert alert-warn">
+        <Icon name="alert" size={15} />
+        <div class="alert-body">{warning}</div>
+      </div>
+    {/if}
+
     <div class="alert alert-info">
       <Icon name="info" size={15} />
       <div class="alert-body">
@@ -148,6 +177,38 @@
   }
   .msg {
     margin-top: var(--s3);
+  }
+  .guide {
+    margin-top: var(--s3);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    padding: 9px 12px;
+    background: var(--surface-2);
+  }
+  .guide summary {
+    cursor: pointer;
+    font-size: 12.5px;
+    font-weight: 560;
+    color: var(--text-2);
+  }
+  .guide ol {
+    margin: var(--s2) 0 0;
+    padding-left: 20px;
+    color: var(--text-2);
+    font-size: 12.5px;
+    line-height: 1.85;
+  }
+  .guide a {
+    color: var(--primary);
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    word-break: break-all;
+  }
+  .guide-note {
+    margin: var(--s2) 0 0;
+    font-size: 12px;
+    color: var(--text-3);
   }
   .foot {
     display: flex;

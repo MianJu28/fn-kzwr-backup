@@ -3,26 +3,35 @@
   import Icon from './Icon.svelte';
   import { toast } from '../lib/toast.js';
 
-  export let retention = null; // { enabled, cleanup_unmanaged, min_age_days }
+  export let retention = null; // { enabled, cleanup_unmanaged, min_age_days, empty_recycle_bin }
+  export let kzwrReady = false; // 是否已配置 access-token（清空回收站依赖它）
   export let busy = false;
-  export let onSave = null; // ({enabled, cleanup_unmanaged, min_age_days}) => Promise<{error?}>
+  export let onSave = null; // ({enabled, cleanup_unmanaged, min_age_days, empty_recycle_bin}) => Promise<{error?}>
 
   let enabled = false;
   let cleanup = false;
   let minAge = 0;
+  let emptyTrash = false;
+  let recycleMaxGb = 0;
+  let recycleMinAgeDays = 0;
   let working = false;
 
   // 仅在「后端回显值变化」时同步到表单，避免用户输入被覆盖
   let lastSeen = null;
   function syncFrom(r) {
-    const sig = `${!!r.enabled}|${!!r.cleanup_unmanaged}|${Number(r.min_age_days) || 0}`;
+    const sig = `${!!r.enabled}|${!!r.cleanup_unmanaged}|${Number(r.min_age_days) || 0}|${!!r.empty_recycle_bin}|${Number(r.recycle_max_gb) || 0}|${Number(r.recycle_min_age_days) || 0}`;
     if (sig === lastSeen) return;
     lastSeen = sig;
     enabled = !!r.enabled;
     cleanup = !!r.cleanup_unmanaged;
     minAge = Number(r.min_age_days) || 0;
+    emptyTrash = !!r.empty_recycle_bin;
+    recycleMaxGb = Number(r.recycle_max_gb) || 0;
+    recycleMinAgeDays = Number(r.recycle_min_age_days) || 0;
   }
   $: syncFrom(retention || {});
+
+  const nonNeg = (v) => Math.max(0, Math.floor(Number(v) || 0));
 
   async function save() {
     working = true;
@@ -30,7 +39,10 @@
       const r = await onSave({
         enabled,
         cleanup_unmanaged: cleanup,
-        min_age_days: Math.max(0, Math.floor(Number(minAge) || 0)),
+        min_age_days: nonNeg(minAge),
+        empty_recycle_bin: emptyTrash,
+        recycle_max_gb: nonNeg(recycleMaxGb),
+        recycle_min_age_days: nonNeg(recycleMinAgeDays),
       });
       if (r && r.error) toast.error(r.error, '保存失败');
       else toast.success('保留策略已保存并即时生效');
@@ -108,10 +120,63 @@
       <span class="field-hint">大于该天数的孤儿文件才会被清理，设为 0 表示只要发现就清理</span>
     </label>
 
+    <div class="row" class:dim={!enabled || !kzwrReady}>
+      <div class="row-text">
+        <span class="row-title">清空云端回收站</span>
+        <span class="row-desc">
+          {#if kzwrReady}
+            每次备份完成后永久删除回收站内全部条目
+          {:else}
+            需先在「增强功能」中配置 access-token
+          {/if}
+        </span>
+      </div>
+      <button
+        class="switch"
+        class:on={enabled && kzwrReady && emptyTrash}
+        type="button"
+        role="switch"
+        aria-checked={enabled && kzwrReady && emptyTrash}
+        aria-label="清空云端回收站"
+        disabled={!enabled || !kzwrReady}
+        on:click={() => (emptyTrash = !emptyTrash)}
+      >
+        <span class="knob"></span>
+      </button>
+    </div>
+
+    <div class="recycle-gates" class:dim={!enabled || !kzwrReady || !emptyTrash}>
+      <label class="field gate">
+        <span class="label">占用超过（GB）才清理 <span class="opt">0 = 不限制</span></span>
+        <input
+          class="input mono"
+          type="number"
+          min="0"
+          step="1"
+          bind:value={recycleMaxGb}
+          disabled={!enabled || !kzwrReady || !emptyTrash}
+          placeholder="0"
+        />
+      </label>
+      <label class="field gate">
+        <span class="label">仅清理 N 天前的条目 <span class="opt">0 = 不限制</span></span>
+        <input
+          class="input mono"
+          type="number"
+          min="0"
+          step="1"
+          bind:value={recycleMinAgeDays}
+          disabled={!enabled || !kzwrReady || !emptyTrash}
+          placeholder="0"
+        />
+      </label>
+    </div>
+
     <div class="alert alert-info">
       <Icon name="info" size={15} />
       <div class="alert-body">
-        清理范围仅限云端目标文件夹内本应用管理的文件；本地文件永不删除。
+        清理范围仅限云端目标文件夹内本应用管理的文件；本地文件永不删除。清空回收站为<strong>永久删除</strong>，不可恢复；
+        设置「仅清理 N 天前」后，无法解析删除时间的条目会保守保留。设置页的「清空回收站」按钮为手动操作，不受上述门槛限制。
       </div>
     </div>
   </div>
@@ -196,6 +261,20 @@
   }
   .age-field.dim {
     opacity: 0.55;
+  }
+  .recycle-gates {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--s3);
+    margin-top: var(--s3);
+  }
+  .recycle-gates.dim {
+    opacity: 0.55;
+  }
+  @media (max-width: 640px) {
+    .recycle-gates {
+      grid-template-columns: 1fr;
+    }
   }
   .foot {
     display: flex;

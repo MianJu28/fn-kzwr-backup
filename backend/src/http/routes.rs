@@ -49,6 +49,8 @@ pub struct WebdavSaveRequest {
 pub struct WebdavSaveResponse {
     pub success: bool,
     pub url: Option<String>,
+    /// 账号一致性提醒（如 WebDAV 账号与已配置的 kzwr access-token 账号不同）
+    pub warning: Option<String>,
     pub error: Option<String>,
 }
 
@@ -69,6 +71,14 @@ pub struct ConfigResponse {
     pub webdav_username: Option<String>,
     /// 保留策略（目标端孤儿文件清理，非敏感）
     pub retention: RetentionView,
+    /// 是否已配置 kzwr access-token（增强功能；token 本身永不返回）
+    pub kzwr_token_configured: bool,
+    /// 云端空间占用预警阈值（百分比，0 = 关闭）
+    pub kzwr_quota_warn_percent: u64,
+    /// 定时任务未来 5 次触发时间（服务器本地时区；空 = 未启用）
+    pub schedule_next: Vec<String>,
+    /// 服务器时区说明（cron 按此时区解释）
+    pub schedule_timezone: String,
     /// 告警 Webhook 地址（空 = 不外发）
     pub webhook_url: Option<String>,
     /// Webhook 自定义请求头
@@ -89,6 +99,12 @@ pub struct RetentionView {
     pub cleanup_unmanaged: bool,
     /// 仅清理早于该天数的文件（0 = 不限制）
     pub min_age_days: u64,
+    /// 备份后清空云端回收站（需 kzwr access-token）
+    pub empty_recycle_bin: bool,
+    /// 回收站占用超过该 GB 数才清理（0 = 不限制）
+    pub recycle_max_gb: u64,
+    /// 只清理删除时间早于该天数的回收站条目（0 = 不限制）
+    pub recycle_min_age_days: u64,
 }
 
 impl From<&crate::infra::config::RetentionConfig> for RetentionView {
@@ -97,6 +113,9 @@ impl From<&crate::infra::config::RetentionConfig> for RetentionView {
             enabled: r.enabled,
             cleanup_unmanaged: r.cleanup_unmanaged,
             min_age_days: r.min_age_days,
+            empty_recycle_bin: r.empty_recycle_bin,
+            recycle_max_gb: r.recycle_max_gb,
+            recycle_min_age_days: r.recycle_min_age_days,
         }
     }
 }
@@ -115,6 +134,15 @@ pub struct ConfigSaveRequest {
     pub retention_cleanup_unmanaged: Option<bool>,
     #[serde(default)]
     pub retention_min_age_days: Option<u64>,
+    #[serde(default)]
+    pub retention_empty_recycle_bin: Option<bool>,
+    #[serde(default)]
+    pub retention_recycle_max_gb: Option<u64>,
+    #[serde(default)]
+    pub retention_recycle_min_age_days: Option<u64>,
+    /// kzwr 云端空间预警阈值（百分比，0 = 关闭）
+    #[serde(default)]
+    pub kzwr_quota_warn_percent: Option<u64>,
 }
 
 /// 备份响应
@@ -126,6 +154,8 @@ pub struct BackupResponse {
     pub unchanged: usize,
     /// 保留策略清理的孤儿文件数
     pub orphan_removed: usize,
+    /// 跟随保留策略清空的回收站条目数（未启用/未配置 token 时为 0）
+    pub trash_emptied: usize,
     /// 因已有备份正在执行而跳过本次触发（`error` 同时给出原因）
     pub skipped: bool,
     pub error: Option<String>,
@@ -318,6 +348,9 @@ pub struct ConfigBundle {
     pub webdav_username: Option<String>,
     #[serde(default)]
     pub webdav_password: Option<String>,
+    /// kzwr access-token（增强功能：存储空间/回收站；可选）
+    #[serde(default)]
+    pub kzwr_access_token: Option<String>,
     /// age 私钥（恢复配置后可继续解密既有备份）
     #[serde(default)]
     pub age_private_key: Option<String>,
@@ -432,6 +465,7 @@ async fn webdav_save(
         return Json(WebdavSaveResponse {
             success: false,
             url: None,
+            warning: None,
             error: Some("用户名、密码均不能为空".to_string()),
         });
     }
@@ -446,6 +480,7 @@ async fn webdav_save(
         return Json(WebdavSaveResponse {
             success: false,
             url: Some(url),
+            warning: None,
             error: Some(format!("WebDAV 连通性测试失败: {}", e)),
         });
     }
@@ -463,17 +498,64 @@ async fn webdav_save(
                 body.username.trim(),
                 &body.password,
             )));
+            // 账号一致性：已配置 access-token 时，核对 WebDAV 账号与 API 账号
+            let warning = check_account_consistency(&state).await;
+            state.audit.record(
+                "webdav.credentials",
+                format!(
+                    "保存 WebDAV 凭据（账号 {}）{}",
+                    body.username.trim(),
+                    if warning.is_some() { "；账号与 access-token 不一致" } else { "" }
+                ),
+                true,
+                None,
+            );
             Json(WebdavSaveResponse {
                 success: true,
                 url: Some(url),
+                warning,
                 error: None,
             })
         }
-        Err(e) => Json(WebdavSaveResponse {
-            success: false,
-            url: Some(url),
-            error: Some(format!("{:#}", e)),
-        }),
+        Err(e) => {
+            state.audit.record(
+                "webdav.credentials",
+                format!("保存 WebDAV 凭据失败：{:#}", e),
+                false,
+                None,
+            );
+            Json(WebdavSaveResponse {
+                success: false,
+                url: Some(url),
+                warning: None,
+                error: Some(format!("{:#}", e)),
+            })
+        }
+    }
+}
+
+/// 账号一致性检查：WebDAV 账号 vs 已配置的 access-token 所属账号
+///
+/// 返回 `Some(提醒)` 表示不一致（同时生成告警），`None` 表示一致/无法判定/未配置 token。
+async fn check_account_consistency(state: &AppState) -> Option<String> {
+    let user = webdav_username(state)?;
+    let token = kzwr_token_of(state)?;
+    state.kzwr.set_token(token);
+    match state.kzwr.get_member().await {
+        Ok(v) if member_is_login(&v) => {
+            let member = v.get("data").cloned().unwrap_or_default();
+            let mismatch = kzwr_account_mismatch(&user, &member);
+            if let Some(msg) = &mismatch {
+                raise_alert_once(
+                    state,
+                    crate::domain::alerts::AlertLevel::Warn,
+                    crate::domain::alerts::AlertSource::Config,
+                    msg.clone(),
+                );
+            }
+            mismatch
+        }
+        _ => None,
     }
 }
 
@@ -482,10 +564,12 @@ fn config_response(
     cfg: &crate::infra::config::AppConfig,
     webdav_configured: bool,
     webdav_username: Option<String>,
+    kzwr_token_configured: bool,
     error: Option<String>,
 ) -> ConfigResponse {
     let schedule = cfg.backup.schedule_cron.clone().unwrap_or_default();
     let valid = crate::domain::scheduler::validate_cron(&schedule).is_ok();
+    let schedule_next = crate::domain::scheduler::next_runs(&schedule, 5).unwrap_or_default();
     ConfigResponse {
         backup_paths: cfg.backup.paths.clone(),
         target_folder: cfg.backup.target_folder.clone(),
@@ -495,6 +579,10 @@ fn config_response(
         webdav_url: cfg.webdav.url.clone(),
         webdav_username,
         retention: RetentionView::from(&cfg.backup.retention),
+        kzwr_token_configured,
+        kzwr_quota_warn_percent: cfg.kzwr.quota_warn_percent,
+        schedule_next,
+        schedule_timezone: crate::domain::scheduler::timezone_label(),
         webhook_url: cfg.notify.webhook_url.clone(),
         webhook_headers: cfg.notify.webhook_headers.clone(),
         webhook_body: cfg.notify.webhook_body.clone(),
@@ -511,11 +599,11 @@ fn webdav_ready(cfg: &crate::infra::config::AppConfig) -> bool {
 }
 
 async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
-    // 注意：webdav_username 内部会锁 config，故须在下面加锁前先取，避免同一 Mutex 重入死锁
-    let wuser = webdav_username(&state);
+    // 注意：config_echo 内部会锁 config，故须在下面加锁前先取，避免同一 Mutex 重入死锁
+    let (wuser, kzwr_on) = config_echo(&state);
     let cfg_guard = state.config.lock().unwrap();
     match cfg_guard.load() {
-        Ok(c) => Json(config_response(&c, webdav_ready(&c), wuser, None)),
+        Ok(c) => Json(config_response(&c, webdav_ready(&c), wuser, kzwr_on, None)),
         Err(e) => Json(ConfigResponse {
             backup_paths: Vec::new(),
             target_folder: state.target_folder.clone(),
@@ -525,6 +613,10 @@ async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
             webdav_url: None,
             webdav_username: None,
             retention: RetentionView::default(),
+            kzwr_token_configured: false,
+            kzwr_quota_warn_percent: 85,
+            schedule_next: Vec::new(),
+            schedule_timezone: crate::domain::scheduler::timezone_label(),
             webhook_url: None,
             webhook_headers: Vec::new(),
             webhook_body: None,
@@ -539,8 +631,8 @@ async fn config_save(
     State(state): State<AppState>,
     Json(body): Json<ConfigSaveRequest>,
 ) -> Json<ConfigResponse> {
-    // 同 config_get：先取账号再锁配置，避免 Mutex 重入死锁
-    let wuser = webdav_username(&state);
+    // 同 config_get：先取回显字段再锁配置，避免 Mutex 重入死锁
+    let (wuser, kzwr_on) = config_echo(&state);
     let cfg_guard = state.config.lock().unwrap();
     let mut cfg = match cfg_guard.load() {
         Ok(c) => c,
@@ -562,11 +654,24 @@ async fn config_save(
     if let Some(v) = body.retention_min_age_days {
         cfg.backup.retention.min_age_days = v;
     }
+    if let Some(v) = body.retention_empty_recycle_bin {
+        cfg.backup.retention.empty_recycle_bin = v;
+    }
+    if let Some(v) = body.retention_recycle_max_gb {
+        cfg.backup.retention.recycle_max_gb = v;
+    }
+    if let Some(v) = body.retention_recycle_min_age_days {
+        cfg.backup.retention.recycle_min_age_days = v;
+    }
+    if let Some(v) = body.kzwr_quota_warn_percent {
+        // 合法区间 0..=100（0 = 关闭预警）
+        cfg.kzwr.quota_warn_percent = v.min(100);
+    }
     // 定时 cron：校验合法性；空串视为关闭
     if let Some(cron) = body.schedule_cron {
         let cron = cron.trim().to_string();
         if let Err(e) = crate::domain::scheduler::validate_cron(&cron) {
-            let resp = config_response(&cfg, webdav_ready(&cfg), wuser, Some(e.to_string()));
+            let resp = config_response(&cfg, webdav_ready(&cfg), wuser, kzwr_on, Some(e.to_string()));
             return Json(resp);
         }
         if cron.is_empty() {
@@ -576,8 +681,30 @@ async fn config_save(
         }
     }
     match cfg_guard.save(&cfg) {
-        Ok(_) => Json(config_response(&cfg, webdav_ready(&cfg), wuser, None)),
-        Err(e) => Json(config_response(&cfg, false, wuser, Some(format!("{:#}", e)))),
+        Ok(_) => {
+            state.audit.record(
+                "config.save",
+                format!(
+                    "保存配置：目标 {}，路径 {} 个，定时 {}，保留策略[启用={} 孤儿={} 天数={} 回收站={} ≥{}GB >{}天]",
+                    cfg.backup.target_folder,
+                    cfg.backup.paths.len(),
+                    cfg.backup
+                        .schedule_cron
+                        .clone()
+                        .unwrap_or_else(|| "未启用".to_string()),
+                    cfg.backup.retention.enabled,
+                    cfg.backup.retention.cleanup_unmanaged,
+                    cfg.backup.retention.min_age_days,
+                    cfg.backup.retention.empty_recycle_bin,
+                    cfg.backup.retention.recycle_max_gb,
+                    cfg.backup.retention.recycle_min_age_days,
+                ),
+                true,
+                None,
+            );
+            Json(config_response(&cfg, webdav_ready(&cfg), wuser, kzwr_on, None))
+        }
+        Err(e) => Json(config_response(&cfg, false, wuser, kzwr_on, Some(format!("{:#}", e)))),
     }
 }
 
@@ -586,6 +713,44 @@ fn webdav_username(state: &AppState) -> Option<String> {
     let mgr = state.config.lock().unwrap();
     mgr.webdav_credentials().ok().and_then(|(u, _)| u)
 }
+
+/// 设置页回显所需的非敏感信息（内部会锁 config，**必须在加锁前调用**）
+///
+/// 返回 (WebDAV 用户名, 是否已配置 kzwr access-token)；token 本身永不返回。
+fn config_echo(state: &AppState) -> (Option<String>, bool) {
+    let mgr = state.config.lock().unwrap();
+    let user = mgr.webdav_credentials().ok().and_then(|(u, _)| u);
+    let kzwr = mgr.kzwr_token().ok().flatten().is_some();
+    (user, kzwr)
+}
+
+/// 读取配置中的 kzwr access-token（内部锁 config；同步、不跨 await 持有）
+fn kzwr_token_of(state: &AppState) -> Option<String> {
+    state.config.lock().unwrap().kzwr_token().ok().flatten()
+}
+
+/// 用配置里已保存的 token 重置内存副本（token 变更校验失败时回滚用）
+fn restore_saved_kzwr_token(state: &AppState) {
+    match kzwr_token_of(state) {
+        Some(t) => state.kzwr.set_token(t),
+        None => state.kzwr.clear_token(),
+    }
+}
+
+/// 判定 `/api/v2/member` 是否处于登录态。
+///
+/// 实测：access-token 无效/过期时官方 API 仍返回 **HTTP 200**，只是
+/// `data.isLogin = false` / `uid = -1` / 容量为 0，因此不能只看 HTTP 状态码。
+fn member_is_login(v: &serde_json::Value) -> bool {
+    v.get("data")
+        .and_then(|d| d.get("isLogin"))
+        .and_then(|x| x.as_bool())
+        .unwrap_or(true)
+}
+
+/// token 无效/过期时的统一提示
+const KZWR_TOKEN_INVALID: &str =
+    "access-token 无效或已过期（酷族返回未登录状态），请在浏览器重新登录后从 Cookie 复制";
 
 /// 获取当前 WebDAV 账号信息
 async fn user_info(State(state): State<AppState>) -> Json<UserInfoResponse> {
@@ -607,7 +772,24 @@ async fn user_info(State(state): State<AppState>) -> Json<UserInfoResponse> {
 
 /// 触发备份：遍历配置的多备份路径
 async fn backup_run(State(state): State<AppState>) -> Json<BackupResponse> {
-    Json(run_backup_now(&state).await)
+    let resp = run_backup_now(&state).await;
+    state.audit.record(
+        "backup.run",
+        match (&resp.error, resp.skipped) {
+            (Some(e), _) => format!("手动备份失败：{e}"),
+            (None, true) => "手动备份跳过（已有备份在执行）".to_string(),
+            (None, false) => format!(
+                "手动备份完成：上传 {} 个文件（{}），清理孤儿 {} 个，回收站 {} 项",
+                resp.uploaded,
+                human_bytes(resp.uploaded_bytes),
+                resp.orphan_removed,
+                resp.trash_emptied
+            ),
+        },
+        resp.error.is_none(),
+        None,
+    );
+    Json(resp)
 }
 
 /// 备份运行标志的 RAII 守卫：离开作用域时复位（覆盖提前 return 与 panic 展开）
@@ -705,14 +887,23 @@ pub async fn run_backup_now(state: &AppState) -> BackupResponse {
         retention,
     };
     match job.run_multi(&paths).await {
-        Ok(summary) => BackupResponse {
-            uploaded: summary.uploaded,
-            uploaded_bytes: summary.uploaded_bytes,
-            deleted: summary.deleted,
-            unchanged: summary.unchanged,
-            orphan_removed: summary.orphan_removed,
-            ..Default::default()
-        },
+        Ok(summary) => {
+            // 保留策略可选：跟随清空云端回收站（需配置 kzwr access-token）
+            let trash_emptied = if retention_cfg.empty_recycle_bin {
+                empty_recycle_bin_if_configured(state).await
+            } else {
+                0
+            };
+            BackupResponse {
+                uploaded: summary.uploaded,
+                uploaded_bytes: summary.uploaded_bytes,
+                deleted: summary.deleted,
+                unchanged: summary.unchanged,
+                orphan_removed: summary.orphan_removed,
+                trash_emptied,
+                ..Default::default()
+            }
+        }
         Err(e) => {
             let msg = format!("{:#}", e);
             raise_alert(
@@ -1054,11 +1245,24 @@ async fn restore_run(
         snapshot_target,
     };
     match job.run(&files, std::path::Path::new(&restore_root)).await {
-        Ok(summary) => Json(RestoreResponse {
-            restored: summary.restored,
-            restored_bytes: summary.restored_bytes,
-            error: None,
-        }),
+        Ok(summary) => {
+            state.audit.record(
+                "restore.run",
+                format!(
+                    "恢复到 {}：{} 个文件（{}）",
+                    restore_root,
+                    summary.restored,
+                    human_bytes(summary.restored_bytes)
+                ),
+                true,
+                None,
+            );
+            Json(RestoreResponse {
+                restored: summary.restored,
+                restored_bytes: summary.restored_bytes,
+                error: None,
+            })
+        }
         Err(e) => {
             let msg = format!("{:#}", e);
             raise_alert(
@@ -1074,6 +1278,959 @@ async fn restore_run(
             })
         }
     }
+}
+
+// ── 增强功能公共辅助 ──────────────────────────────────────────────────
+
+/// 去重告警：同来源 + 同文案已存在时不再重复记录与外发
+fn raise_alert_once(
+    state: &AppState,
+    level: crate::domain::alerts::AlertLevel,
+    source: crate::domain::alerts::AlertSource,
+    message: String,
+) {
+    let dup = state
+        .alerts
+        .list()
+        .iter()
+        .any(|a| a.source == source && a.message == message);
+    if dup {
+        return;
+    }
+    raise_alert(state, level, source, message);
+}
+
+/// 人类可读的字节数（用于告警文案）
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{} {}", bytes, UNITS[0])
+    } else {
+        format!("{:.1} {}", v, UNITS[i])
+    }
+}
+
+/// 云端空间达到阈值时告警（同文案去重，避免每次刷新都推送）
+fn maybe_warn_quota(state: &AppState, total: u64, used: u64) {
+    if total == 0 {
+        return;
+    }
+    let threshold = state
+        .config
+        .lock()
+        .unwrap()
+        .load()
+        .map(|c| c.kzwr.quota_warn_percent)
+        .unwrap_or(85);
+    if threshold == 0 || threshold > 100 {
+        return;
+    }
+    let pct = (used as f64 / total as f64 * 100.0).round() as u64;
+    if pct >= threshold {
+        raise_alert_once(
+            state,
+            crate::domain::alerts::AlertLevel::Warn,
+            crate::domain::alerts::AlertSource::Kzwr,
+            format!(
+                "云端存储空间已用 {}%（{} / {}），达到预警阈值 {}%，请及时清理以免备份失败",
+                pct,
+                human_bytes(used),
+                human_bytes(total),
+                threshold
+            ),
+        );
+    }
+}
+
+/// 判断 kzwr API 账号与 WebDAV 账号是否一致（邮箱/昵称任一匹配即视为一致）
+///
+/// 返回 `Some(提醒文案)` 表示不一致，`None` 表示一致或无法判定。
+fn kzwr_account_mismatch(webdav_user: &str, member_data: &serde_json::Value) -> Option<String> {
+    let w = webdav_user.trim().to_lowercase();
+    if w.is_empty() {
+        return None;
+    }
+    let get = |k: &str| {
+        member_data
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase()
+    };
+    let email = get("email");
+    let name = get("name");
+    if email.is_empty() && name.is_empty() {
+        return None; // 拿不到账号信息，无法判定
+    }
+    let hit = |a: &str| !a.is_empty() && (a == w || a.contains(&w) || w.contains(a));
+    if hit(&email) || hit(&name) {
+        return None;
+    }
+    Some(format!(
+        "账号不一致：WebDAV 账号「{}」与 access-token 所属账号「{}」不是同一个；\
+         两者指向同一酷族账号时，备份数据与增强功能才会落在同一份数据上，建议改为一致",
+        webdav_user.trim(),
+        if email.is_empty() { name } else { email }
+    ))
+}
+
+/// 启动/按需校验 kzwr access-token：失效则告警提醒用户重新从 Cookie 获取
+pub async fn check_kzwr_token(state: &AppState) {
+    let Some(token) = kzwr_token_of(state) else {
+        return;
+    };
+    state.kzwr.set_token(token);
+    match state.kzwr.get_member().await {
+        Ok(v) if !member_is_login(&v) => {
+            restore_saved_kzwr_token(state);
+            raise_alert_once(
+                state,
+                crate::domain::alerts::AlertLevel::Warn,
+                crate::domain::alerts::AlertSource::Kzwr,
+                KZWR_TOKEN_INVALID.to_string(),
+            );
+            tracing::warn!("kzwr access-token 已失效，已生成告警提醒用户重新获取");
+        }
+        Ok(_) => tracing::info!("kzwr access-token 校验通过（增强功能可用）"),
+        Err(e) => tracing::warn!(err = %e, "kzwr access-token 校验请求失败（网络问题？）"),
+    }
+}
+
+// ── kzwr REST 增强功能（可选，依赖用户提供的 access-token） ──────────────
+
+/// kzwr 账号信息响应（含存储空间与账号详情）
+#[derive(Serialize, Default)]
+pub struct KzwrUserResponse {
+    /// 是否已配置 access-token
+    pub configured: bool,
+    pub email: Option<String>,
+    pub name: Option<String>,
+    pub avatar: Option<String>,
+    /// 套餐名
+    pub plan: Option<String>,
+    /// 总容量（字节）
+    pub total: u64,
+    /// 已用容量（字节）
+    pub used: u64,
+    /// 已用百分比（如 "8.38%"）
+    pub percentage: Option<String>,
+    /// 用户 ID
+    pub uid: Option<i64>,
+    /// 单文件大小上限（字节）
+    pub max_file_size: u64,
+    /// 是否正在升级
+    pub upgrading: bool,
+    /// 地区
+    pub country: Option<String>,
+    /// 登录 IP
+    pub ip: Option<String>,
+    /// 语言
+    pub language: Option<String>,
+    /// 是否属于家庭组
+    pub in_family: bool,
+    /// 站内公告（非空时 UI 可提示）
+    pub announcement: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 审计日志查询参数
+#[derive(Deserialize, Default)]
+pub struct AuditQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// 定时任务预览请求
+#[derive(Deserialize, Default)]
+pub struct SchedulePreviewRequest {
+    #[serde(default)]
+    pub cron: String,
+}
+
+/// 定时任务预览响应
+#[derive(Serialize, Default)]
+pub struct SchedulePreviewResponse {
+    pub valid: bool,
+    /// 未来 5 次触发时间（服务器本地时区）
+    pub next: Vec<String>,
+    /// 服务器时区说明
+    pub timezone: String,
+    pub error: Option<String>,
+}
+
+/// 一键体检中的单项
+#[derive(Serialize, Default)]
+pub struct CheckItem {
+    /// 机器可读标识
+    pub key: String,
+    pub title: String,
+    /// ok | warn | fail | skip
+    pub status: String,
+    pub detail: String,
+    /// 修复建议（可空）
+    pub hint: Option<String>,
+}
+
+/// 一键体检响应
+#[derive(Serialize, Default)]
+pub struct SetupCheckResponse {
+    pub items: Vec<CheckItem>,
+    pub ok_count: usize,
+    pub warn_count: usize,
+    pub fail_count: usize,
+    pub version: String,
+    pub error: Option<String>,
+}
+
+/// 审计日志响应
+#[derive(Serialize, Default)]
+pub struct AuditResponse {
+    pub entries: Vec<crate::domain::audit::AuditEntry>,
+    pub error: Option<String>,
+}
+
+/// 保存 / 清除 access-token 请求（空串 = 清除）
+#[derive(Deserialize, Default)]
+pub struct KzwrTokenRequest {
+    #[serde(default)]
+    pub access_token: String,
+}
+
+/// access-token 保存结果
+#[derive(Serialize, Default)]
+pub struct KzwrTokenResponse {
+    pub success: bool,
+    pub configured: bool,
+    /// 账号一致性提醒（如 API 账号与 WebDAV 账号不同）
+    pub warning: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 清空回收站结果
+#[derive(Serialize, Default)]
+pub struct KzwrTrashResponse {
+    /// 已永久删除的条目数
+    pub emptied: usize,
+    /// 因不满足年龄门槛而保留的条目数
+    pub kept: usize,
+    /// 无法解析删除时间的条目数（保守起见保留）
+    pub unknown_age: usize,
+    /// 回收站总占用（字节；解析不到则为已知部分之和）
+    pub total_bytes: u64,
+    /// 未执行清空时的原因说明
+    pub reason: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 取出响应里的回收站条目数组
+fn trash_items(v: &serde_json::Value) -> Vec<serde_json::Value> {
+    v.get("data")
+        .and_then(|d| d.get("items"))
+        .and_then(|i| i.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// 解析回收站条目大小（字节）：字段名随不同版本而异，逐个尝试
+fn trash_item_size(it: &serde_json::Value) -> Option<u64> {
+    for k in ["size", "fileSize", "sizeBytes", "bytes", "totalSize"] {
+        let Some(v) = it.get(k) else { continue };
+        if let Some(n) = v.as_u64() {
+            return Some(n);
+        }
+        if let Some(s) = v.as_str() {
+            if let Ok(n) = s.parse::<u64>() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// 解析回收站条目的删除时间（毫秒时间戳）：兼容秒级数值与 RFC3339 字符串
+fn trash_item_deleted_ms(it: &serde_json::Value) -> Option<i64> {
+    const KEYS: [&str; 7] = [
+        "deleteTime",
+        "deletedAt",
+        "deleteAt",
+        "deleteDate",
+        "updateTime",
+        "time",
+        "createTime",
+    ];
+    for k in KEYS {
+        let Some(v) = it.get(k) else { continue };
+        if let Some(n) = v.as_i64() {
+            return Some(if n < 10_000_000_000 { n * 1000 } else { n });
+        }
+        if let Some(s) = v.as_str() {
+            if let Ok(n) = s.parse::<i64>() {
+                return Some(if n < 10_000_000_000 { n * 1000 } else { n });
+            }
+            if let Ok(d) = chrono::DateTime::parse_from_rfc3339(s) {
+                return Some(d.timestamp_millis());
+            }
+        }
+    }
+    None
+}
+
+/// 清空回收站的结果明细
+#[derive(Debug, Default)]
+struct TrashOutcome {
+    emptied: usize,
+    kept: usize,
+    unknown_age: usize,
+    total_bytes: u64,
+    reason: Option<String>,
+}
+
+/// 清理回收站（支持两种门槛）
+///
+/// - `max_gb`：回收站（首页采样）占用低于该 GB 数时**整体跳过**（0 = 不限制）
+/// - `min_age_days`：只删除删除时间早于该天数的条目（0 = 不限制）；
+///   **无法解析时间的条目一律保留**（永久删除不可逆，宁可少删）
+async fn empty_recycle_bin_gated(
+    client: &crate::infra::kzwr_api::client::KzwrClient,
+    max_gb: u64,
+    min_age_days: u64,
+) -> Result<TrashOutcome, String> {
+    let mut out = TrashOutcome::default();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    for round in 0..200 {
+        let v = client.get_trash(1).await.map_err(|e| format!("{e}"))?;
+        let items = trash_items(&v);
+        if items.is_empty() {
+            if round == 0 {
+                out.reason = Some("回收站为空".to_string());
+            }
+            return Ok(out);
+        }
+
+        // 仅首轮做占用门槛判断（首页采样；后续轮次已在执行清理中）
+        if round == 0 {
+            out.total_bytes = items.iter().filter_map(trash_item_size).sum();
+            if max_gb > 0 && out.total_bytes < max_gb * 1024 * 1024 * 1024 {
+                out.kept = items.len();
+                out.reason = Some(format!(
+                    "回收站占用 {} MB 不足 {} GB，本次未清空",
+                    out.total_bytes / (1024 * 1024),
+                    max_gb
+                ));
+                return Ok(out);
+            }
+        }
+
+        // 年龄门槛：解析不出时间的条目保守保留
+        let mut deletable: Vec<serde_json::Value> = Vec::new();
+        for it in &items {
+            match trash_item_deleted_ms(it) {
+                Some(ts) => {
+                    let age_days = (now_ms - ts).max(0) / 86_400_000;
+                    if min_age_days == 0 || age_days as u64 >= min_age_days {
+                        deletable.push(it.clone());
+                    } else {
+                        out.kept += 1;
+                    }
+                }
+                None => {
+                    if min_age_days == 0 {
+                        deletable.push(it.clone());
+                    } else {
+                        out.unknown_age += 1;
+                        out.kept += 1;
+                    }
+                }
+            }
+        }
+        if deletable.is_empty() {
+            out.reason = Some(if out.unknown_age > 0 {
+                format!(
+                    "本页无可删除条目（{} 项无法解析删除时间，已保守保留）",
+                    out.unknown_age
+                )
+            } else {
+                "剩余条目均未达到最小保留天数".to_string()
+            });
+            return Ok(out);
+        }
+        let n = deletable.len();
+        client
+            .delete_trash_items(&deletable)
+            .await
+            .map_err(|e| format!("删除回收站条目失败: {e}"))?;
+        out.emptied += n;
+    }
+    Ok(out)
+}
+
+/// 保留策略联动：按配置门槛清理回收站（未配置 token 或失败仅记日志，不影响备份结果）
+async fn empty_recycle_bin_if_configured(state: &AppState) -> usize {
+    let Some(token) = kzwr_token_of(state) else {
+        tracing::warn!("保留策略要求清空回收站，但未配置 kzwr access-token，已跳过");
+        return 0;
+    };
+    let (max_gb, min_age_days) = {
+        let cfg = state.config.lock().unwrap().load().unwrap_or_default();
+        (
+            cfg.backup.retention.recycle_max_gb,
+            cfg.backup.retention.recycle_min_age_days,
+        )
+    };
+    state.kzwr.set_token(token);
+    match empty_recycle_bin_gated(&state.kzwr, max_gb, min_age_days).await {
+        Ok(o) => {
+            tracing::info!(
+                emptied = o.emptied,
+                kept = o.kept,
+                reason = o.reason.clone().unwrap_or_default(),
+                "保留策略：回收站清理完成"
+            );
+            o.emptied
+        }
+        Err(e) => {
+            tracing::warn!("保留策略：清空回收站失败：{}", e);
+            0
+        }
+    }
+}
+
+/// kzwr 增强：账号信息（存储空间 / 套餐 / 邮箱）
+async fn kzwr_user(State(state): State<AppState>) -> Json<KzwrUserResponse> {
+    let Some(token) = kzwr_token_of(&state) else {
+        return Json(KzwrUserResponse {
+            configured: false,
+            error: Some(
+                "未配置 access-token：请在浏览器登录酷族后，从开发者工具 → 应用（Application）→ Cookies → www.kzwr.com 复制 access-token 填入"
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+    };
+    state.kzwr.set_token(token);
+    match state.kzwr.get_member().await {
+        Ok(v) if !member_is_login(&v) => {
+            restore_saved_kzwr_token(&state);
+            // access-token 失效：告警提醒用户重新从 Cookie 获取（同文案去重）
+            raise_alert_once(
+                &state,
+                crate::domain::alerts::AlertLevel::Warn,
+                crate::domain::alerts::AlertSource::Kzwr,
+                KZWR_TOKEN_INVALID.to_string(),
+            );
+            Json(KzwrUserResponse {
+                configured: kzwr_token_of(&state).is_some(),
+                error: Some(KZWR_TOKEN_INVALID.to_string()),
+                ..Default::default()
+            })
+        }
+        Ok(v) => {
+            let data = v.get("data").cloned().unwrap_or_default();
+            let num = |key: &str| data.get(key).and_then(|x| x.as_u64()).unwrap_or(0);
+            let opt_str =
+                |key: &str| data.get(key).and_then(|x| x.as_str()).map(|s| s.to_string());
+            let total = num("total").max(num("capacity"));
+            let used = num("use");
+            // 空间预警：达到阈值时生成告警（去重）
+            maybe_warn_quota(&state, total, used);
+            Json(KzwrUserResponse {
+                configured: true,
+                email: opt_str("email"),
+                name: opt_str("name"),
+                avatar: opt_str("avatar"),
+                plan: opt_str("plan"),
+                total,
+                used,
+                percentage: opt_str("percentage"),
+                uid: data.get("uid").and_then(|x| x.as_i64()),
+                max_file_size: num("maxFileSize"),
+                upgrading: data.get("upgrading").and_then(|x| x.as_i64()).unwrap_or(0) != 0,
+                country: opt_str("country"),
+                ip: opt_str("ip"),
+                language: opt_str("language"),
+                in_family: data.get("inFamily").and_then(|x| x.as_bool()).unwrap_or(false),
+                announcement: opt_str("announcement").filter(|s| !s.trim().is_empty()),
+                error: None,
+            })
+        }
+        Err(e) => {
+            // 请求本身失败：回滚成配置里的 token（若有），避免内存副本被污染
+            restore_saved_kzwr_token(&state);
+            Json(KzwrUserResponse {
+                configured: kzwr_token_of(&state).is_some(),
+                error: Some(format!("获取账号信息失败：{e}")),
+                ..Default::default()
+            })
+        }
+    }
+}
+
+/// kzwr 增强：保存 / 清除 access-token（保存前先实测，避免存入无效 token）
+async fn kzwr_token_save(
+    State(state): State<AppState>,
+    Json(body): Json<KzwrTokenRequest>,
+) -> Json<KzwrTokenResponse> {
+    let token = body.access_token.trim().to_string();
+
+    if token.is_empty() {
+        state.kzwr.clear_token();
+        let saved = state.config.lock().unwrap().save_kzwr_token("");
+        return Json(match saved {
+            Ok(_) => {
+                state
+                    .audit
+                    .record("kzwr.token.clear", "清除 access-token", true, None);
+                KzwrTokenResponse {
+                    success: true,
+                    configured: false,
+                    warning: None,
+                    error: None,
+                }
+            }
+            Err(e) => KzwrTokenResponse {
+                success: false,
+                configured: false,
+                warning: None,
+                error: Some(format!("清除失败: {:#}", e)),
+            },
+        });
+    }
+
+    // 先热更新内存副本并实测；通过后才落盘
+    state.kzwr.set_token(token.clone());
+    match state.kzwr.get_member().await {
+        Ok(v) if member_is_login(&v) => {
+            let member = v.get("data").cloned().unwrap_or_default();
+            // 账号一致性：API 账号应与 WebDAV 账号一致，否则提醒用户修改
+            let warning = webdav_username(&state)
+                .and_then(|u| kzwr_account_mismatch(&u, &member));
+            let saved = state.config.lock().unwrap().save_kzwr_token(&token);
+            Json(match saved {
+                Ok(_) => {
+                    state.audit.record(
+                        "kzwr.token.save",
+                        format!(
+                            "保存 access-token（账号 {}）{}",
+                            member
+                                .get("email")
+                                .and_then(|x| x.as_str())
+                                .or_else(|| member.get("name").and_then(|x| x.as_str()))
+                                .unwrap_or("未知"),
+                            if warning.is_some() { "；账号与 WebDAV 不一致" } else { "" }
+                        ),
+                        true,
+                        None,
+                    );
+                    KzwrTokenResponse {
+                        success: true,
+                        configured: true,
+                        warning,
+                        error: None,
+                    }
+                }
+                Err(e) => KzwrTokenResponse {
+                    success: false,
+                    configured: true,
+                    warning,
+                    error: Some(format!("保存失败: {:#}", e)),
+                },
+            })
+        }
+        Ok(_) => {
+            // 无效 token：官方接口仍返回 200，只能靠 isLogin 判定
+            restore_saved_kzwr_token(&state);
+            raise_alert_once(
+                &state,
+                crate::domain::alerts::AlertLevel::Warn,
+                crate::domain::alerts::AlertSource::Kzwr,
+                KZWR_TOKEN_INVALID.to_string(),
+            );
+            Json(KzwrTokenResponse {
+                success: false,
+                configured: kzwr_token_of(&state).is_some(),
+                warning: None,
+                error: Some(KZWR_TOKEN_INVALID.to_string()),
+            })
+        }
+        Err(e) => {
+            restore_saved_kzwr_token(&state);
+            Json(KzwrTokenResponse {
+                success: false,
+                configured: kzwr_token_of(&state).is_some(),
+                warning: None,
+                error: Some(format!(
+                    "access-token 校验未通过（请确认网络可达酷族后重试）：{e}"
+                )),
+            })
+        }
+    }
+}
+
+/// kzwr 增强：手动清空回收站
+///
+/// 显式操作 → **忽略保留策略门槛**（占用/年龄），直接清空；物理删除不可恢复，
+/// 前端有二次确认。
+async fn kzwr_trash_empty(State(state): State<AppState>) -> Json<KzwrTrashResponse> {
+    let Some(token) = kzwr_token_of(&state) else {
+        return Json(KzwrTrashResponse {
+            error: Some("未配置 access-token，无法操作回收站".to_string()),
+            ..Default::default()
+        });
+    };
+    state.kzwr.set_token(token);
+
+    // 先确认登录态：无效 token 时官方接口会返回空列表，避免误报「回收站为空」
+    match state.kzwr.get_member().await {
+        Ok(v) if !member_is_login(&v) => {
+            restore_saved_kzwr_token(&state);
+            raise_alert_once(
+                &state,
+                crate::domain::alerts::AlertLevel::Warn,
+                crate::domain::alerts::AlertSource::Kzwr,
+                KZWR_TOKEN_INVALID.to_string(),
+            );
+            return Json(KzwrTrashResponse {
+                error: Some(KZWR_TOKEN_INVALID.to_string()),
+                ..Default::default()
+            });
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Json(KzwrTrashResponse {
+                error: Some(format!("校验 access-token 失败：{e}")),
+                ..Default::default()
+            })
+        }
+    }
+
+    match empty_recycle_bin_gated(&state.kzwr, 0, 0).await {
+        Ok(o) => {
+            state.audit.record(
+                "kzwr.trash.empty",
+                format!(
+                    "手动清空回收站：删除 {} 项（占用 {}）",
+                    o.emptied,
+                    human_bytes(o.total_bytes)
+                ),
+                true,
+                None,
+            );
+            Json(KzwrTrashResponse {
+                emptied: o.emptied,
+                kept: o.kept,
+                unknown_age: o.unknown_age,
+                total_bytes: o.total_bytes,
+                reason: o.reason,
+                error: None,
+            })
+        }
+        Err(e) => {
+            state.audit.record(
+                "kzwr.trash.empty",
+                format!("清空回收站失败：{e}"),
+                false,
+                None,
+            );
+            Json(KzwrTrashResponse {
+                error: Some(e),
+                ..Default::default()
+            })
+        }
+    }
+}
+
+/// 定时任务预览：校验 cron 并给出未来 5 次触发时间（服务器本地时区）
+async fn schedule_preview(
+    Json(body): Json<SchedulePreviewRequest>,
+) -> Json<SchedulePreviewResponse> {
+    let tz = crate::domain::scheduler::timezone_label();
+    let cron = body.cron.trim();
+    if cron.is_empty() {
+        return Json(SchedulePreviewResponse {
+            valid: true,
+            next: Vec::new(),
+            timezone: tz,
+            error: None,
+        });
+    }
+    match crate::domain::scheduler::next_runs(cron, 5) {
+        Ok(next) => Json(SchedulePreviewResponse {
+            valid: true,
+            next,
+            timezone: tz,
+            error: None,
+        }),
+        Err(e) => Json(SchedulePreviewResponse {
+            valid: false,
+            next: Vec::new(),
+            timezone: tz,
+            error: Some(format!("{:#}", e)),
+        }),
+    }
+}
+
+/// 一键体检：逐项检查配置与连通性，给出可操作建议
+async fn setup_check(State(state): State<AppState>) -> Json<SetupCheckResponse> {
+    let mut items: Vec<CheckItem> = Vec::new();
+
+    // 1) 服务
+    items.push(CheckItem {
+        key: "service".to_string(),
+        title: "服务运行状态".to_string(),
+        status: "ok".to_string(),
+        detail: format!("版本 v{}", env!("CARGO_PKG_VERSION")),
+        hint: None,
+    });
+
+    // 2) WebDAV 配置 + 实连
+    let (cfg, creds) = {
+        let mgr = state.config.lock().unwrap();
+        (
+            mgr.load().unwrap_or_default(),
+            mgr.webdav_credentials().unwrap_or((None, None)),
+        )
+    };
+    if !webdav_ready(&cfg) {
+        items.push(CheckItem {
+            key: "webdav".to_string(),
+            title: "WebDAV 目标".to_string(),
+            status: "fail".to_string(),
+            detail: "尚未配置 WebDAV 凭据，备份与恢复不可用".to_string(),
+            hint: Some(
+                "前往「设置 → WebDAV 目标」填写账号与应用密码；应用密码请在 https://www.kzwr.com/account/apps 创建，选择「永不过期」与读写权限"
+                    .to_string(),
+            ),
+        });
+    } else {
+        let url = cfg
+            .webdav
+            .url
+            .clone()
+            .unwrap_or_else(|| crate::infra::target::webdav::DEFAULT_URL.to_string());
+        let target = crate::infra::target::webdav::WebdavTarget::new(
+            &url,
+            creds.0.clone().unwrap_or_default().as_str(),
+            creds.1.clone().unwrap_or_default().as_str(),
+        );
+        match target.ping().await {
+            Ok(_) => items.push(CheckItem {
+                key: "webdav".to_string(),
+                title: "WebDAV 目标".to_string(),
+                status: "ok".to_string(),
+                detail: format!("已连接 {}", url),
+                hint: None,
+            }),
+            Err(e) => items.push(CheckItem {
+                key: "webdav".to_string(),
+                title: "WebDAV 目标".to_string(),
+                status: "fail".to_string(),
+                detail: format!("连通性测试失败：{:#}", e),
+                hint: Some(
+                    "请确认应用密码未过期且有读写权限（可在 https://www.kzwr.com/account/apps 重新创建）"
+                        .to_string(),
+                ),
+            }),
+        }
+    }
+
+    // 3) 备份路径 + 已备份文件数
+    let paths: Vec<String> = cfg.backup.paths.clone();
+    if paths.is_empty() {
+        items.push(CheckItem {
+            key: "paths".to_string(),
+            title: "备份路径".to_string(),
+            status: "fail".to_string(),
+            detail: "尚未添加任何备份路径".to_string(),
+            hint: Some("前往「备份」页添加要备份的文件夹".to_string()),
+        });
+    } else {
+        let account = webdav_username(&state).unwrap_or_default();
+        let mut files = 0usize;
+        for (i, _) in paths.iter().enumerate() {
+            let job_id = format!("{}-{}", state.job_id, i);
+            if let Ok(entries) = state.store.load_snapshot(&job_id, &account) {
+                files += entries.iter().filter(|e| !e.is_dir).count();
+            }
+        }
+        items.push(CheckItem {
+            key: "paths".to_string(),
+            title: "备份路径".to_string(),
+            status: if files > 0 { "ok" } else { "warn" }.to_string(),
+            detail: if files > 0 {
+                format!("{} 个路径，已备份 {} 个文件", paths.len(), files)
+            } else {
+                format!("{} 个路径，但还没有备份记录", paths.len())
+            },
+            hint: if files > 0 {
+                None
+            } else {
+                Some("前往「备份」页执行一次备份".to_string())
+            },
+        });
+    }
+
+    // 4) 私钥备份确认
+    items.push(CheckItem {
+        key: "key".to_string(),
+        title: "私钥备份".to_string(),
+        status: if cfg.keys.backed_up { "ok" } else { "warn" }.to_string(),
+        detail: if cfg.keys.backed_up {
+            "已确认妥善保存 age 私钥".to_string()
+        } else {
+            "尚未确认私钥已备份；私钥丢失将无法恢复数据".to_string()
+        },
+        hint: if cfg.keys.backed_up {
+            None
+        } else {
+            Some("前往「设置 → 加密密钥」导出私钥并确认已保存".to_string())
+        },
+    });
+
+    // 5) 定时备份
+    let cron = cfg.backup.schedule_cron.clone().unwrap_or_default();
+    if cron.trim().is_empty() {
+        items.push(CheckItem {
+            key: "schedule".to_string(),
+            title: "定时备份".to_string(),
+            status: "warn".to_string(),
+            detail: "未启用（仅手动备份）".to_string(),
+            hint: Some("如需无人值守，可在「备份」页设置 cron 表达式".to_string()),
+        });
+    } else {
+        let next = crate::domain::scheduler::next_runs(&cron, 1).unwrap_or_default();
+        items.push(CheckItem {
+            key: "schedule".to_string(),
+            title: "定时备份".to_string(),
+            status: "ok".to_string(),
+            detail: format!(
+                "{}（{}，下次 {})",
+                cron,
+                crate::domain::scheduler::timezone_label(),
+                next.first().cloned().unwrap_or_else(|| "—".to_string())
+            ),
+            hint: None,
+        });
+    }
+
+    // 6) 增强功能（token）与云端空间
+    match kzwr_token_of(&state) {
+        None => items.push(CheckItem {
+            key: "kzwr".to_string(),
+            title: "增强功能".to_string(),
+            status: "warn".to_string(),
+            detail: "未配置 access-token（可选）：无存储空间信息与回收站清理".to_string(),
+            hint: Some(
+                "如需存储空间预警/清空回收站：浏览器登录酷族 → F12 → Application → Cookies → www.kzwr.com → 复制 access-token 填入设置页"
+                    .to_string(),
+            ),
+        }),
+        Some(token) => {
+            state.kzwr.set_token(token);
+            match state.kzwr.get_member().await {
+                Ok(v) if !member_is_login(&v) => {
+                    restore_saved_kzwr_token(&state);
+                    raise_alert_once(
+                        &state,
+                        crate::domain::alerts::AlertLevel::Warn,
+                        crate::domain::alerts::AlertSource::Kzwr,
+                        KZWR_TOKEN_INVALID.to_string(),
+                    );
+                    items.push(CheckItem {
+                        key: "kzwr".to_string(),
+                        title: "增强功能".to_string(),
+                        status: "fail".to_string(),
+                        detail: KZWR_TOKEN_INVALID.to_string(),
+                        hint: Some("重新从浏览器 Cookie 复制 access-token".to_string()),
+                    });
+                }
+                Ok(v) => {
+                    let data = v.get("data").cloned().unwrap_or_default();
+                    let num =
+                        |key: &str| data.get(key).and_then(|x| x.as_u64()).unwrap_or(0);
+                    let total = num("total").max(num("capacity"));
+                    let used = num("use");
+                    let pct = if total > 0 {
+                        (used as f64 / total as f64 * 100.0).round() as u64
+                    } else {
+                        0
+                    };
+                    let threshold = cfg.kzwr.quota_warn_percent;
+                    let over = total > 0 && threshold > 0 && pct >= threshold;
+                    maybe_warn_quota(&state, total, used);
+                    items.push(CheckItem {
+                        key: "kzwr".to_string(),
+                        title: "增强功能".to_string(),
+                        status: "ok".to_string(),
+                        detail: format!("access-token 有效；空间已用 {}%", pct),
+                        hint: None,
+                    });
+                    items.push(CheckItem {
+                        key: "quota".to_string(),
+                        title: "云端空间".to_string(),
+                        status: if over { "warn" } else { "ok" }.to_string(),
+                        detail: format!(
+                            "{} / {}（{}%）{}",
+                            human_bytes(used),
+                            human_bytes(total),
+                            pct,
+                            if threshold > 0 {
+                                format!("，预警阈值 {}%", threshold)
+                            } else {
+                                "，未启用预警".to_string()
+                            }
+                        ),
+                        hint: if over {
+                            Some("空间接近上限，建议清理回收站或扩容".to_string())
+                        } else {
+                            None
+                        },
+                    });
+                }
+                Err(e) => items.push(CheckItem {
+                    key: "kzwr".to_string(),
+                    title: "增强功能".to_string(),
+                    status: "warn".to_string(),
+                    detail: format!("账号信息获取失败（网络问题？）：{e}"),
+                    hint: None,
+                }),
+            }
+        }
+    }
+
+    let ok_count = items.iter().filter(|i| i.status == "ok").count();
+    let warn_count = items.iter().filter(|i| i.status == "warn").count();
+    let fail_count = items.iter().filter(|i| i.status == "fail").count();
+    Json(SetupCheckResponse {
+        items,
+        ok_count,
+        warn_count,
+        fail_count,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        error: None,
+    })
+}
+
+/// 审计日志查询（最新在前）
+async fn audit_list(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<AuditQuery>,
+) -> Json<AuditResponse> {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    Json(AuditResponse {
+        entries: state.audit.recent(limit),
+        error: None,
+    })
 }
 
 /// 当前 age 公钥（用于展示；永不回传私钥）
@@ -1128,6 +2285,12 @@ async fn keys_set(
         .swap(crate::domain::crypto::CryptoSession::full(&keys));
     // 用户粘贴了自己的私钥 ⇒ 其本人已持有，视为已备份
     set_key_backed_up(&state, true);
+    state.audit.record(
+        "keys.set",
+        format!("更换 age 私钥（新公钥 {}）", public_key),
+        true,
+        None,
+    );
     tracing::info!("已更换 age 密钥（用户自定义私钥）");
     Json(KeysChangeResponse {
         success: true,
@@ -1156,6 +2319,12 @@ async fn keys_generate(State(state): State<AppState>) -> Json<KeysChangeResponse
         .swap(crate::domain::crypto::CryptoSession::full(&keys));
     // 新生成的私钥用户尚未保存 ⇒ 重置备份标记，UI 持续提示风险
     set_key_backed_up(&state, false);
+    state.audit.record(
+        "keys.generate",
+        format!("生成新 age 密钥对（公钥 {}）", public_key),
+        true,
+        None,
+    );
     tracing::info!("已自动生成新的 age 密钥对");
     Json(KeysChangeResponse {
         success: true,
@@ -1246,21 +2415,38 @@ async fn keys_export(
         Ok(keys) => {
             // 展示私钥即视为「需重新确认备份」：重置标记，使「我已妥善保存」按钮可再次点击
             set_key_backed_up(&state, false);
+            state.audit.record(
+                "keys.export",
+                "导出 age 私钥明文（管理员口令校验通过）",
+                true,
+                None,
+            );
             Json(KeysExportResponse {
                 private_key: Some(keys.to_secret_key()),
                 error: None,
             })
         }
-        Err(e) => Json(KeysExportResponse {
-            private_key: None,
-            error: Some(format!("读取密钥库失败: {:#}", e)),
-        }),
+        Err(e) => {
+            state.audit.record(
+                "keys.export",
+                format!("导出 age 私钥失败：{:#}", e),
+                false,
+                None,
+            );
+            Json(KeysExportResponse {
+                private_key: None,
+                error: Some(format!("读取密钥库失败: {:#}", e)),
+            })
+        }
     }
 }
 
 /// 确认已妥善备份私钥（消除 UI 的丢失风险提示）
 async fn keys_backup_ack(State(state): State<AppState>) -> Json<BackupAckResponse> {
     set_key_backed_up(&state, true);
+    state
+        .audit
+        .record("keys.backup_ack", "确认已妥善保存 age 私钥", true, None);
     Json(BackupAckResponse {
         success: true,
         error: None,
@@ -1324,11 +2510,12 @@ async fn config_export(
             error: Some("管理员口令错误".to_string()),
         });
     }
-    let (cfg, creds) = {
+    let (cfg, creds, kzwr_token) = {
         let mgr = state.config.lock().unwrap();
         let cfg = mgr.load().unwrap_or_default();
         let creds = mgr.webdav_credentials().unwrap_or((None, None));
-        (cfg, creds)
+        let kzwr_token = mgr.kzwr_token().unwrap_or(None);
+        (cfg, creds, kzwr_token)
     };
     let ks_path = crate::infra::keystore::keystore_path(&state.cfg_dir);
     let age_private_key = crate::infra::keystore::load_keystore(&state.passphrase, &ks_path)
@@ -1351,6 +2538,7 @@ async fn config_export(
         webdav_url: cfg.webdav.url.clone(),
         webdav_username: creds.0,
         webdav_password: creds.1,
+        kzwr_access_token: kzwr_token,
         age_private_key,
         key_backed_up: cfg.keys.backed_up,
     };
@@ -1441,12 +2629,30 @@ async fn config_import(
         {
             cfg.webdav.url = Some(url.trim_end_matches('/').to_string());
         }
+        // kzwr access-token（增强功能，可选）
+        if let Some(token) = bundle.kzwr_access_token.as_ref().filter(|s| !s.trim().is_empty()) {
+            match mgr.encrypt_field(token.trim()) {
+                Ok(e) => cfg.kzwr.access_token_enc = Some(e),
+                Err(_) => {
+                    return Json(ConfigImportResponse {
+                        success: false,
+                        error: Some("kzwr access-token 加密失败".to_string()),
+                    })
+                }
+            }
+        }
         if let Err(e) = mgr.save(&cfg) {
             return Json(ConfigImportResponse {
                 success: false,
                 error: Some(format!("保存配置失败: {:#}", e)),
             });
         }
+    }
+
+    // 1.5) 同步内存中的 kzwr access-token（热更新，无需重启）
+    match kzwr_token_of(&state) {
+        Some(t) => state.kzwr.set_token(t),
+        None => state.kzwr.clear_token(),
     }
 
     // 2) 可选：恢复 age 私钥（热切换，无需重启）
@@ -1498,6 +2704,12 @@ async fn config_import(
         tracing::info!("已从导入配置切换 WebDAV 目标");
     }
 
+    state.audit.record(
+        "config.import",
+        "导入配置包（备份路径/目标/定时/通知/WebDAV 凭据/kzwr token）",
+        true,
+        None,
+    );
     Json(ConfigImportResponse {
         success: true,
         error: None,
@@ -1518,6 +2730,12 @@ pub fn router(state: AppState) -> Router {
         .route("/restore/files", get(restore_files))
         .route("/restore/tree", get(restore_tree))
         .route("/restore/run", post(restore_run))
+        .route("/kzwr/user", get(kzwr_user))
+        .route("/kzwr/token", post(kzwr_token_save))
+        .route("/kzwr/trash/empty", post(kzwr_trash_empty))
+        .route("/schedule/preview", post(schedule_preview))
+        .route("/setup/check", get(setup_check))
+        .route("/audit", get(audit_list))
         .route("/keys", get(keys_get).post(keys_set))
         .route("/keys/generate", post(keys_generate))
         .route("/keys/export", post(keys_export))

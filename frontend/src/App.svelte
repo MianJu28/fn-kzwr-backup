@@ -55,7 +55,20 @@
   let alerts = [];
   // 非敏感配置回显：WebDAV 用户名（密码永不返回）与保留策略
   let webdavUsername = '';
-  let retention = { enabled: false, cleanup_unmanaged: false, min_age_days: 0 };
+  let retention = {
+    enabled: false,
+    cleanup_unmanaged: false,
+    min_age_days: 0,
+    empty_recycle_bin: false,
+  };
+  // kzwr REST 增强功能（可选）
+  let kzwrConfigured = false;
+  let kzwrUser = null;
+  let kzwrQuotaWarnPercent = 85;
+  // 账号一致性提醒 / 一键体检 / 审计日志
+  let webdavWarning = '';
+  let setupResult = null;
+  let auditEntries = [];
   let webhookUrl = '';
   let webhookHeaders = [];
   let webhookBody = '';
@@ -102,13 +115,33 @@
       webdavConfigured = !!d.webdav_configured;
       webdavUrl = d.webdav_url || '';
       webdavUsername = d.webdav_username || '';
-      retention = d.retention || { enabled: false, cleanup_unmanaged: false, min_age_days: 0 };
+      retention = d.retention || {
+        enabled: false,
+        cleanup_unmanaged: false,
+        min_age_days: 0,
+        empty_recycle_bin: false,
+      };
+      kzwrConfigured = !!d.kzwr_token_configured;
+      kzwrQuotaWarnPercent = d.kzwr_quota_warn_percent ?? 85;
       webhookUrl = d.webhook_url || '';
       webhookHeaders = d.webhook_headers || [];
       webhookBody = d.webhook_body || '';
       keyBackedUp = !!d.key_backed_up;
     } catch (e) {
       error = e.message;
+    }
+  }
+
+  /** 加载 kzwr 增强信息（未配置 token 时不请求，避免无谓提示） */
+  async function loadKzwrUser() {
+    if (!kzwrConfigured) {
+      kzwrUser = null;
+      return;
+    }
+    try {
+      kzwrUser = await api.kzwrUser();
+    } catch (e) {
+      kzwrUser = { error: e.message };
     }
   }
 
@@ -153,6 +186,8 @@
   async function loadAll() {
     loading = true;
     await Promise.all([loadHealth(), loadConfig(), loadUserInfo(), loadKeys(), loadAlerts(), loadRestoreFiles()]);
+    // 依赖 loadConfig 得到的 kzwrConfigured，故串行放在其后
+    await loadKzwrUser();
     loading = false;
   }
 
@@ -242,6 +277,103 @@
     }
   }
 
+  /** kzwr 增强：保存或清除 access-token（保存成功后刷新账号信息） */
+  async function handleSaveKzwrToken(token) {
+    busy = true;
+    error = null;
+    try {
+      const d = await api.kzwrSaveToken(token);
+      kzwrConfigured = !!d.configured;
+      if (d.success) await loadKzwrUser();
+      else if (!kzwrConfigured) kzwrUser = null;
+      return d;
+    } catch (e) {
+      return { success: false, configured: kzwrConfigured, error: e.message };
+    } finally {
+      busy = false;
+    }
+  }
+
+  /** kzwr 增强：保存空间预警阈值（复用 /api/config） */
+  async function handleSaveKzwrQuota(percent) {
+    busy = true;
+    error = null;
+    try {
+      const d = await api.saveConfig({
+        backup_paths: backupPaths,
+        target_folder: targetFolder,
+        kzwr_quota_warn_percent: Math.max(0, Math.min(100, Math.floor(Number(percent) || 0))),
+      });
+      if (d.error) {
+        error = d.error;
+        return { error: d.error };
+      }
+      kzwrQuotaWarnPercent = d.kzwr_quota_warn_percent ?? percent;
+      return {};
+    } catch (e) {
+      error = e.message;
+      return { error: e.message };
+    } finally {
+      busy = false;
+    }
+  }
+
+  /** 定时任务预览：cron → 未来 5 次触发时间 */
+  async function handlePreviewCron(cron) {
+    try {
+      return await api.schedulePreview(cron || '');
+    } catch (e) {
+      return { valid: false, next: [], error: e.message };
+    }
+  }
+
+  /** 一键体检 */
+  async function handleSetupCheck() {
+    busy = true;
+    error = null;
+    try {
+      setupResult = await api.setupCheck();
+      await loadAlerts();
+      if (kzwrConfigured) await loadKzwrUser();
+      return setupResult;
+    } catch (e) {
+      error = e.message;
+      toast.error(e.message, '体检失败');
+      return null;
+    } finally {
+      busy = false;
+    }
+  }
+
+  /** 读取操作审计日志 */
+  async function handleLoadAudit() {
+    busy = true;
+    try {
+      const d = await api.auditLog(100);
+      auditEntries = d.entries || [];
+      if (d.error) toast.error(d.error);
+      return d;
+    } catch (e) {
+      toast.error(e.message, '读取审计失败');
+      return null;
+    } finally {
+      busy = false;
+    }
+  }
+
+  /** kzwr 增强：清空回收站 */
+  async function handleEmptyTrash() {
+    busy = true;
+    error = null;
+    try {
+      return await api.kzwrTrashEmpty();
+    } catch (e) {
+      return { emptied: 0, error: e.message };
+    } finally {
+      busy = false;
+    }
+  }
+
   /** 保存保留策略：只提交保留策略（不提交 cron，避免被无效表达式阻塞） */
   async function handleSaveRetention(next) {
     busy = true;
@@ -253,6 +385,7 @@
         retention_enabled: next.enabled,
         retention_cleanup_unmanaged: next.cleanup_unmanaged,
         retention_min_age_days: next.min_age_days,
+        retention_empty_recycle_bin: next.empty_recycle_bin,
       });
       if (d.error) {
         error = d.error;
@@ -316,8 +449,10 @@
       if (d.success) {
         webdavConfigured = true;
         webdavUrl = d.url || webdavUrl;
+        webdavWarning = d.warning || '';
         await loadUserInfo();
-        toast.success('WebDAV 凭据已保存并验证通过');
+        if (webdavWarning) toast.warn('凭据已保存，但检测到账号不一致', '请检查账号');
+        else toast.success('WebDAV 凭据已保存并验证通过');
         return '';
       }
       toast.error(d.error || '凭据验证未通过');
@@ -385,6 +520,7 @@
     const d = await api.importConfig(passphrase, configText);
     if (d.success) {
       await Promise.all([loadConfig(), loadKeys(), loadUserInfo(), loadRestoreFiles()]);
+      await loadKzwrUser();
       toast.success('配置已导入并即时生效');
     }
     return d;
@@ -522,6 +658,10 @@
               {userInfo}
               {userInfoError}
               {keyBackedUp}
+              kzwr={kzwrUser}
+              {setupResult}
+              {busy}
+              onSetupCheck={handleSetupCheck}
               onGoto={go}
             />
           {:else if currentPage === 'backup'}
@@ -535,6 +675,7 @@
               {webdavConfigured}
               onSave={handleSaveConfig}
               onRunBackup={handleRunBackup}
+              onPreviewCron={handlePreviewCron}
               onGoto={go}
             />
           {:else if currentPage === 'restore'}
@@ -551,7 +692,12 @@
               {webdavConfigured}
               {webdavUrl}
               {webdavUsername}
+              {webdavWarning}
               {retention}
+              {kzwrConfigured}
+              {kzwrUser}
+              {kzwrQuotaWarnPercent}
+              {auditEntries}
               {busy}
               {userInfo}
               {userInfoError}
@@ -567,6 +713,10 @@
               onExportKey={handleExportKey}
               onBackupAck={handleBackupAck}
               onSaveRetention={handleSaveRetention}
+              onSaveKzwrToken={handleSaveKzwrToken}
+              onSaveKzwrQuota={handleSaveKzwrQuota}
+              onEmptyTrash={handleEmptyTrash}
+              onLoadAudit={handleLoadAudit}
               onSaveWebhook={handleSaveWebhook}
               onTestWebhook={handleTestWebhook}
               onExportConfig={handleExportConfig}

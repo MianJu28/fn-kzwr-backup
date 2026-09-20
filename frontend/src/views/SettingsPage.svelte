@@ -1,21 +1,32 @@
 <script>
   import UserCard from '../components/UserCard.svelte';
   import WebdavSection from '../components/WebdavSection.svelte';
+  import KzwrSection from '../components/KzwrSection.svelte';
   import RetentionSection from '../components/RetentionSection.svelte';
   import KeySection from '../components/KeySection.svelte';
   import NotifySection from '../components/NotifySection.svelte';
   import ConfigSection from '../components/ConfigSection.svelte';
+  import AuditSection from '../components/AuditSection.svelte';
 
   export let webdavConfigured = false;
   export let webdavUrl = '';
   export let webdavUsername = '';
+  export let webdavWarning = ''; // 账号一致性提醒
   export let busy = false;
   export let userInfo = null;
   export let userInfoError = null;
   export let onSaveWebdav = null; // (username, password) => Promise
 
+  // kzwr REST 增强功能（可选）
+  export let kzwrConfigured = false;
+  export let kzwrUser = null; // { plan, total, used, percentage, error }
+  export let kzwrQuotaWarnPercent = 85; // 空间预警阈值（%）
+  export let onSaveKzwrToken = null; // (token) => Promise<{success, configured, warning, error}>
+  export let onSaveKzwrQuota = null; // (percent) => Promise<{error?}>
+  export let onEmptyTrash = null; // () => Promise<{emptied, kept, total_bytes, reason, error}>
+
   // 保留策略（非敏感配置，回显后可就地修改）
-  export let retention = null; // { enabled, cleanup_unmanaged, min_age_days }
+  export let retention = null;
   export let onSaveRetention = null; // (retention) => Promise<{error?}>
 
   // 加密密钥（age）
@@ -37,19 +48,34 @@
   // 配置导入/导出
   export let onExportConfig = null; // (passphrase) => Promise<{success, config, error}>
   export let onImportConfig = null; // (passphrase, configText) => Promise<{success, error}>
+
+  // 操作审计
+  export let auditEntries = [];
+  export let onLoadAudit = null; // () => Promise
 </script>
 
-<UserCard {userInfo} {userInfoError} configured={webdavConfigured} />
+<UserCard {userInfo} {userInfoError} configured={webdavConfigured} kzwr={kzwrUser} />
 
 <WebdavSection
   configured={webdavConfigured}
   configuredUrl={webdavUrl}
   configuredUsername={webdavUsername}
+  warning={webdavWarning}
   {busy}
   onSave={onSaveWebdav}
 />
 
-<RetentionSection {retention} {busy} onSave={onSaveRetention} />
+<KzwrSection
+  configured={kzwrConfigured}
+  user={kzwrUser}
+  quotaWarnPercent={kzwrQuotaWarnPercent}
+  {busy}
+  onSaveToken={onSaveKzwrToken}
+  onSaveQuota={onSaveKzwrQuota}
+  onEmptyTrash={onEmptyTrash}
+/>
+
+<RetentionSection {retention} kzwrReady={kzwrConfigured} {busy} onSave={onSaveRetention} />
 
 <KeySection
   {keyInfo}
@@ -65,3 +91,5 @@
 <NotifySection {webhookUrl} {webhookHeaders} {webhookBody} {busy} onSave={onSaveWebhook} onTest={onTestWebhook} />
 
 <ConfigSection {busy} {onExportConfig} {onImportConfig} />
+
+<AuditSection entries={auditEntries} {busy} onLoad={onLoadAudit} />

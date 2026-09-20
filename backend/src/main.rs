@@ -73,6 +73,16 @@ async fn main() -> anyhow::Result<()> {
         infra::keystore::secret(&passphrase_str),
     )));
 
+    // kzwr REST 增强客户端（账号存储空间/回收站清理；与备份通道无关）
+    let kzwr = Arc::new(infra::kzwr_api::client::KzwrClient::default());
+    match config_mgr.lock().unwrap().kzwr_token() {
+        Ok(Some(t)) => {
+            kzwr.set_token(t);
+            info!("kzwr access-token 已加载（增强功能可用：存储空间/回收站）");
+        }
+        _ => info!("未配置 kzwr access-token（增强功能降级，不影响备份/恢复）"),
+    }
+
     // 目标存储：kzwr 官方 WebDAV（唯一目标，ADR-009）
     let (target, backend_name, target_ready) = build_target(&config_mgr)?;
     let target = Arc::new(infra::storage_trait::SwapTarget::new(target));
@@ -94,9 +104,13 @@ async fn main() -> anyhow::Result<()> {
     // 内部事件总线（状态推送）
     let eventbus = Arc::new(fnos_backup::eventbus::EventBus::new());
 
+    let audit = Arc::new(fnos_backup::domain::audit::AuditLog::new(&var_dir));
+
     let state = AppState {
         target,
         target_ready,
+        kzwr,
+        audit,
         backup_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         crypto,
         passphrase: passphrase.clone(),
@@ -117,6 +131,14 @@ async fn main() -> anyhow::Result<()> {
     // 定时备份调度器（后台任务，到点触发备份）
     let scheduler_state = state.clone();
     fnos_backup::domain::scheduler::spawn_scheduler(scheduler_state, 60);
+
+    // 启动时校验 kzwr access-token（已配置时；失效则生成告警提醒用户重新获取）
+    {
+        let check_state = state.clone();
+        tokio::spawn(async move {
+            http::routes::check_kzwr_token(&check_state).await;
+        });
+    }
 
     // 前端静态资源目录
     let www_dir = std::env::var("TRIM_WWW_DIR").unwrap_or_else(|_| "www".to_string());
