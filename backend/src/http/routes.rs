@@ -1387,6 +1387,147 @@ async fn restore_run(
     }
 }
 
+// ── 运行日志（日志页） ─────────────────────────────────────────────
+
+/// 日志查询参数
+#[derive(Deserialize)]
+pub struct LogsQuery {
+    /// 末尾行数（默认 800，上限 5000）
+    #[serde(default)]
+    pub tail: Option<usize>,
+}
+
+/// 日志查询响应
+#[derive(Serialize)]
+pub struct LogsResponse {
+    pub lines: Vec<String>,
+    /// 文件行数是否超过返回内容（前端提示「仅显示末尾 N 行」）
+    pub truncated: bool,
+    /// 日志文件大小（字节）
+    pub size: u64,
+    pub error: Option<String>,
+}
+
+/// 读取运行日志末尾（文件超过 5MB 时自动轮转，故整读安全）
+async fn logs_get(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<LogsQuery>,
+) -> Json<LogsResponse> {
+    let path = state.log_file.clone();
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    if size == 0 {
+        return Json(LogsResponse {
+            lines: Vec::new(),
+            truncated: false,
+            size: 0,
+            error: None,
+        });
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            return Json(LogsResponse {
+                lines: Vec::new(),
+                truncated: false,
+                size,
+                error: Some(format!("读取日志失败: {e}")),
+            })
+        }
+    };
+    let all: Vec<String> = String::from_utf8_lossy(&bytes)
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
+    let total = all.len();
+    let tail = q.tail.unwrap_or(800).min(5000);
+    let start = total.saturating_sub(tail);
+    let lines = all[start..].to_vec();
+    Json(LogsResponse {
+        truncated: total > tail,
+        lines,
+        size,
+        error: None,
+    })
+}
+
+/// 清空运行日志
+async fn logs_clear(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let res = std::fs::write(&state.log_file, b"");
+    match res {
+        Ok(_) => {
+            state.audit.record("logs.clear", "清空运行日志", true, None);
+            Json(serde_json::json!({ "ok": true, "error": null }))
+        }
+        Err(e) => Json(serde_json::json!({ "ok": false, "error": format!("清空失败: {e}") })),
+    }
+}
+
+/// 下载运行日志（text/plain 附件）
+async fn logs_download(State(state): State<AppState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match std::fs::read(&state.log_file) {
+        Ok(bytes) => {
+            let mut resp = (axum::http::StatusCode::OK, bytes).into_response();
+            resp.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            if let Ok(v) = axum::http::HeaderValue::from_str("attachment; filename=\"app.log\"") {
+                resp.headers_mut()
+                    .insert(axum::http::header::CONTENT_DISPOSITION, v);
+            }
+            resp
+        }
+        Err(e) => (
+            axum::http::StatusCode::NOT_FOUND,
+            format!("日志文件不存在: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// 清空审计日志请求（需管理员口令校验）
+#[derive(Deserialize)]
+pub struct AuditClearRequest {
+    /// 管理员口令（安装向导设置的应用口令）
+    #[serde(default)]
+    pub passphrase: String,
+}
+
+/// 清空审计日志响应
+#[derive(Serialize)]
+pub struct AuditClearResponse {
+    pub cleared: usize,
+    pub error: Option<String>,
+}
+
+async fn audit_clear(
+    State(state): State<AppState>,
+    body: Option<Json<AuditClearRequest>>,
+) -> Json<AuditClearResponse> {
+    // 破坏性操作：需管理员口令校验（与导出私钥/配置导入导出同口径）
+    let passphrase = body
+        .and_then(|Json(b)| Some(b.passphrase))
+        .unwrap_or_default();
+    if passphrase.as_str() != state.passphrase.expose_secret().as_str() {
+        return Json(AuditClearResponse {
+            cleared: 0,
+            error: Some("管理员口令错误".to_string()),
+        });
+    }
+    let cleared = state.audit.clear();
+    state.audit.record(
+        "audit.clear",
+        format!("清空审计日志（{cleared} 条，管理员口令校验通过）"),
+        true,
+        None,
+    );
+    Json(AuditClearResponse {
+        cleared,
+        error: None,
+    })
+}
+
 // ── 云端缺失记录清理 ────────────────────────────────────────────────
 
 /// 清理请求体
@@ -3069,6 +3210,10 @@ pub fn router(state: AppState) -> Router {
         .route("/restore/tree", get(restore_tree))
         .route("/restore/run", post(restore_run))
         .route("/restore/prune", post(restore_prune))
+        .route("/logs", get(logs_get))
+        .route("/logs/clear", post(logs_clear))
+        .route("/logs/download", get(logs_download))
+        .route("/audit/clear", post(audit_clear))
         .route("/kzwr/user", get(kzwr_user))
         .route("/kzwr/token", post(kzwr_token_save))
         .route("/kzwr/trash/empty", post(kzwr_trash_empty))

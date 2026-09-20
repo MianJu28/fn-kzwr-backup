@@ -86,4 +86,12 @@ export const api = {
   setupCheck: () => get('/api/setup/check'),
   /** 操作审计日志（最新在前） */
   auditLog: (limit = 100) => get(`/api/audit?limit=${limit}`),
+  /** 清空审计日志（需管理员口令） */
+  auditClear: (passphrase) => post('/api/audit/clear', { passphrase }),
+  /** 运行日志末尾（默认 800 行） */
+  logsTail: (tail = 800) => get(`/api/logs?tail=${tail}`),
+  /** 清空运行日志 */
+  logsClear: () => post('/api/logs/clear'),
+  /** 运行日志下载地址（直接 <a>/window.open） */
+  logsDownloadUrl: '/api/logs/download',
 };

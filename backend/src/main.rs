@@ -43,6 +43,10 @@ async fn main() -> anyhow::Result<()> {
         infra::keystore::secret(&passphrase_str),
     )));
 
+    // 运行日志文件（日志页查看/清空/下载；超过 5MB 轮转为 .old）
+    let log_file = var_dir.join("logs").join("app.log");
+    let log_writer = open_log_file(&log_file)?;
+
     // 日志初始化（调试开关从已持久化配置读取；运行时可经设置页热切换）
     let debug_on = config_mgr
         .lock()
@@ -50,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
         .load()
         .map(|c| c.debug)
         .unwrap_or(false);
-    init_logging(debug_on)?;
+    init_logging(debug_on, log_writer)?;
 
     // 元数据快照库：存 $TRIM_PKGVAR
     let store = Arc::new(infra::persistence::snapshot::SnapshotStore::open(
@@ -133,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
         tmp_dir,
         backup_tmp,
         default_restore_dir,
+        log_file,
     };
 
     // 定时备份调度器（后台任务，到点触发备份）
@@ -167,7 +172,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// 初始化结构化日志（tracing；过滤器可经 [`fnos_backup::apply_log_debug`] 热更新）
-fn init_logging(debug: bool) -> anyhow::Result<()> {
+///
+/// 同时输出到 stdout 与日志文件（日志页查看/下载）。
+fn init_logging(debug: bool, file: LogFileWriter) -> anyhow::Result<()> {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, reload};
     let base = if debug {
         "fnos_backup=debug,tower_http=info"
@@ -180,9 +187,50 @@ fn init_logging(debug: bool) -> anyhow::Result<()> {
     let _ = fnos_backup::LOG_HANDLE.set(handle);
     tracing_subscriber::registry()
         .with(filter_layer)
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer()) // stdout
+        .with(tracing_subscriber::fmt::layer().with_writer(file)) // 日志文件
         .init();
     Ok(())
+}
+
+/// 追加写日志文件的 MakeWriter（供 tracing fmt 层使用）
+struct LogFileWriter(std::sync::Mutex<std::fs::File>);
+
+/// MutexGuard 不实现 io::Write，包一层转发
+struct LogFileGuard<'a>(std::sync::MutexGuard<'a, std::fs::File>);
+
+impl std::io::Write for LogFileGuard<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogFileWriter {
+    type Writer = LogFileGuard<'a>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogFileGuard(self.0.lock().unwrap())
+    }
+}
+
+/// 打开（或轮转后创建）日志文件；超过 5MB 时移为 `app.old.log`
+fn open_log_file(path: &std::path::Path) -> anyhow::Result<LogFileWriter> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > 5 * 1024 * 1024 {
+        let old = path.with_extension("old.log");
+        std::fs::remove_file(&old).ok();
+        std::fs::rename(path, &old).ok();
+    }
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    Ok(LogFileWriter(std::sync::Mutex::new(f)))
 }
 
 /// 构建目标存储：WebDAV 凭据来源优先级 TRIM_DAV_* 环境变量 > 加密配置 [webdav] 段。
