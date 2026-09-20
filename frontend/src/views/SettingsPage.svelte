@@ -6,7 +6,6 @@
   import KeySection from '../components/KeySection.svelte';
   import NotifySection from '../components/NotifySection.svelte';
   import ConfigSection from '../components/ConfigSection.svelte';
-  import AuditSection from '../components/AuditSection.svelte';
 
   export let webdavConfigured = false;
   export let webdavUrl = '';
@@ -48,10 +47,6 @@
   // 配置导入/导出
   export let onExportConfig = null; // (passphrase) => Promise<{success, config, error}>
   export let onImportConfig = null; // (passphrase, configText) => Promise<{success, error}>
-
-  // 操作审计
-  export let auditEntries = [];
-  export let onLoadAudit = null; // () => Promise
 </script>
 
 <UserCard {userInfo} {userInfoError} configured={webdavConfigured} kzwr={kzwrUser} />
@@ -91,5 +86,3 @@
 <NotifySection {webhookUrl} {webhookHeaders} {webhookBody} {busy} onSave={onSaveWebhook} onTest={onTestWebhook} />
 
 <ConfigSection {busy} {onExportConfig} {onImportConfig} />
-
-<AuditSection entries={auditEntries} {busy} onLoad={onLoadAudit} />

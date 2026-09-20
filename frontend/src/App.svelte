@@ -3,12 +3,14 @@
   import BackupPage from './views/BackupPage.svelte';
   import RestorePage from './views/RestorePage.svelte';
   import SettingsPage from './views/SettingsPage.svelte';
+  import AuditPage from './views/AuditPage.svelte';
   import LiveStatus from './components/LiveStatus.svelte';
   import AlertBanner from './components/AlertBanner.svelte';
   import Toast from './components/Toast.svelte';
   import ConfirmDialog from './components/ConfirmDialog.svelte';
   import Icon from './components/Icon.svelte';
   import Logo from './components/Logo.svelte';
+  import RailAccount from './components/RailAccount.svelte';
 
   import { api } from './lib/api.js';
   import { toast } from './lib/toast.js';
@@ -65,10 +67,9 @@
   let kzwrConfigured = false;
   let kzwrUser = null;
   let kzwrQuotaWarnPercent = 85;
-  // 账号一致性提醒 / 一键体检 / 审计日志
+  // 账号一致性提醒 / 一键体检
   let webdavWarning = '';
   let setupResult = null;
-  let auditEntries = [];
   let webhookUrl = '';
   let webhookHeaders = [];
   let webhookBody = '';
@@ -78,6 +79,7 @@
     { id: 'backup', label: '备份', icon: 'upload' },
     { id: 'restore', label: '恢复', icon: 'download' },
     { id: 'settings', label: '设置', icon: 'sliders' },
+    { id: 'audit', label: '审计', icon: 'file' },
   ];
 
   const PAGE_META = {
@@ -85,6 +87,7 @@
     backup: { title: '备份', desc: '配置备份路径与定时任务，或立即执行一次增量备份' },
     restore: { title: '恢复', desc: '浏览云端备份内容，按文件或目录恢复到原位置' },
     settings: { title: '设置', desc: 'WebDAV 凭据、加密密钥、通知与配置迁移' },
+    audit: { title: '操作审计', desc: '敏感与破坏性操作的本地留痕（audit.log）' },
   };
 
   $: page = PAGE_META[currentPage] || PAGE_META.dashboard;
@@ -339,22 +342,6 @@
     } catch (e) {
       error = e.message;
       toast.error(e.message, '体检失败');
-      return null;
-    } finally {
-      busy = false;
-    }
-  }
-
-  /** 读取操作审计日志 */
-  async function handleLoadAudit() {
-    busy = true;
-    try {
-      const d = await api.auditLog(100);
-      auditEntries = d.entries || [];
-      if (d.error) toast.error(d.error);
-      return d;
-    } catch (e) {
-      toast.error(e.message, '读取审计失败');
       return null;
     } finally {
       busy = false;
@@ -687,6 +674,8 @@
               onLoadTree={handleLoadTree}
               onGoto={go}
             />
+          {:else if currentPage === 'audit'}
+            <AuditPage {busy} />
           {:else if currentPage === 'settings'}
             <SettingsPage
               {webdavConfigured}
@@ -697,7 +686,6 @@
               {kzwrConfigured}
               {kzwrUser}
               {kzwrQuotaWarnPercent}
-              {auditEntries}
               {busy}
               {userInfo}
               {userInfoError}
@@ -716,7 +704,6 @@
               onSaveKzwrToken={handleSaveKzwrToken}
               onSaveKzwrQuota={handleSaveKzwrQuota}
               onEmptyTrash={handleEmptyTrash}
-              onLoadAudit={handleLoadAudit}
               onSaveWebhook={handleSaveWebhook}
               onTestWebhook={handleTestWebhook}
               onExportConfig={handleExportConfig}
@@ -726,6 +713,12 @@
         </div>
 
         <aside class="rail">
+          <RailAccount
+            username={webdavUsername || (userInfo && userInfo.username) || ''}
+            configured={webdavConfigured}
+            kzwr={kzwrUser}
+            onGoto={go}
+          />
           <LiveStatus {liveStatus} {wsConnected} />
         </aside>
       </div>
