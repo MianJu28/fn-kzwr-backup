@@ -16,8 +16,6 @@ const DEFAULT_PORT: u16 = 8080;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_logging()?;
-
     // 飞牛路径用 TRIM_* 环境变量，禁止硬编码
     let port: u16 = std::env::var("TRIM_HTTP_PORT")
         .ok()
@@ -34,15 +32,30 @@ async fn main() -> anyhow::Result<()> {
     let backup_tmp = tmp_dir.join("staging");
     std::fs::create_dir_all(&backup_tmp).ok();
 
-    // 元数据快照库：存 $TRIM_PKGVAR
-    let store = Arc::new(infra::persistence::snapshot::SnapshotStore::open(
-        &var_dir.join("meta.db"),
-    )?);
-
     // 口令：用于敏感字段（WebDAV 凭据、密钥库）加密
     let passphrase_str =
         std::env::var("TRIM_PASSPHRASE").unwrap_or_else(|_| "change-me".to_string());
     let passphrase = Arc::new(infra::keystore::secret(&passphrase_str));
+
+    // 配置管理器（提前创建：日志初始化需读取 debug 开关）
+    let config_mgr = Arc::new(Mutex::new(infra::config::ConfigManager::new(
+        &cfg_dir,
+        infra::keystore::secret(&passphrase_str),
+    )));
+
+    // 日志初始化（调试开关从已持久化配置读取；运行时可经设置页热切换）
+    let debug_on = config_mgr
+        .lock()
+        .unwrap()
+        .load()
+        .map(|c| c.debug)
+        .unwrap_or(false);
+    init_logging(debug_on)?;
+
+    // 元数据快照库：存 $TRIM_PKGVAR
+    let store = Arc::new(infra::persistence::snapshot::SnapshotStore::open(
+        &var_dir.join("meta.db"),
+    )?);
 
     // 加密会话（age 密钥对：从密钥库加载；不存在则自动生成并提示用户保存）
     let pending_reveal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -66,12 +79,6 @@ async fn main() -> anyhow::Result<()> {
     let crypto = Arc::new(fnos_backup::CryptoSwap::new(
         fnos_backup::domain::crypto::CryptoSession::full(&keys),
     ));
-
-    // 配置管理器
-    let config_mgr = Arc::new(Mutex::new(infra::config::ConfigManager::new(
-        &cfg_dir,
-        infra::keystore::secret(&passphrase_str),
-    )));
 
     // kzwr REST 增强客户端（账号存储空间/回收站清理；与备份通道无关）
     let kzwr = Arc::new(infra::kzwr_api::client::KzwrClient::default());
@@ -159,12 +166,22 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 初始化结构化日志（tracing）
-fn init_logging() -> anyhow::Result<()> {
-    use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("fnos_backup=info,tower_http=info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+/// 初始化结构化日志（tracing；过滤器可经 [`fnos_backup::apply_log_debug`] 热更新）
+fn init_logging(debug: bool) -> anyhow::Result<()> {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, reload};
+    let base = if debug {
+        "fnos_backup=debug,tower_http=info"
+    } else {
+        "fnos_backup=info,tower_http=info"
+    };
+    // TRIM_LOG=debug 环境变量仍可强制覆盖初始级别
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(base));
+    let (filter_layer, handle) = reload::Layer::new(filter);
+    let _ = fnos_backup::LOG_HANDLE.set(handle);
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
     Ok(())
 }
 

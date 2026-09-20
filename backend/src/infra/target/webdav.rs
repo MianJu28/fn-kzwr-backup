@@ -188,6 +188,53 @@ impl WebdavTarget {
             .basic_auth(&self.username, Some(&self.password))
     }
 
+    /// 发送请求并在**网络错误 / 5xx** 时重试（最多 3 次，线性退避 500ms*n）
+    ///
+    /// 仅用于幂等的小请求（PROPFIND / MKCOL / DELETE / GET；body 为空或小字符串，
+    /// 可被 `try_clone` 复制）。PUT 大 body 走 [`put_bytes_retry`]，不经过这里。
+    async fn send_retry(
+        &self,
+        rb: reqwest::RequestBuilder,
+        what: &str,
+    ) -> StorageResult<reqwest::Response> {
+        const RETRY_ATTEMPTS: u32 = 3;
+        for attempt in 1..=RETRY_ATTEMPTS {
+            let req = match rb.try_clone() {
+                Some(r) => r,
+                None => {
+                    // body 不可克隆时退化为单次发送
+                    return rb
+                        .send()
+                        .await
+                        .map_err(|e| StorageError::Protocol(format!("{what} 失败: {e}")));
+                }
+            };
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_server_error() && attempt < RETRY_ATTEMPTS {
+                        tracing::warn!("{what} 第 {attempt}/{RETRY_ATTEMPTS} 次失败: HTTP {status}");
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            500 * attempt as u64,
+                        ))
+                        .await;
+                        continue;
+                    }
+                    return Ok(resp);
+                }
+                Err(e) if attempt < RETRY_ATTEMPTS => {
+                    tracing::warn!("{what} 第 {attempt}/{RETRY_ATTEMPTS} 次失败: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
+                        .await;
+                }
+                Err(e) => {
+                    return Err(StorageError::Protocol(format!("{what} 失败: {e}")));
+                }
+            }
+        }
+        Err(StorageError::Protocol(format!("{what} 重试次数耗尽")))
+    }
+
     /// 逐级 MKCOL 创建路径上的所有目录（从根到叶子；已存在视为成功）
     async fn mkcol_chain(&self, path: &Path) -> StorageResult<()> {
         let mut cur = String::new();
@@ -203,10 +250,11 @@ impl WebdavTarget {
             }
             let url = self.url_for(&cur);
             let resp = self
-                .request(Method::from_bytes(b"MKCOL").unwrap(), &url)
-                .send()
-                .await
-                .map_err(|e| StorageError::Protocol(format!("MKCOL {} 失败: {}", url, e)))?;
+                .send_retry(
+                    self.request(Method::from_bytes(b"MKCOL").unwrap(), &url),
+                    &format!("MKCOL {url}"),
+                )
+                .await?;
             let status = resp.status();
             // 201 创建成功；405/301 已存在（kzwr 服务器对已存在目录返回 301）
             if status != StatusCode::CREATED
@@ -235,12 +283,13 @@ impl WebdavTarget {
     async fn propfind(&self, rel: &str, depth: &str) -> StorageResult<Vec<DavEntry>> {
         let url = self.url_for(rel);
         let resp = self
-            .request(Method::from_bytes(b"PROPFIND").unwrap(), &url)
-            .header("Depth", depth)
-            .body("")
-            .send()
-            .await
-            .map_err(|e| StorageError::Protocol(format!("PROPFIND {} 失败: {}", url, e)))?;
+            .send_retry(
+                self.request(Method::from_bytes(b"PROPFIND").unwrap(), &url)
+                    .header("Depth", depth)
+                    .body(""),
+                &format!("PROPFIND {url}"),
+            )
+            .await?;
         match resp.status() {
             StatusCode::MULTI_STATUS => {}
             StatusCode::NOT_FOUND => return Ok(Vec::new()),
@@ -414,10 +463,8 @@ impl WebdavTarget {
     async fn delete_raw(&self, path: &Path) -> StorageResult<()> {
         let url = self.url_for(&path.to_string_lossy());
         let resp = self
-            .request(Method::DELETE, &url)
-            .send()
-            .await
-            .map_err(|e| StorageError::Protocol(format!("DELETE {} 失败: {}", url, e)))?;
+            .send_retry(self.request(Method::DELETE, &url), &format!("DELETE {url}"))
+            .await?;
         match resp.status() {
             s if s.is_success() => Ok(()),
             StatusCode::NOT_FOUND => Ok(()),
@@ -439,12 +486,9 @@ impl WebdavTarget {
         for idx in 1.. {
             let part = self.part_path(path, idx);
             let url = self.url_for(&part.to_string_lossy());
-            let resp = match self.request(Method::DELETE, &url).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    return Err(StorageError::Protocol(format!("DELETE {} 失败: {}", url, e)))
-                }
-            };
+            let resp = self
+                .send_retry(self.request(Method::DELETE, &url), &format!("DELETE {url}"))
+                .await?;
             match resp.status() {
                 s if s.is_success() => continue,
                 StatusCode::NOT_FOUND => return Ok(()),
@@ -476,10 +520,8 @@ impl WebdavTarget {
     ) -> StorageResult<Box<dyn Stream<Item = StorageResult<Bytes>> + Send + Unpin>> {
         let url = self.url_for(&path.to_string_lossy());
         let resp = self
-            .request(Method::GET, &url)
-            .send()
-            .await
-            .map_err(|e| StorageError::Protocol(format!("GET {} 失败: {}", url, e)))?;
+            .send_retry(self.request(Method::GET, &url), &format!("GET {url}"))
+            .await?;
         let status = resp.status();
         match status {
             StatusCode::OK => {}

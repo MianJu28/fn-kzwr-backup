@@ -87,6 +87,8 @@ pub struct ConfigResponse {
     pub webhook_body: Option<String>,
     /// 用户是否已确认备份 age 私钥（未确认时 UI 提示丢失风险）
     pub key_backed_up: bool,
+    /// 调试日志开关（开启后输出详细日志，便于问题定位）
+    pub debug: bool,
     pub error: Option<String>,
 }
 
@@ -143,6 +145,9 @@ pub struct ConfigSaveRequest {
     /// kzwr 云端空间预警阈值（百分比，0 = 关闭）
     #[serde(default)]
     pub kzwr_quota_warn_percent: Option<u64>,
+    /// 调试日志开关（不传则保持原值）
+    #[serde(default)]
+    pub debug: Option<bool>,
 }
 
 /// 备份响应
@@ -182,6 +187,9 @@ pub struct RestoreResponse {
     pub restored: usize,
     pub restored_bytes: u64,
     pub error: Option<String>,
+    /// 云端已不存在而被跳过的文件（最多 200 条；为空不序列化）
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub missing: Vec<String>,
 }
 
 /// 一个备份文件夹的可恢复概况（文件明细改为按目录懒加载）
@@ -587,6 +595,7 @@ fn config_response(
         webhook_headers: cfg.notify.webhook_headers.clone(),
         webhook_body: cfg.notify.webhook_body.clone(),
         key_backed_up: cfg.keys.backed_up,
+        debug: cfg.debug,
         error,
     }
 }
@@ -621,6 +630,7 @@ async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
             webhook_headers: Vec::new(),
             webhook_body: None,
             key_backed_up: false,
+            debug: false,
             error: Some(format!("{:#}", e)),
         }),
     }
@@ -667,6 +677,10 @@ async fn config_save(
         // 合法区间 0..=100（0 = 关闭预警）
         cfg.kzwr.quota_warn_percent = v.min(100);
     }
+    // 调试日志开关：保存并即时生效（日志过滤器热更新）
+    if let Some(v) = body.debug {
+        cfg.debug = v;
+    }
     // 定时 cron：校验合法性；空串视为关闭
     if let Some(cron) = body.schedule_cron {
         let cron = cron.trim().to_string();
@@ -702,6 +716,8 @@ async fn config_save(
                 true,
                 None,
             );
+            // 调试日志开关热更新（保存成功后立即切换日志级别）
+            crate::apply_log_debug(cfg.debug);
             Json(config_response(&cfg, webdav_ready(&cfg), wuser, kzwr_on, None))
         }
         Err(e) => Json(config_response(&cfg, false, wuser, kzwr_on, Some(format!("{:#}", e)))),
@@ -912,6 +928,20 @@ pub async fn run_backup_now(state: &AppState) -> BackupResponse {
                 crate::domain::alerts::AlertSource::Backup,
                 format!("备份失败：{}", msg),
             );
+            // 发布 Failed 终态事件：否则前端任务面板停留在「进行中」永不结束
+            state.eventbus.task_event(
+                crate::eventbus::TaskKind::Backup,
+                crate::eventbus::TaskStatus::Failed,
+                state.job_id.clone(),
+                None,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some(msg.clone()),
+            );
             BackupResponse {
                 error: Some(msg),
                 ..Default::default()
@@ -940,43 +970,99 @@ fn read_backup_config(
     }
 }
 
-/// 统计某前缀（`""` = 整棵快照，`"dir/"` = 某目录）下的递归文件数、子目录数、明文总字节
+/// 快照聚合索引：**一次遍历**构建全部前缀的统计，之后 O(1) 查询
 ///
-/// 快照条目来自 SQLite（可能缺目录条目、且顺序不定），故按路径自行推导层级，
-/// 用 `BTreeSet` 去重目录，避免「同一目录被多条深层文件重复计数」。
-fn snapshot_aggregate(
-    entries: &[crate::infra::persistence::snapshot::SnapshotEntry],
-    prefix: &str,
-) -> (usize, usize, u64) {
-    let mut files = 0usize;
-    let mut dirs = std::collections::BTreeSet::new();
-    let mut bytes = 0u64;
-    for e in entries {
-        let Some(rest) = e.rel_path.strip_prefix(prefix) else {
-            continue;
-        };
-        if rest.is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = rest.split('/').collect();
-        // 目录条目：自身 + 各级祖先；文件：各级祖先（文件本身计入 files）
-        let take = if e.is_dir {
-            parts.len()
-        } else {
-            files += 1;
-            bytes += e.size;
-            parts.len().saturating_sub(1)
-        };
-        let mut acc = String::new();
-        for p in parts.iter().take(take) {
+/// 原实现（`snapshot_aggregate`）对每个目录节点全量扫描一遍快照，
+/// 树接口整体 O(条目数 × 节点数)；大快照下是响应慢的主因之一。
+/// 这里一趟完成：
+/// - 文件条目：把 (1, size) 累加到**各级祖先前缀**（含根 ""）；
+/// - 目录宇宙（目录条目 + 文件的各级祖先）：为每个目录向其**所有真前缀**（含根）
+///   计 1 —— 与原实现「BTreeSet 去重后数集合」语义一致；
+/// - 文件大小表：文件路径 → 明文字节（树接口文件节点 O(1) 取大小）。
+struct SnapshotAgg {
+    /// 前缀（"" 表示根）→ (递归文件数, 递归明文字节)
+    files: std::collections::HashMap<String, (usize, u64)>,
+    /// 前缀（"" 表示根）→ 严格位于该前缀下的目录数
+    dirs: std::collections::HashMap<String, usize>,
+    /// 文件相对路径 → 明文大小
+    sizes: std::collections::HashMap<String, u64>,
+}
+
+impl SnapshotAgg {
+    fn build(
+        entries: &[crate::infra::persistence::snapshot::SnapshotEntry],
+    ) -> Self {
+        let mut files: std::collections::HashMap<String, (usize, u64)> =
+            std::collections::HashMap::new();
+        let mut dir_universe: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut sizes: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+
+        let push_dir = |universe: &mut std::collections::HashSet<String>, acc: &mut String, p: &str| {
             if !acc.is_empty() {
                 acc.push('/');
             }
             acc.push_str(p);
-            dirs.insert(acc.clone());
+            universe.insert(acc.clone());
+        };
+
+        for e in entries {
+            let parts: Vec<&str> = e.rel_path.split('/').collect();
+            if e.is_dir {
+                let mut acc = String::new();
+                for p in &parts {
+                    push_dir(&mut dir_universe, &mut acc, p);
+                }
+            } else {
+                sizes.insert(e.rel_path.clone(), e.size);
+                // 各级祖先（i = 0..len-1；i=0 即根 ""）
+                let mut acc = String::new();
+                for p in &parts[..parts.len().saturating_sub(1)] {
+                    let v = files.entry(acc.clone()).or_insert((0, 0));
+                    v.0 += 1;
+                    v.1 += e.size;
+                    push_dir(&mut dir_universe, &mut acc, p);
+                }
+                let v = files.entry(acc.clone()).or_insert((0, 0));
+                v.0 += 1;
+                v.1 += e.size;
+            }
+        }
+
+        // 每个目录向其所有真前缀（含根 ""）计 1
+        let mut dirs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for d in &dir_universe {
+            let parts: Vec<&str> = d.split('/').collect();
+            let mut acc = String::new();
+            for p in &parts[..parts.len() - 1] {
+                if !acc.is_empty() {
+                    acc.push('/');
+                }
+                acc.push_str(p);
+                *dirs.entry(acc.clone()).or_insert(0) += 1;
+            }
+            *dirs.entry(String::new()).or_insert(0) += 1;
+        }
+
+        Self {
+            files,
+            dirs,
+            sizes,
         }
     }
-    (files, dirs.len(), bytes)
+
+    /// 查询某前缀下的 (递归文件数, 递归子目录数, 递归明文字节)
+    fn get(&self, prefix: &str) -> (usize, usize, u64) {
+        let p = prefix.trim_matches('/');
+        let (f, b) = self.files.get(p).copied().unwrap_or((0, 0));
+        let d = self.dirs.get(p).copied().unwrap_or(0);
+        (f, d, b)
+    }
+
+    /// 文件相对路径 → 明文大小（未知为 0）
+    fn size_of(&self, rel_path: &str) -> u64 {
+        self.sizes.get(rel_path).copied().unwrap_or(0)
+    }
 }
 
 /// 列出某前缀下的直接子项（名称 + 是否目录），目录优先、其余按名称排序
@@ -1038,7 +1124,8 @@ async fn restore_files(State(state): State<AppState>) -> Json<RestoreFilesRespon
         // 多路径备份时，每个路径的 job_id = "{base}-{i}"
         let job_id = format!("{}-{}", state.job_id, i);
         let entries = state.store.load_snapshot(&job_id, &account).unwrap_or_default();
-        let (file_count, dir_count, total_bytes) = snapshot_aggregate(&entries, "");
+        let agg = SnapshotAgg::build(&entries);
+        let (file_count, dir_count, total_bytes) = agg.get("");
 
         folders.push(RestorableFolder {
             path: path.to_string_lossy().into_owned(),
@@ -1076,6 +1163,9 @@ async fn restore_tree(
         format!("{}/", dir)
     };
 
+    // 一次遍历建索引：目录统计与文件大小查询均为 O(1)
+    let agg = SnapshotAgg::build(&entries);
+
     let mut nodes = Vec::new();
     for (name, is_dir) in snapshot_children(&entries, &prefix) {
         let rel_path = if dir.is_empty() {
@@ -1084,8 +1174,7 @@ async fn restore_tree(
             format!("{}/{}", dir, name)
         };
         if is_dir {
-            let (file_count, dir_count, total_bytes) =
-                snapshot_aggregate(&entries, &format!("{}/", rel_path));
+            let (file_count, dir_count, total_bytes) = agg.get(&rel_path);
             nodes.push(RestoreNode {
                 name,
                 rel_path,
@@ -1096,11 +1185,7 @@ async fn restore_tree(
                 total_bytes,
             });
         } else {
-            let size = entries
-                .iter()
-                .find(|e| !e.is_dir && e.rel_path == rel_path)
-                .map(|e| e.size)
-                .unwrap_or(0);
+            let size = agg.size_of(&rel_path);
             nodes.push(RestoreNode {
                 name,
                 rel_path,
@@ -1137,6 +1222,7 @@ async fn restore_run(
             restored: 0,
             restored_bytes: 0,
             error: Some("WebDAV 未配置，请先在设置中填写 WebDAV 地址与凭据".to_string()),
+            missing: Vec::new(),
         });
     }
 
@@ -1205,6 +1291,7 @@ async fn restore_run(
                 restored: 0,
                 restored_bytes: 0,
                 error: Some("未找到该路径的备份快照，请先执行一次备份".to_string()),
+                missing: Vec::new(),
             });
         }
         let prefix = restore_dir.as_ref().map(|d| format!("{}/", d));
@@ -1225,6 +1312,7 @@ async fn restore_run(
                     Some(d) => format!("目录 {d} 下暂无可恢复的文件"),
                     None => "该路径暂无可恢复的文件".to_string(),
                 }),
+                missing: Vec::new(),
             });
         }
         tracing::info!(
@@ -1257,10 +1345,14 @@ async fn restore_run(
                 true,
                 None,
             );
+            // 云端缺失的文件截断到 200 条，避免超大响应
+            let mut missing = summary.missing;
+            missing.truncate(200);
             Json(RestoreResponse {
                 restored: summary.restored,
                 restored_bytes: summary.restored_bytes,
                 error: None,
+                missing,
             })
         }
         Err(e) => {
@@ -1271,13 +1363,178 @@ async fn restore_run(
                 crate::domain::alerts::AlertSource::Restore,
                 format!("恢复失败：{}", msg),
             );
+            // 发布 Failed 终态事件：否则前端任务面板停留在「进行中」永不结束
+            state.eventbus.task_event(
+                crate::eventbus::TaskKind::Restore,
+                crate::eventbus::TaskStatus::Failed,
+                "restore".to_string(),
+                None,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some(msg.clone()),
+            );
             Json(RestoreResponse {
                 restored: 0,
                 restored_bytes: 0,
                 error: Some(msg),
+                missing: Vec::new(),
             })
         }
     }
+}
+
+// ── 云端缺失记录清理 ────────────────────────────────────────────────
+
+/// 清理请求体
+#[derive(Deserialize)]
+pub struct PruneMissingRequest {
+    /// 备份源路径（与恢复页一致）
+    pub source_path: String,
+}
+
+/// 清理响应
+#[derive(Serialize)]
+pub struct PruneMissingResponse {
+    /// 检查的快照文件数
+    pub checked: usize,
+    /// 已从快照移除的失效记录数
+    pub removed: usize,
+    /// 被移除的文件（最多 200 条）
+    pub files: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// 清理快照中云端已不存在的文件记录
+///
+/// 做法：递归列出目标端 `/<target_folder>/<源文件夹名>` 下的实际文件，
+/// 与快照对比；快照里有、云端没有的记录即为失效，逐条从快照删除。
+/// **只动快照元数据，不删云端任何文件。**
+async fn restore_prune(
+    State(state): State<AppState>,
+    Json(body): Json<PruneMissingRequest>,
+) -> Json<PruneMissingResponse> {
+    fn resp(checked: usize, removed: usize, files: Vec<String>, error: Option<String>) -> PruneMissingResponse {
+        PruneMissingResponse {
+            checked,
+            removed,
+            files,
+            error,
+        }
+    }
+    fn err(e: impl std::fmt::Display) -> PruneMissingResponse {
+        resp(0, 0, Vec::new(), Some(e.to_string()))
+    }
+
+    let configured = state.target_ready
+        || {
+            let mgr = state.config.lock().unwrap();
+            mgr.load().map(|c| webdav_ready(&c)).unwrap_or(false)
+        };
+    if !configured {
+        return Json(err("WebDAV 未配置，请先在设置中填写 WebDAV 地址与凭据"));
+    }
+
+    // 定位该源路径对应的快照（与恢复页一致的两级匹配）
+    let (paths, target_folder, _) = read_backup_config(&state);
+    let root = std::path::Path::new(&body.source_path);
+    let idx = paths
+        .iter()
+        .position(|p| p.as_path() == root)
+        .or_else(|| {
+            root.file_name()
+                .and_then(|n| paths.iter().position(|p| p.file_name() == Some(n)))
+        });
+    let Some(idx) = idx else {
+        return Json(err("该路径不在备份配置中"));
+    };
+    let account = webdav_username(&state).unwrap_or_default();
+    let job_id = format!("{}-{}", state.job_id, idx);
+    let entries = match state.store.load_snapshot(&job_id, &account) {
+        Ok(e) => e,
+        Err(e) => return Json(err(format!("读取备份快照失败: {e:#}"))),
+    };
+    let snapshot_files: Vec<String> = entries
+        .iter()
+        .filter(|e| !e.is_dir)
+        .map(|e| e.rel_path.clone())
+        .collect();
+    if snapshot_files.is_empty() {
+        return Json(resp(0, 0, Vec::new(), None));
+    }
+
+    // 目标端基路径：/<target_folder>[/<源文件夹名>]（与备份/恢复的布局一致）
+    let source_root_name = root
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut segs: Vec<String> = Vec::new();
+    let tf = target_folder.trim_matches('/');
+    if !tf.is_empty() {
+        segs.push(tf.to_string());
+    }
+    let rn = source_root_name.trim_matches('/');
+    if !rn.is_empty() {
+        segs.push(rn.to_string());
+    }
+    if segs.is_empty() {
+        return Json(err("目标目录为空，无法清理"));
+    }
+    let base = format!("/{}", segs.join("/"));
+    let base_prefix = format!("{}/", base.trim_matches('/'));
+
+    // 递归列出云端实际文件（显式栈遍历；分片文件由 list 合并为逻辑条目）
+    let mut cloud: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stack: Vec<String> = vec![base.clone()];
+    while let Some(dir) = stack.pop() {
+        let entries = match state.target.list(&dir).await {
+            Ok(e) => e,
+            Err(e) => return Json(err(format!("列出云端目录失败: {e}"))),
+        };
+        for e in entries {
+            if e.is_dir {
+                stack.push(format!("/{}", e.rel_path.trim_matches('/')));
+            } else {
+                let rel = e
+                    .rel_path
+                    .trim_start_matches('/')
+                    .strip_prefix(base_prefix.as_str())
+                    .unwrap_or(e.rel_path.trim_start_matches('/'));
+                cloud.insert(rel.to_string());
+            }
+        }
+    }
+
+    // 对比并删除失效记录（快照有、云端没有）
+    let mut removed_files: Vec<String> = Vec::new();
+    for rel in &snapshot_files {
+        if !cloud.contains(rel) {
+            match state.store.delete_entry(&job_id, &account, rel) {
+                Ok(true) => removed_files.push(rel.clone()),
+                Ok(false) => {}
+                Err(e) => return Json(err(format!("删除快照记录失败: {e}"))),
+            }
+        }
+    }
+    let checked = snapshot_files.len();
+    let removed = removed_files.len();
+    let mut files = removed_files;
+    files.truncate(200);
+    if removed > 0 {
+        state.audit.record(
+            "restore.prune",
+            format!(
+                "清理云端缺失记录（{}）：移除 {} 条失效快照",
+                body.source_path, removed
+            ),
+            true,
+            None,
+        );
+    }
+    Json(resp(checked, removed, files, None))
 }
 
 // ── 增强功能公共辅助 ──────────────────────────────────────────────────
@@ -1530,17 +1787,33 @@ pub struct KzwrTrashResponse {
 }
 
 /// 取出响应里的回收站条目数组
+///
+/// 字段名随版本而异，逐个尝试常见位置（`data.items` / `data.list` /
+/// `data.records` / `data.files` / 根 `items` / `data` 本身为数组）。
 fn trash_items(v: &serde_json::Value) -> Vec<serde_json::Value> {
-    v.get("data")
-        .and_then(|d| d.get("items"))
-        .and_then(|i| i.as_array())
-        .cloned()
-        .unwrap_or_default()
+    for (obj, key) in [
+        (v.get("data"), "items"),
+        (v.get("data"), "list"),
+        (v.get("data"), "records"),
+        (v.get("data"), "files"),
+        (Some(v), "items"),
+    ] {
+        if let Some(arr) = obj.and_then(|d| d.get(key)).and_then(|i| i.as_array()) {
+            if !arr.is_empty() {
+                return arr.clone();
+            }
+        }
+    }
+    if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+        return arr.clone();
+    }
+    Vec::new()
 }
 
 /// 解析回收站条目大小（字节）：字段名随不同版本而异，逐个尝试
+/// （实测 kzwr 返回 `length`；其余为兼容候选）
 fn trash_item_size(it: &serde_json::Value) -> Option<u64> {
-    for k in ["size", "fileSize", "sizeBytes", "bytes", "totalSize"] {
+    for k in ["length", "size", "fileSize", "sizeBytes", "bytes", "totalSize"] {
         let Some(v) = it.get(k) else { continue };
         if let Some(n) = v.as_u64() {
             return Some(n);
@@ -1556,7 +1829,8 @@ fn trash_item_size(it: &serde_json::Value) -> Option<u64> {
 
 /// 解析回收站条目的删除时间（毫秒时间戳）：兼容秒级数值与 RFC3339 字符串
 fn trash_item_deleted_ms(it: &serde_json::Value) -> Option<i64> {
-    const KEYS: [&str; 7] = [
+    const KEYS: [&str; 8] = [
+        "deletedDate",
         "deleteTime",
         "deletedAt",
         "deleteAt",
@@ -1577,7 +1851,38 @@ fn trash_item_deleted_ms(it: &serde_json::Value) -> Option<i64> {
             if let Ok(d) = chrono::DateTime::parse_from_rfc3339(s) {
                 return Some(d.timestamp_millis());
             }
+            // 无时区的裸日期时间（如 "2026-09-20 12:34:56"）：kzwr 返回的是
+            // 服务器本地时间，按**宿主本地时区**解释（与调度器口径一致），
+            // 否则年龄门槛会偏差一个时区偏移量
+            if let Some(ms) = parse_naive_local_ms(s) {
+                return Some(ms);
+            }
         }
+    }
+    None
+}
+
+/// 解析无时区的日期时间字符串，按宿主本地时区解释为毫秒时间戳
+fn parse_naive_local_ms(s: &str) -> Option<i64> {
+    use chrono::TimeZone;
+    if let Ok(nd) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return chrono::Local
+            .from_local_datetime(&nd)
+            .single()
+            .map(|d| d.timestamp_millis());
+    }
+    if let Ok(nd) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        return chrono::Local
+            .from_local_datetime(&nd)
+            .single()
+            .map(|d| d.timestamp_millis());
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        let nd = d.and_hms_opt(0, 0, 0)?;
+        return chrono::Local
+            .from_local_datetime(&nd)
+            .single()
+            .map(|d| d.timestamp_millis());
     }
     None
 }
@@ -1610,6 +1915,10 @@ async fn empty_recycle_bin_gated(
 
     for round in 0..200 {
         let v = client.get_trash(1).await.map_err(|e| format!("{e}"))?;
+        if round == 0 {
+            // debug 日志记录首页原始响应（结构不确定，便于排查「没清理」类问题）
+            tracing::debug!("回收站首页原始响应: {}", v.to_string().chars().take(1200).collect::<String>());
+        }
         let items = trash_items(&v);
         if items.is_empty() {
             if round == 0 {
@@ -1697,10 +2006,39 @@ async fn empty_recycle_bin_if_configured(state: &AppState) -> usize {
                 reason = o.reason.clone().unwrap_or_default(),
                 "保留策略：回收站清理完成"
             );
+            // 结果留痕到审计（含未清理原因），用户可从审计页看到「为什么没清理」
+            let reason = o.reason.clone().unwrap_or_default();
+            let summary = if o.emptied > 0 {
+                format!(
+                    "自动清空回收站：清理 {} 项、保留 {} 项{}",
+                    o.emptied,
+                    o.kept,
+                    if reason.is_empty() { String::new() } else { format!("；{reason}") }
+                )
+            } else {
+                format!(
+                    "自动清空回收站：未删除任何条目（保留 {} 项）{}",
+                    o.kept,
+                    if reason.is_empty() { String::new() } else { format!("：{reason}") }
+                )
+            };
+            state.audit.record("kzwr.trash.auto", summary, true, None);
             o.emptied
         }
         Err(e) => {
             tracing::warn!("保留策略：清空回收站失败：{}", e);
+            state.audit.record(
+                "kzwr.trash.auto",
+                format!("自动清空回收站失败：{e}"),
+                false,
+                None,
+            );
+            raise_alert_once(
+                state,
+                crate::domain::alerts::AlertLevel::Warn,
+                crate::domain::alerts::AlertSource::Kzwr,
+                format!("备份后自动清空回收站失败：{e}"),
+            );
             0
         }
     }
@@ -2730,6 +3068,7 @@ pub fn router(state: AppState) -> Router {
         .route("/restore/files", get(restore_files))
         .route("/restore/tree", get(restore_tree))
         .route("/restore/run", post(restore_run))
+        .route("/restore/prune", post(restore_prune))
         .route("/kzwr/user", get(kzwr_user))
         .route("/kzwr/token", post(kzwr_token_save))
         .route("/kzwr/trash/empty", post(kzwr_trash_empty))

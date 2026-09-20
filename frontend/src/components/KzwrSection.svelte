@@ -227,11 +227,17 @@
     <div class="quota-row">
       <label class="field quota-field">
         <span class="label">空间预警阈值（%）<span class="opt">0 = 关闭</span></span>
-        <input class="input mono" type="number" min="0" max="100" bind:value={qwPercent} />
+        <span class="quota-inline">
+          <input class="input mono" type="number" min="0" max="100" bind:value={qwPercent} />
+          <button
+            class="btn btn-soft nowrap"
+            on:click={saveQuota}
+            disabled={busy || savingQuota || !onSaveQuota}
+          >
+            {#if savingQuota}<span class="spin"></span>保存中{:else}<Icon name="check" size={14} />保存阈值{/if}
+          </button>
+        </span>
       </label>
-      <button class="btn btn-soft" on:click={saveQuota} disabled={busy || savingQuota || !onSaveQuota}>
-        {#if savingQuota}<span class="spin"></span>保存中{:else}<Icon name="check" size={14} />保存阈值{/if}
-      </button>
       {#if quotaMsg}<span class="quota-msg">{quotaMsg}</span>{/if}
     </div>
 
@@ -334,18 +340,30 @@
   }
   .quota-row {
     display: flex;
-    align-items: flex-end;
+    align-items: center;
     gap: var(--s3);
     margin-top: var(--s3);
     flex-wrap: wrap;
   }
   .quota-field {
-    max-width: 200px;
+    max-width: 340px;
+    flex: 1;
+    min-width: 240px;
+  }
+  /* 输入框与保存按钮同行对齐（修复按钮错位） */
+  .quota-inline {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+    width: 100%;
+  }
+  .quota-inline .input {
+    flex: 1;
+    min-width: 0;
   }
   .quota-msg {
     font-size: 12px;
     color: var(--text-3);
-    padding-bottom: 9px;
   }
   .guide {
     margin-top: var(--s3);

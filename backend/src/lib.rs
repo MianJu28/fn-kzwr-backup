@@ -24,6 +24,26 @@ pub struct CryptoSwap {
     inner: RwLock<CryptoSession>,
 }
 
+/// 日志过滤器热更新句柄（设置页切换「调试日志」时即时生效，无需重启）
+///
+/// main 初始化日志时装入；config 保存 debug 开关时经 `modify` 切换级别。
+pub static LOG_HANDLE: std::sync::OnceLock<
+    tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>,
+> = std::sync::OnceLock::new();
+
+/// 应用调试日志过滤器（debug=true 输出 fnos_backup 详细日志）
+pub fn apply_log_debug(debug: bool) {
+    use tracing_subscriber::EnvFilter;
+    let filter = if debug {
+        "fnos_backup=debug,tower_http=info"
+    } else {
+        "fnos_backup=info,tower_http=info"
+    };
+    if let Some(h) = LOG_HANDLE.get() {
+        let _ = h.modify(|l| *l = EnvFilter::new(filter));
+    }
+}
+
 impl CryptoSwap {
     /// 创建（初始会话）
     pub fn new(session: CryptoSession) -> Self {

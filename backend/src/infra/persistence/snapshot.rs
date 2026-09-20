@@ -179,6 +179,18 @@ impl SnapshotStore {
         rows.collect()
     }
 
+    /// 删除单条快照记录（云端文件已不存在时清理用）
+    ///
+    /// 返回是否确有删除（false = 记录本就不存在）
+    pub fn delete_entry(&self, job_id: &str, account: &str, rel_path: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM sync_snapshots WHERE account = ?1 AND job_id = ?2 AND rel_path = ?3",
+            rusqlite::params![account, job_id, rel_path],
+        )?;
+        Ok(n > 0)
+    }
+
     /// 获取单个文件的快照记录（可选）
     pub fn get_entry(&self, job_id: &str, rel_path: &str) -> rusqlite::Result<Option<SnapshotEntry>> {
         let conn = self.conn.lock().unwrap();

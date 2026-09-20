@@ -123,27 +123,84 @@ impl KzwrClient {
         h
     }
 
-    /// 统一 GET 请求（JSON）
+    /// 统一 GET 请求（JSON；网络错误/5xx 自动重试）
     async fn get_json(&self, path: &str, params: &[(&str, String)]) -> KzwrResult<Value> {
-        let mut req = self.http.get(self.url(path));
-        for (k, v) in params {
-            req = req.query(&[(k, v.as_str())]);
-        }
-        for (k, v) in self.auth_headers() {
-            req = req.header(&k, v);
-        }
-        let resp = req.send().await?;
-        Self::parse_response(resp).await
+        let what = format!("GET {path}");
+        self.request_with_retry(&what, || {
+            let mut req = self.http.get(self.url(path));
+            for (k, v) in params {
+                req = req.query(&[(k, v.as_str())]);
+            }
+            for (k, v) in self.auth_headers() {
+                req = req.header(&k, v);
+            }
+            req
+        })
+        .await
     }
 
-    /// 统一 POST 请求（JSON body）
+    /// 统一 POST 请求（JSON body；网络错误/5xx 自动重试）
     pub(crate) async fn post_json(&self, path: &str, body: Value) -> KzwrResult<Value> {
-        let mut req = self.http.post(self.url(path)).json(&body);
-        for (k, v) in self.auth_headers() {
-            req = req.header(&k, v);
+        let what = format!("POST {path}");
+        self.request_with_retry(&what, || {
+            let mut req = self.http.post(self.url(path)).json(&body);
+            for (k, v) in self.auth_headers() {
+                req = req.header(&k, v);
+            }
+            req
+        })
+        .await
+    }
+
+    /// 发送请求并在**网络错误 / 5xx** 时重试（最多 [`RETRY_ATTEMPTS`] 次，线性退避；
+    /// 4xx 属于确定性错误不重试）。debug 日志记录响应摘要，便于问题定位。
+    async fn request_with_retry(
+        &self,
+        what: &str,
+        build: impl Fn() -> reqwest::RequestBuilder,
+    ) -> KzwrResult<Value> {
+        const RETRY_ATTEMPTS: u32 = 3;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let result = match build().send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.as_u16() >= 500 && attempt < RETRY_ATTEMPTS {
+                        tracing::warn!(
+                            "{what} 第 {attempt}/{RETRY_ATTEMPTS} 次失败: HTTP {status}"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            500 * attempt as u64,
+                        ))
+                        .await;
+                        continue;
+                    }
+                    Self::parse_response(resp).await
+                }
+                Err(e) => Err(KzwrError::Network(e)),
+            };
+            match result {
+                Ok(v) => {
+                    tracing::debug!("{what} 响应: {}", truncate_json(&v));
+                    return Ok(v);
+                }
+                Err(e) => {
+                    let retryable = matches!(e, KzwrError::Network(_))
+                        || matches!(&e, KzwrError::Api(m) if m.starts_with("HTTP 5"));
+                    if retryable && attempt < RETRY_ATTEMPTS {
+                        tracing::warn!("{what} 第 {attempt}/{RETRY_ATTEMPTS} 次失败: {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            500 * attempt as u64,
+                        ))
+                        .await;
+                        continue;
+                    }
+                    tracing::debug!("{what} 最终失败: {e}");
+                    return Err(e);
+                }
+            }
         }
-        let resp = req.send().await?;
-        Self::parse_response(resp).await
     }
 
     /// 原始 GET 下载内容（带认证头），返回字节
@@ -494,18 +551,44 @@ impl KzwrClient {
     }
 
     /// 从回收站批量永久删除条目(文件+文件夹自动区分)。
-    /// items 为 get_trash() 返回的 items 数组，按 itemType 分发。
+    /// items 为 get_trash() 返回的 items 数组，按类型分发到对应端点。
+    /// 字段名随版本而异，逐个尝试兼容（见 [`trash_is_folder`] / [`trash_item_id`]）。
     pub async fn delete_trash_items(&self, items: &[Value]) -> KzwrResult<Vec<Value>> {
         let file_pids: Vec<String> = items
             .iter()
-            .filter(|it| it.get("itemType").and_then(|v| v.as_str()) != Some("folder"))
-            .filter_map(|it| it.get("encodedId").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .filter(|it| !trash_is_folder(it))
+            .filter_map(|it| trash_item_id(it))
             .collect();
         let folder_ids: Vec<String> = items
             .iter()
-            .filter(|it| it.get("itemType").and_then(|v| v.as_str()) == Some("folder"))
-            .filter_map(|it| it.get("encodedId").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .filter(|it| trash_is_folder(it))
+            .filter_map(|it| trash_item_id(it))
             .collect();
+
+        tracing::debug!(
+            "回收站删除分组：{} 个文件 id、{} 个文件夹 id（共 {} 条目）",
+            file_pids.len(),
+            folder_ids.len(),
+            items.len()
+        );
+        if !file_pids.is_empty() {
+            tracing::debug!("文件 ids: {:?}", file_pids);
+        }
+        if !folder_ids.is_empty() {
+            tracing::debug!("文件夹 ids: {:?}", folder_ids);
+        }
+        // 一个 id 都没提取到：记录首条目原文辅助定位字段差异，并返回错误
+        // （否则空转删除会让「已清理」计数虚高而实际什么都没删）
+        if file_pids.is_empty() && folder_ids.is_empty() {
+            let first = items
+                .first()
+                .map(truncate_json)
+                .unwrap_or_else(|| "(无条目)".to_string());
+            tracing::warn!("回收站条目未能提取到任何 id，首条目原文: {}", first);
+            return Err(KzwrError::Api(format!(
+                "回收站条目格式不识别（无法提取 id），已保守取消删除；首条目: {first}"
+            )));
+        }
 
         let mut results = Vec::new();
         if !file_pids.is_empty() {
@@ -515,5 +598,45 @@ impl KzwrClient {
             results.push(self.delete_trash_folders(&folder_ids).await?);
         }
         Ok(results)
+    }
+}
+
+/// 判断回收站条目是否为文件夹（字段名随版本而异，逐个尝试）
+fn trash_is_folder(it: &Value) -> bool {
+    for k in ["itemType", "type", "kind"] {
+        if let Some(s) = it.get(k).and_then(|v| v.as_str()) {
+            return s.eq_ignore_ascii_case("folder") || s.eq_ignore_ascii_case("dir");
+        }
+    }
+    it.get("isFolder")
+        .or_else(|| it.get("is_folder"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// 提取回收站条目 id（encodedId 优先，逐个尝试兼容字段）
+fn trash_item_id(it: &Value) -> Option<String> {
+    for k in ["encodedId", "encoded_id", "id", "pid", "sid", "fileId", "folderId"] {
+        if let Some(v) = it.get(k) {
+            if let Some(s) = v.as_str() {
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+            if let Some(n) = v.as_i64() {
+                return Some(n.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 截断 JSON 字符串用于日志（避免超长响应刷屏）
+fn truncate_json(v: &Value) -> String {
+    let s = v.to_string();
+    if s.chars().count() <= 800 {
+        s
+    } else {
+        s.chars().take(800).collect::<String>() + "…(截断)"
     }
 }

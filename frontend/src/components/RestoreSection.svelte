@@ -8,8 +8,9 @@
   export let restoreFolders = [];
   export let backupPaths = [];
   export let busy = false;
-  export let onRestore = null; // (files, sourcePath, all, dir) => Promise<{restored, restored_bytes, error}>
+  export let onRestore = null; // (files, sourcePath, all, dir) => Promise<{restored, restored_bytes, missing?, error}>
   export let onLoadTree = null; // (source, dir) => Promise<{nodes, error}>
+  export let onPrune = null; // (sourcePath) => Promise<{checked, removed, files, error}>
   export let onGoto = null; // (pageId) => void
 
   /**
@@ -93,9 +94,51 @@
       const r = await onRestore(files, sourcePath, all, dir);
       result = r;
       if (r && r.error) notify(`恢复失败：${r.error}`, false);
-      else notify(`${label}恢复完成：${r.restored} 个文件（${fmtBytes(r.restored_bytes)}）`, true);
+      else {
+        const miss = (r && r.missing) || [];
+        notify(
+          `${label}恢复完成：${r.restored} 个文件（${fmtBytes(r.restored_bytes)}）` +
+            (miss.length
+              ? `；${miss.length} 个文件在云端已不存在，已跳过，可点「清理缺失」移除记录`
+              : ''),
+          !miss.length
+        );
+      }
     } catch (e) {
       notify(`恢复失败：${e.message}`, false);
+    } finally {
+      working = false;
+    }
+  }
+
+  /** 清理快照中云端已不存在的文件记录（只动快照元数据，不删云端/本地文件） */
+  async function pruneMissing(folder) {
+    if (
+      !confirm(
+        `检查 ${folder.path} 的备份记录，移除云端已不存在的文件？\n（只清理失效的快照记录，不会删除云端或本地任何文件）`
+      )
+    )
+      return;
+    working = true;
+    msg = '';
+    try {
+      const r = onPrune
+        ? await onPrune(folder.path)
+        : { checked: 0, removed: 0, files: [] };
+      if (r && r.error) {
+        notify(`清理失败：${r.error}`, false);
+      } else if (!r || !r.removed) {
+        notify(`检查完成：${r.checked ?? 0} 条备份记录均正常，无需清理`, true);
+      } else {
+        const names = (r.files || []).slice(0, 3).join('、');
+        notify(
+          `已清理 ${r.removed} 条失效记录（共检查 ${r.checked} 条）${names ? `：${names}${(r.files || []).length > 3 ? ' 等' : ''}` : ''}`,
+          true
+        );
+        await refreshFolder(folder.path);
+      }
+    } catch (e) {
+      notify(`清理失败：${e.message}`, false);
     } finally {
       working = false;
     }
@@ -218,6 +261,14 @@
                   disabled={busyAll}
                 >
                   <Icon name="download" size={13} />恢复
+                </button>
+                <button
+                  class="btn btn-sm btn-soft"
+                  on:click={() => pruneMissing(folder)}
+                  disabled={busyAll}
+                  title="移除快照中云端已不存在的文件记录（不删云端文件）"
+                >
+                  <Icon name="trash" size={13} />清理缺失
                 </button>
               {:else}
                 <span class="badge badge-warn">未备份</span>
