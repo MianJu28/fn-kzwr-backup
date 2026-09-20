@@ -14,8 +14,6 @@
   export let onBackupAck = null; // () => Promise<void>
 
   let privateKeyInput = '';
-  let adminPassphrase = '';
-  let showExportBox = false;
   let showPrivateInput = false;
   let shownKey = revealKey || '';
   let shownTag = revealKey ? 'new' : ''; // new=新生成 / export=导出的当前私钥
@@ -95,36 +93,33 @@
   }
 
   function startExport() {
-    showExportBox = true;
     showPrivateInput = false;
+    exportKey();
   }
 
-  function cancelExport() {
-    showExportBox = false;
-    adminPassphrase = '';
-  }
-
+  /** 显示私钥：口令经统一弹窗收集（input 模式） */
   async function exportKey() {
-    if (!adminPassphrase.trim()) {
+    const pass = await confirmDialog({
+      title: '显示私钥明文？',
+      message:
+        '需先验证管理员口令（安装应用时设置）。\n请勿在公共场所或截图中泄露，确认后私钥将显示在页面上。',
+      confirmText: '验证并显示',
+      danger: true,
+      input: true,
+      placeholder: '管理员口令',
+    });
+    if (pass === false) return;
+    if (!pass) {
       toast.warn('请输入管理员口令');
       return;
     }
-    const yes = await confirmDialog({
-      title: '显示私钥明文？',
-      message: '请勿在公共场所或截图中泄露。确认后私钥将显示在页面上。',
-      confirmText: '确认显示',
-      danger: true,
-    });
-    if (!yes) return;
 
     working = true;
-    const r = await onExportKey(adminPassphrase.trim());
+    const r = await onExportKey(pass);
     working = false;
     if (r.private_key) {
       shownKey = r.private_key;
       shownTag = 'export';
-      showExportBox = false;
-      adminPassphrase = '';
       toast.info('已显示当前私钥，请妥善保存到安全位置');
     } else {
       toast.error(`导出失败：${r.error}`);
@@ -137,8 +132,6 @@
     working = false;
     shownKey = '';
     shownTag = '';
-    showExportBox = false;
-    adminPassphrase = '';
   }
 </script>
 
@@ -200,31 +193,6 @@
       <Icon name="key" size={14} />{showPrivateInput ? '收起' : '更换密钥'}
     </button>
   </div>
-
-  {#if showExportBox}
-    <div class="card-body block">
-      <div class="alert alert-warn">
-        <Icon name="lock" size={15} />
-        <div class="alert-body">显示私钥需要先验证管理员口令（安装应用时设置）</div>
-      </div>
-      <label class="field">
-        <span class="label">管理员口令</span>
-        <input
-          class="input"
-          type="password"
-          bind:value={adminPassphrase}
-          autocomplete="off"
-          placeholder="安装时设置的管理员口令"
-        />
-      </label>
-      <div class="row-wrap">
-        <button class="btn btn-primary" on:click={exportKey} disabled={working || !adminPassphrase.trim()}>
-          {#if working}<span class="spin"></span>校验中…{:else}<Icon name="eye" size={15} />确认显示{/if}
-        </button>
-        <button class="btn btn-ghost" on:click={cancelExport} disabled={working}>取消</button>
-      </div>
-    </div>
-  {/if}
 
   {#if shownKey}
     <div class="card-body block">

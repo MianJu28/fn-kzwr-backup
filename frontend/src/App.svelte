@@ -723,7 +723,7 @@
           {:else if currentPage === 'audit'}
             <AuditPage {busy} />
           {:else if currentPage === 'logs'}
-            <LogsPage />
+            <LogsPage debug={debugOn} onSaveDebug={handleSaveDebug} />
           {:else if currentPage === 'settings'}
             <SettingsPage
               {webdavConfigured}
@@ -754,8 +754,6 @@
               onTestWebhook={handleTestWebhook}
               onExportConfig={handleExportConfig}
               onImportConfig={handleImportConfig}
-              debug={debugOn}
-              onSaveDebug={handleSaveDebug}
             />
           {/if}
         </div>

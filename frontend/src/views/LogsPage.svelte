@@ -7,6 +7,9 @@
   import { confirmDialog } from '../lib/confirm.js';
   import { fmtBytes } from '../lib/format.js';
 
+  export let debug = false;
+  export let onSaveDebug = null; // (enabled) => Promise<{error?}>
+
   const TAIL = 800;
 
   let lines = [];
@@ -14,8 +17,26 @@
   let size = 0;
   let loading = false;
   let clearing = false;
+  let savingDebug = false;
 
   $: text = lines.join('\n');
+
+  /** 调试日志开关（切换即保存并热生效） */
+  async function toggleDebug(e) {
+    const v = e.currentTarget.checked;
+    if (!onSaveDebug) return;
+    savingDebug = true;
+    try {
+      const r = await onSaveDebug(v);
+      if (r && r.error) {
+        toast.error(r.error);
+        return;
+      }
+      toast.success(v ? '已开启调试日志：将记录详细请求/响应日志' : '已关闭调试日志');
+    } finally {
+      savingDebug = false;
+    }
+  }
 
   async function load() {
     loading = true;
@@ -80,6 +101,22 @@
     </button>
   </div>
 
+  <div class="card-body dbg-body">
+    <label class="dbg-row">
+      <input
+        type="checkbox"
+        checked={debug}
+        on:change={toggleDebug}
+        disabled={savingDebug || !onSaveDebug}
+      />
+      <span class="dbg-text">
+        调试日志
+        <small>记录网络请求/响应明细与关键流程，便于问题定位；切换后立即生效并持久化（关闭后恢复常规日志）</small>
+      </span>
+      {#if savingDebug}<span class="spin"></span>{/if}
+    </label>
+  </div>
+
   <div class="card-body">
     {#if !loading && lines.length === 0}
       <div class="empty slim">
@@ -105,6 +142,30 @@
   .grow {
     flex: 1;
     min-width: 0;
+  }
+  .dbg-body {
+    padding-top: 0;
+  }
+  .dbg-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    cursor: pointer;
+  }
+  .dbg-row input {
+    margin-top: 2px;
+    accent-color: var(--primary);
+  }
+  .dbg-text {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    font-size: 13px;
+    color: var(--text);
+  }
+  .dbg-text small {
+    color: var(--text-3);
+    font-size: 12px;
   }
   .foot {
     display: flex;
