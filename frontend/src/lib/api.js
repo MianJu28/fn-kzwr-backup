@@ -69,4 +69,19 @@ export const api = {
   /** 恢复：all=true 时恢复该源路径（可用 dir 限定子目录）下的全部文件 */
   restore: (files, source_path, all = false, dir = '') =>
     post('/api/restore/run', { files, source_path, all, dir }),
+
+  // kzwr REST 增强功能（可选，需 access-token）
+  /** 账号信息（存储空间/套餐；未配置 token 时返回 configured:false + 指引） */
+  kzwrUser: () => get('/api/kzwr/user'),
+  /** 保存或清除 access-token（空串 = 清除） */
+  kzwrSaveToken: (access_token) => post('/api/kzwr/token', { access_token }),
+  /** 清空云端回收站（物理删除，不可恢复） */
+  kzwrTrashEmpty: () => post('/api/kzwr/trash/empty'),
+
+  /** 定时任务预览：cron → 未来 5 次触发时间（服务器本地时区） */
+  schedulePreview: (cron) => post('/api/schedule/preview', { cron }),
+  /** 一键体检：逐项检查配置与连通性，返回可操作建议 */
+  setupCheck: () => get('/api/setup/check'),
+  /** 操作审计日志（最新在前） */
+  auditLog: (limit = 100) => get(`/api/audit?limit=${limit}`),
 };

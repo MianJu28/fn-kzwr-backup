@@ -80,4 +80,10 @@ pub struct AppState {
     pub backup_tmp: PathBuf,
     /// 恢复默认目录
     pub default_restore_dir: PathBuf,
+    /// kzwr REST 客户端（**增强功能**：账号存储空间、回收站清理等，非备份通道）
+    ///
+    /// access-token 从配置解密后注入；未配置时调用返回认证提示，不影响备份/恢复。
+    pub kzwr: Arc<crate::infra::kzwr_api::client::KzwrClient>,
+    /// 操作审计日志（敏感/破坏性操作留痕，存 $TRIM_PKGVAR/audit.log）
+    pub audit: Arc<crate::domain::audit::AuditLog>,
 }

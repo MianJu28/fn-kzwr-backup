@@ -1,12 +1,17 @@
 <script>
-  // 备份账号卡片（官方 WebDAV 无套餐/容量接口，仅展示账号与连接状态）
+  // 备份账号卡片（WebDAV 本身无套餐/容量接口；配置 access-token 后可显示存储空间）
   import Icon from './Icon.svelte';
+  import { fmtBytes } from '../lib/format.js';
 
   export let userInfo = null;
   export let userInfoError = null;
   export let configured = false;
+  /** kzwr 增强信息（可选）：{ plan, total, used, percentage } */
+  export let kzwr = null;
 
   $: name = (userInfo && userInfo.username) || '';
+  $: quota = kzwr && kzwr.total ? kzwr : null;
+  $: pct = quota ? Math.min(100, Math.round((quota.used / quota.total) * 100)) : 0;
 </script>
 
 <section class="card">
@@ -45,7 +50,30 @@
           <span class="k">服务</span>
           <span class="v">kzwr 官方 WebDAV</span>
         </div>
+        {#if quota}
+          <div class="kv">
+            <span class="k">套餐</span>
+            <span class="v">{quota.plan || '—'}</span>
+          </div>
+          <div class="kv">
+            <span class="k">存储空间</span>
+            <span class="v">
+              {fmtBytes(quota.used)} / {fmtBytes(quota.total)}
+              {#if quota.percentage}<span class="dim">（{quota.percentage}）</span>{/if}
+            </span>
+          </div>
+        {:else}
+          <div class="kv">
+            <span class="k">存储空间</span>
+            <span class="v dim">配置 access-token 后显示</span>
+          </div>
+        {/if}
       </div>
+      {#if quota}
+        <div class="bar" aria-label="空间占用 {pct}%">
+          <div class="fill" style="width:{pct}%"></div>
+        </div>
+      {/if}
     {/if}
   </div>
 </section>
@@ -77,5 +105,21 @@
   .rows {
     display: flex;
     flex-direction: column;
+  }
+  .dim {
+    color: var(--text-3);
+    font-size: 12px;
+  }
+  .bar {
+    height: 7px;
+    border-radius: 999px;
+    background: var(--surface-3);
+    overflow: hidden;
+    margin-top: var(--s3);
+  }
+  .bar .fill {
+    height: 100%;
+    background: var(--primary);
+    transition: width var(--t-fast);
   }
 </style>

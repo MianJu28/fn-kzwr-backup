@@ -9,6 +9,7 @@
   export let scheduleCronValid = true;
   export let busy = false;
   export let onSave = null; // () => Promise
+  export let onPreviewCron = null; // (cron) => Promise<{valid, next, timezone, error}>
 
   let pathInput = '';
   let pathMsg = '';
@@ -16,6 +17,36 @@
   let inTrimHost = isInTrimHost();
   let savedHint = '';
   let saveTimer = null;
+
+  // 定时任务可视化：cron → 未来 5 次触发时间（服务器本地时区）
+  let nextRuns = [];
+  let previewTz = '';
+  let previewErr = '';
+  let previewTimer = null;
+  let lastPreview = null;
+
+  function maybePreview(cron) {
+    if (cron === lastPreview) return;
+    lastPreview = cron;
+    clearTimeout(previewTimer);
+    previewTimer = setTimeout(() => runPreview(cron), 400);
+  }
+
+  async function runPreview(cron) {
+    if (!onPreviewCron) return;
+    try {
+      const r = await onPreviewCron((cron || '').trim());
+      nextRuns = (r && r.next) || [];
+      previewTz = (r && r.timezone) || '';
+      previewErr = r && r.valid === false ? r.error || '表达式无效' : '';
+    } catch (e) {
+      nextRuns = [];
+      previewTz = '';
+      previewErr = e.message || '预览失败';
+    }
+  }
+
+  $: maybePreview(scheduleCron);
 
   const CRON_PRESETS = [
     { label: '每天 00:00', value: '0 0 * * *' },
@@ -203,14 +234,30 @@
         bind:value={scheduleCron}
         placeholder="0 0 * * *"
       />
-      {#if cronInvalid}
-        <span class="field-error">表达式无效，请按「分 时 日 月 周」填写</span>
+      {#if cronInvalid || previewErr}
+        <span class="field-error">{previewErr || '表达式无效，请按「分 时 日 月 周」填写'}</span>
       {:else}
         <span class="field-hint">
           示例：<code>0 */12 * * *</code> 每 12 小时 · <code>0 2 * * 1</code> 每周一 02:00
         </span>
       {/if}
     </label>
+
+    {#if nextRuns.length}
+      <div class="next-runs">
+        <div class="nr-head">
+          <Icon name="clock" size={13} />接下来 5 次运行
+          {#if previewTz}<span class="tz">{previewTz}</span>{/if}
+        </div>
+        <ul>
+          {#each nextRuns as t (t)}
+            <li class="mono">{t}</li>
+          {/each}
+        </ul>
+      </div>
+    {:else if !scheduleCron.trim()}
+      <p class="field-hint">留空即关闭定时备份，仅手动触发。</p>
+    {/if}
   </div>
 
   <div class="card-foot foot">
@@ -280,6 +327,41 @@
     flex-wrap: wrap;
     gap: 6px;
     margin-bottom: var(--s4);
+  }
+  .next-runs {
+    margin-top: var(--s3);
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    background: var(--surface-2);
+  }
+  .nr-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12.5px;
+    font-weight: 560;
+    color: var(--text-2);
+  }
+  .nr-head .tz {
+    font-weight: 400;
+    font-size: 11.5px;
+    color: var(--text-3);
+  }
+  .next-runs ul {
+    list-style: none;
+    margin: 7px 0 0;
+    padding: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .next-runs li {
+    font-size: 12px;
+    color: var(--text-2);
+    background: var(--surface-3);
+    border-radius: var(--r-xs);
+    padding: 3px 8px;
   }
   .foot {
     display: flex;

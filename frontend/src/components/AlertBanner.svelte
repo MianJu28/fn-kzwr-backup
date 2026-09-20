@@ -11,6 +11,7 @@
     restore: '恢复',
     scheduler: '定时',
     config: '配置',
+    kzwr: '增强',
   };
   const COLLAPSED = 3;
   let expanded = false;

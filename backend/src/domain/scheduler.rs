@@ -56,7 +56,7 @@ async fn scheduler_loop(state: AppState, interval_secs: u64) {
             }
         };
 
-        let now = chrono::Utc::now();
+        let now = chrono::Local::now();
         let next = match parsed.iter_after(now).next() {
             Some(t) => t,
             None => {
@@ -65,7 +65,7 @@ async fn scheduler_loop(state: AppState, interval_secs: u64) {
                 continue;
             }
         };
-        let wait = (next - chrono::Utc::now()).to_std().unwrap_or(Duration::from_secs(60));
+        let wait = (next - chrono::Local::now()).to_std().unwrap_or(Duration::from_secs(60));
         info!(expr = cron_expr, next = %next, wait_secs = wait.as_secs(), "下次定时备份");
 
         // 3) 等到点（分小段 sleep 以便及时响应配置变更）
@@ -124,4 +124,29 @@ pub fn validate_cron(expr: &str) -> Result<()> {
         .parse()
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("cron 表达式无效: {e}"))
+}
+
+/// 计算未来 `count` 次触发时间（**服务器本地时区**，与调度器一致）
+///
+/// 返回 `("2026-09-21 00:00", ...)` 形式的字符串列表，供 UI 展示「下次运行」。
+pub fn next_runs(expr: &str, count: usize) -> Result<Vec<String>> {
+    let expr = expr.trim();
+    if expr.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cron = croner::Cron::new(expr)
+        .parse()
+        .map_err(|e| anyhow::anyhow!("cron 表达式无效: {e}"))?;
+    // croner 的时区由传入的 DateTime 决定：用 Local 让表达式按 NAS 本地时间解释
+    let now = chrono::Local::now();
+    let mut out: Vec<String> = Vec::new();
+    for t in cron.iter_after(now).take(count) {
+        out.push(t.format("%Y-%m-%d %H:%M").to_string());
+    }
+    Ok(out)
+}
+
+/// 服务器时区说明（供 UI 标注 cron 的解释基准）
+pub fn timezone_label() -> String {
+    chrono::Local::now().format("%Z (UTC%:z)").to_string()
 }

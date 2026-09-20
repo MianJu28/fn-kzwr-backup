@@ -27,10 +27,43 @@ pub struct AppConfig {
     /// 密钥配置（私钥备份状态）
     #[serde(default)]
     pub keys: KeyConfig,
+    /// kzwr REST API 增强功能配置（可选，非备份通道）
+    #[serde(default)]
+    pub kzwr: KzwrConfig,
+}
+
+/// kzwr REST API 增强功能配置（可选）
+///
+/// 备份/恢复仍走官方 WebDAV（ADR-009）；此处的 `access-token` 仅用于
+/// WebDAV 提供不了的增强能力：账号存储空间信息、回收站查看/清空等。
+/// 用户在浏览器登录 kzwr 后，从 Cookie 的 `access-token` 复制值填入设置页。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KzwrConfig {
+    /// access-token（加密存储）
+    #[serde(default)]
+    pub access_token_enc: Option<String>,
+    /// 云端空间占用预警阈值（百分比，0 = 关闭）；达到该值生成告警
+    #[serde(default = "default_quota_warn_percent")]
+    pub quota_warn_percent: u64,
+}
+
+fn default_quota_warn_percent() -> u64 {
+    85
+}
+
+impl Default for KzwrConfig {
+    /// 手写 Default：与 BackupConfig 同理，`#[derive(Default)]` 不会采用
+    /// serde 的 default 函数，会让预警阈值默认成 0（= 关闭）。
+    fn default() -> Self {
+        Self {
+            access_token_enc: None,
+            quota_warn_percent: default_quota_warn_percent(),
+        }
+    }
 }
 
 /// 备份配置
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupConfig {
     /// 备份源路径列表（支持多个）
     #[serde(default)]
@@ -44,6 +77,20 @@ pub struct BackupConfig {
     /// 定时备份 cron 表达式（如 "0 0 * * *" 每天零点；None/空 = 不启用）
     #[serde(default)]
     pub schedule_cron: Option<String>,
+}
+
+impl Default for BackupConfig {
+    /// 手写 Default：`#[derive(Default)]` 不会采用 serde 的
+    /// `default_target_folder()`，会让全新配置的 `target_folder` 变成空串，
+    /// 导致首次备份直接落在目标根目录而非 `fn-backup/`。
+    fn default() -> Self {
+        Self {
+            paths: Vec::new(),
+            target_folder: default_target_folder(),
+            retention: RetentionConfig::default(),
+            schedule_cron: None,
+        }
+    }
 }
 
 /// 保留策略配置
@@ -62,6 +109,15 @@ pub struct RetentionConfig {
     /// 可选：只清理创建时间早于该天数（0 表示不限制）
     #[serde(default)]
     pub min_age_days: u64,
+    /// 备份后清空云端回收站（需配置 kzwr access-token，走 REST 增强功能）
+    #[serde(default)]
+    pub empty_recycle_bin: bool,
+    /// 回收站占用超过该 GB 数才清理（0 = 不限制，总是清理）
+    #[serde(default)]
+    pub recycle_max_gb: u64,
+    /// 只清理删除时间早于该天数的回收站条目（0 = 不限制）
+    #[serde(default)]
+    pub recycle_min_age_days: u64,
 }
 
 fn default_target_folder() -> String {
@@ -177,6 +233,26 @@ impl ConfigManager {
         cfg.webdav.url = Some(url.trim_end_matches('/').to_string());
         cfg.webdav.username_enc = Some(self.encrypt_field(username)?);
         cfg.webdav.password_enc = Some(self.encrypt_field(password)?);
+        self.save(&cfg)
+    }
+
+    /// 读取 kzwr access-token（解密；未配置或为空返回 None）
+    pub fn kzwr_token(&self) -> Result<Option<String>> {
+        let cfg = self.load()?;
+        Ok(self
+            .decrypt_field(&cfg.kzwr.access_token_enc)?
+            .filter(|s| !s.is_empty()))
+    }
+
+    /// 保存 kzwr access-token（加密存储；传空串则清除）
+    pub fn save_kzwr_token(&self, token: &str) -> Result<()> {
+        let mut cfg = self.load().unwrap_or_default();
+        let token = token.trim();
+        if token.is_empty() {
+            cfg.kzwr.access_token_enc = None;
+        } else {
+            cfg.kzwr.access_token_enc = Some(self.encrypt_field(token)?);
+        }
         self.save(&cfg)
     }
 

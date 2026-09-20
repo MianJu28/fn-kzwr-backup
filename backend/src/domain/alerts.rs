@@ -25,6 +25,8 @@ pub enum AlertSource {
     Restore,
     Scheduler,
     Config,
+    /// kzwr 增强功能（access-token 失效、云端空间预警等）
+    Kzwr,
 }
 
 /// 告警条目
@@ -195,5 +197,6 @@ fn source_name(source: AlertSource) -> &'static str {
         AlertSource::Restore => "restore",
         AlertSource::Scheduler => "scheduler",
         AlertSource::Config => "config",
+        AlertSource::Kzwr => "kzwr",
     }
 }
