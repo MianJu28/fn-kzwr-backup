@@ -48,6 +48,8 @@ Target 适配器需将加密文件写入酷族网软（kzwr.com）。**（以下
 ### session token 处理（已作废，ADR-009）
 
 > ⚠️ 本节属已移除的逆向 REST API / 登录二进制方案，**现行方案不存在 session 概念**：WebDAV 走 HTTP Basic，每次请求自带凭据，无 token 签发/复用/过期重登。以下内容仅作历史存档。
+>
+> **2026-09-20 补充（ADR-011）**：REST **客户端**以「可选增强功能」形式回归（`infra/kzwr_api`，取自提交 `f8141d5`），仅用于 WebDAV 提供不了的账号级能力（存储空间、回收站清理）。认证不再依赖登录二进制——用户从浏览器 Cookie 复制 `access-token` 填入设置页；未配置时功能降级，备份/恢复仍走 WebDAV。
 
 - ~~session token 由登录二进制产出，存储于 `$TRIM_PKGETC`（加密），备份任务复用~~
 - ~~token 过期（`TOKEN_EXPIRED`）时暂停任务，UI 提示用户重新触发登录二进制~~
