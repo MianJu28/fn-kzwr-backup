@@ -18,9 +18,27 @@
   let working = false;
   let testing = false;
 
-  $: input = webhookUrl || '';
-  $: headers = (webhookHeaders || []).map((h) => ({ name: h.name, value: h.value }));
-  $: body = webhookBody || '';
+  // 只在「父组件传入值真正变化」时回填本地可编辑副本。
+  // ⚠️ 不能写成 `$: input = webhookUrl || ''`：绑定变量被响应式语句写入时，Svelte 会在
+  //    输入回调里连带把 webhookUrl 置脏并重跑该语句 → 用户刚敲进去的字符立刻被清掉
+  //    （地址 / 请求体 / 请求头都会变成完全无法输入）。加了「同值不覆盖」判断后，
+  //    即使语句因脏标记重跑也不会动用户正在编辑的内容。
+  let syncedUrl = null;
+  let syncedHeaders = null;
+  let syncedBody = null;
+
+  $: if (webhookUrl !== syncedUrl) {
+    syncedUrl = webhookUrl;
+    input = webhookUrl || '';
+  }
+  $: if (webhookHeaders !== syncedHeaders) {
+    syncedHeaders = webhookHeaders;
+    headers = (webhookHeaders || []).map((h) => ({ name: h.name, value: h.value }));
+  }
+  $: if (webhookBody !== syncedBody) {
+    syncedBody = webhookBody;
+    body = webhookBody || '';
+  }
 
   function addHeader() {
     headers = [...headers, { name: '', value: '' }];
