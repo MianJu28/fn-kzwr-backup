@@ -54,6 +54,7 @@ async fn handle_socket(mut socket: WebSocket, eventbus: Arc<EventBus>) {
                             "type": "event",
                             "kind": event.kind,
                             "status": event.status,
+                            "phase": event.phase,
                             "job_id": event.job_id,
                             "current_file": event.current_file,
                             "done": event.done,

@@ -82,6 +82,24 @@ impl BackupJob {
             target_prefix: Option<String>,
         }
 
+        let meter = Arc::new(Mutex::new(SpeedMeter::new()));
+        let started = Instant::now();
+
+        // 0) 准备阶段：先推一条事件，让面板在「扫描 / 差分」期间也有明确反馈
+        self.publish(
+            &self.job_id,
+            crate::eventbus::TaskStatus::Started,
+            Some(crate::eventbus::TaskPhase::Prepare),
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Some("准备中：扫描源目录并与上次快照比对，计算本次增量…".to_string()),
+        );
+
         // 1) 预扫描 + 差分：汇总总文件数与总字节数（明文）
         let mut prepared: Vec<Prepared> = Vec::new();
         let mut grand_total_files: u64 = 0;
@@ -114,17 +132,17 @@ impl BackupJob {
             });
         }
 
-        let meter = Arc::new(Mutex::new(SpeedMeter::new()));
-        let started = Instant::now();
+        // 准备完成 → 进入传输阶段（带总数，前端进度条从 0/N 起走）
         self.publish(
             &self.job_id,
-            crate::eventbus::TaskStatus::Started,
+            crate::eventbus::TaskStatus::Progress,
+            Some(crate::eventbus::TaskPhase::Transfer),
             None,
             0,
             grand_total_files,
             0,
             grand_total_bytes,
-            0,
+            started.elapsed().as_millis() as u64,
             0,
             None,
         );
@@ -134,7 +152,7 @@ impl BackupJob {
         let mut summary = BackupSummary::default();
         let mut job_ids: Vec<String> = Vec::new();
 
-        for p in prepared {
+        for p in &prepared {
             // 1) 显式创建目标端目录结构（含空目录），保证「所选文件夹」及其各级子目录存在
             let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
             for fd in p.current.iter().filter(|e| !e.is_dir) {
@@ -218,6 +236,7 @@ impl BackupJob {
                 self.publish(
                     &self.job_id,
                     crate::eventbus::TaskStatus::Progress,
+                    Some(crate::eventbus::TaskPhase::Transfer),
                     Some(fd.rel_path.clone()),
                     done,
                     grand_total_files,
@@ -229,8 +248,26 @@ impl BackupJob {
                 );
                 info!("已上传: {} ({plain_n} B)", fd.rel_path);
             }
+        }
 
-            // 3) 删除目标中已不存在的文件
+        // 3) 收尾阶段：删除云端多余文件 → 落盘快照 → 保留策略清理孤儿
+        //    （单独切到 cleanup 阶段，面板显示「收尾/清理」而不是一直停在传输）
+        self.publish(
+            &self.job_id,
+            crate::eventbus::TaskStatus::Progress,
+            Some(crate::eventbus::TaskPhase::Cleanup),
+            None,
+            done,
+            grand_total_files,
+            bytes_done,
+            grand_total_bytes,
+            started.elapsed().as_millis() as u64,
+            meter.lock().unwrap().speed_bps(),
+            Some("收尾：清理云端多余文件并保存快照…".to_string()),
+        );
+
+        for p in &prepared {
+            // 删除云端已不存在的文件
             for rel in &p.changeset.delete {
                 let target_path = target_path_with(p.target_prefix.as_deref(), rel);
                 match self.target.delete(&target_path).await {
@@ -243,29 +280,16 @@ impl BackupJob {
                 }
             }
 
-            // 4) 保存该路径的新快照
+            // 保存该路径的新快照
             let snapshot: Vec<SnapshotEntry> =
                 p.current.iter().map(SnapshotEntry::from_fd).collect();
             self.store
                 .save_snapshot(&p.job_id, self.account(), &snapshot)?;
             summary.unchanged += p.changeset.unchanged;
-            job_ids.push(p.job_id);
+            job_ids.push(p.job_id.clone());
         }
 
-        self.publish(
-            &self.job_id,
-            crate::eventbus::TaskStatus::Completed,
-            None,
-            done,
-            grand_total_files,
-            bytes_done,
-            grand_total_bytes,
-            started.elapsed().as_millis() as u64,
-            meter.lock().unwrap().speed_bps(),
-            None,
-        );
-
-        // 保留策略：备份完成后清理目标端孤儿文件
+        // 保留策略：清理目标端孤儿文件（属于收尾阶段）
         if let Some(rt) = &self.retention {
             // 受管理路径必须带上「源文件夹名」前缀：目标端布局是
             // /<target_prefix>/<源文件夹名>/<rel>，只拼 rel 会把刚备份完的
@@ -290,7 +314,34 @@ impl BackupJob {
                 scanned = report.scanned_files,
                 "保留策略：孤儿文件清理完成"
             );
+            self.publish(
+                &self.job_id,
+                crate::eventbus::TaskStatus::Progress,
+                Some(crate::eventbus::TaskPhase::Cleanup),
+                None,
+                done,
+                grand_total_files,
+                bytes_done,
+                grand_total_bytes,
+                started.elapsed().as_millis() as u64,
+                0,
+                Some(format!("保留策略：已清理 {} 个云端孤儿文件", report.removed)),
+            );
         }
+
+        self.publish(
+            &self.job_id,
+            crate::eventbus::TaskStatus::Completed,
+            None,
+            None,
+            done,
+            grand_total_files,
+            bytes_done,
+            grand_total_bytes,
+            started.elapsed().as_millis() as u64,
+            meter.lock().unwrap().speed_bps(),
+            None,
+        );
 
         Ok(summary)
     }
@@ -339,6 +390,24 @@ impl BackupJob {
         job_id: &str,
         strict: bool,
     ) -> Result<BackupSummary> {
+        let meter = Arc::new(Mutex::new(SpeedMeter::new()));
+        let started = Instant::now();
+
+        // 0) 准备阶段：先推一条事件，让面板在「扫描 / 差分」期间也有明确反馈
+        self.publish(
+            job_id,
+            crate::eventbus::TaskStatus::Started,
+            Some(crate::eventbus::TaskPhase::Prepare),
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Some("准备中：扫描源目录并与上次快照比对，计算本次增量…".to_string()),
+        );
+
         // 1) 扫描源目录（严格模式时计算 BLAKE3 内容哈希）
         let current = if strict {
             scan_all_strict(source, source_root).await?
@@ -379,17 +448,17 @@ impl BackupJob {
             .filter(|fd| !fd.is_dir)
             .map(|fd| fd.size)
             .sum();
-        let meter = Arc::new(Mutex::new(SpeedMeter::new()));
-        let started = Instant::now();
+        // 准备完成 → 进入传输阶段
         self.publish(
             job_id,
-            crate::eventbus::TaskStatus::Started,
+            crate::eventbus::TaskStatus::Progress,
+            Some(crate::eventbus::TaskPhase::Transfer),
             None,
             0,
             total_upload,
             0,
             total_bytes,
-            0,
+            started.elapsed().as_millis() as u64,
             0,
             None,
         );
@@ -458,6 +527,7 @@ impl BackupJob {
             self.publish(
                 job_id,
                 crate::eventbus::TaskStatus::Progress,
+                Some(crate::eventbus::TaskPhase::Transfer),
                 Some(fd.rel_path.clone()),
                 uploaded as u64,
                 total_upload,
@@ -470,7 +540,21 @@ impl BackupJob {
             info!("已上传: {} ({plain_n} B)", fd.rel_path);
         }
 
-        // 4) 删除目标中已不存在的文件
+        // 4) 收尾阶段：删除云端多余文件 → 保存快照
+        self.publish(
+            job_id,
+            crate::eventbus::TaskStatus::Progress,
+            Some(crate::eventbus::TaskPhase::Cleanup),
+            None,
+            uploaded as u64,
+            total_upload,
+            uploaded_bytes,
+            total_bytes,
+            started.elapsed().as_millis() as u64,
+            meter.lock().unwrap().speed_bps(),
+            Some("收尾：清理云端多余文件并保存快照…".to_string()),
+        );
+
         let mut deleted = 0usize;
         for rel in &changeset.delete {
             let target_path = target_path_with(self.target_prefix.as_deref(), rel);
@@ -491,6 +575,7 @@ impl BackupJob {
         self.publish(
             job_id,
             crate::eventbus::TaskStatus::Completed,
+            None,
             None,
             uploaded as u64,
             total_upload,
@@ -548,6 +633,7 @@ impl BackupJob {
                 eb.task_event(
                     crate::eventbus::TaskKind::Backup,
                     crate::eventbus::TaskStatus::Progress,
+                    Some(crate::eventbus::TaskPhase::Transfer),
                     job_id.clone(),
                     Some(file.clone()),
                     done,
@@ -568,6 +654,7 @@ impl BackupJob {
         &self,
         job_id: &str,
         status: crate::eventbus::TaskStatus,
+        phase: Option<crate::eventbus::TaskPhase>,
         current_file: Option<String>,
         done: u64,
         total: u64,
@@ -581,6 +668,7 @@ impl BackupJob {
             eb.task_event(
                 crate::eventbus::TaskKind::Backup,
                 status,
+                phase,
                 job_id.to_string(),
                 current_file,
                 done,

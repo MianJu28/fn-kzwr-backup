@@ -55,7 +55,7 @@
   <div class="card-body">
     <div class="grid2">
       <label class="field">
-        <span class="label">用户名 / 账号</span>
+        <span class="label">账号</span>
         <input
           class="input"
           bind:value={username}
@@ -69,7 +69,7 @@
       </label>
 
       <label class="field">
-        <span class="label">密码 / 应用密码</span>
+        <span class="label">应用密码</span>
         <div class="pwd">
           <input
             class="input"
@@ -89,7 +89,7 @@
           </button>
         </div>
         {#if configured}
-          <span class="field-hint">出于安全不回显已保存密码；仅修改账号时仍需重新输入一次</span>
+          <span class="field-hint">出于安全不回显已保存的应用密码；仅修改账号时仍需重新输入一次</span>
         {/if}
       </label>
     </div>
@@ -107,7 +107,7 @@
         <li>点击「创建应用」/「新增应用密码」</li>
         <li><strong>权限选择「读写」</strong>（只读会导致上传备份失败）</li>
         <li><strong>有效期选择「永不过期」</strong>（否则密码到期后备份会中断）</li>
-        <li>复制生成的密码，粘贴到上方「密码 / 应用密码」输入框，用户名填写同一个酷族账号</li>
+        <li>复制生成的密码，粘贴到上方「应用密码」输入框，账号填写同一个酷族账号</li>
       </ol>
       <p class="guide-note">
         提示：这里不要填账号登录密码，应用密码可随时在同一个页面吊销，更安全。
