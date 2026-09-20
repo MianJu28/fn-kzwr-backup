@@ -19,6 +19,13 @@
     failed: { text: '已失败', icon: 'x-circle' },
   };
 
+  // 任务全流程阶段（后端事件携带 phase）：准备 → 传输 → 收尾
+  const PHASES = [
+    { id: 'prepare', label: '准备', hint: '扫描源目录、比对快照差分、列取云端文件' },
+    { id: 'transfer', label: '传输', hint: '上传 / 下载文件' },
+    { id: 'cleanup', label: '收尾', hint: '清理云端多余文件、保留策略、保存快照' },
+  ];
+
   $: status = liveStatus ? STATUS[liveStatus.status] || { text: liveStatus.status, icon: 'info' } : null;
   $: running = !!liveStatus && (liveStatus.status === 'started' || liveStatus.status === 'progress');
   $: failed = !!liveStatus && liveStatus.status === 'failed';
@@ -31,6 +38,11 @@
     : 0;
   $: kindIcon = liveStatus && liveStatus.kind === 'restore' ? 'download' : 'upload';
   $: kindText = liveStatus && liveStatus.kind === 'restore' ? '恢复' : '备份';
+  // 当前阶段下标（-1 = 后端未上报阶段，如旧版本或任务刚结束）
+  $: phaseIdx = liveStatus && liveStatus.phase
+    ? PHASES.findIndex((p) => p.id === liveStatus.phase)
+    : -1;
+  $: phaseText = phaseIdx >= 0 ? PHASES[phaseIdx].label : '';
 </script>
 
 <section class="card live" class:active={running} class:done class:failed>
@@ -45,7 +57,8 @@
     <div class="grow">
       <h2 class="card-title">实时任务</h2>
       <p class="card-desc">
-        {#if liveStatus}{kindText}任务 · {status.text}{:else}通过 WebSocket 推送进度{/if}
+        {#if liveStatus}{kindText}任务 · {status.text}{phaseText ? ` · ${phaseText}` : ''}{:else}通过 WebSocket
+          推送进度{/if}
       </p>
     </div>
   </div>
@@ -66,6 +79,24 @@
           <span class="count mono">{liveStatus.done} / {liveStatus.total}</span>
         {/if}
       </div>
+
+      {#if phaseIdx >= 0}
+        <!-- 全流程阶段：准备 → 传输 → 收尾（不止上传下载） -->
+        <ol class="steps">
+          {#each PHASES as p, i}
+            <li
+              class="step"
+              class:done={done || i < phaseIdx}
+              class:active={i === phaseIdx && running}
+              class:bad={i === phaseIdx && failed}
+              title={p.hint}
+            >
+              <span class="step-dot"></span>
+              <span class="step-label">{p.label}</span>
+            </li>
+          {/each}
+        </ol>
+      {/if}
 
       <div class="progress">
         <div
@@ -143,6 +174,76 @@
   .count {
     color: var(--text-2);
     font-size: 12px;
+  }
+
+  /* 阶段进度条：准备 → 传输 → 收尾 */
+  .steps {
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin: 0 0 var(--s3);
+    padding: 0;
+  }
+  .step {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+  .step-dot {
+    height: 3px;
+    border-radius: 999px;
+    background: var(--surface-3);
+    border: 1px solid var(--border);
+    transition: background var(--t-fast);
+  }
+  .step-label {
+    font-size: 10.5px;
+    color: var(--text-3);
+    text-align: center;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .step.done .step-dot {
+    background: var(--primary);
+    border-color: var(--primary);
+  }
+  .step.done .step-label {
+    color: var(--text-2);
+  }
+  .step.active .step-dot {
+    background: var(--primary);
+    border-color: var(--primary);
+    animation: stepPulse 1.4s ease-in-out infinite;
+  }
+  .step.active .step-label {
+    color: var(--primary);
+    font-weight: 600;
+  }
+  .step.bad .step-dot {
+    background: var(--danger, #dc2626);
+    border-color: var(--danger, #dc2626);
+  }
+  .step.bad .step-label {
+    color: var(--danger, #dc2626);
+    font-weight: 600;
+  }
+  @keyframes stepPulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.45;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .step.active .step-dot {
+      animation: none;
+    }
   }
 
   .file {

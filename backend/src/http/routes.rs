@@ -932,6 +932,7 @@ pub async fn run_backup_now(state: &AppState) -> BackupResponse {
             state.eventbus.task_event(
                 crate::eventbus::TaskKind::Backup,
                 crate::eventbus::TaskStatus::Failed,
+                None,
                 state.job_id.clone(),
                 None,
                 0,
@@ -1367,6 +1368,7 @@ async fn restore_run(
             state.eventbus.task_event(
                 crate::eventbus::TaskKind::Restore,
                 crate::eventbus::TaskStatus::Failed,
+                None,
                 "restore".to_string(),
                 None,
                 0,

@@ -89,8 +89,7 @@
     <div class="grow">
       <h2 class="card-title">运行日志</h2>
       <p class="card-desc">
-        服务端运行日志（app.log）末尾 {TAIL} 行 · 共 {fmtBytes(size)}；
-        需要更详细日志请在设置页开启「调试日志」
+        服务端运行日志（app.log）末尾 {TAIL} 行 · 共 {fmtBytes(size)}；需要更详细日志请开启下方「调试日志」
       </p>
     </div>
     {#if truncated}

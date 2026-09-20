@@ -78,6 +78,23 @@ impl RestoreJob {
     pub async fn run(&self, rel_files: &[String], restore_dir: &Path) -> Result<RestoreSummary> {
         std::fs::create_dir_all(restore_dir)?;
 
+        let meter = Arc::new(Mutex::new(SpeedMeter::new()));
+        let started = Instant::now();
+
+        // 准备阶段：先推一条事件，避免「列取云端文件」期间面板毫无反馈
+        self.publish(
+            crate::eventbus::TaskStatus::Started,
+            Some(crate::eventbus::TaskPhase::Prepare),
+            None,
+            0,
+            0,
+            0,
+            0,
+            started.elapsed().as_millis() as u64,
+            0,
+            Some("准备中：读取快照并列出云端待恢复文件…".to_string()),
+        );
+
         let files_to_restore: Vec<String> = if rel_files.is_empty() {
             self.list_target_files().await?
         } else {
@@ -90,16 +107,16 @@ impl RestoreJob {
             .map(|r| self.meta.get(r).map(|(s, _)| *s).unwrap_or(0))
             .sum();
 
-        let meter = Arc::new(Mutex::new(SpeedMeter::new()));
-        let started = Instant::now();
+        // 准备完成 → 进入传输（下载）阶段
         self.publish(
             crate::eventbus::TaskStatus::Started,
+            Some(crate::eventbus::TaskPhase::Transfer),
             None,
             0,
             total,
             0,
             total_bytes,
-            0,
+            started.elapsed().as_millis() as u64,
             0,
             None,
         );
@@ -138,6 +155,7 @@ impl RestoreJob {
                             eb.task_event(
                                 crate::eventbus::TaskKind::Restore,
                                 crate::eventbus::TaskStatus::Progress,
+                                Some(crate::eventbus::TaskPhase::Transfer),
                                 "restore".to_string(),
                                 Some(file.clone()),
                                 done,
@@ -211,6 +229,7 @@ impl RestoreJob {
                 };
                 self.publish(
                     crate::eventbus::TaskStatus::Progress,
+                    Some(crate::eventbus::TaskPhase::Transfer),
                     Some(rel.clone()),
                     d,
                     total,
@@ -232,6 +251,7 @@ impl RestoreJob {
             restored_bytes += n;
             self.publish(
                 crate::eventbus::TaskStatus::Progress,
+                Some(crate::eventbus::TaskPhase::Transfer),
                 Some(rel.clone()),
                 d,
                 total,
@@ -256,6 +276,7 @@ impl RestoreJob {
         self.publish(
             crate::eventbus::TaskStatus::Completed,
             None,
+            None,
             restored as u64,
             total,
             restored_bytes,
@@ -277,6 +298,7 @@ impl RestoreJob {
     fn publish(
         &self,
         status: crate::eventbus::TaskStatus,
+        phase: Option<crate::eventbus::TaskPhase>,
         current_file: Option<String>,
         done: u64,
         total: u64,
@@ -290,6 +312,7 @@ impl RestoreJob {
             eb.task_event(
                 crate::eventbus::TaskKind::Restore,
                 status,
+                phase,
                 "restore".to_string(),
                 current_file,
                 done,

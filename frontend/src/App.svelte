@@ -236,6 +236,7 @@
           liveStatus = {
             kind: data.kind,
             status: data.status,
+            phase: data.phase,
             current_file: data.current_file,
             done: data.done,
             total: data.total,
@@ -651,7 +652,7 @@
           <Icon name="alert" size={17} />
           <div class="alert-body">
             <div class="alert-title">尚未配置 WebDAV 凭据</div>
-            填写账号密码后才能执行备份与恢复。
+            填写账号与应用密码后才能执行备份与恢复。
             <button class="btn btn-sm btn-soft inline" on:click={() => go('settings')}>
               前往设置<Icon name="arrow-right" size={13} />
             </button>
@@ -972,6 +973,10 @@
     flex-shrink: 0;
     position: sticky;
     top: 92px;
+    /* 账号卡与实时任务卡之间留出间距（此前两块卡片紧贴，显得很挤） */
+    display: flex;
+    flex-direction: column;
+    gap: var(--s4);
   }
   .inline {
     margin-left: 6px;

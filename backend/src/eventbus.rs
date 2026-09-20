@@ -27,6 +27,18 @@ pub enum TaskStatus {
     Failed,
 }
 
+/// 任务阶段（UI 用「准备 → 传输 → 收尾」展示任务全流程，而不只是上传下载）
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskPhase {
+    /// 准备：扫描源目录、比对快照差分、列取云端文件
+    Prepare,
+    /// 传输：上传 / 下载文件
+    Transfer,
+    /// 收尾：删除云端多余文件、保留策略清理孤儿、落盘快照
+    Cleanup,
+}
+
 /// 领域事件（备份/恢复任务状态推送）
 #[derive(Debug, Clone, Serialize)]
 pub struct DomainEvent {
@@ -34,6 +46,9 @@ pub struct DomainEvent {
     pub kind: TaskKind,
     /// 任务状态（started / progress / completed / failed）
     pub status: TaskStatus,
+    /// 当前阶段（prepare / transfer / cleanup；为空表示未上报阶段）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<TaskPhase>,
     /// 任务 id（多路径时含索引）
     pub job_id: String,
     /// 当前处理文件（可选）
@@ -92,6 +107,7 @@ impl EventBus {
         &self,
         kind: TaskKind,
         status: TaskStatus,
+        phase: Option<TaskPhase>,
         job_id: String,
         current_file: Option<String>,
         done: u64,
@@ -109,6 +125,7 @@ impl EventBus {
         self.publish(DomainEvent {
             kind,
             status,
+            phase,
             job_id,
             current_file,
             done,
