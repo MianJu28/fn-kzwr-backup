@@ -101,6 +101,19 @@ impl AuditLog {
         items
     }
 
+    /// 清空审计日志，返回清除的条数
+    pub fn clear(&self) -> usize {
+        let _guard = self.lock.lock().unwrap();
+        let n = std::fs::File::open(&self.path)
+            .map(|f| BufReader::new(f).lines().count())
+            .unwrap_or(0);
+        if let Err(e) = std::fs::write(&self.path, "") {
+            tracing::warn!(err = %e, "清空审计日志失败");
+            return 0;
+        }
+        n
+    }
+
     /// 裁剪日志文件（保留最近 KEEP_LINES 行）
     fn trim(&self) {
         let file = match std::fs::File::open(&self.path) {

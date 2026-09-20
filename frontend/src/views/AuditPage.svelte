@@ -23,8 +23,18 @@
     }
   }
 
+  /** 清空审计（AuditSection 弹窗内输入管理员口令） */
+  async function clearAudit(passphrase) {
+    try {
+      return await api.auditClear(passphrase);
+    } catch (e) {
+      toast.error(e.message, '清空审计失败');
+      return { error: e.message };
+    }
+  }
+
   // 进入页面即加载最新记录（切页由 App.go 触发重挂载）
   onMount(load);
 </script>
 
-<AuditSection {entries} busy={busy || loading} onLoad={load} />
+<AuditSection {entries} busy={busy || loading} onLoad={load} onClear={clearAudit} />

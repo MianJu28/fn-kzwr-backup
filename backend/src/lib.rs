@@ -100,6 +100,8 @@ pub struct AppState {
     pub backup_tmp: PathBuf,
     /// 恢复默认目录
     pub default_restore_dir: PathBuf,
+    /// 运行日志文件路径（日志页查看/清空/下载）
+    pub log_file: PathBuf,
     /// kzwr REST 客户端（**增强功能**：账号存储空间、回收站清理等，非备份通道）
     ///
     /// access-token 从配置解密后注入；未配置时调用返回认证提示，不影响备份/恢复。

@@ -4,6 +4,7 @@
   import RestorePage from './views/RestorePage.svelte';
   import SettingsPage from './views/SettingsPage.svelte';
   import AuditPage from './views/AuditPage.svelte';
+  import LogsPage from './views/LogsPage.svelte';
   import LiveStatus from './components/LiveStatus.svelte';
   import AlertBanner from './components/AlertBanner.svelte';
   import Toast from './components/Toast.svelte';
@@ -81,6 +82,7 @@
     { id: 'restore', label: '恢复', icon: 'download' },
     { id: 'settings', label: '设置', icon: 'sliders' },
     { id: 'audit', label: '审计', icon: 'file' },
+    { id: 'logs', label: '日志', icon: 'file' },
   ];
 
   const PAGE_META = {
@@ -89,6 +91,7 @@
     restore: { title: '恢复', desc: '浏览云端备份内容，按文件或目录恢复到原位置' },
     settings: { title: '设置', desc: 'WebDAV 凭据、加密密钥、通知与配置迁移' },
     audit: { title: '操作审计', desc: '敏感与破坏性操作的本地留痕（audit.log）' },
+    logs: { title: '运行日志', desc: '服务端运行日志查看、清空与下载' },
   };
 
   $: page = PAGE_META[currentPage] || PAGE_META.dashboard;
@@ -719,6 +722,8 @@
             />
           {:else if currentPage === 'audit'}
             <AuditPage {busy} />
+          {:else if currentPage === 'logs'}
+            <LogsPage />
           {:else if currentPage === 'settings'}
             <SettingsPage
               {webdavConfigured}

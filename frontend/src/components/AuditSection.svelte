@@ -2,12 +2,16 @@
   // 操作审计日志：记录敏感/破坏性操作（凭据变更、密钥导出、配置导入、备份恢复等）
   import Icon from './Icon.svelte';
   import { fmtTime } from '../lib/format.js';
+  import { confirmDialog } from '../lib/confirm.js';
+  import { toast } from '../lib/toast.js';
 
   export let entries = [];
   export let busy = false;
   export let onLoad = null; // () => Promise
+  export let onClear = null; // () => Promise<{cleared, error}>
 
   let loading = false;
+  let clearing = false;
   let shown = 20;
 
   const ACTION_TEXT = {
@@ -24,6 +28,10 @@
     'kzwr.token.save': '保存 token',
     'kzwr.token.clear': '清除 token',
     'kzwr.trash.empty': '清空回收站',
+    'kzwr.trash.auto': '自动清空回收站',
+    'restore.prune': '清理缺失记录',
+    'logs.clear': '清空日志',
+    'audit.clear': '清空审计',
   };
 
   $: list = entries || [];
@@ -36,6 +44,37 @@
       await onLoad();
     } finally {
       loading = false;
+    }
+  }
+
+  async function clear() {
+    const pass = await confirmDialog({
+      title: '清空操作审计？',
+      message: '所有审计记录将被删除（本次清空操作本身会留痕）。\n请输入管理员口令以继续：',
+      confirmText: '验证并清空',
+      cancelText: '取消',
+      danger: true,
+      input: true,
+      placeholder: '管理员口令',
+    });
+    // input 模式：取消返回 false；空串直接提示
+    if (pass === false) return;
+    if (!pass) {
+      toast.error('请输入管理员口令');
+      return;
+    }
+    if (!onClear) return;
+    clearing = true;
+    try {
+      const r = await onClear(pass);
+      if (r && r.error) {
+        toast.error(r.error);
+        return;
+      }
+      toast.success(`审计已清空（${r.cleared} 条）`);
+      await reload();
+    } finally {
+      clearing = false;
     }
   }
 </script>
@@ -51,6 +90,15 @@
       </p>
     </div>
     <span class="badge">{list.length} 条</span>
+    {#if onClear}
+      <button
+        class="btn btn-sm btn-ghost clear"
+        on:click={clear}
+        disabled={busy || loading || clearing}
+      >
+        {#if clearing}<span class="spin"></span>清空中{:else}<Icon name="trash" size={13} />清空{/if}
+      </button>
+    {/if}
   </div>
 
   <div class="card-body">
@@ -93,6 +141,23 @@
   .grow {
     flex: 1;
     min-width: 0;
+  }
+  .clear {
+    color: var(--danger, #dc2626);
+  }
+  .spin {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    animation: spin 0.7s linear infinite;
+    display: inline-block;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
   .slim {
     padding: 14px;

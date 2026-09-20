@@ -106,127 +106,108 @@ impl RestoreJob {
 
         let mut restored = 0usize;
         let mut restored_bytes = 0u64;
-        // 并发下载：完成数/字节数由共享计数器汇总，速度由每文件独立基线汇入共享计量器
-        let shared = Arc::new(Mutex::new((0u64, 0u64)));
-        let downloads = futures::stream::iter(
-            files_to_restore
-                .into_iter()
-                .filter(|r| !r.trim().is_empty())
-                .map(|rel| {
-                    let shared = shared.clone();
-                    let meter = meter.clone();
-                    let file_plain = self.meta.get(&rel).map(|(s, _)| *s).unwrap_or(0);
-                    async move {
-                        // 文件内实时进度：按下载密文字节（≈明文）换算为明文已传量
-                        let fm = Arc::new(Mutex::new(SpeedMeter::begin_file()));
-                        let cb: Option<crate::infra::storage_trait::ProgressCb> = {
-                            let eb = self.eventbus.clone();
-                            let file = rel.clone();
-                            let meter = meter.clone();
-                            let shared = shared.clone();
-                            Some(std::sync::Arc::new(
-                                move |enc_read: u64, _t: u64, elapsed_ms: u64| {
-                                    let speed = {
-                                        let mut m = meter.lock().unwrap();
-                                        fm.lock()
-                                            .unwrap()
-                                            .observe(&mut m, enc_read, elapsed_ms);
-                                        m.speed_bps()
-                                    };
-                                    // 下载完成后才计入完成数：基准从共享计数器现读
-                                    let (done, base) = {
-                                        let s = shared.lock().unwrap();
-                                        (s.0, s.1)
-                                    };
-                                    let plain_in_file = if file_plain > 0 {
-                                        enc_read.min(file_plain)
-                                    } else {
-                                        enc_read
-                                    };
-                                    if let Some(eb) = &eb {
-                                        eb.task_event(
-                                            crate::eventbus::TaskKind::Restore,
-                                            crate::eventbus::TaskStatus::Progress,
-                                            "restore".to_string(),
-                                            Some(file.clone()),
-                                            done,
-                                            total,
-                                            base + plain_in_file,
-                                            total_bytes,
-                                            started.elapsed().as_millis() as u64,
-                                            speed,
-                                            None,
-                                        );
-                                    }
-                                },
-                            ))
-                        };
-                        // 网络类失败自动重试（最多 3 次，线性退避）；
-                        // 云端文件不存在 → 标记为缺失并继续；其余错误照常中止
-                        let (n, is_missing) = {
-                            let mut out: Result<(u64, bool), anyhow::Error> =
-                                Err(anyhow::anyhow!("恢复未执行"));
-                            for attempt in 1..=crate::domain::NETWORK_RETRY_ATTEMPTS {
-                                out = match self.restore_one(&rel, restore_dir, cb.clone()).await {
-                                    Ok(n) => Ok((n, false)),
-                                    Err(e) => {
-                                        let not_found = e
-                                            .downcast_ref::<crate::infra::storage_trait::StorageError>()
-                                            .map(|se| {
-                                                matches!(
-                                                    se,
-                                                    crate::infra::storage_trait::StorageError::NotFound(_)
-                                                )
-                                            })
-                                            .unwrap_or(false);
-                                        if not_found {
-                                            tracing::warn!("云端文件不存在，恢复时跳过: {}", rel);
-                                            Ok((0u64, true))
-                                        } else {
-                                            Err(e)
-                                        }
-                                    }
-                                };
-                                match &out {
-                                    Ok(_) => break,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "恢复 {} 第 {attempt}/{} 次失败: {e:#}",
-                                            rel,
-                                            crate::domain::NETWORK_RETRY_ATTEMPTS
-                                        );
-                                        if !crate::domain::is_retryable_err(e)
-                                            || attempt == crate::domain::NETWORK_RETRY_ATTEMPTS
-                                        {
-                                            break;
-                                        }
-                                        tokio::time::sleep(std::time::Duration::from_millis(
-                                            500 * attempt as u64,
-                                        ))
-                                        .await;
-                                    }
-                                }
-                            }
-                            out?
-                        };
-                        Ok::<(String, u64, bool), anyhow::Error>((rel, n, is_missing))
-                    }
-                }),
-        )
-        .buffer_unordered(crate::domain::TRANSFER_CONCURRENCY);
         let mut missing: Vec<String> = Vec::new();
-        let mut downloads = std::pin::pin!(downloads);
-        while let Some(item) = downloads.next().await {
-            let (rel, n, is_missing) = item?;
+        // 顺序下载；共享计数器供进度回调读取基准（完成数含缺失跳过）
+        let shared = Arc::new(Mutex::new((0u64, 0u64)));
+        for rel in files_to_restore.into_iter().filter(|r| !r.trim().is_empty()) {
+            let file_plain = self.meta.get(&rel).map(|(s, _)| *s).unwrap_or(0);
+            // 文件内实时进度：按下载密文字节（≈明文）换算为明文已传量
+            let fm = Arc::new(Mutex::new(SpeedMeter::begin_file()));
+            let cb: Option<crate::infra::storage_trait::ProgressCb> = {
+                let eb = self.eventbus.clone();
+                let file = rel.clone();
+                let meter = meter.clone();
+                let shared = shared.clone();
+                Some(std::sync::Arc::new(
+                    move |enc_read: u64, _t: u64, elapsed_ms: u64| {
+                        let speed = {
+                            let mut m = meter.lock().unwrap();
+                            fm.lock().unwrap().observe(&mut m, enc_read, elapsed_ms);
+                            m.speed_bps()
+                        };
+                        let (done, base) = {
+                            let s = shared.lock().unwrap();
+                            (s.0, s.1)
+                        };
+                        let plain_in_file = if file_plain > 0 {
+                            enc_read.min(file_plain)
+                        } else {
+                            enc_read
+                        };
+                        if let Some(eb) = &eb {
+                            eb.task_event(
+                                crate::eventbus::TaskKind::Restore,
+                                crate::eventbus::TaskStatus::Progress,
+                                "restore".to_string(),
+                                Some(file.clone()),
+                                done,
+                                total,
+                                base + plain_in_file,
+                                total_bytes,
+                                started.elapsed().as_millis() as u64,
+                                speed,
+                                None,
+                            );
+                        }
+                    },
+                ))
+            };
+            // 网络类失败自动重试（最多 3 次，线性退避）；
+            // 云端文件不存在 → 标记为缺失并继续；其余错误照常中止
+            let (n, is_missing) = {
+                let mut out: Result<(u64, bool), anyhow::Error> =
+                    Err(anyhow::anyhow!("恢复未执行"));
+                for attempt in 1..=crate::domain::NETWORK_RETRY_ATTEMPTS {
+                    out = match self.restore_one(&rel, restore_dir, cb.clone()).await {
+                        Ok(n) => Ok((n, false)),
+                        Err(e) => {
+                            let not_found = e
+                                .downcast_ref::<crate::infra::storage_trait::StorageError>()
+                                .map(|se| {
+                                    matches!(
+                                        se,
+                                        crate::infra::storage_trait::StorageError::NotFound(_)
+                                    )
+                                })
+                                .unwrap_or(false);
+                            if not_found {
+                                tracing::warn!("云端文件不存在，恢复时跳过: {}", rel);
+                                Ok((0u64, true))
+                            } else {
+                                Err(e)
+                            }
+                        }
+                    };
+                    match &out {
+                        Ok(_) => break,
+                        Err(e) => {
+                            tracing::warn!(
+                                "恢复 {} 第 {attempt}/{} 次失败: {e:#}",
+                                rel,
+                                crate::domain::NETWORK_RETRY_ATTEMPTS
+                            );
+                            if !crate::domain::is_retryable_err(e)
+                                || attempt == crate::domain::NETWORK_RETRY_ATTEMPTS
+                            {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                500 * attempt as u64,
+                            ))
+                            .await;
+                        }
+                    }
+                }
+                out?
+            };
             if is_missing {
-                // 云端文件已被删除（如用户直接在网盘上删了文件）：
-                // 跳过并记录，不使整个恢复任务失败，进度照常推进到 100%
+                // 云端文件已被删除：跳过并记录，进度照常推进到 100%
                 // 注意：进度完成数（done，含缺失跳过）与恢复成功数（restored）分开统计
                 missing.push(rel.clone());
-                let (d, _b) = {
+                let d = {
                     let mut s = shared.lock().unwrap();
                     s.0 += 1;
-                    (s.0, s.1)
+                    s.0
                 };
                 self.publish(
                     crate::eventbus::TaskStatus::Progress,
@@ -241,14 +222,14 @@ impl RestoreJob {
                 );
                 continue;
             }
-            let (d, b) = {
+            let d = {
                 let mut s = shared.lock().unwrap();
                 s.0 += 1;
                 s.1 += n;
-                (s.0, s.1)
+                s.0
             };
             restored += 1;
-            restored_bytes = b;
+            restored_bytes += n;
             self.publish(
                 crate::eventbus::TaskStatus::Progress,
                 Some(rel.clone()),

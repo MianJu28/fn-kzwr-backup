@@ -156,87 +156,65 @@ impl BackupJob {
                 let _ = self.target.ensure_dir(&tp).await;
             }
 
-            // 2) 上传新增/修改文件（断点续传：每上传完一个文件即时保存其快照）
-            //    并发 TRANSFER_CONCURRENCY 路；完成数/字节数由共享计数器汇总
-            let upload_files: Vec<FileDescriptor> = p
-                .changeset
-                .upload
-                .iter()
-                .filter(|fd| !fd.is_dir)
-                .cloned()
-                .collect();
+            // 2) 上传新增/修改文件（顺序传输；断点续传：每上传完一个文件即时保存其快照）
             let shared = Arc::new(Mutex::new((done, bytes_done)));
-            let uploads = futures::stream::iter(upload_files.into_iter().map(|fd| {
-                let source = p.source.clone();
-                let prefix = p.target_prefix.clone();
-                let shared = shared.clone();
-                let meter = meter.clone();
-                async move {
-                    let cb = self.plain_progress_cb(
-                        &self.job_id,
-                        &fd.rel_path,
-                        shared,
-                        grand_total_files,
-                        grand_total_bytes,
-                        fd.size,
-                        meter,
-                        started,
-                    );
-                    // 网络类失败自动重试（最多 3 次，线性退避；认证/不存在类不重试）
-                    let plain_n = {
-                        let mut out: Result<u64, anyhow::Error> =
-                            Err(anyhow::anyhow!("上传未执行"));
-                        for attempt in 1..=crate::domain::NETWORK_RETRY_ATTEMPTS {
-                            out = self
-                                .upload_one(
-                                    &*source,
-                                    &fd.rel_path,
-                                    prefix.as_deref(),
-                                    Some(cb.clone()),
-                                )
-                                .await;
-                            match &out {
-                                Ok(_) => break,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "上传 {} 第 {attempt}/{} 次失败: {e:#}",
-                                        fd.rel_path,
-                                        crate::domain::NETWORK_RETRY_ATTEMPTS
-                                    );
-                                    if !crate::domain::is_retryable_err(e)
-                                        || attempt == crate::domain::NETWORK_RETRY_ATTEMPTS
-                                    {
-                                        break;
-                                    }
-                                    tokio::time::sleep(std::time::Duration::from_millis(
-                                        500 * attempt as u64,
-                                    ))
-                                    .await;
+            for fd in p.changeset.upload.iter().filter(|fd| !fd.is_dir) {
+                {
+                    let mut s = shared.lock().unwrap();
+                    s.0 = done;
+                    s.1 = bytes_done;
+                }
+                let cb = self.plain_progress_cb(
+                    &self.job_id,
+                    &fd.rel_path,
+                    shared.clone(),
+                    grand_total_files,
+                    grand_total_bytes,
+                    fd.size,
+                    meter.clone(),
+                    started,
+                );
+                // 网络类失败自动重试（最多 3 次，线性退避；认证/不存在类不重试）
+                let plain_n = {
+                    let mut out: Result<u64, anyhow::Error> = Err(anyhow::anyhow!("上传未执行"));
+                    for attempt in 1..=crate::domain::NETWORK_RETRY_ATTEMPTS {
+                        out = self
+                            .upload_one(
+                                &*p.source,
+                                &fd.rel_path,
+                                p.target_prefix.as_deref(),
+                                Some(cb.clone()),
+                            )
+                            .await;
+                        match &out {
+                            Ok(_) => break,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "上传 {} 第 {attempt}/{} 次失败: {e:#}",
+                                    fd.rel_path,
+                                    crate::domain::NETWORK_RETRY_ATTEMPTS
+                                );
+                                if !crate::domain::is_retryable_err(e)
+                                    || attempt == crate::domain::NETWORK_RETRY_ATTEMPTS
+                                {
+                                    break;
                                 }
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    500 * attempt as u64,
+                                ))
+                                .await;
                             }
                         }
-                        out?
-                    };
-                    Ok::<(FileDescriptor, u64), anyhow::Error>((fd, plain_n))
-                }
-            }))
-            .buffer_unordered(crate::domain::TRANSFER_CONCURRENCY);
-            let mut uploads = std::pin::pin!(uploads);
-            while let Some(item) = uploads.next().await {
-                let (fd, plain_n) = item?;
-                // 上传**完成后**才计入完成数（避免「未完成就 +1」）
-                let (d, b) = {
-                    let mut s = shared.lock().unwrap();
-                    s.0 += 1;
-                    s.1 += plain_n;
-                    (s.0, s.1)
+                    }
+                    out?
                 };
-                done = d;
-                bytes_done = b;
+                // 上传**完成后**才计入完成数（避免「未完成就 +1」）
+                done += 1;
+                bytes_done += plain_n;
                 summary.uploaded += 1;
                 summary.uploaded_bytes += plain_n;
                 self.store
-                    .save_entry(&p.job_id, self.account(), &SnapshotEntry::from_fd(&fd))?;
+                    .save_entry(&p.job_id, self.account(), &SnapshotEntry::from_fd(fd))?;
                 self.publish(
                     &self.job_id,
                     crate::eventbus::TaskStatus::Progress,
