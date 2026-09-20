@@ -70,6 +70,10 @@
   }
   .modal-input {
     width: 100%;
-    margin: var(--s2) 0 0;
+    margin: 0;
+  }
+  /* 输入模式：输入框与按钮之间留足间距，避免拥挤 */
+  .modal-actions {
+    margin-top: var(--s4);
   }
 </style>

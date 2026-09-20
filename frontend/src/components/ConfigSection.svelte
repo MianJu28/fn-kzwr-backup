@@ -7,7 +7,6 @@
   export let onExportConfig = null; // (passphrase) => Promise<{success, config, error}>
   export let onImportConfig = null; // (passphrase, configText) => Promise<{success, error}>
 
-  let passphrase = '';
   let exportText = '';
   let importText = '';
   let msg = '';
@@ -40,14 +39,21 @@
   }
 
   async function doExport() {
-    if (!passphrase.trim()) {
-      msg = '请先输入管理员口令';
-      msgOk = false;
-      return;
-    }
+    // 口令经统一弹窗收集（input 模式）
+    const pass = await confirmDialog({
+      title: '导出配置？',
+      message:
+        '导出内容包含 WebDAV 凭据与 age 私钥明文，需验证管理员口令。\n请勿在公共场合泄露导出结果。',
+      confirmText: '验证并导出',
+      danger: true,
+      input: true,
+      placeholder: '管理员口令',
+    });
+    if (pass === false || !pass) return;
+
     working = true;
     msg = '';
-    const r = await onExportConfig(passphrase.trim());
+    const r = await onExportConfig(pass);
     working = false;
     if (r.success) {
       exportText = r.config || '';
@@ -70,28 +76,26 @@
   }
 
   async function doImport() {
-    if (!passphrase.trim()) {
-      msg = '请先输入管理员口令';
-      msgOk = false;
-      return;
-    }
     if (!importText.trim()) {
       msg = '请粘贴或选择配置文件';
       msgOk = false;
       return;
     }
-    const yes = await confirmDialog({
+    // 口令经统一弹窗收集（input 模式）
+    const pass = await confirmDialog({
       title: '导入配置？',
       message:
-        '导入将覆盖当前的备份路径、目标文件夹、定时任务与通知设置；若配置包内含 age 私钥，也会一并恢复。\n\n确定继续？',
-      confirmText: '导入并覆盖',
+        '导入将覆盖当前的备份路径、目标文件夹、定时任务与通知设置；若配置包内含 age 私钥，也会一并恢复。\n请输入管理员口令以继续：',
+      confirmText: '验证并导入',
       danger: true,
+      input: true,
+      placeholder: '管理员口令',
     });
-    if (!yes) return;
+    if (pass === false || !pass) return;
 
     working = true;
     msg = '';
-    const r = await onImportConfig(passphrase.trim(), importText.trim());
+    const r = await onImportConfig(pass, importText.trim());
     working = false;
     if (r.success) {
       msg = '配置已导入并立即生效';
@@ -128,20 +132,11 @@
   </div>
 
   <div class="card-body">
-    <label class="field">
-      <span class="label">管理员口令 <span class="opt">（导入 / 导出均需校验）</span></span>
-      <input
-        class="input"
-        type="password"
-        bind:value={passphrase}
-        autocomplete="off"
-        placeholder="安装时设置的管理员口令"
-      />
-    </label>
+    <p class="card-desc head-desc">导入 / 导出均需验证管理员口令（在弹窗中输入）。</p>
 
     <div class="divider-title">导出</div>
     <div class="row-wrap">
-      <button class="btn btn-primary" on:click={doExport} disabled={busy || working || !passphrase.trim()}>
+      <button class="btn btn-primary" on:click={doExport} disabled={busy || working}>
         {#if working}<span class="spin"></span>处理中…{:else}<Icon name="download" size={15} />导出配置{/if}
       </button>
       <button class="btn btn-ghost" on:click={() => copyText(exportText)} disabled={!exportText}>
