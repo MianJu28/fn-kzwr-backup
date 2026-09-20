@@ -1,5 +1,5 @@
 appname               = fn-kzwr-backup
-version               = 0.2.2
+version               = 0.2.3
 display_name          = 酷族备份
 desc                  = 在飞牛 NAS 上把指定文件夹增量、age 加密备份到酷族网软（kzwr）官方 WebDAV：断点续传、大文件自动分片、cron 定时、实时进度与速度、保留策略，并支持按文件或目录选择性恢复。
 platform              = x86
@@ -15,4 +15,4 @@ service_port          = 8080
 checkport             = true
 disable_authorization_path = false
 micro_app             = true
-changelog             = 设置项回显：WebDAV 用户名回填到输入框（密码仍不回显），新增「保留策略」设置（孤儿文件清理开关 + 最小保留天数），云端目标文件夹、定时、通知等非敏感配置沿用回显，改完即可就地保存。
+changelog             = 新增增强功能（可选）：浏览器从 Cookie 复制 access-token 即可查看存储空间/账号详情、清空云端回收站（可跟随保留策略：占用与时间门槛）、空间占用预警，token 失效自动告警；WebDAV 凭据引导在官网创建应用密码（永不过期+读写），并校验账号一致性；新增定时任务可视化、一键体检与操作审计。
