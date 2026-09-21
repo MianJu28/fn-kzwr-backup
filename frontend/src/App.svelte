@@ -17,6 +17,7 @@
   import { APP_BASE } from './lib/appBase.js';
   import { toast } from './lib/toast.js';
   import { theme, initTheme, toggleTheme } from './lib/theme.js';
+  import { setHostTimezone } from './lib/format.js';
 
   /* ── 全局状态 ─────────────────────────────────────────────── */
   let health = ''; // 服务状态文本
@@ -36,6 +37,8 @@
   let targetFolder = 'fn-backup';
   let scheduleCron = '';
   let scheduleCronValid = true;
+  // 宿主时区说明（如「CST (UTC+08:00)」，用于页面标注时间口径）
+  let scheduleTimezone = '';
 
   // 备份 / 恢复
   let busy = false;
@@ -116,6 +119,9 @@
   async function loadConfig() {
     try {
       const d = await api.config();
+      // 时间展示统一按宿主（NAS）时区，而不是浏览器时区
+      setHostTimezone(d.host_utc_offset_minutes);
+      scheduleTimezone = d.schedule_timezone || '';
       backupPaths = d.backup_paths || [];
       targetFolder = d.target_folder || 'fn-backup';
       scheduleCron = d.schedule_cron || '';
@@ -637,6 +643,12 @@
         <span class="dot" class:on={wsConnected} class:off={!wsConnected}></span>
         <span>{wsConnected ? '实时通道已连接' : '实时通道断开'}</span>
       </div>
+      {#if scheduleTimezone}
+        <div class="status-pill" title="页面上的时间均按宿主（NAS）时区显示">
+          <span class="dot"></span>
+          <span>时区 {scheduleTimezone}</span>
+        </div>
+      {/if}
       <button class="theme-btn" on:click={toggleTheme}>
         <Icon name={$theme === 'dark' ? 'sun' : 'moon'} size={15} />
         <span>{$theme === 'dark' ? '浅色模式' : '深色模式'}</span>

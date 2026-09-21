@@ -355,14 +355,35 @@ fn init_logging(debug: bool, file: LogFileWriter) -> anyhow::Result<()> {
         .with(filter_layer)
         // 关闭 ANSI 颜色码：stdout 会被生命周期脚本重定向进同一个日志文件，
         // 带颜色码时日志页/下载的 app.log 会混入 [2m[32m 之类的乱码
-        .with(tracing_subscriber::fmt::layer().with_ansi(false)) // stdout
         .with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
+                .with_timer(LocalTimer),
+        ) // stdout（生命周期脚本会把它重定向进同一个 app.log，时间戳口径要一致）
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                // 时间戳按宿主本地时区输出（默认是 UTC，在东八区差 8 小时）
+                .with_timer(LocalTimer)
                 .with_writer(file),
         ) // 日志文件
         .init();
     Ok(())
+}
+
+/// 日志时间戳：宿主本地时区，格式 `YYYY-MM-DD HH:MM:SS.mmm`
+///
+/// tracing 默认用 UTC（`2026-09-21T04:14:21.827270Z`），与 NAS 上看到的时间不一致；
+/// 这里用 chrono::Local 渲染，历史行由 `routes.rs::localize_log_time` 在读侧兜底转换。
+struct LocalTimer;
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
+    fn format_time(
+        &self,
+        w: &mut tracing_subscriber::fmt::format::Writer<'_>,
+    ) -> std::fmt::Result {
+        write!(w, "{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"))
+    }
 }
 
 /// 追加写日志文件的 MakeWriter（供 tracing fmt 层使用）

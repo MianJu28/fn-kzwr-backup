@@ -150,3 +150,11 @@ pub fn next_runs(expr: &str, count: usize) -> Result<Vec<String>> {
 pub fn timezone_label() -> String {
     chrono::Local::now().format("%Z (UTC%:z)").to_string()
 }
+
+/// 宿主时区相对 UTC 的分钟偏移（如东八区 = 480）。
+///
+/// 时间戳在传输层统一用 epoch（毫秒，与时区无关），由前端按**宿主时区**展示，
+/// 避免浏览器时区与 NAS 不一致时显示成另一个时间。
+pub fn utc_offset_minutes() -> i64 {
+    chrono::Local::now().offset().local_minus_utc() as i64 / 60
+}

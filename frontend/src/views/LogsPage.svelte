@@ -19,7 +19,8 @@
   let clearing = false;
   let savingDebug = false;
 
-  $: text = lines.join('\n');
+  // 倒序显示：最新日志在最上方（文件本身仍是追加写的正序，下载保持原样）
+  $: text = [...lines].reverse().join('\n');
 
   /** 调试日志开关（切换即保存并热生效） */
   async function toggleDebug(e) {
@@ -89,7 +90,8 @@
     <div class="grow">
       <h2 class="card-title">运行日志</h2>
       <p class="card-desc">
-        服务端运行日志（app.log）末尾 {TAIL} 行 · 共 {fmtBytes(size)}；需要更详细日志请开启下方「调试日志」
+        服务端运行日志（app.log）末尾 {TAIL} 行 · 共 {fmtBytes(size)}；<strong>最新在上面</strong>，时间为宿主本地时区；
+        需要更详细日志请开启下方「调试日志」
       </p>
     </div>
     {#if truncated}
