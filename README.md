@@ -24,7 +24,7 @@
 - **Web UI**：导航栏多页面，实时进度（WebSocket，含速度/大小/用时）、WebDAV 凭据配置（保存前自动实测连通性）
 - **任务阶段**：实时任务面板展示 **准备 → 传输 → 收尾** 全流程（扫描差分、上传/下载、删除多余文件与保留策略清理），不再只有传输过程
 - **运行日志**：日志页查看/清空/下载运行日志，调试日志开关即时生效（倒序显示、最新在上，已去除 ANSI 颜色码，时间按宿主 NAS 时区，历史 UTC 行自动换算）
-- **访问方式**：飞牛桌面经**统一网关**打开（`/app/fn-kzwr-backup`，宿主同源反代到应用 Unix Socket）——以 https 访问飞牛时不再被浏览器混合内容拦截；端口直连 `http://<nas>:8080/` 同样可用
+- **访问方式**：飞牛桌面经**统一网关**打开（`/app/fn-kzwr-backup`，宿主同源反代到应用 Unix Socket）——以 https 访问飞牛时不再被浏览器混合内容拦截；**应用不监听 TCP 端口**（唯一入口为网关，需直连调试时手动设 `FN_KZWR_DEBUG_PORT`）
 
 ## 🏗️ 架构
 
@@ -74,7 +74,7 @@ export TRIM_PKGVAR=$HOME/rf-var      # 数据目录（SQLite/密钥库）
 export TRIM_PKGETC=$HOME/rf-cfg      # 配置目录（config.toml）
 export TRIM_PASSPHRASE=your-pass     # 密钥库口令
 export TRIM_WWW_DIR=frontend/dist    # 前端产物
-export TRIM_HTTP_PORT=8098
+export TRIM_APP_SOCK=/tmp/fn-kzwr-backup.sock   # 统一网关 Socket（也可用 FN_KZWR_DEBUG_PORT 临时开端口）
 ./target/release/fn-kzwr-backup
 ```
 
@@ -86,9 +86,9 @@ export TRIM_DAV_USER=your-account
 export TRIM_DAV_PASS=your-password
 ```
 
-打开 `http://<nas>:8098` 进入 Web 界面。
+命令行运行时可设 `FN_KZWR_DEBUG_PORT=8098` 临时开一个本地端口（`http://<nas>:8098`）方便联调，生产不设置。
 
-> 装机后（`.fpk`）由**飞牛统一网关**提供页面访问：`https://<nas>/app/fn-kzwr-backup`（宿主同源反代，https 桌面下不会触发混合内容拦截，WebSocket 同样走该前缀）；`manifest.service_port` 声明的端口仍可直连访问。
+> 装机后（`.fpk`）**只**由**飞牛统一网关**提供页面访问：`https://<nas>/app/fn-kzwr-backup`（宿主同源反代，https 桌面下不会触发混合内容拦截，WebSocket 同样走该前缀）。应用不再声明 `service_port`、也不监听 TCP 端口。
 
 ### 配置（config.toml）
 
