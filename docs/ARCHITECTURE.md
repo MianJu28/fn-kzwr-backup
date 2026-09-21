@@ -292,7 +292,7 @@ trait TargetStorage {
 集成要点：
 - **打包**：`fnpack build` 生成 `.fpk`；项目结构遵循飞牛规范（`app/`、`cmd/`、`config/`、`wizard/`、`manifest`）
 - **生命周期**：`cmd/main` 脚本处理 `start`（启动 Rust 进程）/`stop`（优雅关闭）/`status`（检查存活）
-- **UI 入口**：`app/ui/config` 声明 iframe 桌面入口；**v0.3.2 起改用飞牛统一网关**（`protocol=""` + `gatewayPrefix=/app/fn-kzwr-backup` + `gatewaySocket=app.sock` + `url=/app/fn-kzwr-backup`），`service_port` 端口服务保留用于直连访问与 `checkport` 健康检查（详见 ADR-012）
+- **UI 入口**：`app/ui/config` 声明 iframe 桌面入口；**v0.3.2 起改用飞牛统一网关**（`protocol=""` + `gatewayPrefix=/app/fn-kzwr-backup` + `gatewaySocket=app.sock` + `url=/app/fn-kzwr-backup`）；**v0.3.10 起不再有端口直连**（只监听网关 Socket，详见 ADR-012）
 - **权限**：`run-as=package`，专用用户 `fnosbackup`；通过 `config/resource` 声明共享目录或引导用户授权源目录
 - **路径**：全部使用 `TRIM_*` 环境变量（`TRIM_APPDEST`/`TRIM_PKGETC`/`TRIM_PKGVAR`/`TRIM_PKGTMP`），禁止硬编码
 - **数据归属**：SQLite→`$TRIM_PKGVAR`，配置→`$TRIM_PKGETC`，密钥库→`$TRIM_PKGETC`，临时→`$TRIM_PKGTMP`
@@ -397,7 +397,7 @@ trait TargetStorage {
 - 应用监听 `$TRIM_APPDEST/app.sock`（Unix Socket），由 fnOS 校验 NAS 登录态后**同源反代**（转发时保留前缀）；`cmd/main` 通过 `GATEWAY_PREFIX`/`TRIM_APP_SOCK` 注入，并在启动前与停止后清理残留 socket 文件
 - 前端资源用**绝对前缀**引用（`vite.config.js` 的 `base` + `lib/appBase.js`），API 与 WebSocket 同样带前缀（`${APP_BASE}/api/...`、`ws(s)://host${APP_BASE}/api/ws`）
 - 后端同一套路由同时挂在**根路径与前缀**下；网关连接进入时**先剥离前缀**再交给路由（手写泛型 `tower::Service` 包装器）
-- **保留** `service_port` 端口监听：直连访问（`http://<nas>:8080/`）与 `checkport` 健康检查继续可用
+- ~~**保留** `service_port` 端口监听：直连访问（`http://<nas>:8080/`）与 `checkport` 健康检查继续可用~~ —— **2026-09-21（v0.3.10）作废并移除**：应用不再声明 `service_port`/`checkport`，后端只监听网关 Socket；直连调试改为显式设置 `FN_KZWR_DEBUG_PORT=<端口>` 临时开启
 
 **实现说明（axum 0.7 约束）**：
 - `axum::serve` 只接受 `TcpListener`，Unix Socket 需自行用 `hyper` + `hyper-util` 驱动（`TokioIo` + `TowerToHyperService` + `http1::Builder::serve_connection(...).with_upgrades()`，`with_upgrades` 是 WebSocket 101 的必要条件）
@@ -407,7 +407,8 @@ trait TargetStorage {
 **后果**：
 - (+) https 访问飞牛桌面时页面不再被拦（iframe 与桌面同源同协议）
 - (+) WebSocket 经网关可用；网关先校验登录态，多一层访问控制
-- (+) 端口直连方式保留，调试与兼容旧书签不受影响
+- ~~(+) 端口直连方式保留，调试与兼容旧书签不受影响~~（**已作废（v0.3.10）：移除端口直连**，旧书签 `http://<nas>:8080/` 不再可用；调试改用 `FN_KZWR_DEBUG_PORT`）
+- (+) 少一个对局域网暴露的入口（仅网关 Socket，且网关侧校验 NAS 登录态）
 - (-) 应用需适配「带前缀路由 + Unix Socket 监听」，前端资源与 API 必须使用同一前缀（四处需保持一致：`ui/config` 的 `gatewayPrefix`、`cmd/main` 的 `GATEWAY_PREFIX`、后端 `gateway_prefix()`、前端 `lib/appBase.js` + `vite.config.js`）
 - (-) 前缀变更需**升级安装**才生效（入口声明在安装/升级时注册）
 
@@ -584,7 +585,7 @@ fn-kzwr-backup/
 
 ### 11.1 当前开发状态
 
-**核心备份/恢复主链路已完成并在 x86 飞牛设备实测通过**；当前功能版本 **v0.3.9**（0.2.0 起项目更名 `fn-kzwr-backup`；0.2.1 恢复页懒加载与「全部恢复」；0.2.2 设置项回显；0.2.3 按 ADR-011 引入 kzwr REST 增强功能：存储空间/空间预警/回收站门槛清理，及定时可视化、一键体检、操作审计、账号一致性校验；0.2.4 修复飞牛目录选择器误报取消、操作审计独立成页；0.2.5 修复目录选择器 1003103——config/resource 权限声明键修正为官方的 api-scope；0.2.6 修复保留策略误删刚备份文件、上传/下载 4 路并发并重写速度计量、回收站年龄门槛按宿主时区、凭据解密缓存与恢复树聚合索引提速；0.2.7 恢复容忍云端缺失并新增「清理缺失」按钮、任务失败正确显示失败态；0.2.8 账号信息整合至侧边栏（可刷新）、网络请求自动重试 3 次、调试日志开关、依据实测修正回收站字段 length/deletedDate 使保留策略清空回收站全链路生效——已用真实 token 实测清理 70 项；0.2.9 传输改为顺序执行并保留网络自动重试、日志页（查看/清空/下载 + 调试开关）、审计页清空；0.2.10 调试开关迁移至日志页、需要管理员口令的操作统一改为弹窗输入；0.3.0 实时任务面板展示完整流程阶段（准备/传输/收尾，含扫描差分与保留策略清理）、侧栏卡片间距与 WebDAV 文案优化；0.3.1 修复口令弹窗与通知设置输入框无法输入（Svelte 响应式语句回写绑定变量）；0.3.2 **接入飞牛统一网关修复 https 混合内容拦截**（ADR-012）；0.3.3 应用介绍改用 HTML 富文本并接入宣传图；0.3.4 介绍精简为一句一行；**0.3.9 日志倒序显示、修复日志 ANSI 乱码、**时间口径统一为宿主时区**（日志写入端本地时区 + 历史 UTC 行读侧换算；前端 `fmtTime` 按 `/api/config.host_utc_offset_minutes` 渲染）、空间预警改为后台定期巡检并进入「消息提醒」（回落自动消解）、异常提示统一到「消息提醒」；宣传图显示修复：`desc` 的 `<img>` 只保留 src/alt/width，`style` 属性会被宿主转义成纯文本；文档同步**）。构建与测试**统一通过 SSH 在飞牛 NAS 上进行**（WSL 已废弃：上行仅 ~4KB/s、后台进程随会话被回收）；源码从 Windows 侧经 `pscp`/tar 同步至 NAS 后执行 `Scripts/build_fnos_app.sh`，运行编译好的二进制或通过 HTTP API 测试。
+**核心备份/恢复主链路已完成并在 x86 飞牛设备实测通过**；当前功能版本 **v0.3.10**（0.2.0 起项目更名 `fn-kzwr-backup`；0.2.1 恢复页懒加载与「全部恢复」；0.2.2 设置项回显；0.2.3 按 ADR-011 引入 kzwr REST 增强功能：存储空间/空间预警/回收站门槛清理，及定时可视化、一键体检、操作审计、账号一致性校验；0.2.4 修复飞牛目录选择器误报取消、操作审计独立成页；0.2.5 修复目录选择器 1003103——config/resource 权限声明键修正为官方的 api-scope；0.2.6 修复保留策略误删刚备份文件、上传/下载 4 路并发并重写速度计量、回收站年龄门槛按宿主时区、凭据解密缓存与恢复树聚合索引提速；0.2.7 恢复容忍云端缺失并新增「清理缺失」按钮、任务失败正确显示失败态；0.2.8 账号信息整合至侧边栏（可刷新）、网络请求自动重试 3 次、调试日志开关、依据实测修正回收站字段 length/deletedDate 使保留策略清空回收站全链路生效——已用真实 token 实测清理 70 项；0.2.9 传输改为顺序执行并保留网络自动重试、日志页（查看/清空/下载 + 调试开关）、审计页清空；0.2.10 调试开关迁移至日志页、需要管理员口令的操作统一改为弹窗输入；0.3.0 实时任务面板展示完整流程阶段（准备/传输/收尾，含扫描差分与保留策略清理）、侧栏卡片间距与 WebDAV 文案优化；0.3.1 修复口令弹窗与通知设置输入框无法输入（Svelte 响应式语句回写绑定变量）；0.3.2 **接入飞牛统一网关修复 https 混合内容拦截**（ADR-012）；0.3.3 应用介绍改用 HTML 富文本并接入宣传图；0.3.4 介绍精简为一句一行；**0.3.10 **取消端口直连**（只监听统一网关 Socket，manifest 去掉 `service_port`，安装向导不再收集端口，调试端口 `FN_KZWR_DEBUG_PORT` 默认关闭）、应用介绍去掉宣传图；0.3.9 日志倒序显示、修复日志 ANSI 乱码、**时间口径统一为宿主时区**（日志写入端本地时区 + 历史 UTC 行读侧换算；前端 `fmtTime` 按 `/api/config.host_utc_offset_minutes` 渲染）、空间预警改为后台定期巡检并进入「消息提醒」（回落自动消解）、异常提示统一到「消息提醒」；宣传图显示修复：`desc` 的 `<img>` 只保留 src/alt/width，`style` 属性会被宿主转义成纯文本；文档同步**）。构建与测试**统一通过 SSH 在飞牛 NAS 上进行**（WSL 已废弃：上行仅 ~4KB/s、后台进程随会话被回收）；源码从 Windows 侧经 `pscp`/tar 同步至 NAS 后执行 `Scripts/build_fnos_app.sh`，运行编译好的二进制或通过 HTTP API 测试。
 
 ### 11.2 已实现功能（按模块）
 
@@ -622,7 +623,7 @@ fn-kzwr-backup/
 | **事件总线** | 内部事件总线 | ✅ | tokio::broadcast，备份/恢复进度事件（ADR-007） |
 | **WebSocket** | 实时状态推送 | ✅ | `/api/ws`，前端实时进度条，断线重连；事件携带 `bytes_done`/`bytes_total`/`elapsed_ms`/`speed` |
 | | 任务阶段（phase） | ✅ | 事件新增 `phase`：`prepare`（扫描源目录/差分、列取云端文件）→ `transfer`（上传/下载）→ `cleanup`（删除云端多余文件、保留策略清理、落盘快照）；面板展示完整流程；保留策略改在 `Completed` 之前完成 |
-| **访问方式** | 飞牛统一网关（ADR-012） | ✅ | `app/ui/config` 声明 `gatewayPrefix`/`gatewaySocket`；后端监听 `$TRIM_APPDEST/app.sock` 并在连接入口剥离前缀；端口直连与 `checkport` 保留；前端资源/API/WS 统一带前缀 |
+| **访问方式** | 飞牛统一网关（ADR-012） | ✅ | `app/ui/config` 声明 `gatewayPrefix`/`gatewaySocket`；后端监听 `$TRIM_APPDEST/app.sock` 并在连接入口剥离前缀；**无端口直连**（`service_port` 已移除）；前端资源/API/WS 统一带前缀 |
 | **运行日志** | 日志页（查看/清空/下载） | ✅ | `GET /api/logs?tail=N`（末尾 N 行）、`POST /api/logs/clear`、`GET /api/logs/download`；文件超 5MB 轮转为 `app.old.log`；调试日志开关（`POST /api/config` 的 `debug`）即时热生效 |
 | | 日志无 ANSI 颜色码 | ✅ | tracing 的 stdout 与文件两层均 `with_ansi(false)`；读取/下载时再剥离历史 ANSI 序列（旧日志也不会显示 `[2m`/`[32m`） |
 | **性能** | 凭据解密缓存 | ✅ | `ConfigManager::decrypt_field` 以**密文**为键缓存解密结果（age scrypt 单次数百毫秒，凭据属热路径） |
@@ -736,7 +737,7 @@ frontend/src/
 
 ```
 packaging/fn-kzwr-backup-app/
-├── manifest                    # 元数据：platform=x86, ctl_stop=true, service_port=8080
+├── manifest                    # 元数据：platform=x86, ctl_stop=true, checkport=false（无 service_port）
 ├── ICON.PNG / ICON_256.PNG     # 128/256 图标
 ├── app/                        # → $TRIM_APPDEST（安装后为 /var/apps/{appname}/target）
 │   ├── ui/config               # 桌面入口：统一网关（gatewayPrefix=/app/fn-kzwr-backup, gatewaySocket=app.sock）
@@ -751,11 +752,11 @@ packaging/fn-kzwr-backup-app/
 ```
 
 **关键落地点（对照飞牛规范）**：
-- **应用形态**：普通应用（非 Docker）；UI 经**统一网关**（`/app/fn-kzwr-backup` + Unix Socket）暴露，端口服务 `service_port=8080` 保留作直连与健康检查（ADR-008 / ADR-012 / 选型 5）
-- **路径**：全部使用 `TRIM_*` 环境变量（`TRIM_APPDEST`/`TRIM_PKGETC`/`TRIM_PKGVAR`/`TRIM_PKGTMP`/`TRIM_SERVICE_PORT`/`TRIM_USERNAME`），禁止硬编码
+- **应用形态**：普通应用（非 Docker）；UI 经**统一网关**（`/app/fn-kzwr-backup` + Unix Socket）暴露，**不监听 TCP 端口**（ADR-008 / ADR-012 / 选型 5）
+- **路径**：全部使用 `TRIM_*` 环境变量（`TRIM_APPDEST`/`TRIM_PKGETC`/`TRIM_PKGVAR`/`TRIM_PKGTMP`/`TRIM_USERNAME`），禁止硬编码
 - **权限**：`run-as=package` 专用用户 `fnosbackup`；`cmd/main` 用 `runuser -u $TRIM_USERNAME` 降权启动服务进程
 - **源目录授权**：`disable_authorization_path=false`，用户在应用设置授权备份源目录
-- **端口**：`manifest.service_port` + 安装向导收集（wizard/install），写入 `$PKGETC/.port`，`cmd/main` 优先读取
+- **端口（v0.3.10 起）**：**无**。manifest 不再声明 `service_port`（`checkport=false`），安装向导不再收集端口，`cmd/main` 不再写/读 `$PKGETC/.port`；仅保留 `FN_KZWR_DEBUG_PORT` 显式开启的本地调试端口（默认关闭）
 - **口令**：安装向导收集管理员口令 → `$PKGETC/.passphrase`（权限 600），用作配置/age 密钥库加密
 - **数据归属**：快照→`$TRIM_PKGVAR`；配置/密钥库→`$TRIM_PKGETC`
 - **错误输出**：生命周期脚本失败时写 `TRIM_TEMP_LOGFILE`
