@@ -1,6 +1,6 @@
 [package]
 name = "fn-kzwr-backup"
-version = "0.3.8"
+version = "0.3.9"
 edition = "2021"
 description = "飞牛 NAS 增量加密备份系统（备份至酷族网软）"
 license = "MIT"
