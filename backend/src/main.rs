@@ -11,17 +11,8 @@ use fnos_backup::infra;
 use fnos_backup::AppState;
 use tracing::info;
 
-/// 默认监听端口
-const DEFAULT_PORT: u16 = 8080;
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 飞牛路径用 TRIM_* 环境变量，禁止硬编码
-    let port: u16 = std::env::var("TRIM_HTTP_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(DEFAULT_PORT);
-
     // 数据目录（快照）与配置目录（配置/密钥库）
     let var_dir = std::env::var("TRIM_PKGVAR").unwrap_or_else(|_| ".".to_string());
     let cfg_dir = std::env::var("TRIM_PKGETC").unwrap_or_else(|_| ".".to_string());
@@ -178,13 +169,12 @@ async fn main() -> anyhow::Result<()> {
     // `$TRIM_APPDEST/app.sock`，由 fnOS 以 `/app/<appname>` 前缀反代到该 Socket
     // （与桌面同源同协议 → 自动跟随 https，且支持 WebSocket）。
     //
-    // 网关转发时**保留前缀**（如 /app/fn-kzwr-backup/api/health），所以整套路由
-    // 同时注册在「根」与「前缀」两处：端口直连（http://nas:8080/）与网关访问都可用。
+    // 网关转发时**保留前缀**（如 /app/fn-kzwr-backup/api/health），网关侧会先剥掉前缀
+    // 再走根路由；另外把「前缀路由」也注册一份，供可选的本地调试端口直接访问
+    // （前端资源在打包时写死为 `/app/<appname>/...` 绝对路径）。
     let prefix = gateway_prefix();
     let api_router = http::routes::router(state);
 
-    // 端口直连：根路径（`/api` + 静态资源）同时保留前缀路径
-    //（前端资源在打包时写死为 `/app/<appname>/...` 绝对路径，端口访问也要能取到）
     let mut root = axum::Router::new();
     if !prefix.is_empty() {
         root = root.nest(&prefix, app_router(api_router.clone(), &www_dir));
@@ -196,22 +186,47 @@ async fn main() -> anyhow::Result<()> {
                 .not_found_service(tower_http::services::ServeFile::new(www_dir.join("index.html"))),
         );
 
-    // 统一网关：监听 Unix Socket（失败仅告警，端口直连仍可用）
-    if let Some(sock) = gateway_socket() {
-        let sock_log = sock.display().to_string();
-        let prefix_log = prefix.clone();
-        let gw = root.clone();
+    // ── 对外入口：只走飞牛统一网关（Unix Socket）──
+    //
+    // 不再监听 TCP 端口：桌面入口 `/app/fn-kzwr-backup` 由宿主同源反代到本 Socket，
+    // 跟随宿主 http/https（无混合内容问题），也少一个对局域网暴露的入口。
+    let sock = gateway_socket();
+    let dbg_port = debug_port();
+    if sock.is_none() && dbg_port.is_none() {
+        anyhow::bail!(
+            "未配置对外入口：需要飞牛统一网关 Socket（TRIM_APP_SOCK / TRIM_APPDEST）\
+             或本地调试端口（FN_KZWR_DEBUG_PORT）"
+        );
+    }
+
+    // 可选调试端口（默认关闭；仅本地联调时设置 FN_KZWR_DEBUG_PORT）
+    if let Some(port) = dbg_port {
+        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        let dbg_router = root.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_unix(gw, sock, &prefix_log).await {
-                tracing::warn!(err = %e, sock = %sock_log, "统一网关监听失败（仅端口直连可用）");
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    tracing::warn!(%addr, "调试端口已开启（FN_KZWR_DEBUG_PORT，仅本地联调用）");
+                    let _ = axum::serve(listener, dbg_router).await;
+                }
+                Err(e) => tracing::warn!(err = %e, %addr, "调试端口监听失败"),
             }
         });
     }
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!("酷族备份（fn-kzwr-backup）服务启动: http://{addr}（网关前缀 {prefix}）");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, root).await?;
+    match sock {
+        Some(sock) => {
+            info!(
+                "酷族备份（fn-kzwr-backup）服务启动：经飞牛统一网关访问（前缀 {prefix}，socket {}）",
+                sock.display()
+            );
+            serve_unix(root, sock, &prefix).await?;
+        }
+        None => {
+            info!("酷族备份（fn-kzwr-backup）调试模式：仅监听本地调试端口");
+            std::future::pending::<()>().await;
+        }
+    }
     Ok(())
 }
 
@@ -283,7 +298,7 @@ fn app_router(api: axum::Router, www_dir: &std::path::Path) -> axum::Router {
 
 /// 统一网关前缀：`GATEWAY_PREFIX` > `/app/<TRIM_APPNAME>`（默认 `/app/fn-kzwr-backup`）
 ///
-/// 空串表示禁用前缀（仅端口直连）。
+/// 空串表示禁用前缀（仅调试端口）。
 fn gateway_prefix() -> String {
     if let Some(p) = env_nonempty("GATEWAY_PREFIX") {
         return p.trim().trim_end_matches('/').to_string();
@@ -300,9 +315,17 @@ fn gateway_socket() -> Option<std::path::PathBuf> {
     env_nonempty("TRIM_APPDEST").map(|d| std::path::PathBuf::from(d).join("app.sock"))
 }
 
+/// 本地调试端口（默认**关闭**）。
+///
+/// 应用对外只提供飞牛统一网关（Unix Socket）；仅在需要直连调试（例如 NAS 上跑
+/// 冒烟测试、前端 vite 代理）时设置 `FN_KZWR_DEBUG_PORT=<端口>` 临时开启。
+fn debug_port() -> Option<u16> {
+    env_nonempty("FN_KZWR_DEBUG_PORT").and_then(|v| v.trim().parse().ok())
+}
+
 /// 在 Unix Socket 上提供服务（hyper 驱动；`with_upgrades` 保证 WebSocket 升级可用）
 ///
-/// 请求进入前先剥掉网关前缀，因此与端口直连共用同一套路由。
+/// 请求进入前先剥掉网关前缀，因此与调试端口共用同一套路由。
 async fn serve_unix(
     root: axum::Router,
     sock: std::path::PathBuf,

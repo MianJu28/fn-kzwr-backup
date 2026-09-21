@@ -1,7 +1,7 @@
 appname               = fn-kzwr-backup
-version               = 0.3.9
+version               = 0.3.10
 display_name          = 酷族备份
-desc                  = <b>酷族备份</b> —— 飞牛 NAS 增量加密备份<br>把指定文件夹增量、age 加密备份到<a href='https://www.kzwr.com' target='_blank'>酷族网软</a>官方 WebDAV。<br>支持断点续传、大文件自动分片、cron 定时、实时进度与速度、保留策略，按文件或目录选择性恢复。<br><br><b>酷族网软</b>：官网 <a href='https://www.kzwr.com' target='_blank'>www.kzwr.com</a>。<br>免费用户提供 10G 空间、不限速，但下载站在大陆境外，实际速度看网络情况。<br><br>意见建议反馈：<a href='https://github.com/MianJu28/fn-kzwr-backup/issues' target='_blank'>github.com/MianJu28/fn-kzwr-backup/issues</a><br>邮箱：mianju@agent.qq.com<br><br><img src='https://img.remit.ee/i/746I5wqkMeXS' alt='酷族备份 功能宣传图' width='100%'>
+desc                  = <b>酷族备份</b> —— 飞牛 NAS 增量加密备份<br>把指定文件夹增量、age 加密备份到<a href='https://www.kzwr.com' target='_blank'>酷族网软</a>官方 WebDAV。<br>支持断点续传、大文件自动分片、cron 定时、实时进度与速度、保留策略，按文件或目录选择性恢复。<br><br><b>酷族网软</b>：官网 <a href='https://www.kzwr.com' target='_blank'>www.kzwr.com</a>。<br>免费用户提供 10G 空间、不限速，但下载站在大陆境外，实际速度看网络情况。<br><br>意见建议反馈：<a href='https://github.com/MianJu28/fn-kzwr-backup/issues' target='_blank'>github.com/MianJu28/fn-kzwr-backup/issues</a><br>邮箱：mianju@agent.qq.com
 platform              = x86
 source                = thirdparty
 maintainer            = MianJu
@@ -12,8 +12,7 @@ os_min_version        = 1.2.0
 desktop_uidir         = ui
 desktop_applaunchname = fn-kzwr-backup.Application
 ctl_stop              = true
-service_port          = 8080
-checkport             = true
+checkport             = false
 disable_authorization_path = false
 micro_app             = true
-changelog             = 运行日志倒序显示（最新在上）、去掉 ANSI 颜色码，且日志与页面上的所有时间统一按宿主（NAS）时区显示（历史 UTC 日志自动换算）；空间预警改为后台定期检查，超阈值进入「消息提醒」并在回落时自动消失；各类异常统一汇总到「消息提醒」；宣传图修复为自适应宽度并恢复完整介绍。
+changelog             = 取消端口直连：应用只经飞牛统一网关访问（不再声明与监听服务端口，安装向导不再询问端口）；应用介绍去掉宣传图片；运行日志倒序显示（最新在上）、时间统一按宿主（NAS）时区（历史 UTC 日志自动换算）；空间预警后台定期检查并进入「消息提醒」，各类异常统一汇总到「消息提醒」。
