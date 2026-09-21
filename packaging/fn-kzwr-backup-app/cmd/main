@@ -44,6 +44,12 @@ PID_FILE="$APPTMP/fn-kzwr-backup.pid"
 # 前端静态资源目录（后端 axum 托管；package app/ → $TRIM_APPDEST）
 WWW_DIR="${TRIM_WWW_DIR:-$APPDEST/www}"
 
+# 统一网关（app/ui/config 的 gatewayPrefix / gatewaySocket）：
+# 飞牛以 https 访问桌面时，若应用只提供 http 端口，iframe 会被混合内容拦截；
+# 网关由 fnOS 同源反代到本 Socket，自动跟随宿主协议，且支持 WebSocket。
+GATEWAY_PREFIX="/app/fn-kzwr-backup"
+GATEWAY_SOCKET="$APPDEST/app.sock"
+
 # 应用口令：来自安装向导（写入 etc/.passphrase），用于配置/密钥库加密
 PASSPHRASE_FILE="$PKGETC/.passphrase"
 if [ -f "$PASSPHRASE_FILE" ]; then
@@ -102,12 +108,16 @@ do_start() {
     echo "启动 酷族备份 (port=$SERVICE_PORT) ..." | tee -a "$LOG_FILE"
     echo "当前执行用户: $(id -un 2>/dev/null) (uid=$(id -u 2>/dev/null))" | tee -a "$LOG_FILE"
 
+    # 统一网关 Socket：残留文件会导致 bind 失败（EADDRINUSE）
+    rm -f "$GATEWAY_SOCKET"
+
     # 直接以当前用户身份启动后端进程（飞牛生命周期脚本默认以应用用户执行，无需降权）
     # 后端二进制所需的 TRIM_* 环境变量通过 env -i 清 后再注入，避免污染
     env -i \
         HOME="$HOME" \
         PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
         TRIM_APPDEST="$APPDEST" \
+        TRIM_APPNAME="fn-kzwr-backup" \
         TRIM_PKGETC="$PKGETC" \
         TRIM_PKGVAR="$PKGVAR" \
         TRIM_PKGTMP="$APPTMP" \
@@ -116,6 +126,8 @@ do_start() {
         TRIM_PASSPHRASE="$PASSPHRASE" \
         TRIM_KZWR_FOLDER="fn-backup" \
         TRIM_JOB_ID="default" \
+        GATEWAY_PREFIX="$GATEWAY_PREFIX" \
+        TRIM_APP_SOCK="$GATEWAY_SOCKET" \
         nohup "$DAEMON" >>"$APP_LOG" 2>&1 &
     local pid="$!"
 
@@ -156,6 +168,7 @@ do_stop() {
         kill -9 "$pid" 2>/dev/null || true
     fi
     rm -f "$PID_FILE"
+    rm -f "$GATEWAY_SOCKET"
     echo "已停止"
 }
 

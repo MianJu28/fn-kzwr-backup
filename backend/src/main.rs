@@ -156,19 +156,170 @@ async fn main() -> anyhow::Result<()> {
     let www_dir = std::env::var("TRIM_WWW_DIR").unwrap_or_else(|_| "www".to_string());
     let www_dir = std::path::PathBuf::from(&www_dir);
 
+    // ── 路由 ──────────────────────────────────────────────────────────────
+    //
+    // 飞牛桌面可能用 https 访问，而应用若只以 http 端口提供服务，iframe 会因
+    // **混合内容**被浏览器拦截。官方解法是「统一网关」：应用监听
+    // `$TRIM_APPDEST/app.sock`，由 fnOS 以 `/app/<appname>` 前缀反代到该 Socket
+    // （与桌面同源同协议 → 自动跟随 https，且支持 WebSocket）。
+    //
+    // 网关转发时**保留前缀**（如 /app/fn-kzwr-backup/api/health），所以整套路由
+    // 同时注册在「根」与「前缀」两处：端口直连（http://nas:8080/）与网关访问都可用。
+    let prefix = gateway_prefix();
     let api_router = http::routes::router(state);
-    let app = axum::Router::new()
+
+    // 端口直连：根路径（`/api` + 静态资源）同时保留前缀路径
+    //（前端资源在打包时写死为 `/app/<appname>/...` 绝对路径，端口访问也要能取到）
+    let mut root = axum::Router::new();
+    if !prefix.is_empty() {
+        root = root.nest(&prefix, app_router(api_router.clone(), &www_dir));
+    }
+    let root = root
         .nest("/api", api_router)
         .fallback_service(
             tower_http::services::ServeDir::new(&www_dir)
                 .not_found_service(tower_http::services::ServeFile::new(www_dir.join("index.html"))),
         );
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
-    info!("酷族备份（fn-kzwr-backup）服务启动: http://{addr}");
+    // 统一网关：监听 Unix Socket（失败仅告警，端口直连仍可用）
+    if let Some(sock) = gateway_socket() {
+        let sock_log = sock.display().to_string();
+        let prefix_log = prefix.clone();
+        let gw = root.clone();
+        tokio::spawn(async move {
+            if let Err(e) = serve_unix(gw, sock, &prefix_log).await {
+                tracing::warn!(err = %e, sock = %sock_log, "统一网关监听失败（仅端口直连可用）");
+            }
+        });
+    }
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    info!("酷族备份（fn-kzwr-backup）服务启动: http://{addr}（网关前缀 {prefix}）");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, root).await?;
     Ok(())
+}
+
+/// 去掉统一网关前缀：`/app/<appname>/api/health` → `/api/health`
+///
+/// 网关转发会保留前缀，剥掉后与端口直连走**完全相同**的路由。
+/// 不依赖 axum `nest` 的匹配细节（它对 `/prefix` 与 `/prefix/` 表现不一致）。
+fn strip_gateway_prefix<B>(req: &mut axum::http::Request<B>, prefix: &str) {
+    if prefix.is_empty() {
+        return;
+    }
+    let uri = req.uri().clone();
+    let path = uri.path();
+    let rest = match path.strip_prefix(prefix) {
+        // 只接受「正好是前缀」或「前缀 + /」，避免误伤 /app/<app>xxx
+        Some(r) if r.is_empty() || r.starts_with('/') => r,
+        _ => return,
+    };
+    let new_path = if rest.is_empty() { "/" } else { rest };
+    let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+    let Ok(pq) = format!("{new_path}{query}").parse::<axum::http::uri::PathAndQuery>() else {
+        return;
+    };
+    let mut parts = uri.into_parts();
+    parts.path_and_query = Some(pq);
+    if let Ok(new_uri) = axum::http::Uri::from_parts(parts) {
+        *req.uri_mut() = new_uri;
+    }
+}
+
+/// 网关前缀剥离服务：类型完全透传（响应/错误/Future 与内部服务一致），
+/// 避免用 `map_request` 时闭包参数类型与 hyper 连接类型对不上。
+#[derive(Clone)]
+struct StripGatewayPrefix<S> {
+    inner: S,
+    prefix: String,
+}
+
+impl<S, B> tower::Service<axum::http::Request<B>> for StripGatewayPrefix<S>
+where
+    S: tower::Service<axum::http::Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: axum::http::Request<B>) -> Self::Future {
+        strip_gateway_prefix(&mut req, &self.prefix);
+        self.inner.call(req)
+    }
+}
+
+/// 构建一份应用路由（`/api` + 静态资源，SPA 回退到 index.html）
+fn app_router(api: axum::Router, www_dir: &std::path::Path) -> axum::Router {
+    axum::Router::new()
+        .nest("/api", api)
+        .fallback_service(
+            tower_http::services::ServeDir::new(www_dir)
+                .not_found_service(tower_http::services::ServeFile::new(www_dir.join("index.html"))),
+        )
+}
+
+/// 统一网关前缀：`GATEWAY_PREFIX` > `/app/<TRIM_APPNAME>`（默认 `/app/fn-kzwr-backup`）
+///
+/// 空串表示禁用前缀（仅端口直连）。
+fn gateway_prefix() -> String {
+    if let Some(p) = env_nonempty("GATEWAY_PREFIX") {
+        return p.trim().trim_end_matches('/').to_string();
+    }
+    let appname = env_nonempty("TRIM_APPNAME").unwrap_or_else(|| "fn-kzwr-backup".to_string());
+    format!("/app/{appname}")
+}
+
+/// 统一网关 Socket 路径：`TRIM_APP_SOCK` > `GATEWAY_SOCKET` > `$TRIM_APPDEST/app.sock`
+fn gateway_socket() -> Option<std::path::PathBuf> {
+    if let Some(p) = env_nonempty("TRIM_APP_SOCK").or_else(|| env_nonempty("GATEWAY_SOCKET")) {
+        return Some(std::path::PathBuf::from(p));
+    }
+    env_nonempty("TRIM_APPDEST").map(|d| std::path::PathBuf::from(d).join("app.sock"))
+}
+
+/// 在 Unix Socket 上提供服务（hyper 驱动；`with_upgrades` 保证 WebSocket 升级可用）
+///
+/// 请求进入前先剥掉网关前缀，因此与端口直连共用同一套路由。
+async fn serve_unix(
+    root: axum::Router,
+    sock: std::path::PathBuf,
+    prefix: &str,
+) -> anyhow::Result<()> {
+    // 残留的 socket 文件会导致 bind 失败（EADDRINUSE）
+    std::fs::remove_file(&sock).ok();
+    if let Some(parent) = sock.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let listener = tokio::net::UnixListener::bind(&sock)?;
+    info!("统一网关已监听: {} （前缀 {}）", sock.display(), prefix);
+
+    let svc = StripGatewayPrefix {
+        inner: root,
+        prefix: prefix.to_string(),
+    };
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let svc = svc.clone();
+        tokio::spawn(async move {
+            let io = hyper_util::rt::TokioIo::new(stream);
+            if let Err(e) = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, hyper_util::service::TowerToHyperService::new(svc))
+                .with_upgrades()
+                .await
+            {
+                tracing::debug!(err = %e, "网关连接结束");
+            }
+        });
+    }
 }
 
 /// 初始化结构化日志（tracing；过滤器可经 [`fnos_backup::apply_log_debug`] 热更新）

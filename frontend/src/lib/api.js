@@ -3,10 +3,14 @@
  *
  * 约定：后端统一返回 200 + JSON（错误放在 `error` 字段），
  * 因此这里只做网络层异常抛出与 JSON 解析，业务错误由调用方判断。
+ *
+ * 路径统一加网关前缀（APP_BASE）：经飞牛统一网关访问时，应用在
+ * `/app/<appname>` 下，裸 `/api` 会落到宿主服务上。
  */
+import { APP_BASE } from './appBase.js';
 
 async function req(path, options = {}) {
-  const res = await fetch(path, options);
+  const res = await fetch(APP_BASE + path, options);
   let data;
   try {
     data = await res.json();
@@ -93,5 +97,5 @@ export const api = {
   /** 清空运行日志 */
   logsClear: () => post('/api/logs/clear'),
   /** 运行日志下载地址（直接 <a>/window.open） */
-  logsDownloadUrl: '/api/logs/download',
+  logsDownloadUrl: `${APP_BASE}/api/logs/download`,
 };

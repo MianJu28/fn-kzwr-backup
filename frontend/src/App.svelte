@@ -14,6 +14,7 @@
   import RailAccount from './components/RailAccount.svelte';
 
   import { api } from './lib/api.js';
+  import { APP_BASE } from './lib/appBase.js';
   import { toast } from './lib/toast.js';
   import { theme, initTheme, toggleTheme } from './lib/theme.js';
 
@@ -225,7 +226,8 @@
   function connectWS() {
     try {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const ws = new WebSocket(`${proto}://${location.host}/api/ws`);
+      // 带网关前缀（统一网关下应用在 /app/<appname>，裸 /api 会落到宿主）
+      const ws = new WebSocket(`${proto}://${location.host}${APP_BASE}/api/ws`);
       ws.onopen = () => {
         wsConnected = true;
       };

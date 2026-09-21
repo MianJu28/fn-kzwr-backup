@@ -4,10 +4,11 @@
       "title": "酷族备份",
       "icon": "images/ICON_256.PNG",
       "type": "iframe",
-      "protocol": "http",
-      "port": "8080",
-      "url": "/",
-      "allUsers": true
+      "protocol": "",
+      "gatewayPrefix": "/app/fn-kzwr-backup",
+      "gatewaySocket": "app.sock",
+      "url": "/app/fn-kzwr-backup",
+      "allUsers": false
     }
   }
 }
