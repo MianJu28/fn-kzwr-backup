@@ -79,6 +79,8 @@ pub struct ConfigResponse {
     pub schedule_next: Vec<String>,
     /// 服务器时区说明（cron 按此时区解释）
     pub schedule_timezone: String,
+    /// 宿主时区相对 UTC 的分钟偏移（前端据此把时间戳按宿主时区展示）
+    pub host_utc_offset_minutes: i64,
     /// 告警 Webhook 地址（空 = 不外发）
     pub webhook_url: Option<String>,
     /// Webhook 自定义请求头
@@ -591,6 +593,7 @@ fn config_response(
         kzwr_quota_warn_percent: cfg.kzwr.quota_warn_percent,
         schedule_next,
         schedule_timezone: crate::domain::scheduler::timezone_label(),
+        host_utc_offset_minutes: crate::domain::scheduler::utc_offset_minutes(),
         webhook_url: cfg.notify.webhook_url.clone(),
         webhook_headers: cfg.notify.webhook_headers.clone(),
         webhook_body: cfg.notify.webhook_body.clone(),
@@ -626,6 +629,7 @@ async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
             kzwr_quota_warn_percent: 85,
             schedule_next: Vec::new(),
             schedule_timezone: crate::domain::scheduler::timezone_label(),
+            host_utc_offset_minutes: crate::domain::scheduler::utc_offset_minutes(),
             webhook_url: None,
             webhook_headers: Vec::new(),
             webhook_body: None,
@@ -1440,6 +1444,30 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// 把行首的 UTC 时间戳换算成宿主本地时间。
+///
+/// tracing 默认写 UTC（`2026-09-21T04:14:21.827270Z`），在东八区看起来比本地少 8 小时；
+/// 新版本写入端已改为直接写宿主本地时间（无 `Z` 后缀），这里负责把**历史行**也换算过来，
+/// 因此「日志页 / 下载的 app.log」时间口径一致。
+fn localize_log_time(line: &str) -> String {
+    let (ts, rest) = match line.find(char::is_whitespace) {
+        Some(i) => (&line[..i], &line[i..]),
+        None => (line, ""),
+    };
+    if !ts.ends_with('Z') {
+        return line.to_string();
+    }
+    match chrono::DateTime::parse_from_rfc3339(ts) {
+        Ok(dt) => format!(
+            "{}{}",
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S%.3f"),
+            rest
+        ),
+        Err(_) => line.to_string(),
+    }
+}
+
 /// 读取运行日志末尾（文件超过 5MB 时自动轮转，故整读安全）
 async fn logs_get(
     State(state): State<AppState>,
@@ -1469,6 +1497,7 @@ async fn logs_get(
     let all: Vec<String> = String::from_utf8_lossy(&bytes)
         .lines()
         .map(strip_ansi)
+        .map(|l| localize_log_time(&l))
         .collect();
     let total = all.len();
     let tail = q.tail.unwrap_or(800).min(5000);
@@ -1499,8 +1528,13 @@ async fn logs_download(State(state): State<AppState>) -> axum::response::Respons
     use axum::response::IntoResponse;
     match std::fs::read(&state.log_file) {
         Ok(bytes) => {
-            // 下载件同样去掉 ANSI 颜色码，保证拿到的是纯文本日志
-            let text = strip_ansi(&String::from_utf8_lossy(&bytes));
+            // 下载件同样去掉 ANSI 颜色码，并把历史 UTC 时间戳换算成宿主本地时间
+            let raw = strip_ansi(&String::from_utf8_lossy(&bytes));
+            let text = raw
+                .lines()
+                .map(localize_log_time)
+                .collect::<Vec<String>>()
+                .join("\n");
             let mut resp = (axum::http::StatusCode::OK, text).into_response();
             resp.headers_mut().insert(
                 axum::http::header::CONTENT_TYPE,

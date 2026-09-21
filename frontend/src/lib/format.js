@@ -30,21 +30,51 @@ export function fmtDuration(ms) {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
-/** 本地时间（日期 + 时分秒） */
+/**
+ * 宿主（NAS）时区相对 UTC 的分钟偏移，由 App 在拿到 /api/config 后注入。
+ *
+ * 时间戳在传输层统一是 epoch（毫秒，与时区无关），**展示层统一按宿主时区渲染**，
+ * 这样浏览器时区与 NAS 不同也能看到与服务器一致的时间（日志、告警、审计口径一致）。
+ */
+let hostOffsetMinutes = null;
+
+/** 设置宿主时区偏移（分钟）；传 null/非法值则退回浏览器本地时区 */
+export function setHostTimezone(offsetMinutes) {
+  hostOffsetMinutes = Number.isFinite(offsetMinutes) ? offsetMinutes : null;
+}
+
+/** 宿主时区是否已注入 */
+export function hasHostTimezone() {
+  return hostOffsetMinutes !== null;
+}
+
+/** 把 epoch 毫秒按宿主偏移平移，再按 UTC 输出 = 宿主墙钟时间 */
+function shifted(ts) {
+  const ms = Number(ts);
+  return new Date(hostOffsetMinutes === null ? ms : ms + hostOffsetMinutes * 60000);
+}
+
+/** 宿主时区（日期 + 时分秒） */
 export function fmtTime(ts) {
   if (!ts) return '';
   try {
-    return new Date(ts).toLocaleString();
+    const d = shifted(ts);
+    return hostOffsetMinutes === null
+      ? d.toLocaleString()
+      : d.toLocaleString('zh-CN', { timeZone: 'UTC', hour12: false });
   } catch (e) {
     return '';
   }
 }
 
-/** 本地时间（仅时分秒） */
+/** 宿主时区（仅时分秒） */
 export function fmtClock(ts) {
   if (!ts) return '';
   try {
-    return new Date(ts).toLocaleTimeString();
+    const d = shifted(ts);
+    return hostOffsetMinutes === null
+      ? d.toLocaleTimeString()
+      : d.toLocaleTimeString('zh-CN', { timeZone: 'UTC', hour12: false });
   } catch (e) {
     return '';
   }
