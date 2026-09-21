@@ -152,6 +152,21 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // 后台空间巡检：每 30 分钟（首次 20 秒后）检查云端占用是否达到空间预警阈值。
+    // 不依赖用户打开界面 —— 预警会直接进入「消息提醒」，占用回落时自动消解。
+    {
+        let quota_state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(30 * 60));
+            loop {
+                ticker.tick().await;
+                http::routes::check_kzwr_quota(&quota_state).await;
+            }
+        });
+    }
+
     // 前端静态资源目录
     let www_dir = std::env::var("TRIM_WWW_DIR").unwrap_or_else(|_| "www".to_string());
     let www_dir = std::path::PathBuf::from(&www_dir);
@@ -338,8 +353,14 @@ fn init_logging(debug: bool, file: LogFileWriter) -> anyhow::Result<()> {
     let _ = fnos_backup::LOG_HANDLE.set(handle);
     tracing_subscriber::registry()
         .with(filter_layer)
-        .with(tracing_subscriber::fmt::layer()) // stdout
-        .with(tracing_subscriber::fmt::layer().with_writer(file)) // 日志文件
+        // 关闭 ANSI 颜色码：stdout 会被生命周期脚本重定向进同一个日志文件，
+        // 带颜色码时日志页/下载的 app.log 会混入 [2m[32m 之类的乱码
+        .with(tracing_subscriber::fmt::layer().with_ansi(false)) // stdout
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(file),
+        ) // 日志文件
         .init();
     Ok(())
 }

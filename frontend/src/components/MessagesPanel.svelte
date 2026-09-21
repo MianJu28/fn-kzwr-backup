@@ -1,5 +1,10 @@
 <script>
-  // 告警卡片（备份/恢复/定时/配置异常）：默认折叠展示最新若干条
+  // 消息提醒（统一消息中心）
+  //
+  // 汇总原则：
+  // - **聚焦点即时反馈**（刚点完按钮的结果、字段校验）用 toast / 卡片内就地提示，保留；
+  // - **需要留存、跨页可见的异常与风险**（备份/恢复失败、空间预警、token 失效、
+  //   账号不一致、配置缺失）统一汇总到这里，不再在各卡片里各写一份重复提示。
   import Icon from './Icon.svelte';
   import { fmtTime } from '../lib/format.js';
 
@@ -16,8 +21,13 @@
   const COLLAPSED = 3;
   let expanded = false;
 
-  $: hasError = alerts.some((a) => a.level === 'error');
+  $: errors = alerts.filter((a) => a.level === 'error').length;
+  $: warns = alerts.length - errors;
+  $: hasError = errors > 0;
   $: shown = expanded ? alerts : alerts.slice(0, COLLAPSED);
+  $: summary = hasError
+    ? `${errors} 条错误${warns ? ` · ${warns} 条警告` : ''}`
+    : `${warns} 条警告`;
 </script>
 
 {#if alerts.length > 0}
@@ -28,10 +38,14 @@
       </div>
       <div class="grow">
         <h2 class="card-title">
-          {hasError ? '存在异常告警' : '提示告警'}
+          消息提醒
           <span class="badge {hasError ? 'badge-danger' : 'badge-warn'}">{alerts.length}</span>
+          <span class="sum">{summary}</span>
         </h2>
-        <p class="card-desc">备份/恢复失败或配置缺失会在此汇总，可在设置中配置 Webhook 外发</p>
+        <p class="card-desc">
+          备份/恢复失败、空间预警、账号与配置异常都汇总在这里（情况恢复后会自动消失）；可在设置中配置 Webhook
+          外发到手机或群机器人
+        </p>
       </div>
       <button class="btn btn-sm btn-ghost" on:click={onClear}>
         <Icon name="trash" size={13} />清空
@@ -41,6 +55,7 @@
     <ul class="list">
       {#each shown as a (a.id)}
         <li class:err={a.level === 'error'}>
+          <Icon name={a.level === 'error' ? 'x-circle' : 'alert'} size={13} />
           <span class="tag">{SOURCE_TEXT[a.source] || a.source}</span>
           <span class="msg">{a.message}</span>
           <span class="ts mono">{fmtTime(a.ts)}</span>
@@ -74,6 +89,11 @@
     display: flex;
     align-items: center;
     gap: 8px;
+  }
+  .sum {
+    font-size: 11.5px;
+    font-weight: 400;
+    color: var(--text-3);
   }
   .list {
     list-style: none;

@@ -90,6 +90,20 @@ impl AlertSink {
     pub fn clear(&self) {
         self.inner.lock().unwrap().items.clear();
     }
+
+    /// 移除满足条件的告警并返回移除条数。
+    ///
+    /// 用于「条件恢复后自动消解」的告警：例如空间占用回落到预警阈值以下时，
+    /// 之前的空间预警应自行消失，而不是一直挂在消息提醒里。
+    pub fn remove_where<F>(&self, pred: F) -> usize
+    where
+        F: Fn(&Alert) -> bool,
+    {
+        let mut guard = self.inner.lock().unwrap();
+        let before = guard.items.len();
+        guard.items.retain(|a| !pred(a));
+        before - guard.items.len()
+    }
 }
 
 fn now_ms() -> i64 {
