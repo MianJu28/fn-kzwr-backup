@@ -57,9 +57,10 @@
     if (r && r.success) {
       token = '';
       warned = r.warning || '';
-      msg = warned ? '已保存并通过校验（存在账号不一致提醒，见下）' : '已保存并通过校验，增强功能已启用';
+      // 账号不一致属于「留存型异常」：统一进「消息提醒」，此处只做即时反馈
+      msg = warned ? '已保存并通过校验（账号不一致提醒见「消息提醒」）' : '已保存并通过校验，增强功能已启用';
       msgOk = true;
-      toast.success(warned ? '已保存，请查看账号提醒' : '增强功能已启用');
+      toast.success(warned ? '已保存，账号不一致提醒见「消息提醒」' : '增强功能已启用');
     } else {
       msg = (r && r.error) || '保存失败';
       msgOk = false;
@@ -191,12 +192,6 @@
       </div>
     {/if}
 
-    {#if warned}
-      <div class="alert alert-warn">
-        <Icon name="alert" size={15} />
-        <div class="alert-body">{warned}</div>
-      </div>
-    {/if}
 
     <label class="field token-field">
       <span class="label">

@@ -910,6 +910,11 @@ pub async fn run_backup_now(state: &AppState) -> BackupResponse {
             } else {
                 0
             };
+            // 备份后云端占用会变化：异步巡检一次空间预警（不阻塞本次响应）
+            {
+                let quota_state = state.clone();
+                tokio::spawn(async move { check_kzwr_quota(&quota_state).await });
+            }
             BackupResponse {
                 uploaded: summary.uploaded,
                 uploaded_bytes: summary.uploaded_bytes,
@@ -1410,6 +1415,31 @@ pub struct LogsResponse {
     pub error: Option<String>,
 }
 
+/// 去掉 ANSI 转义序列（CSI：`ESC [ 参数… 终止字节`）
+///
+/// 旧版本日志里带着 tracing 的终端颜色码（`\x1b[2m`、`\x1b[32m` 等），直接展示会变成
+/// `[2m2026-...` 这类乱码；新版本已在写入端关闭 ANSI，这里再兜一层保证历史日志也干净。
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                // 参数字节（0x30-0x3F）与中间字节（0x20-0x2F）之后是终止字节（0x40-0x7E）
+                for c2 in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c2) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// 读取运行日志末尾（文件超过 5MB 时自动轮转，故整读安全）
 async fn logs_get(
     State(state): State<AppState>,
@@ -1438,7 +1468,7 @@ async fn logs_get(
     };
     let all: Vec<String> = String::from_utf8_lossy(&bytes)
         .lines()
-        .map(|s| s.to_string())
+        .map(strip_ansi)
         .collect();
     let total = all.len();
     let tail = q.tail.unwrap_or(800).min(5000);
@@ -1469,7 +1499,9 @@ async fn logs_download(State(state): State<AppState>) -> axum::response::Respons
     use axum::response::IntoResponse;
     match std::fs::read(&state.log_file) {
         Ok(bytes) => {
-            let mut resp = (axum::http::StatusCode::OK, bytes).into_response();
+            // 下载件同样去掉 ANSI 颜色码，保证拿到的是纯文本日志
+            let text = strip_ansi(&String::from_utf8_lossy(&bytes));
+            let mut resp = (axum::http::StatusCode::OK, text).into_response();
             resp.headers_mut().insert(
                 axum::http::header::CONTENT_TYPE,
                 axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
@@ -1716,7 +1748,12 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// 空间预警告警文案前缀（用于「占用回落」时自动消解同前缀的告警）
+const QUOTA_ALERT_PREFIX: &str = "云端存储空间已用";
+
 /// 云端空间达到阈值时告警（同文案去重，避免每次刷新都推送）
+///
+/// 占用回落到阈值以下时，把之前的空间预警**自动移除**（消息提醒里不留旧账）。
 fn maybe_warn_quota(state: &AppState, total: u64, used: u64) {
     if total == 0 {
         return;
@@ -1738,13 +1775,22 @@ fn maybe_warn_quota(state: &AppState, total: u64, used: u64) {
             crate::domain::alerts::AlertLevel::Warn,
             crate::domain::alerts::AlertSource::Kzwr,
             format!(
-                "云端存储空间已用 {}%（{} / {}），达到预警阈值 {}%，请及时清理以免备份失败",
+                "{} {}%（{} / {}），达到预警阈值 {}%，请及时清理以免备份失败",
+                QUOTA_ALERT_PREFIX,
                 pct,
                 human_bytes(used),
                 human_bytes(total),
                 threshold
             ),
         );
+    } else {
+        let removed = state.alerts.remove_where(|a| {
+            a.source == crate::domain::alerts::AlertSource::Kzwr
+                && a.message.starts_with(QUOTA_ALERT_PREFIX)
+        });
+        if removed > 0 {
+            tracing::info!(removed, "空间占用已回落至阈值以下，空间预警自动解除");
+        }
     }
 }
 
@@ -1800,6 +1846,36 @@ pub async fn check_kzwr_token(state: &AppState) {
         }
         Ok(_) => tracing::info!("kzwr access-token 校验通过（增强功能可用）"),
         Err(e) => tracing::warn!(err = %e, "kzwr access-token 校验请求失败（网络问题？）"),
+    }
+}
+
+/// 后台空间巡检：拉取账号空间并评估是否需要「空间预警」告警。
+///
+/// 由 main.rs 的定时任务周期调用（**不依赖用户打开界面**），备份成功后也会触发一次；
+/// 占用回落到阈值以下时同一条预警会自动消解。
+pub async fn check_kzwr_quota(state: &AppState) {
+    let Some(token) = kzwr_token_of(state) else {
+        return;
+    };
+    state.kzwr.set_token(token);
+    match state.kzwr.get_member().await {
+        Ok(v) if !member_is_login(&v) => {
+            restore_saved_kzwr_token(state);
+            raise_alert_once(
+                state,
+                crate::domain::alerts::AlertLevel::Warn,
+                crate::domain::alerts::AlertSource::Kzwr,
+                KZWR_TOKEN_INVALID.to_string(),
+            );
+        }
+        Ok(v) => {
+            let data = v.get("data").cloned().unwrap_or_default();
+            let num = |key: &str| data.get(key).and_then(|x| x.as_u64()).unwrap_or(0);
+            let total = num("total").max(num("capacity"));
+            let used = num("use");
+            maybe_warn_quota(state, total, used);
+        }
+        Err(e) => tracing::warn!(err = %e, "空间巡检请求失败（网络问题？）"),
     }
 }
 

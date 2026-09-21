@@ -6,7 +6,7 @@
   import AuditPage from './views/AuditPage.svelte';
   import LogsPage from './views/LogsPage.svelte';
   import LiveStatus from './components/LiveStatus.svelte';
-  import AlertBanner from './components/AlertBanner.svelte';
+  import MessagesPanel from './components/MessagesPanel.svelte';
   import Toast from './components/Toast.svelte';
   import ConfirmDialog from './components/ConfirmDialog.svelte';
   import Icon from './components/Icon.svelte';
@@ -187,10 +187,27 @@
     }
   }
 
+  // 已见过的最大告警 id：用于「后台新增消息」时即时 toast 一次（消息本身留在「消息提醒」）
+  let alertsMaxId = 0;
+  let alertsLoadedOnce = false;
+
   async function loadAlerts() {
     try {
       const d = await api.alerts();
-      alerts = d.alerts || [];
+      const list = d.alerts || [];
+      const maxId = list.reduce((m, a) => Math.max(m, a.id || 0), 0);
+      if (alertsLoadedOnce && maxId > alertsMaxId) {
+        const fresh = list.filter((a) => (a.id || 0) > alertsMaxId);
+        const last = fresh[fresh.length - 1];
+        if (last) {
+          const title = fresh.length > 1 ? `消息提醒（${fresh.length} 条）` : '消息提醒';
+          if (last.level === 'error') toast.error(last.message, title);
+          else toast.warn(last.message, title);
+        }
+      }
+      alerts = list;
+      alertsMaxId = maxId;
+      alertsLoadedOnce = true;
     } catch (e) {
       error = e.message;
     }
@@ -568,7 +585,7 @@
     try {
       await api.clearAlerts();
       alerts = [];
-      toast.info('告警已清空');
+      toast.info('消息提醒已清空');
     } catch (e) {
       toast.error(e.message);
     }
@@ -579,6 +596,8 @@
   initTheme();
   loadAll();
   connectWS();
+  // 「消息提醒」轮询：后台巡检（空间预警等）产生的消息不依赖页面操作，每 60 秒拉取一次
+  setInterval(() => loadAlerts(), 60000);
 </script>
 
 <div class="app">
@@ -672,7 +691,7 @@
         </div>
       {/if}
 
-      <AlertBanner {alerts} onClear={clearAlerts} />
+      <MessagesPanel {alerts} onClear={clearAlerts} />
 
       <div class="columns">
         <div class="content">
