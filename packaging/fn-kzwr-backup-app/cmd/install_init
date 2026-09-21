@@ -6,8 +6,9 @@
 # 参考：docs/fnnas-dev-docs/core-concepts/01-framework.md（安装流程）
 #
 # 向导值以环境变量传入（不使用 TRIM_ 前缀）：
-#   wizard_http_port     HTTP 服务端口（默认 8080）
 #   wizard_admin_pass    管理员口令（用于配置/age 密钥库加密）
+#
+# 注：应用只经飞牛统一网关（Unix Socket）访问，不再有 HTTP 服务端口。
 #
 # 注意：不使用 set -e，避免任一命令非零退出导致飞牛判定"执行脚本出错"。
 # 所有非关键命令显式用 || true 容错。
@@ -36,12 +37,5 @@ fi
 echo -n "$PASSPHRASE" >"$PASSPHRASE_FILE" 2>/dev/null || true
 chown "$APP_USER:$APP_GROUP" "$PASSPHRASE_FILE" 2>/dev/null || true
 chmod 600 "$PASSPHRASE_FILE" 2>/dev/null || true
-
-# ── HTTP 端口 ──
-if [ -n "${wizard_http_port:-}" ]; then
-    mkdir -p "$PKGETC"
-    echo -n "$wizard_http_port" >"$PKGETC/.port" 2>/dev/null || true
-    chown "$APP_USER:$APP_GROUP" "$PKGETC/.port" 2>/dev/null || true
-fi
 
 exit 0
