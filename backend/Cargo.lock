@@ -602,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "fn-kzwr-backup"
-version = "0.3.4"
+version = "0.3.8"
 dependencies = [
  "age",
  "anyhow",
