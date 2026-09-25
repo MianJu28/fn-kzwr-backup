@@ -415,6 +415,32 @@ trait TargetStorage {
 
 ---
 
+### ADR-013：远程目标与增强功能插件化
+
+**状态**：Draft（分支 `feat/plugin-architecture` 上实施；首期为编译期内置插件）
+
+**背景**：远程备份目标（当前仅官方 WebDAV）与"增强功能"（kzwr REST：账号空间、回收站、token）是两套**易变、可选**的能力，却写在核心里：目标由 `main.rs` 的工厂硬编码选择，增强功能直接挂在核心 Router（`GET /kzwr/user` 等）并由 `AppState` 持有具体客户端。新增一个目标或增强能力就要改核心。
+
+**决策**：引入插件层，核心只依赖契约：
+
+- `plugin::api`：`TargetPlugin`（提供 `TargetStorage`：`build(mgr)` / `verify(user,pass)`）与 `EnhancePlugin`（`caps()` / `available(cfg)`），外加 `PluginMeta`、`PluginKind`、`EnhanceCaps`
+- `plugin::registry::PluginRegistry`：**唯一装配点**，替代原 `main.rs::build_target()`；依次询问目标插件，第一个可用者即当前目标，全部不可用则回退 `UnconfiguredTarget`
+- `plugin::builtin`：内置插件 —— `webdav`（目标插件，默认启用）、`kzwr`（增强插件，先做能力登记）
+- 新增 `GET /api/plugins` 返回插件清单，供前端区块注册表与诊断
+- 首期（方案 D）**编译期装配**：插件随应用一同编译；外置加载（子进程 JSON-RPC / 动态库 / WASM）留作后续，届时只需替换 `PluginRegistry::builtin()` 的来源，trait 与核心不动
+
+**实施顺序**：
+- P1 抽 `plugin-api`；P2 `webdav` 插件化（`build_target` 与保存后的热切换都走注册表）；P3 `kzwr` 增强插件化（路由迁 `/api/p/kzwr/*`）；P4 前端 Section 注册表 + UI Schema；P5 外置加载；P6 文档收尾
+
+**后果**：
+- (+) 新增远程目标/增强能力不改核心；增强插件禁用后核心仍可正常备份
+- (+) WebDAV 作为**内置默认插件**，基本备份能力不依赖插件机制本身
+- (+) 装配过程可观测（`fnos_backup::plugin::registry` 日志 + `/api/plugins`）
+- (-) 多一层 trait/注册表间接；`routes.rs` 里的增强功能路由需逐步迁入插件（P3）
+- ⚠️ 装配日志必须打在**库 crate**（`fnos_backup::*`）内：`main.rs` 属二进制 crate，其 `info!` 会被默认过滤器挡掉
+
+---
+
 ## 7. 项目目录结构
 
 项目遵循飞牛应用规范，Rust 源码与前端源码在开发期独立，打包时合入飞牛目录结构。
