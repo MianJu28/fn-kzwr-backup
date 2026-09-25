@@ -468,8 +468,12 @@ async fn health(State(_state): State<AppState>) -> Json<HealthResponse> {
 }
 
 /// 插件清单（内置插件；供前端区块注册表与问题诊断）
+///
+/// 返回项包含 `available`（是否已可用）与 `ui`（设置页/概览页区块描述），
+/// 前端据此决定渲染哪些卡片、顺序如何、用内置组件还是 `blocks` 通用渲染。
 async fn plugins_list(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "plugins": state.plugins.list() }))
+    let cfg = state.config.lock().unwrap().load().unwrap_or_default();
+    Json(serde_json::json!({ "plugins": state.plugins.describe(&cfg) }))
 }
 
 /// 保存 WebDAV 配置：先实测连通性（PROPFIND ping），通过后加密存储

@@ -77,8 +77,11 @@ export const api = {
   pruneMissing: (source_path) => post('/api/restore/prune', { source_path }),
 
   // ── 插件（插件自带路由统一挂在 /api/p/<插件id> 下）──────────────
-  /** 插件清单（内置插件 id/名称/类别/能力） */
+  /** 插件清单（id/名称/类别/可用性/UI 区块描述）—— 前端区块由它驱动 */
   plugins: () => get('/api/plugins'),
+  /** 通用插件调用：base 为插件 api_base（如 /api/p/kzwr），path 为插件内路径 */
+  pluginGet: (base, path) => get(`${base}${path}`),
+  pluginPost: (base, path, body) => post(`${base}${path}`, body || {}),
 
   // kzwr 增强插件（非备份通道，可选，需 access-token）
   /** 账号信息（存储空间/套餐；未配置 token 时返回 configured:false + 指引） */

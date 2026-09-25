@@ -425,15 +425,16 @@ trait TargetStorage {
 
 - `plugin::api`：`TargetPlugin`（提供 `TargetStorage`：`build(mgr)` / `verify(user,pass)`）与 `EnhancePlugin`（`caps()` / `available(cfg)`），外加 `PluginMeta`、`PluginKind`、`EnhanceCaps`
 - `plugin::registry::PluginRegistry`：**唯一装配点**，替代原 `main.rs::build_target()`；依次询问目标插件，第一个可用者即当前目标，全部不可用则回退 `UnconfiguredTarget`
-- `plugin::builtin`：内置插件 —— `webdav`（目标插件，默认启用）、`kzwr`（增强插件，先做能力登记）
-- 新增 `GET /api/plugins` 返回插件清单，供前端区块注册表与诊断
+- `plugin::builtin`：内置插件 —— `webdav`（目标插件，默认启用）、`kzwr`（增强插件：账号/空间/回收站）
+- 新增 `GET /api/plugins`：返回 `meta + available + api_base + ui`，**前端唯一的区块数据来源**（有哪些卡片、顺序、用内置组件还是 `blocks` 通用渲染）
 - 首期（方案 D）**编译期装配**：插件随应用一同编译；外置加载（子进程 JSON-RPC / 动态库 / WASM）留作后续，届时只需替换 `PluginRegistry::builtin()` 的来源，trait 与核心不动
 
 **实施顺序**：
 - ✅ P1 抽 `plugin-api`（trait/meta/事件/自检项）
 - ✅ P2 `webdav` 插件化：`main.rs::build_target` 删除，装配与「保存凭据后的热切换」都走注册表；新增 `GET /api/plugins`
 - ✅ P3 `kzwr` 增强插件化：实现（DTO/回收站辅助/3 个 handler/一致性检查/巡检）整体迁入 `plugin/builtin/kzwr.rs`，路由挂 `/api/p/kzwr/*`（旧 `/api/kzwr/*` 下线）；核心通过 trait 钩子调用：`routes()`（插件路由）、`on_startup()`（启动自检）、`patrol()`（周期巡检 + 备份后）、`after_backup()`（清空回收站）、`health_check()`（一键体检项）、`reload()`（配置变更后刷新状态）；`raise_alert/raise_alert_once/human_bytes/webdav_username` 对插件开放为 `pub(crate)`
-- ⏳ P4 前端 Section 注册表 + UI Schema（`/api/plugins` 驱动）；P5 外置加载；P6 文档收尾
+- ✅ P4 前端插件驱动：`lib/plugins.js`（拉取/缓存 `/api/plugins`、按 `ui.section`+`ui.order` 排序）+ `views/SettingsPage.svelte` 按清单渲染卡片（内置组件映射 `webdav`/`kzwr`，**不认识的名字回退** `components/PluginBlocks.svelte` 通用 UI Schema 渲染：metric / text / number / toggle / button / tips，操作统一 POST `${api_base}${action}`）；接口不可用时用 `FALLBACK_SECTIONS` 兜底，页面不会白屏
+- ⏳ P5 外置加载；P6 文档收尾
 - 遗留（P3b）：`AppState.kzwr` 这个客户端实例仍由核心持有（插件驱动它），后续可移入插件自身
 
 **后果**：
