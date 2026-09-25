@@ -76,13 +76,17 @@ export const api = {
   /** 清理快照中云端已不存在的文件记录（只动快照，不删云端文件） */
   pruneMissing: (source_path) => post('/api/restore/prune', { source_path }),
 
-  // kzwr REST 增强功能（可选，需 access-token）
+  // ── 插件（插件自带路由统一挂在 /api/p/<插件id> 下）──────────────
+  /** 插件清单（内置插件 id/名称/类别/能力） */
+  plugins: () => get('/api/plugins'),
+
+  // kzwr 增强插件（非备份通道，可选，需 access-token）
   /** 账号信息（存储空间/套餐；未配置 token 时返回 configured:false + 指引） */
-  kzwrUser: () => get('/api/kzwr/user'),
+  kzwrUser: () => get('/api/p/kzwr/user'),
   /** 保存或清除 access-token（空串 = 清除） */
-  kzwrSaveToken: (access_token) => post('/api/kzwr/token', { access_token }),
+  kzwrSaveToken: (access_token) => post('/api/p/kzwr/token', { access_token }),
   /** 清空云端回收站（物理删除，不可恢复） */
-  kzwrTrashEmpty: () => post('/api/kzwr/trash/empty'),
+  kzwrTrashEmpty: () => post('/api/p/kzwr/trash/empty'),
 
   /** 定时任务预览：cron → 未来 5 次触发时间（服务器本地时区） */
   schedulePreview: (cron) => post('/api/schedule/preview', { cron }),
