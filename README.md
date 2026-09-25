@@ -10,6 +10,7 @@
 - **age 加密**：X25519 公私钥，公钥加密/私钥解密，私钥可被口令派生密钥加密存储（密钥库）
 - **断点续传**：每文件上传后即时写快照，中断可续
 - **多路径备份**：多个源目录独立快照，各自在网盘以**源文件夹名**建目录（`/目标文件夹/<源文件夹名>/…`，含空目录）
+- **多目标 · 多任务**（v0.4.0）：可配置**多个备份目标**（各自独立的 WebDAV 地址与账号凭据，凭据加密存储、保存前实测连通性），并把「源文件夹 + 目标 + 定时 + 保留策略」组合成**多个备份任务**——每个任务在每个目标上都有**独立快照、独立增量与独立保留策略**，某个目标异常不影响其它任务；同一个源可同时分别备份到不同账号（异地/多账号容灾）。升级时旧配置自动迁移为默认任务/目标，既有备份记录继续增量、不会重传
 - **大文件分片**：超过 90MiB 自动拆分为 `.part0001…` 依次上传（规避站点 100MB 限制）；流式请求体保留 `Content-Length` 并实时上报进度
 - **保留策略**：备份后自动清理目标端孤儿文件，防空间膨胀；可选**清空云端回收站**（占用/时间门槛可调）
 - **定时备份**：cron 表达式定时自动触发，运行中热更新；与手动触发**全局互斥**，不并发执行；修改即预览**接下来 5 次运行时间**（服务器本地时区）
@@ -92,21 +93,40 @@ export TRIM_DAV_PASS=your-password
 
 ### 配置（config.toml）
 
+> v0.4.0 起主数据为 **`targets`（目标）+ `tasks`（任务）**；旧的 `[backup]`/`[webdav]` 段会自动迁移为 `default` 任务/目标，并作为兼容镜像继续回写（降级旧版本仍可读）。日常无需手改——「任务」「目标」页即可管理。
+
 ```toml
+# 目标：一个目的地 = 一个地址 + 一套凭据（可被多个任务共用）
+[[targets]]
+id = "default"                     # 任务的 target_id 引用它
+name = "默认目标（WebDAV）"
+kind = "webdav"
+url = "https://dav.kzwr.com/dav"
+username_enc = "enc:..."           # 账号/密码加密存储（age scrypt）
+password_enc = "enc:..."
+enabled = true
+
+# 任务：源路径集 + 目标 + 调度 + 保留策略（各自独立增量与快照）
+[[tasks]]
+id = "default"                     # 快照 key = "{id}-{源序号}"（default-0…）
+name = "默认任务"
+enabled = true
+paths = ["/volume1/data", "/volume1/docs"]
+target_id = "default"
+target_folder = "fn-backup"
+schedule_cron = "0 2 * * *"        # 可选：定时备份（宿主本地时区）
+
+[tasks.retention]
+enabled = true
+cleanup_unmanaged = true           # 备份后清理该目标上的孤儿文件
+min_age_days = 0
+
+# —— 旧字段（自动迁移 / 兼容镜像，可忽略）——
 [backup]
 paths = ["/volume1/data", "/volume1/docs"]
 target_folder = "fn-backup"
-
-[backup.retention]
-enabled = true
-cleanup_unmanaged = true   # 备份后清理目标端孤儿文件
-min_age_days = 0
-schedule_cron = "0 2 * * *"  # 可选：定时备份
-
-[webdav]                   # WebDAV 凭据（UI 保存后自动生成，敏感字段已加密）
+[webdav]
 url = "https://dav.kzwr.com/dav"
-username_enc = "enc:..."
-password_enc = "enc:..."
 ```
 
 ## 📄 文档
@@ -117,5 +137,5 @@ password_enc = "enc:..."
 ## 🗺️ 路线图
 
 - ✅ Phase 1-3：MVP、增量加密、恢复能力
-- ✅ Phase 4：保留策略 / 断点续传 / WebSocket 监控 / 定时备份 / WebDAV 目标 / 监控告警 / 飞牛 `.fpk` 打包与 x86 设备实测
-- ⏳ Phase 5：aarch64 设备实测、密钥轮换、异地恢复
+- ✅ Phase 4：保留策略 / 断点续传 / WebSocket 监控 / 定时备份 / WebDAV 目标 / 监控告警 / 飞牛 `.fpk` 打包与 x86 设备实测 / **多目标 · 多任务**（v0.4.0）
+- 🔶 Phase 5：插件化（内置插件已落地，外置加载待做）、aarch64 设备实测、密钥轮换、异地恢复
