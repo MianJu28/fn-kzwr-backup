@@ -85,8 +85,14 @@ async fn main() -> anyhow::Result<()> {
         _ => info!("未配置 kzwr access-token（增强功能降级，不影响备份/恢复）"),
     }
 
-    // 目标存储：kzwr 官方 WebDAV（唯一目标，ADR-009）
-    let (target, backend_name, target_ready) = build_target(&config_mgr)?;
+    // 插件注册表（唯一装配点）：内置 WebDAV 目标插件 + kzwr 增强插件（ADR-013）
+    let registry = Arc::new(fnos_backup::plugin::PluginRegistry::builtin());
+
+    // 目标存储：由注册表向目标插件索取（未配置时回退占位适配器）
+    let (target, backend_name, target_ready) = {
+        let mgr = config_mgr.lock().unwrap();
+        registry.build_target(&mgr)
+    };
     let target = Arc::new(infra::storage_trait::SwapTarget::new(target));
     info!("目标存储后端: {}（ready={target_ready}）", backend_name);
 
@@ -111,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         target,
         target_ready,
+        plugins: registry,
         kzwr,
         audit,
         backup_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -447,59 +454,6 @@ fn open_log_file(path: &std::path::Path) -> anyhow::Result<LogFileWriter> {
         .append(true)
         .open(path)?;
     Ok(LogFileWriter(std::sync::Mutex::new(f)))
-}
-
-/// 构建目标存储：WebDAV 凭据来源优先级 TRIM_DAV_* 环境变量 > 加密配置 [webdav] 段。
-///
-/// 未配置时返回占位适配器（服务照常启动供 UI 配置，操作返回引导错误）。
-fn build_target(
-    config_mgr: &Arc<Mutex<infra::config::ConfigManager>>,
-) -> anyhow::Result<(
-    Arc<dyn infra::storage_trait::TargetStorage>,
-    String,
-    bool,
-)> {
-    // 1) 环境变量
-    let env_url = env_nonempty("TRIM_DAV_URL");
-    let env_user = env_nonempty("TRIM_DAV_USER");
-    let env_pass = env_nonempty("TRIM_DAV_PASS");
-
-    // 2) 加密配置
-    let (cfg_url, cfg_user, cfg_pass) = {
-        let mgr = config_mgr.lock().unwrap();
-        let (user, pass) = mgr.webdav_credentials().unwrap_or((None, None));
-        let url = mgr
-            .load()
-            .ok()
-            .and_then(|c| c.webdav.url)
-            .filter(|s| !s.is_empty());
-        (url, user, pass)
-    };
-
-    let user = env_user.or(cfg_user);
-    let pass = env_pass.or(cfg_pass);
-    // 地址：环境变量 > 配置 > 官方默认（凭据存在时）
-    let url = env_url.or(cfg_url).or_else(|| {
-        user.as_ref()
-            .map(|_| infra::target::webdav::DEFAULT_URL.to_string())
-    });
-
-    match (url, user, pass) {
-        (Some(url), Some(user), Some(pass)) if !user.is_empty() && !pass.is_empty() => Ok((
-            Arc::new(infra::target::webdav::WebdavTarget::new(&url, user, pass)),
-            format!("WebDAV（{}）", url),
-            true,
-        )),
-        _ => {
-            let msg = "WebDAV 未配置，请在设置中填写 WebDAV 地址与凭据".to_string();
-            info!("{}", msg);
-            Ok((
-                Arc::new(infra::storage_trait::UnconfiguredTarget { message: msg }),
-                "未配置".to_string(),
-                false,
-            ))
-        }
-    }
 }
 
 /// 读取非空环境变量

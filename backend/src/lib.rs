@@ -10,6 +10,7 @@ pub mod domain;
 pub mod eventbus;
 pub mod http;
 pub mod infra;
+pub mod plugin;
 
 use age::secrecy::SecretString;
 use domain::alerts::AlertSink;
@@ -102,6 +103,8 @@ pub struct AppState {
     pub default_restore_dir: PathBuf,
     /// 运行日志文件路径（日志页查看/清空/下载）
     pub log_file: PathBuf,
+    /// 插件注册表（远程目标与增强插件的唯一装配点；详见 `plugin` 模块）
+    pub plugins: Arc<crate::plugin::registry::PluginRegistry>,
     /// kzwr REST 客户端（**增强功能**：账号存储空间、回收站清理等，非备份通道）
     ///
     /// access-token 从配置解密后注入；未配置时调用返回认证提示，不影响备份/恢复。

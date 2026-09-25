@@ -465,12 +465,16 @@ async fn health(State(_state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
+/// 插件清单（内置插件；供前端区块注册表与问题诊断）
+async fn plugins_list(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "plugins": state.plugins.list() }))
+}
+
 /// 保存 WebDAV 配置：先实测连通性（PROPFIND ping），通过后加密存储
 async fn webdav_save(
     State(state): State<AppState>,
     Json(body): Json<WebdavSaveRequest>,
 ) -> Json<WebdavSaveResponse> {
-    let url = crate::infra::target::webdav::DEFAULT_URL.to_string();
     if body.username.trim().is_empty() || body.password.is_empty() {
         return Json(WebdavSaveResponse {
             success: false,
@@ -480,20 +484,28 @@ async fn webdav_save(
         });
     }
 
-    // 1) 实测连通性与凭据
-    let probe = crate::infra::target::webdav::WebdavTarget::new(
-        &url,
-        body.username.trim(),
-        &body.password,
-    );
-    if let Err(e) = probe.ping().await {
-        return Json(WebdavSaveResponse {
-            success: false,
-            url: Some(url),
-            warning: None,
-            error: Some(format!("WebDAV 连通性测试失败: {}", e)),
-        });
-    }
+    // 1) 实测连通性与凭据：交给**目标插件**判定（地址与协议由插件决定）
+    let url = match state.plugins.default_target() {
+        Some(p) => match p.verify(body.username.trim(), &body.password).await {
+            Ok(u) => u,
+            Err(e) => {
+                return Json(WebdavSaveResponse {
+                    success: false,
+                    url: None,
+                    warning: None,
+                    error: Some(e),
+                })
+            }
+        },
+        None => {
+            return Json(WebdavSaveResponse {
+                success: false,
+                url: None,
+                warning: None,
+                error: Some("未注册任何备份目标插件".to_string()),
+            })
+        }
+    };
 
     // 2) 加密保存
     let saved = {
@@ -502,12 +514,12 @@ async fn webdav_save(
     };
     match saved {
         Ok(_) => {
-            // 热切换目标实现（无需重启服务）
-            state.target.swap(Arc::new(crate::infra::target::webdav::WebdavTarget::new(
-                &url,
-                body.username.trim(),
-                &body.password,
-            )));
+            // 热切换目标实现（无需重启服务）：由注册表按当前配置重新装配
+            let (next, _name, _ready) = {
+                let mgr = state.config.lock().unwrap();
+                state.plugins.build_target(&mgr)
+            };
+            state.target.swap(next);
             // 账号一致性：已配置 access-token 时，核对 WebDAV 账号与 API 账号
             let warning = check_account_consistency(&state).await;
             state.audit.record(
@@ -3311,6 +3323,7 @@ async fn config_import(
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/plugins", get(plugins_list))
         .route("/ws", get(ws::ws_handler))
         .route("/webdav/config", post(webdav_save))
         .route("/user/info", get(user_info))
