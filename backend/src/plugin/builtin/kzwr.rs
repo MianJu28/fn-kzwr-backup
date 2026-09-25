@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::http::routes::{human_bytes, raise_alert_once, webdav_username};
 use crate::infra::config::AppConfig;
-use crate::plugin::api::{CheckOutcome, EnhanceCaps, EnhancePlugin, PluginKind, PluginMeta};
+use crate::plugin::api::{
+    CheckOutcome, EnhanceCaps, EnhancePlugin, PluginKind, PluginMeta, PluginUi, UiBlock,
+};
 use crate::AppState;
 
 /// kzwr 增强插件
@@ -63,6 +65,40 @@ impl EnhancePlugin for KzwrPlugin {
     /// 备份后动作：按保留策略清空云端回收站（返回清理计数）
     async fn after_backup(&self, state: &AppState) -> Option<u64> {
         Some(empty_recycle_bin_if_configured(state).await as u64)
+    }
+
+    /// 设置页：增强功能卡片。
+    ///
+    /// 内置前端用 `component="kzwr"` 的完整组件；**不认识该组件的前端**（或外置插件）
+    /// 则由 `blocks` 通用渲染，因此这里同时给出可被 schema 描述的等价操作。
+    fn ui(&self) -> Option<PluginUi> {
+        Some(PluginUi {
+            section: "settings".to_string(),
+            title: "增强功能（酷族账号）".to_string(),
+            order: 20,
+            component: Some("kzwr".to_string()),
+            blocks: vec![
+                UiBlock::Text {
+                    field: "access_token".to_string(),
+                    label: "access-token".to_string(),
+                    value: None,
+                    placeholder: Some("浏览器登录酷族后从 Cookie 复制".to_string()),
+                    secret: true,
+                    action: "/token".to_string(),
+                    button: "保存".to_string(),
+                },
+                UiBlock::Button {
+                    label: "清空云端回收站".to_string(),
+                    action: "/trash/empty".to_string(),
+                    danger: true,
+                    confirm: Some("将物理删除回收站内所有文件，不可恢复".to_string()),
+                },
+                UiBlock::Tips {
+                    text: "空间用量可读取 GET /api/p/kzwr/user；内置前端组件提供完整界面。"
+                        .to_string(),
+                },
+            ],
+        })
     }
 
     /// 配置变更后刷新内存中的 access-token（热更新，无需重启）

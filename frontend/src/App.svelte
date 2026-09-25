@@ -18,6 +18,7 @@
   import { toast } from './lib/toast.js';
   import { theme, initTheme, toggleTheme } from './lib/theme.js';
   import { setHostTimezone } from './lib/format.js';
+  import { loadPlugins } from './lib/plugins.js';
 
   /* ── 全局状态 ─────────────────────────────────────────────── */
   let health = ''; // 服务状态文本
@@ -39,6 +40,8 @@
   let scheduleCronValid = true;
   // 宿主时区说明（如「CST (UTC+08:00)」，用于页面标注时间口径）
   let scheduleTimezone = '';
+  // 插件清单（/api/plugins）：设置页区块由它驱动
+  let plugins = [];
 
   // 备份 / 恢复
   let busy = false;
@@ -119,6 +122,8 @@
   async function loadConfig() {
     try {
       const d = await api.config();
+      // 插件清单：决定设置页/概览页显示哪些插件卡片、什么顺序
+      plugins = await loadPlugins(true);
       // 时间展示统一按宿主（NAS）时区，而不是浏览器时区
       setHostTimezone(d.host_utc_offset_minutes);
       scheduleTimezone = d.schedule_timezone || '';
@@ -331,7 +336,11 @@
     try {
       const d = await api.kzwrSaveToken(token);
       kzwrConfigured = !!d.configured;
-      if (d.success) await loadKzwrUser();
+      if (d.success) {
+        await loadKzwrUser();
+        // 插件可用性变了（token 已配置/清除）：刷新插件清单
+        plugins = await loadPlugins(true);
+      }
       else if (!kzwrConfigured) kzwrUser = null;
       return d;
     } catch (e) {
@@ -390,6 +399,16 @@
     } finally {
       busy = false;
     }
+  }
+
+  /**
+   * 插件通用区块（UI Schema）完成一次操作后的回调：
+   * 刷新消息提醒、配置与插件清单（可用性可能已变化）
+   */
+  async function handlePluginDone() {
+    await loadAlerts();
+    await loadConfig();
+    if (kzwrConfigured) await loadKzwrUser();
   }
 
   /** kzwr 增强：清空回收站 */
@@ -760,6 +779,8 @@
             <LogsPage debug={debugOn} onSaveDebug={handleSaveDebug} />
           {:else if currentPage === 'settings'}
             <SettingsPage
+              {plugins}
+              onPluginDone={handlePluginDone}
               {webdavConfigured}
               {webdavUrl}
               {webdavUsername}

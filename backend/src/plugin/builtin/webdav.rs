@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use crate::infra::config::ConfigManager;
 use crate::infra::storage_trait::TargetStorage;
 use crate::infra::target::webdav::{WebdavTarget, DEFAULT_URL};
-use crate::plugin::api::{PluginKind, PluginMeta, TargetPlugin};
+use crate::plugin::api::{PluginKind, PluginMeta, PluginUi, TargetPlugin};
 
 pub struct WebdavPlugin;
 
@@ -53,6 +53,17 @@ impl TargetPlugin for WebdavPlugin {
             Arc::new(WebdavTarget::new(&url, &user, &pass)),
             format!("WebDAV（{}）", url),
         ))
+    }
+
+    /// 设置页：备份目标卡片（前端有内置组件 `webdav`）
+    fn ui(&self) -> Option<PluginUi> {
+        Some(PluginUi {
+            section: "settings".to_string(),
+            title: "备份目标（WebDAV）".to_string(),
+            order: 10,
+            component: Some("webdav".to_string()),
+            blocks: Vec::new(),
+        })
     }
 
     async fn verify(&self, user: &str, pass: &str) -> Result<String, String> {

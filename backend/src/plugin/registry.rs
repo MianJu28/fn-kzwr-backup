@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use crate::infra::config::ConfigManager;
+use crate::infra::config::{AppConfig, ConfigManager};
 use crate::infra::storage_trait::{TargetStorage, UnconfiguredTarget};
 
-use super::api::{EnhancePlugin, PluginMeta, TargetPlugin};
+use super::api::{EnhancePlugin, PluginEntry, TargetPlugin};
 use super::builtin;
 
 pub struct PluginRegistry {
@@ -38,14 +38,26 @@ impl PluginRegistry {
         &self.enhances
     }
 
-    /// 插件清单（供 `/api/plugins` 与前端区块注册表）
-    pub fn list(&self) -> Vec<PluginMeta> {
+    /// 插件清单（供 `/api/plugins`；**前端唯一的区块数据来源**）
+    pub fn describe(&self, cfg: &AppConfig) -> Vec<PluginEntry> {
         let mut out = Vec::new();
         for p in &self.targets {
-            out.push(p.meta());
+            let meta = p.meta();
+            out.push(PluginEntry {
+                api_base: format!("/api/p/{}", meta.id),
+                meta,
+                available: true,
+                ui: p.ui(),
+            });
         }
         for p in &self.enhances {
-            out.push(p.meta());
+            let meta = p.meta();
+            out.push(PluginEntry {
+                api_base: format!("/api/p/{}", meta.id),
+                available: p.available(cfg),
+                ui: p.ui(),
+                meta,
+            });
         }
         out
     }

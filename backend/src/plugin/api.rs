@@ -44,6 +44,11 @@ pub trait TargetPlugin: Send + Sync {
 
     /// 保存配置前的连通性验证，返回实际使用的地址（基址由插件自行决定）
     async fn verify(&self, user: &str, pass: &str) -> Result<String, String>;
+
+    /// 设置页 UI 描述（默认不出现）
+    fn ui(&self) -> Option<PluginUi> {
+        None
+    }
 }
 
 /// 增强插件提供的能力（前端据此决定是否渲染对应区块）
@@ -57,6 +62,85 @@ pub struct EnhanceCaps {
     pub recycle_bin: bool,
     /// 通知外发
     pub notify: bool,
+}
+
+/// 插件 UI 描述：前端据此决定「设置页/概览页」显示哪些卡片、顺序如何。
+///
+/// 内置插件可以只填 `component`（前端有手写组件）；外置插件填 `blocks`，
+/// 由前端通用渲染器渲染 —— 这样新增插件**不需要重新打包前端**。
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginUi {
+    /// 分区：`settings` | `dashboard`
+    pub section: String,
+    /// 卡片标题
+    pub title: String,
+    /// 排序（小的在前）
+    pub order: i32,
+    /// 内置组件名（如 `kzwr`）；前端认识时优先用它，不认识则回退到 `blocks`
+    pub component: Option<String>,
+    /// 通用渲染块
+    pub blocks: Vec<UiBlock>,
+}
+
+/// 通用 UI 块（schema 驱动，外置插件用）
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UiBlock {
+    /// 只读指标（如空间用量）
+    Metric {
+        label: String,
+        value: String,
+        hint: Option<String>,
+    },
+    /// 文本/密码输入 + 提交按钮
+    Text {
+        field: String,
+        label: String,
+        value: Option<String>,
+        placeholder: Option<String>,
+        #[serde(default)]
+        secret: bool,
+        action: String,
+        button: String,
+    },
+    /// 数字输入 + 提交按钮
+    Number {
+        field: String,
+        label: String,
+        value: Option<i64>,
+        suffix: Option<String>,
+        action: String,
+        button: String,
+    },
+    /// 按钮（可带二次确认文案）
+    Button {
+        label: String,
+        action: String,
+        #[serde(default)]
+        danger: bool,
+        confirm: Option<String>,
+    },
+    /// 开关
+    Toggle {
+        field: String,
+        label: String,
+        value: bool,
+        action: String,
+    },
+    /// 只读提示
+    Tips { text: String },
+}
+
+/// 插件清单条目（供 `/api/plugins`；前端唯一的数据来源）
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginEntry {
+    #[serde(flatten)]
+    pub meta: PluginMeta,
+    /// 是否已可用（如 token 已配置）
+    pub available: bool,
+    /// 插件 API 前缀（前端拼请求用），如 `/api/p/kzwr`
+    pub api_base: String,
+    pub ui: Option<PluginUi>,
 }
 
 /// 插件自检项（供「一键体检」汇总；由核心映射成 UI 的检查项）
@@ -97,6 +181,11 @@ pub trait EnhancePlugin: Send + Sync {
 
     /// 配置变更后重载插件自身状态（如配置导入/保存后刷新 token）；默认无操作
     async fn reload(&self, _state: &crate::AppState) {}
+
+    /// 设置页/概览页的 UI 描述（默认不出现）
+    fn ui(&self) -> Option<PluginUi> {
+        None
+    }
 
     /// 「一键体检」自检项（默认不参与）
     async fn health_check(
