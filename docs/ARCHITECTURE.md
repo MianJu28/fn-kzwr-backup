@@ -415,6 +415,44 @@ trait TargetStorage {
 
 ---
 
+### ADR-014：多目标 · 多任务（多用户/多目标管理）
+
+**状态**：✅ 已实施（2026-09-26，v0.4.0）
+
+**背景**：早期决策为「单源集 + 单 WebDAV 目标」（多目标一度按用户决策放弃）。实际使用中用户需要：**同一份源备份到多个账号/目的地**，以及**不同源各自独立调度与保留策略**。此时架构上已有两处有利条件：① 快照表 `sync_snapshots` 的主键本就是 `(account, job_id, rel_path)`——按目标账号分桶的数据模型早已存在，只是运行时永远填同一个账号；② ADR-013 已把「目标」抽象成 `TargetPlugin`，多目标只是"多装配几个实例"。
+
+**决策**：
+
+- **配置模型**（`infra/config.rs`）：`AppConfig` 新增
+  - `targets: Vec<TargetConfig>`：一个目标 = 一个插件实例（`kind`）+ 地址 + 加密凭据 + 启用位
+  - `tasks: Vec<TaskConfig>`：一个任务 = 源路径集 + `target_id` + 目标目录前缀 + `schedule_cron` + `retention`
+  - **旧字段 `backup` / `webdav` 保留为兼容镜像**：载入时若 `targets`/`tasks` 为空 → `migrate()` 由旧字段生成 `default` 目标与 `default` 任务（幂等，落盘一次）；保存时 `sync_legacy_mirror()` 把首个任务/目标回写旧字段（降级到 0.3.x 仍可读）。**默认任务 id 刻意取 `default`**，与旧 `AppState.job_id`（`TRIM_JOB_ID`）一致 → 快照 key 仍是 `default-0`，**升级后不会全量重传**。
+- **目标池**（`infra/storage_trait.rs::TargetPool`）：`目标 id → 适配器`；`PluginRegistry::build_targets(cfg, mgr)` 装配全部目标（未就绪也入池，取用时回退占位适配器并给出明确提示）。`AppState.targets` 是池，`AppState.target`（`SwapTarget`）仍是**主目标**（首个启用目标），供 kzwr 增强等全局能力与兼容接口使用。
+- **任务执行**（`http/routes.rs::run_task_now`）：`job_id = "{task.id}-{源序号}"`、`account = 该目标任务凭据的用户名`、target 取自目标池 → **每个任务在每个目标上都各自独立快照/增量/保留策略**。互斥仍是全局 `backup_running`（同一时刻只跑一个备份任务，避免 NAS 带宽争抢）。
+- **调度**（`domain/scheduler.rs`）：由「单 cron」改为**每任务独立 cron**：维护 `任务 id → (cron, 下次触发)`，每轮 tick 重建/清理待触发表，到点调用 `run_task_now`；新增/删除/停用/改 cron 均热生效。
+- **API**：新增 `GET/POST /api/targets`、`POST /api/targets/:id/{delete,test}`、`GET/POST /api/tasks`、`POST /api/tasks/:id/{delete,run}`；恢复侧 `restore/files|tree|run|prune` 增加 `task` 维度（缺省按源路径自动定位）；`/api/config`、`/api/webdav/config`、`/api/backup/run` 保留并作用于「首个任务/主目标」（兼容旧前端与旧客户端）。配置导出/导入加入 `targets`（含明文凭据）/`tasks`。
+- **前端**：新增 `views/TasksPage.svelte`（任务列表 + 内联编辑：源路径/目标下拉/cron 预设与预览/保留策略；立即备份/停用/编辑/删除）、`views/TargetsPage.svelte`（目标列表 + 内联编辑，保存前实测连通性、测试连接、删除保护提示）；恢复页按「任务」分组展示并在调用中带上 `task`；`app.css` 增加通用列表行/编辑器类。
+- **权限边界**：目标选项由**人（用户）**决定并把关（地址、账号、应用密码、任务归属、删除），AI 不替用户决定目标与凭据。
+
+**后果**：
+- (+) 同一源可同时/分别备份到多个账号；每个目标独立增量、独立保留策略，某目标失败不影响其它目标
+- (+) 升级无感：旧配置自动迁移、快照 key 不变、旧接口继续可用
+- (+) 新增目标类型只需再写一个 `TargetPlugin`（ADR-013），配置与 UI 自动支持「再建一个」
+- (-) 配置模型变复杂（两套字段并存期）；`routes.rs` 的兼容分支（首个任务/主目标）在旧前端下线后可移除
+- ⚠️ 后端**不能持有 config 锁跨 await**（`target_save` 的连通性实测因此必须「先实测、后加密」，否则自锁）
+- ⚠️ 恢复页的多任务键：同一路径可能属于多个任务，UI 状态键用「任务 id + 路径」，并把 `task` 透传给树/恢复/清理接口
+
+**验证（2026-09-26，NAS 实测）**：以 `rclone serve webdav` 起两个本地 WebDAV 当目标——
+① 写入 legacy 单任务配置 → 启动后自动迁移（`/api/targets` 得到 `default` 目标含原地址/账号，`/api/tasks` 得到 `default` 任务含原路径/cron，config.toml 落盘 `[[targets]]`/`[[tasks]]`）；
+② 新建第二个目标（保存前实测连通性通过）与第二个任务（同源 → 目标 B / 目录 `backupB`）；
+③ 两任务各自运行 → **目标 A 落盘 `/fn-backup/src1/…`、目标 B 落盘 `/backupB/src1/…`**（真实上传）；
+④ `/api/restore/files` 返回两条任务项（同一本地路径在两个任务上各自独立的文件数/字节数）；
+⑤ 任务 B 二次运行 → `uploaded=0, unchanged=3`（独立增量）；
+⑥ 删除保护（被引用的目标拒绝删除）、错误路径（不存在任务/无效 cron/不存在目标）均返回明确文案；
+⑦ 前端 Playwright 实测：任务/目标页渲染正确，且**通过 UI 完成**新建目标、新建任务、两步确认删除任务、删除目标。
+
+---
+
 ### ADR-013：远程目标与增强功能插件化
 
 **状态**：Draft（分支 `feat/plugin-architecture` 上实施；首期为编译期内置插件）
@@ -532,8 +570,8 @@ fn-kzwr-backup/
 | **Phase 1 · MVP** | 全量备份 · 单源单目标 · 基础 Web UI · 本地 FS 源 · 酷族官方 WebDAV 目标（ADR-009） · 飞牛 `.fpk` 打包 | ✅ 完成（x86 飞牛设备安装/运行实测通过；aarch64 待测） | WebDAV 对接（已解决）· 飞牛生命周期集成 | 完全可逆 |
 | **Phase 2 · 增量加密** | mtime 差分 · age 加密 · 流式管道 · 64MB 分块 · SQLite 元数据 | ✅ 完成 | 私钥管理（已用密钥库解决）· 大文件内存 | 完全可逆 |
 | **Phase 3 · 恢复能力** | 选择性恢复 · 恢复向导 UI · 完整性校验 · BLAKE3 严格模式 | ✅ 完成 | 索引膨胀（结合保留策略缓解） | 部分可逆（元数据格式定型需迁移） |
-| **Phase 4 · 生产强化** | 多目标支持 · 保留策略 · 断点续传 · 监控告警 · fnos 服务化 | ✅ 保留策略 / 断点续传 / WebSocket 监控 / `.fpk` 打包 / 监控告警 / 飞牛设备实测均已完成（多目标按用户决策放弃） | 并发控制 · 资源争用 | 部分可逆 |
-| **Phase 5 · 演进扩展** | 异地恢复 · 密钥轮换 · 插件化 · 可选分布式 | ⏳ 规划中 | 跨节点一致性 | 视需求启用 |
+| **Phase 4 · 生产强化** | 多目标支持 · 保留策略 · 断点续传 · 监控告警 · fnos 服务化 | ✅ 保留策略 / 断点续传 / WebSocket 监控 / `.fpk` 打包 / 监控告警 / 飞牛设备实测均已完成；**多目标支持已于 v0.4.0 落地（ADR-014，含多任务）** | 并发控制 · 资源争用 | 部分可逆 |
+| **Phase 5 · 演进扩展** | 异地恢复 · 密钥轮换 · 插件化 · 可选分布式 | 🔶 插件化进行中（P1–P4 已落地，ADR-013；外置加载 P5 待做）· 其余规划中 | 跨节点一致性 | 视需求启用 |
 
 **可逆性原则**：Phase 1-2 纯增量能力叠加，决策完全可逆；Phase 3-4 元数据格式定型后部分可逆（需写迁移脚本）；Phase 5 视实际需求启用，避免过早优化。
 
@@ -617,7 +655,7 @@ fn-kzwr-backup/
 
 ### 11.1 当前开发状态
 
-**核心备份/恢复主链路已完成并在 x86 飞牛设备实测通过**；当前功能版本 **v0.3.11**（0.2.0 起项目更名 `fn-kzwr-backup`；0.2.1 恢复页懒加载与「全部恢复」；0.2.2 设置项回显；0.2.3 按 ADR-011 引入 kzwr REST 增强功能：存储空间/空间预警/回收站门槛清理，及定时可视化、一键体检、操作审计、账号一致性校验；0.2.4 修复飞牛目录选择器误报取消、操作审计独立成页；0.2.5 修复目录选择器 1003103——config/resource 权限声明键修正为官方的 api-scope；0.2.6 修复保留策略误删刚备份文件、上传/下载 4 路并发并重写速度计量、回收站年龄门槛按宿主时区、凭据解密缓存与恢复树聚合索引提速；0.2.7 恢复容忍云端缺失并新增「清理缺失」按钮、任务失败正确显示失败态；0.2.8 账号信息整合至侧边栏（可刷新）、网络请求自动重试 3 次、调试日志开关、依据实测修正回收站字段 length/deletedDate 使保留策略清空回收站全链路生效——已用真实 token 实测清理 70 项；0.2.9 传输改为顺序执行并保留网络自动重试、日志页（查看/清空/下载 + 调试开关）、审计页清空；0.2.10 调试开关迁移至日志页、需要管理员口令的操作统一改为弹窗输入；0.3.0 实时任务面板展示完整流程阶段（准备/传输/收尾，含扫描差分与保留策略清理）、侧栏卡片间距与 WebDAV 文案优化；0.3.1 修复口令弹窗与通知设置输入框无法输入（Svelte 响应式语句回写绑定变量）；0.3.2 **接入飞牛统一网关修复 https 混合内容拦截**（ADR-012）；0.3.3 应用介绍改用 HTML 富文本并接入宣传图；0.3.4 介绍精简为一句一行；**0.3.11 **修复安装失败**（`wizard/config`、`wizard/upgrade` 不能是空数组 `[]`——会被安装校验判为 `code 10111`「应用包不符合系统要求」；改为**不打包这两个文件**即不显示步骤）；0.3.10 **取消端口直连**（只监听统一网关 Socket，manifest 去掉 `service_port`，安装向导不再收集端口，调试端口 `FN_KZWR_DEBUG_PORT` 默认关闭）、应用介绍去掉宣传图；0.3.9 日志倒序显示、修复日志 ANSI 乱码、**时间口径统一为宿主时区**（日志写入端本地时区 + 历史 UTC 行读侧换算；前端 `fmtTime` 按 `/api/config.host_utc_offset_minutes` 渲染）、空间预警改为后台定期巡检并进入「消息提醒」（回落自动消解）、异常提示统一到「消息提醒」；宣传图显示修复：`desc` 的 `<img>` 只保留 src/alt/width，`style` 属性会被宿主转义成纯文本；文档同步**）。构建与测试**统一通过 SSH 在飞牛 NAS 上进行**（WSL 已废弃：上行仅 ~4KB/s、后台进程随会话被回收）；源码从 Windows 侧经 `pscp`/tar 同步至 NAS 后执行 `Scripts/build_fnos_app.sh`，运行编译好的二进制或通过 HTTP API 测试。
+**核心备份/恢复主链路已完成并在 x86 飞牛设备实测通过**；当前功能版本 **v0.4.0**（**0.4.0 多目标 · 多任务（ADR-014）：配置改为 `targets` + `tasks` 两列表（旧字段自动迁移并保留兼容镜像）、目标池按任务取适配器、每任务独立 cron 调度与独立快照/增量/保留策略、新增目标与任务管理页（含保存前连通性实测与删除保护）、恢复侧支持按任务定位、导出导入含多目标多任务**；0.2.0 起项目更名 `fn-kzwr-backup`；0.2.1 恢复页懒加载与「全部恢复」；0.2.2 设置项回显；0.2.3 按 ADR-011 引入 kzwr REST 增强功能：存储空间/空间预警/回收站门槛清理，及定时可视化、一键体检、操作审计、账号一致性校验；0.2.4 修复飞牛目录选择器误报取消、操作审计独立成页；0.2.5 修复目录选择器 1003103——config/resource 权限声明键修正为官方的 api-scope；0.2.6 修复保留策略误删刚备份文件、上传/下载 4 路并发并重写速度计量、回收站年龄门槛按宿主时区、凭据解密缓存与恢复树聚合索引提速；0.2.7 恢复容忍云端缺失并新增「清理缺失」按钮、任务失败正确显示失败态；0.2.8 账号信息整合至侧边栏（可刷新）、网络请求自动重试 3 次、调试日志开关、依据实测修正回收站字段 length/deletedDate 使保留策略清空回收站全链路生效——已用真实 token 实测清理 70 项；0.2.9 传输改为顺序执行并保留网络自动重试、日志页（查看/清空/下载 + 调试开关）、审计页清空；0.2.10 调试开关迁移至日志页、需要管理员口令的操作统一改为弹窗输入；0.3.0 实时任务面板展示完整流程阶段（准备/传输/收尾，含扫描差分与保留策略清理）、侧栏卡片间距与 WebDAV 文案优化；0.3.1 修复口令弹窗与通知设置输入框无法输入（Svelte 响应式语句回写绑定变量）；0.3.2 **接入飞牛统一网关修复 https 混合内容拦截**（ADR-012）；0.3.3 应用介绍改用 HTML 富文本并接入宣传图；0.3.4 介绍精简为一句一行；**0.3.11 **修复安装失败**（`wizard/config`、`wizard/upgrade` 不能是空数组 `[]`——会被安装校验判为 `code 10111`「应用包不符合系统要求」；改为**不打包这两个文件**即不显示步骤）；0.3.10 **取消端口直连**（只监听统一网关 Socket，manifest 去掉 `service_port`，安装向导不再收集端口，调试端口 `FN_KZWR_DEBUG_PORT` 默认关闭）、应用介绍去掉宣传图；0.3.9 日志倒序显示、修复日志 ANSI 乱码、**时间口径统一为宿主时区**（日志写入端本地时区 + 历史 UTC 行读侧换算；前端 `fmtTime` 按 `/api/config.host_utc_offset_minutes` 渲染）、空间预警改为后台定期巡检并进入「消息提醒」（回落自动消解）、异常提示统一到「消息提醒」；宣传图显示修复：`desc` 的 `<img>` 只保留 src/alt/width，`style` 属性会被宿主转义成纯文本；文档同步**）。构建与测试**统一通过 SSH 在飞牛 NAS 上进行**（WSL 已废弃：上行仅 ~4KB/s、后台进程随会话被回收）；源码从 Windows 侧经 `pscp`/tar 同步至 NAS 后执行 `Scripts/build_fnos_app.sh`，运行编译好的二进制或通过 HTTP API 测试。
 
 ### 11.2 已实现功能（按模块）
 
@@ -676,7 +714,8 @@ fn-kzwr-backup/
 | | Webhook 自定义 | ✅ | 支持自定义请求头与请求体模板（占位符 `{{message}}`/`{{level}}`/`{{source}}`/`{{ts}}`/`{{id}}`）；`POST /api/notify/webhook/test` 可用当前表单值直接测连通性 |
 | **密钥管理** | age 密钥查看/更换 | ✅ | `GET/POST /api/keys`、`POST /api/keys/generate`；密钥热切换无需重启（设置页 KeySection） |
 | | 私钥备份/恢复 | ✅ | `POST /api/keys/export`（**需管理员口令校验**后导出另存，导出即重置为未确认）、`POST /api/keys/backup-ack`（备份确认）；未确认备份时设置页持续提示「私钥丢失将无法恢复」 |
-| **多目标** | 备份到多个目标 | ❌ 放弃 | 按用户决策，保留策略实现，多目标不做 |
+| **多目标** | 备份到多个目标 | ✅ | v0.4.0 起支持（ADR-014）：`targets` 列表 + 目标池；每个目标的凭据独立加密、快照按目标账号分桶、独立增量与保留策略（`GET/POST /api/targets`、`/api/targets/:id/{test,delete}`） |
+| **多任务** | 多个独立备份任务 | ✅ | v0.4.0 起支持（ADR-014）：`tasks` 列表 = 源路径集 + 目标 + cron + 保留策略；每任务独立调度（`domain/scheduler.rs`）与快照（`job_id = "{task.id}-{源序号}"`）；`GET/POST /api/tasks`、`POST /api/tasks/:id/{run,delete}`；前端「任务」「目标」两页 |
 
 ### 11.3 当前实际 Rust 源码结构
 
@@ -697,14 +736,20 @@ backend/src/
 │   ├── pace.rs          # SpeedMeter（传输速度计量：累计实际字节/实际传输耗时）
 │   ├── restore.rs       # RestoreJob (恢复编排 + 恢复后回写快照)
 │   ├── retention.rs     # RetentionPolicy (孤儿文件清理)
-│   └── scheduler.rs     # Scheduler (cron 定时备份调度)
+│   └── scheduler.rs     # Scheduler (**每任务独立 cron**，ADR-014)
+├── plugin/              # 插件层（ADR-013）
+│   ├── api.rs           # 契约：TargetPlugin/EnhancePlugin/PluginMeta/PluginUi/UiBlock
+│   ├── registry.rs      # 唯一装配点：build_targets(全部目标) / describe(/api/plugins)
+│   └── builtin/
+│       ├── webdav.rs    # 目标插件（默认启用；每个目标一份实例）
+│       └── kzwr.rs      # 增强插件（账号/空间/回收站/告警/巡检）
 ├── infra/
 │   ├── mod.rs
-│   ├── storage_trait.rs # TargetStorage/SourceStorage trait + SwapTarget/UnconfiguredTarget
+│   ├── storage_trait.rs # TargetStorage/SourceStorage trait + **TargetPool(多目标池，ADR-014)** + SwapTarget(主目标)/UnconfiguredTarget
 │   ├── source/local/    # LocalFsSource
 │   ├── target/webdav.rs # WebdavTarget (官方 WebDAV，ADR-009)
-│   ├── persistence/snapshot.rs  # SnapshotStore (SQLite)
-│   ├── config.rs        # ConfigManager (TOML，含 WebDAV 凭据加解密)
+│   ├── persistence/snapshot.rs  # SnapshotStore (SQLite；`(account, job_id, rel_path)` 主键 → 每目标/每任务独立分桶)
+│   ├── config.rs        # ConfigManager (TOML)：**targets/tasks 多目标多任务** + 旧字段迁移与兼容镜像 + 凭据加解密
 │   └── keystore.rs      # 密钥库
 ├── bin/                 # 测试二进制 (开发期)
 ├── eventbus.rs          # EventBus (tokio::broadcast)
@@ -719,16 +764,20 @@ frontend/src/
 ├── main.js                 # Svelte 挂载入口
 ├── views/                  # 页面级组件
 │   ├── DashboardPage.svelte  # 概览：UserCard + Overview（实时任务为右侧常驻面板）
-│   ├── BackupPage.svelte     # 备份：配置 + 定时 + 执行
+│   ├── TasksPage.svelte      # 任务管理（多任务，ADR-014）：列表 + 内联编辑 + 立即备份/停用/删除
+│   ├── TargetsPage.svelte    # 目标管理（多目标，ADR-014）：列表 + 内联编辑 + 测试连接/删除
+│   ├── BackupPage.svelte     # 备份：配置 + 定时 + 执行（作用于首个任务）
 │   ├── RestorePage.svelte    # 恢复
-│   └── SettingsPage.svelte   # 设置：UserCard + WebDAV 配置 + 密钥管理 + 通知 + 配置备份/恢复
+│   ├── AuditPage.svelte      # 操作审计
+│   ├── LogsPage.svelte       # 日志（倒序、宿主时区）
+│   └── SettingsPage.svelte   # 设置：**按 /api/plugins 清单渲染插件卡片** + 核心区（保留策略/密钥/通知/配置迁移）
 ├── components/             # 功能区块组件
 │   ├── LiveStatus.svelte      # 实时任务状态（右侧常驻面板：文件进度/明文大小/速度/用时 + 空闲态）
 │   ├── OverviewSection.svelte # 配置概览（网格卡片）
 │   ├── UserCard.svelte        # WebDAV 账号（WebDAV 无容量/套餐接口）
 │   ├── WebdavSection.svelte   # WebDAV 凭据配置（ping 验证后加密保存）
 │   ├── KeySection.svelte      # age 密钥管理（公钥展示 / 自定义私钥 / 自动生成 / 口令校验后显示私钥 / 备份确认）
-│   ├── AlertBanner.svelte     # 监控告警横幅（失败/异常列表 + 清空）
+│   ├── MessagesPanel.svelte   # 「消息提醒」：唯一的留存型通知出口（级别/来源/时间 + 清空）
 │   ├── NotifySection.svelte   # 通知设置（Webhook 地址 + 自定义请求头/请求体模板 + 连通性测试）
 │   ├── ConfigSection.svelte   # 配置备份/恢复（导出/复制/下载 JSON；粘贴或选文件导入）
 │   ├── BackupConfigSection.svelte # 备份路径（增删即自动保存）+ 定时 cron（手动保存）
@@ -742,7 +791,9 @@ frontend/src/
 - **镜像一致而非多版本**：目标端与本地保持一致（`8ee9b0a` 移除版本树），不做多版本历史，简化恢复与保留语义
 - **保留策略语义**：因无多版本，保留策略聚焦"目标端孤儿文件清理"（不在任何 job 快照中的残留），防目标空间膨胀
 - **恢复目标**：支持恢复到配置源路径（原位置）或指定目录；目录用"新建/覆盖"按钮控制
-- **配置热切换**：UI 保存 WebDAV 凭据后 `SwapTarget` 即时切换目标实现，无需重启（`storage_trait.rs`）
+- **配置热切换**：UI 保存目标凭据后由注册表**重建目标池**（`AppState::reload_targets`），全部目标即时生效，无需重启（`storage_trait.rs::TargetPool`，ADR-014）
+- **多任务/多目标隔离**：`job_id = "{task.id}-{源序号}"` + `account = 目标任务凭据用户名` → 每个任务在每个目标上都有独立快照/增量/保留策略；目标失败只影响该任务（ADR-014）
+- **升级无感**：旧 `[backup]`/`[webdav]` 配置自动迁移为 `default` 任务/目标，快照 key 不变（`default-0`）→ 装机升级后不会全量重传；旧字段持续作为兼容镜像回写
 - **定时备份**：cron 表达式到点触发，运行中改配置热更新（`domain/scheduler.rs`）；调度循环 await 备份完成后才排下一轮
 - **备份运行互斥**：定时调度与手动触发共用 `AppState.backup_running`（`AtomicBool`，`run_backup_now` 入口 CAS 抢占 + RAII 守卫复位），已有备份在执行时第二次触发立即返回 `skipped = true` 与提示文案，避免并发备份争抢带宽与快照写入
 - **用户信息**：账号记录在配置（username_enc 解密），`/api/user/info` 返回本地账号；WebDAV 无套餐/容量接口
@@ -759,7 +810,10 @@ frontend/src/
 4. ✅ **密钥丢失恢复流程**：设置页可随时「显示私钥」另存备份，并可「我已妥善保存」确认；未备份时持续提示丢失风险（`POST /api/keys/export`、`POST /api/keys/backup-ack`）
 5. ❌ **大文件块级增量**：**不做**（用户决策，2026-09-19）——维持整文件差分（mtime+size / 严格 BLAKE3），不引入块级哈希
 6. ✅ **交互与能力补齐（v0.1.4 → v0.1.9）**：备份目标按源文件夹名分层（ADR-010）、实时任务合并统计与后端计量速度、上传/下载显示明文总量与已传量、Webhook 自定义请求头/请求体模板与连通性测试、配置导入/导出、显示私钥需管理员口令校验、恢复后回写快照防重复上传、修复分片请求 413
-7. **aarch64 设备实测**：CI 已产出双架构包，需在 aarch64 飞牛设备上验证二进制可用性（**当前唯一遗留项**）
+7. **aarch64 设备实测**：CI 已产出双架构包，需在 aarch64 飞牛设备上验证二进制可用性
+8. **0.4.0 打包与真机回归**：多任务/多目标代码已通过 NAS 端到端测试（rclone 双 WebDAV 目标），但**尚未打包 `.fpk` 装机**；打包后需在真机验证「旧配置自动迁移 + 旧快照继续增量」这一升级路径（NAS 测试用的是构造的 legacy 配置）
+9. **插件外置加载（ADR-013 P5）**：机制未定（子进程 JSON-RPC / 动态库 / WASM）；当前为编译期装配
+10. **兼容层收尾**：待旧前端下线后，可移除「首个任务/主目标」兼容分支与 `[backup]`/`[webdav]` 镜像字段（另一大版本）
 
 ### 11.6 飞牛应用打包实现（基于抓取到的飞牛开发文档）
 
