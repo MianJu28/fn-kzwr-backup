@@ -86,13 +86,36 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 插件注册表（唯一装配点）：内置 WebDAV 目标插件 + kzwr 增强插件（ADR-013）
-    let registry = Arc::new(fnos_backup::plugin::PluginRegistry::builtin());
+    let mut registry_inner = fnos_backup::plugin::PluginRegistry::builtin();
 
     // 配置载入 + 旧版单任务配置迁移（多任务/多目标模型，ADR-014）
     let initial_cfg = {
         let mgr = config_mgr.lock().unwrap();
         mgr.load_and_persist_migration().unwrap_or_default()
     };
+
+    // 外置插件（ADR-013 方案 B：动态库）
+    //
+    // 默认**关闭**（加载 .so = 执行任意本地代码，须用户显式开启）；
+    // 开启方式：配置 `plugins.enabled = true`，或环境变量 `FN_KZWR_PLUGINS=1`
+    // （环境变量优先，便于开发与临时验证）；开关变更需重启生效。
+    let external_enabled = fnos_backup::plugin::loader::enabled_by_env()
+        .unwrap_or(initial_cfg.plugins.enabled);
+    if external_enabled {
+        let dirs =
+            fnos_backup::plugin::loader::plugin_dirs(initial_cfg.plugins.dir.as_deref());
+        if dirs.is_empty() {
+            info!("外置插件已启用，但没有任何插件目录存在（未加载任何插件）");
+        } else {
+            for (p, src) in &dirs {
+                info!(dir = %p.display(), source = %src, "扫描外置插件目录");
+            }
+            registry_inner.load_external(&dirs);
+        }
+    } else {
+        info!("外置插件加载已关闭（配置 plugins.enabled 或 FN_KZWR_PLUGINS=1 可开启）");
+    }
+    let registry = Arc::new(registry_inner);
 
     // 目标文件夹 + 任务 id（默认值，实际由配置决定）
     let target_folder = std::env::var("TRIM_KZWR_FOLDER")

@@ -49,6 +49,33 @@ pub struct AppConfig {
     /// 运行时切换即时生效（日志过滤器热更新），并持久化到配置。
     #[serde(default)]
     pub debug: bool,
+    /// 外置插件（动态库）设置
+    #[serde(default)]
+    pub plugins: PluginSettings,
+}
+
+/// 外置插件设置（ADR-013 方案 B：动态库）
+///
+/// **默认关闭**：加载 `*.so` 等价于执行任意本地代码，必须由用户显式开启。
+/// 开关变更需**重启应用**生效（插件在启动时装配，运行中不热加载）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginSettings {
+    /// 是否加载外置插件
+    #[serde(default)]
+    pub enabled: bool,
+    /// 额外插件目录（`:` 分隔多个）；留空则用默认目录
+    /// （`$TRIM_PKGETC/plugins`、`$TRIM_APPDEST/plugins`）
+    #[serde(default)]
+    pub dir: Option<String>,
+}
+
+impl Default for PluginSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: None,
+        }
+    }
 }
 
 /// 迁移后的默认目标 id（旧配置升级时创建）

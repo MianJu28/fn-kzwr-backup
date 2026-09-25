@@ -27,8 +27,11 @@
 
   $: blocks = (plugin && plugin.ui && plugin.ui.blocks) || [];
 
-  // 初始化输入值（schema 给了 value 就用它作默认）
-  $: if (plugin && plugin.id) {
+  // 仅在**切换到另一个插件**时重置表单/结果：外层刷新插件清单时 plugin 对象会换新引用，
+  // 若每次都重置，操作结果与用户已填内容会立刻被清掉。
+  let initedId = null;
+  $: if (plugin && plugin.id && plugin.id !== initedId) {
+    initedId = plugin.id;
     const next = {};
     for (const b of blocks) {
       if (b.type === 'text' || b.type === 'number' || b.type === 'toggle') {
@@ -73,7 +76,10 @@
         mark(b.action, r.error, false);
         toast.error(r.error);
       } else {
-        mark(b.action, '已完成', true);
+        // 插件可以返回 { message } / { detail } 作为操作结果文案，直接展示给用户
+        const text = (r && (r.message || r.detail)) || '已完成';
+        mark(b.action, String(text), true);
+        if (r && r.message) toast.success(String(r.message));
         if (b.field && b.type !== 'toggle') values = { ...values, [b.field]: '' };
         if (onDone) await onDone();
       }

@@ -13,7 +13,13 @@
   import NotifySection from '../components/NotifySection.svelte';
   import ConfigSection from '../components/ConfigSection.svelte';
   import PluginBlocks from '../components/PluginBlocks.svelte';
+  import PluginSection from '../components/PluginSection.svelte';
   import { sectionsFor, FALLBACK_SECTIONS } from '../lib/plugins.js';
+
+  // 外置插件加载（动态库，ADR-013 方案 B）
+  export let pluginsEnabled = false;
+  export let pluginsDir = '';
+  export let onSavePlugins = null; // (enabled, dir) => Promise<{error?}>
 
   /** 插件清单（来自 /api/plugins） */
   export let plugins = [];
@@ -94,6 +100,7 @@
 {/each}
 
 <!-- ── 核心区（不属于插件）────────────────────────────────────── -->
+<PluginSection enabled={pluginsEnabled} dir={pluginsDir} {busy} onSave={onSavePlugins} />
 <RetentionSection {retention} kzwrReady={kzwrConfigured} {busy} onSave={onSaveRetention} />
 
 <KeySection

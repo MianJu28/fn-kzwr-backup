@@ -81,6 +81,10 @@ pub struct ConfigResponse {
     pub schedule_timezone: String,
     /// 宿主时区相对 UTC 的分钟偏移（前端据此把时间戳按宿主时区展示）
     pub host_utc_offset_minutes: i64,
+    /// 是否启用外置插件（动态库）加载
+    pub plugins_enabled: bool,
+    /// 自定义插件目录（空 = 用默认目录）
+    pub plugins_dir: String,
     /// 告警 Webhook 地址（空 = 不外发）
     pub webhook_url: Option<String>,
     /// Webhook 自定义请求头
@@ -194,7 +198,9 @@ pub struct TaskDeleteRequest {
 /// 配置保存请求
 #[derive(Deserialize)]
 pub struct ConfigSaveRequest {
-    pub backup_paths: Vec<String>,
+    /// 备份源路径（**不传 = 保持原值**：插件开关等局部保存不应误清空路径）
+    #[serde(default)]
+    pub backup_paths: Option<Vec<String>>,
     pub target_folder: Option<String>,
     /// 定时备份 cron 表达式（空 = 关闭定时）
     pub schedule_cron: Option<String>,
@@ -217,6 +223,12 @@ pub struct ConfigSaveRequest {
     /// 调试日志开关（不传则保持原值）
     #[serde(default)]
     pub debug: Option<bool>,
+    /// 外置插件加载开关（不传则保持原值；**改动需重启应用生效**）
+    #[serde(default)]
+    pub plugins_enabled: Option<bool>,
+    /// 自定义插件目录（`:` 分隔多个；空串 = 用默认目录）
+    #[serde(default)]
+    pub plugins_dir: Option<String>,
 }
 
 /// 备份响应
@@ -579,7 +591,22 @@ async fn health(State(_state): State<AppState>) -> Json<HealthResponse> {
 /// 前端据此决定渲染哪些卡片、顺序如何、用内置组件还是 `blocks` 通用渲染。
 async fn plugins_list(State(state): State<AppState>) -> Json<serde_json::Value> {
     let cfg = state.config.lock().unwrap().load().unwrap_or_default();
-    Json(serde_json::json!({ "plugins": state.plugins.describe(&cfg) }))
+    let env_override = crate::plugin::loader::enabled_by_env();
+    Json(serde_json::json!({
+        "plugins": state.plugins.describe(&cfg),
+        // 外置插件（ADR-013 方案 B：动态库）的开关/目录/加载诊断
+        "external": {
+            "configured": cfg.plugins.enabled,
+            "env_override": env_override,
+            "enabled": env_override.unwrap_or(cfg.plugins.enabled),
+            "dir": cfg.plugins.dir.clone().unwrap_or_default(),
+            "dirs": state.plugins.plugin_dirs()
+                .iter()
+                .map(|(p, s)| serde_json::json!({ "path": p, "source": s }))
+                .collect::<Vec<_>>(),
+            "reports": state.plugins.external_reports(),
+        }
+    }))
 }
 
 // ── 多任务 / 多目标（ADR-014）辅助 ──────────────────────────────────────
@@ -840,6 +867,8 @@ fn config_response(
         webhook_body: cfg.notify.webhook_body.clone(),
         key_backed_up: cfg.keys.backed_up,
         debug: cfg.debug,
+        plugins_enabled: cfg.plugins.enabled,
+        plugins_dir: cfg.plugins.dir.clone().unwrap_or_default(),
         error,
     }
 }
@@ -871,6 +900,8 @@ async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
             schedule_next: Vec::new(),
             schedule_timezone: crate::domain::scheduler::timezone_label(),
             host_utc_offset_minutes: crate::domain::scheduler::utc_offset_minutes(),
+            plugins_enabled: false,
+            plugins_dir: String::new(),
             webhook_url: None,
             webhook_headers: Vec::new(),
             webhook_body: None,
@@ -921,7 +952,9 @@ async fn config_save(
 
     {
         let task = cfg.tasks.first_mut().expect("刚保证非空");
-        task.paths = body.backup_paths.clone();
+        if let Some(paths) = body.backup_paths.clone() {
+            task.paths = paths;
+        }
         if let Some(folder) = body.target_folder {
             if !folder.trim().is_empty() {
                 task.target_folder = folder;
@@ -957,6 +990,14 @@ async fn config_save(
     // 调试日志开关：保存并即时生效（日志过滤器热更新）
     if let Some(v) = body.debug {
         cfg.debug = v;
+    }
+    // 外置插件开关/目录：只落盘（插件在启动时装配，重启后生效）
+    if let Some(v) = body.plugins_enabled {
+        cfg.plugins.enabled = v;
+    }
+    if let Some(v) = body.plugins_dir {
+        let v = v.trim().to_string();
+        cfg.plugins.dir = if v.is_empty() { None } else { Some(v) };
     }
     match cfg_guard.save(&cfg) {
         Ok(_) => {

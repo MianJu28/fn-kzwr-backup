@@ -84,6 +84,18 @@ cp -r "$FRONTEND_DIR/dist" "$PACK_DIR/app/www"
 chmod +x "$PACK_DIR"/cmd/* 2>/dev/null || true
 chmod +x "$PACK_DIR/app/bin/"* 2>/dev/null || true
 
+# 4.1) 外置插件（可选）：构建 plugins/* 并放入 app/plugins/
+#      插件是 cdylib（*.so），宿主在 $TRIM_APPDEST/plugins 或 $TRIM_PKGETC/plugins 下加载；
+#      加载默认关闭（设置页或 FN_KZWR_PLUGINS=1 开启）。失败不阻断打包。
+if [ "${SKIP_PLUGINS:-0}" != "1" ] && [ -d "$ROOT/plugins" ]; then
+    echo "==> [3.1/4] Build external plugins ..."
+    if bash "$ROOT/Scripts/build_plugins.sh" "$PACK_DIR/app/plugins"; then
+        echo "    插件已放入 app/plugins/"
+    else
+        echo "    ⚠️ 外置插件构建失败（不阻断打包；如需跳过可设 SKIP_PLUGINS=1）" >&2
+    fi
+fi
+
 # 4.5) 统一换行符为 LF（CRLF 会导致飞牛生命周期脚本 "bad interpreter"、manifest 解析值带 \r 报"不是有效 fpk"）
 find "$PACK_DIR" -type f \( -name manifest -o -path "*/cmd/*" -o -path "*/wizard/*" -o -path "*/config/*" -o -name config \) -print0 2>/dev/null \
   | xargs -0 -r sed -i 's/\r$//' 2>/dev/null || true

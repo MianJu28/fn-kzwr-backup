@@ -147,6 +147,12 @@ pub struct PluginEntry {
     /// 插件 API 前缀（前端拼请求用），如 `/api/p/kzwr`
     pub api_base: String,
     pub ui: Option<PluginUi>,
+    /// 来源：`builtin`（随应用编译）| `external`（外置动态库，ADR-013 方案 B）
+    #[serde(default)]
+    pub source: String,
+    /// 外置插件的动态库路径（内置为空）
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 /// 插件自检项（供「一键体检」汇总；由核心映射成 UI 的检查项）
