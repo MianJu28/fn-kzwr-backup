@@ -25,9 +25,9 @@ impl PluginRegistry {
         }
     }
 
-    /// 当前默认目标插件（设计为单目标，ADR-009）
-    pub fn default_target(&self) -> Option<&Arc<dyn TargetPlugin>> {
-        self.targets.first()
+    /// 按插件 id（目标配置里的 `kind`）取目标插件
+    pub fn target_plugin(&self, kind: &str) -> Option<&Arc<dyn TargetPlugin>> {
+        self.targets.iter().find(|p| p.meta().id == kind)
     }
 
     pub fn target_plugins(&self) -> &[Arc<dyn TargetPlugin>] {
@@ -62,25 +62,61 @@ impl PluginRegistry {
         out
     }
 
-    /// 构建当前备份目标：依次询问目标插件，第一个可用者即当前目标；
-    /// 全部不可用 → 占位适配器（服务照常启动，供 UI 完成配置）
-    pub fn build_target(&self, mgr: &ConfigManager) -> (Arc<dyn TargetStorage>, String, bool) {
-        for p in &self.targets {
-            if let Some((t, name)) = p.build(mgr) {
-                // 注：日志要打在**库 crate** 里才会被 `fnos_backup=info` 过滤器放行
-                // （main.rs 属于二进制 crate，其 info! 默认被过滤）
-                tracing::info!(plugin = %p.meta().id, backend = %name, "目标插件已装配");
-                return (t, name, true);
-            }
-        }
-        let msg = "备份目标未配置，请在设置中填写 WebDAV 地址与凭据".to_string();
-        tracing::info!("无可用目标插件，回退占位适配器（等待用户配置）");
-        (
-            Arc::new(UnconfiguredTarget {
-                message: msg.clone(),
-            }),
-            msg,
-            false,
-        )
+    /// 装配配置中的**全部目标**（多目标：每个目标一份独立实例）
+    ///
+    /// 凭据不全/插件不支持/已禁用 → `ready=false` + 占位适配器（服务照常启动，
+    /// 调用该目标时返回明确的配置提示，不影响其它目标）。
+    pub fn build_targets(&self, cfg: &AppConfig, mgr: &ConfigManager) -> Vec<BuiltTarget> {
+        cfg.targets
+            .iter()
+            .map(|t| {
+                let built = self
+                    .target_plugin(&t.kind)
+                    .and_then(|p| p.build(t, mgr));
+                match built {
+                    Some((storage, name)) => {
+                        // 注：日志要打在**库 crate** 里才会被 `fnos_backup=info` 过滤器放行
+                        // （main.rs 属于二进制 crate，其 info! 默认被过滤）
+                        tracing::info!(target = %t.id, backend = %name, "目标已装配");
+                        BuiltTarget {
+                            id: t.id.clone(),
+                            storage,
+                            name,
+                            ready: true,
+                        }
+                    }
+                    None => {
+                        let name = format!("未配置（{}）", t.name);
+                        tracing::info!(
+                            target = %t.id,
+                            kind = %t.kind,
+                            enabled = t.enabled,
+                            "目标未装配，回退占位适配器（等待用户配置）"
+                        );
+                        BuiltTarget {
+                            id: t.id.clone(),
+                            storage: Arc::new(UnconfiguredTarget {
+                                message: format!(
+                                    "目标「{}」未配置凭据，请在「目标管理」中完善后重试",
+                                    if t.name.is_empty() { &t.id } else { &t.name }
+                                ),
+                            }),
+                            name,
+                            ready: false,
+                        }
+                    }
+                }
+            })
+            .collect()
     }
+}
+
+/// 单个目标的装配结果
+pub struct BuiltTarget {
+    pub id: String,
+    pub storage: Arc<dyn TargetStorage>,
+    /// 后端描述（日志与 UI 展示）
+    pub name: String,
+    /// 是否已装配可写（凭据齐备且插件可用）
+    pub ready: bool,
 }

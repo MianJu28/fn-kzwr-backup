@@ -124,6 +124,73 @@ impl From<&crate::infra::config::RetentionConfig> for RetentionView {
     }
 }
 
+impl From<&RetentionView> for crate::infra::config::RetentionConfig {
+    fn from(v: &RetentionView) -> Self {
+        Self {
+            enabled: v.enabled,
+            cleanup_unmanaged: v.cleanup_unmanaged,
+            min_age_days: v.min_age_days,
+            empty_recycle_bin: v.empty_recycle_bin,
+            recycle_max_gb: v.recycle_max_gb,
+            recycle_min_age_days: v.recycle_min_age_days,
+        }
+    }
+}
+
+/// 目标保存请求（`id` 缺省 = 新建；`password` 缺省 = 不修改凭据）
+#[derive(Deserialize)]
+pub struct TargetSaveRequest {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 保存前是否实测连通性（默认 true）
+    #[serde(default = "default_test_true")]
+    pub test: bool,
+}
+
+fn default_test_true() -> bool {
+    true
+}
+
+/// 任务保存请求（未传字段保持原值；`id` 缺省 = 新建）
+#[derive(Deserialize)]
+pub struct TaskSaveRequest {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub target_id: Option<String>,
+    #[serde(default)]
+    pub target_folder: Option<String>,
+    #[serde(default)]
+    pub schedule_cron: Option<String>,
+    #[serde(default)]
+    pub retention: Option<RetentionView>,
+}
+
+/// 任务删除请求（`purge=true` 同时清理该任务的快照记录）
+#[derive(Deserialize, Default)]
+pub struct TaskDeleteRequest {
+    #[serde(default)]
+    pub purge: bool,
+}
+
 /// 配置保存请求
 #[derive(Deserialize)]
 pub struct ConfigSaveRequest {
@@ -181,6 +248,9 @@ pub struct RestoreRequest {
     /// 与 `all` 搭配：只恢复该相对目录（含子目录）下的文件；空 = 整个源路径
     #[serde(default)]
     pub dir: Option<String>,
+    /// 指定任务 id（缺省 = 自动按源路径在所有任务中查找）
+    #[serde(default)]
+    pub task: Option<String>,
 }
 
 /// 恢复响应
@@ -207,6 +277,15 @@ pub struct RestorableFolder {
     pub dir_count: usize,
     /// 递归明文总字节数
     pub total_bytes: u64,
+    /// 所属任务 id（多任务）
+    #[serde(default)]
+    pub task_id: String,
+    /// 所属任务名
+    #[serde(default)]
+    pub task_name: String,
+    /// 该任务的目标名
+    #[serde(default)]
+    pub target_name: String,
 }
 
 /// 恢复文件列表响应
@@ -219,11 +298,14 @@ pub struct RestoreFilesResponse {
 /// 目录树查询参数（懒加载：一次只取一层）
 #[derive(Deserialize)]
 pub struct RestoreTreeQuery {
-    /// 备份源路径（本地目录，须在备份配置中）
+    /// 备份源路径（本地目录，须在某个任务的源列表中）
     pub source: String,
     /// 要展开的目录相对路径（空 / 缺省 = 根层级）
     #[serde(default)]
     pub dir: String,
+    /// 指定任务 id（缺省 = 自动按源路径在所有任务中查找）
+    #[serde(default)]
+    pub task: Option<String>,
 }
 
 /// 目录树节点（目录带递归统计，便于前端直接展示「N 文件 / M 文件夹」）
@@ -366,6 +448,30 @@ pub struct ConfigBundle {
     pub age_private_key: Option<String>,
     #[serde(default)]
     pub key_backed_up: bool,
+    /// 多目标（含明文凭据；导入时用当前口令重新加密）
+    #[serde(default)]
+    pub targets: Vec<BundleTarget>,
+    /// 多任务（源路径 + 目标引用 + cron + 保留策略）
+    #[serde(default)]
+    pub tasks: Vec<crate::infra::config::TaskConfig>,
+}
+
+/// 导出/导入包里的单个目标（**含明文凭据**，仅存于导出的 JSON 文本）
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BundleTarget {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default = "default_test_true")]
+    pub enabled: bool,
 }
 
 /// 配置导出请求（需管理员口令）
@@ -476,6 +582,139 @@ async fn plugins_list(State(state): State<AppState>) -> Json<serde_json::Value> 
     Json(serde_json::json!({ "plugins": state.plugins.describe(&cfg) }))
 }
 
+// ── 多任务 / 多目标（ADR-014）辅助 ──────────────────────────────────────
+
+/// 通用 JSON 错误响应（`{success:false, error}`）
+fn err(e: impl std::fmt::Display) -> serde_json::Value {
+    serde_json::json!({ "success": false, "error": e.to_string() })
+}
+
+/// 生成稳定 id（前缀 + 时间戳/序号十六进制，无需第三方 uuid 依赖）
+fn new_id(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}{:x}{:02x}", ms & 0xffff_ffff, seq & 0xff)
+}
+
+/// 默认任务 id：首个启用的任务，否则首个任务
+fn default_task_id(cfg: &crate::infra::config::AppConfig) -> Option<String> {
+    cfg.tasks
+        .iter()
+        .find(|t| t.enabled)
+        .or_else(|| cfg.tasks.first())
+        .map(|t| t.id.clone())
+}
+
+/// 任务运行上下文：目标适配器 + 快照分桶用的账号
+pub(crate) struct TaskContext {
+    pub task: crate::infra::config::TaskConfig,
+    pub target: Arc<dyn crate::infra::storage_trait::TargetStorage>,
+    /// 目标任务凭据的用户名（快照按此分桶，实现「每目标独立快照」）
+    pub account: Option<String>,
+    /// 目标任务是否已就绪（凭据齐备）
+    pub ready: bool,
+}
+
+/// 取某个任务的运行上下文（任务不存在/未启用/目标未就绪 → Err(提示)）
+pub(crate) fn task_context(state: &AppState, task_id: &str) -> Result<TaskContext, String> {
+    let (task, target_cfg) = {
+        let mgr = state.config.lock().unwrap();
+        let cfg = mgr.load().map_err(|e| format!("{:#}", e))?;
+        let task = cfg
+            .task_by_id(task_id)
+            .cloned()
+            .ok_or_else(|| format!("任务不存在：{task_id}"))?;
+        let tcfg = cfg.target_by_id(&task.target_id).cloned();
+        (task, tcfg)
+    };
+    if !task.enabled {
+        return Err(format!(
+            "任务「{}」已停用",
+            if task.name.is_empty() { &task.id } else { &task.name }
+        ));
+    }
+    let target_cfg = target_cfg.ok_or_else(|| {
+        format!(
+            "任务「{}」引用的目标不存在（{}），请在「任务管理」中重新选择",
+            if task.name.is_empty() { &task.id } else { &task.name },
+            task.target_id
+        )
+    })?;
+    let account = {
+        let mgr = state.config.lock().unwrap();
+        mgr.target_credentials(&target_cfg)
+            .ok()
+            .and_then(|(u, _)| u)
+    };
+    let ready = target_cfg.enabled && state.targets.is_ready(&task.target_id);
+    Ok(TaskContext {
+        target: state.target_for(&task.target_id),
+        task,
+        account,
+        ready,
+    })
+}
+
+/// 目标视图（供 `/api/targets`；凭据永不返回，密码只回显「是否已设置」）
+fn target_view(
+    state: &AppState,
+    t: &crate::infra::config::TargetConfig,
+) -> serde_json::Value {
+    let (user, pass_set) = {
+        let mgr = state.config.lock().unwrap();
+        match mgr.target_credentials(t) {
+            Ok((u, p)) => (u, p.is_some()),
+            Err(_) => (None, false),
+        }
+    };
+    serde_json::json!({
+        "id": t.id,
+        "name": t.name,
+        "kind": t.kind,
+        "url": t.url.clone().unwrap_or_default(),
+        "username": user,
+        "password_set": pass_set,
+        "enabled": t.enabled,
+        "ready": state.targets.is_ready(&t.id),
+        "backend": state.targets.describe(&t.id),
+        "tasks": 0, // 由调用方填充（引用该目标的任务数）
+    })
+}
+
+/// 任务视图（供 `/api/tasks`）
+fn task_view(state: &AppState, t: &crate::infra::config::TaskConfig) -> serde_json::Value {
+    let target_name = {
+        let mgr = state.config.lock().unwrap();
+        mgr.load()
+            .ok()
+            .and_then(|c| c.target_by_id(&t.target_id).map(|x| x.name.clone()))
+            .unwrap_or_default()
+    };
+    let next = crate::domain::scheduler::next_runs(
+        t.schedule_cron.as_deref().unwrap_or_default(),
+        3,
+    )
+    .unwrap_or_default();
+    serde_json::json!({
+        "id": t.id,
+        "name": t.name,
+        "enabled": t.enabled,
+        "paths": t.paths,
+        "target_id": t.target_id,
+        "target_name": target_name,
+        "target_ready": state.targets.is_ready(&t.target_id),
+        "target_folder": t.target_folder,
+        "schedule_cron": t.schedule_cron.clone().unwrap_or_default(),
+        "schedule_next": next,
+        "retention": RetentionView::from(&t.retention),
+    })
+}
+
 /// 保存 WebDAV 配置：先实测连通性（PROPFIND ping），通过后加密存储
 async fn webdav_save(
     State(state): State<AppState>,
@@ -491,41 +730,39 @@ async fn webdav_save(
     }
 
     // 1) 实测连通性与凭据：交给**目标插件**判定（地址与协议由插件决定）
-    let url = match state.plugins.default_target() {
-        Some(p) => match p.verify(body.username.trim(), &body.password).await {
-            Ok(u) => u,
-            Err(e) => {
-                return Json(WebdavSaveResponse {
-                    success: false,
-                    url: None,
-                    warning: None,
-                    error: Some(e),
-                })
-            }
-        },
-        None => {
+    let Some(plugin) = state.plugins.target_plugin("webdav") else {
+        return Json(WebdavSaveResponse {
+            success: false,
+            url: None,
+            warning: None,
+            error: Some("未注册 webdav 目标插件".to_string()),
+        });
+    };
+    let url = match plugin
+        .verify(body.url.as_deref(), body.username.trim(), &body.password)
+        .await
+    {
+        Ok(u) => u,
+        Err(e) => {
             return Json(WebdavSaveResponse {
                 success: false,
                 url: None,
                 warning: None,
-                error: Some("未注册任何备份目标插件".to_string()),
+                error: Some(e),
             })
         }
     };
 
-    // 2) 加密保存
+    // 2) 加密保存（写入**主目标**；保存后同步兼容镜像）
     let saved = {
         let mgr = state.config.lock().unwrap();
         mgr.save_webdav(&url, body.username.trim(), &body.password)
     };
     match saved {
         Ok(_) => {
-            // 热切换目标实现（无需重启服务）：由注册表按当前配置重新装配
-            let (next, _name, _ready) = {
-                let mgr = state.config.lock().unwrap();
-                state.plugins.build_target(&mgr)
-            };
-            state.target.swap(next);
+            // 热刷新目标池（无需重启服务）：由注册表按当前配置重新装配全部目标
+            let cfg = { state.config.lock().unwrap().load().unwrap_or_default() };
+            state.reload_targets(&cfg);
             // 账号一致性：已配置 access-token 时，核对 WebDAV 账号与 API 账号
             // （该能力属于 kzwr 增强插件）
             let warning = crate::plugin::builtin::kzwr::check_account_consistency(&state).await;
@@ -572,18 +809,27 @@ fn config_response(
     kzwr_token_configured: bool,
     error: Option<String>,
 ) -> ConfigResponse {
-    let schedule = cfg.backup.schedule_cron.clone().unwrap_or_default();
+    // 兼容视图：以「首个任务」为默认任务（多任务管理走 `/api/tasks`）
+    let task = cfg.tasks.first();
+    let schedule = task
+        .and_then(|t| t.schedule_cron.clone())
+        .unwrap_or_default();
     let valid = crate::domain::scheduler::validate_cron(&schedule).is_ok();
     let schedule_next = crate::domain::scheduler::next_runs(&schedule, 5).unwrap_or_default();
+    let retention = task
+        .map(|t| &t.retention)
+        .unwrap_or(&cfg.backup.retention);
     ConfigResponse {
-        backup_paths: cfg.backup.paths.clone(),
-        target_folder: cfg.backup.target_folder.clone(),
+        backup_paths: task.map(|t| t.paths.clone()).unwrap_or_default(),
+        target_folder: task
+            .map(|t| t.target_folder.clone())
+            .unwrap_or_else(|| cfg.backup.target_folder.clone()),
         schedule_cron: schedule,
         schedule_cron_valid: valid,
         webdav_configured,
-        webdav_url: cfg.webdav.url.clone(),
+        webdav_url: cfg.primary_target().and_then(|t| t.url.clone()),
         webdav_username,
-        retention: RetentionView::from(&cfg.backup.retention),
+        retention: RetentionView::from(retention),
         kzwr_token_configured,
         kzwr_quota_warn_percent: cfg.kzwr.quota_warn_percent,
         schedule_next,
@@ -598,11 +844,11 @@ fn config_response(
     }
 }
 
-/// 判断 WebDAV 是否已配置（url + 用户名 + 密码齐全）
+/// 判断**主目标**是否已配置（启用 + 用户名 + 密码齐全）
 fn webdav_ready(cfg: &crate::infra::config::AppConfig) -> bool {
-    cfg.webdav.url.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false)
-        && cfg.webdav.username_enc.is_some()
-        && cfg.webdav.password_enc.is_some()
+    cfg.primary_target()
+        .map(|t| t.enabled && t.configured())
+        .unwrap_or(false)
 }
 
 async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
@@ -647,30 +893,62 @@ async fn config_save(
         Ok(c) => c,
         Err(_) => crate::infra::config::AppConfig::default(),
     };
-    cfg.backup.paths = body.backup_paths.clone();
-    if let Some(folder) = body.target_folder {
-        if !folder.trim().is_empty() {
-            cfg.backup.target_folder = folder;
+    // 兼容接口：写「首个任务」（不存在则创建默认任务）；多任务走 `/api/tasks`
+    if cfg.tasks.is_empty() {
+        let mut t = crate::infra::config::TaskConfig::default();
+        t.id = crate::infra::config::DEFAULT_TASK_ID.to_string();
+        t.name = "默认任务".to_string();
+        t.target_id = cfg
+            .primary_target()
+            .map(|x| x.id.clone())
+            .unwrap_or_else(|| crate::infra::config::DEFAULT_TARGET_ID.to_string());
+        t.target_folder = cfg.backup.target_folder.clone();
+        cfg.tasks.push(t);
+    }
+    // 定时 cron：先校验（错误时需借用 cfg 生成响应，故在可变借用前完成）
+    let cron_update: Option<Option<String>> = match body.schedule_cron {
+        Some(cron) => {
+            let cron = cron.trim().to_string();
+            if let Err(e) = crate::domain::scheduler::validate_cron(&cron) {
+                let resp =
+                    config_response(&cfg, webdav_ready(&cfg), wuser, kzwr_on, Some(e.to_string()));
+                return Json(resp);
+            }
+            Some(if cron.is_empty() { None } else { Some(cron) })
         }
-    }
-    // 保留策略：仅更新传入的字段（未传保持原值）
-    if let Some(v) = body.retention_enabled {
-        cfg.backup.retention.enabled = v;
-    }
-    if let Some(v) = body.retention_cleanup_unmanaged {
-        cfg.backup.retention.cleanup_unmanaged = v;
-    }
-    if let Some(v) = body.retention_min_age_days {
-        cfg.backup.retention.min_age_days = v;
-    }
-    if let Some(v) = body.retention_empty_recycle_bin {
-        cfg.backup.retention.empty_recycle_bin = v;
-    }
-    if let Some(v) = body.retention_recycle_max_gb {
-        cfg.backup.retention.recycle_max_gb = v;
-    }
-    if let Some(v) = body.retention_recycle_min_age_days {
-        cfg.backup.retention.recycle_min_age_days = v;
+        None => None,
+    };
+
+    {
+        let task = cfg.tasks.first_mut().expect("刚保证非空");
+        task.paths = body.backup_paths.clone();
+        if let Some(folder) = body.target_folder {
+            if !folder.trim().is_empty() {
+                task.target_folder = folder;
+            }
+        }
+        // 保留策略：仅更新传入的字段（未传保持原值）
+        if let Some(v) = body.retention_enabled {
+            task.retention.enabled = v;
+        }
+        if let Some(v) = body.retention_cleanup_unmanaged {
+            task.retention.cleanup_unmanaged = v;
+        }
+        if let Some(v) = body.retention_min_age_days {
+            task.retention.min_age_days = v;
+        }
+        if let Some(v) = body.retention_empty_recycle_bin {
+            task.retention.empty_recycle_bin = v;
+        }
+        if let Some(v) = body.retention_recycle_max_gb {
+            task.retention.recycle_max_gb = v;
+        }
+        if let Some(v) = body.retention_recycle_min_age_days {
+            task.retention.recycle_min_age_days = v;
+        }
+        if let Some(cron) = cron_update {
+            task.schedule_cron = cron;
+        }
     }
     if let Some(v) = body.kzwr_quota_warn_percent {
         // 合法区间 0..=100（0 = 关闭预警）
@@ -680,50 +958,40 @@ async fn config_save(
     if let Some(v) = body.debug {
         cfg.debug = v;
     }
-    // 定时 cron：校验合法性；空串视为关闭
-    if let Some(cron) = body.schedule_cron {
-        let cron = cron.trim().to_string();
-        if let Err(e) = crate::domain::scheduler::validate_cron(&cron) {
-            let resp = config_response(&cfg, webdav_ready(&cfg), wuser, kzwr_on, Some(e.to_string()));
-            return Json(resp);
-        }
-        if cron.is_empty() {
-            cfg.backup.schedule_cron = None;
-        } else {
-            cfg.backup.schedule_cron = Some(cron);
-        }
-    }
     match cfg_guard.save(&cfg) {
         Ok(_) => {
+            let t = cfg.tasks.first().cloned().unwrap_or_default();
             state.audit.record(
                 "config.save",
                 format!(
-                    "保存配置：目标 {}，路径 {} 个，定时 {}，保留策略[启用={} 孤儿={} 天数={} 回收站={} ≥{}GB >{}天]",
-                    cfg.backup.target_folder,
-                    cfg.backup.paths.len(),
-                    cfg.backup
-                        .schedule_cron
+                    "保存配置（任务 {}）：目标目录 {}，路径 {} 个，定时 {}，保留策略[启用={} 孤儿={} 天数={} 回收站={} ≥{}GB >{}天]",
+                    t.name,
+                    t.target_folder,
+                    t.paths.len(),
+                    t.schedule_cron
                         .clone()
                         .unwrap_or_else(|| "未启用".to_string()),
-                    cfg.backup.retention.enabled,
-                    cfg.backup.retention.cleanup_unmanaged,
-                    cfg.backup.retention.min_age_days,
-                    cfg.backup.retention.empty_recycle_bin,
-                    cfg.backup.retention.recycle_max_gb,
-                    cfg.backup.retention.recycle_min_age_days,
+                    t.retention.enabled,
+                    t.retention.cleanup_unmanaged,
+                    t.retention.min_age_days,
+                    t.retention.empty_recycle_bin,
+                    t.retention.recycle_max_gb,
+                    t.retention.recycle_min_age_days,
                 ),
                 true,
                 None,
             );
             // 调试日志开关热更新（保存成功后立即切换日志级别）
             crate::apply_log_debug(cfg.debug);
+            drop(cfg_guard);
+            state.reload_targets(&cfg);
             Json(config_response(&cfg, webdav_ready(&cfg), wuser, kzwr_on, None))
         }
         Err(e) => Json(config_response(&cfg, false, wuser, kzwr_on, Some(format!("{:#}", e)))),
     }
 }
 
-/// 当前 WebDAV 账号（从加密配置解密）
+/// 当前 WebDAV 账号：取**主目标**的解密用户名
 pub(crate) fn webdav_username(state: &AppState) -> Option<String> {
     let mgr = state.config.lock().unwrap();
     mgr.webdav_credentials().ok().and_then(|(u, _)| u)
@@ -780,6 +1048,348 @@ async fn backup_run(State(state): State<AppState>) -> Json<BackupResponse> {
     Json(resp)
 }
 
+// ── 目标管理 API（多目标，ADR-014）────────────────────────────────────
+
+/// `GET /api/targets`：目标列表（凭据不回传；含就绪状态与引用它的任务数）
+async fn targets_list(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let (targets, tasks) = {
+        let mgr = state.config.lock().unwrap();
+        match mgr.load() {
+            Ok(c) => (c.targets, c.tasks),
+            Err(_) => (Vec::new(), Vec::new()),
+        }
+    };
+    let list: Vec<serde_json::Value> = targets
+        .iter()
+        .map(|t| {
+            let mut v = target_view(&state, t);
+            let used = tasks.iter().filter(|x| x.target_id == t.id).count();
+            v["tasks"] = serde_json::json!(used);
+            v
+        })
+        .collect();
+    Json(serde_json::json!({ "targets": list }))
+}
+
+/// `POST /api/targets`：新建/更新目标（保存前实测连通性；`password` 缺省 = 不修改）
+async fn target_save(
+    State(state): State<AppState>,
+    Json(body): Json<TargetSaveRequest>,
+) -> Json<serde_json::Value> {
+    let kind = body.kind.clone().unwrap_or_else(|| "webdav".to_string());
+    let Some(plugin) = state.plugins.target_plugin(&kind) else {
+        return Json(err(format!("未注册类型为 {kind} 的目标插件")));
+    };
+
+    let (mut cfg, existing) = {
+        let mgr = state.config.lock().unwrap();
+        let cfg = mgr.load().unwrap_or_default();
+        let existing = body
+            .id
+            .as_deref()
+            .and_then(|id| cfg.target_by_id(id).cloned());
+        (cfg, existing)
+    };
+
+    let id = existing
+        .as_ref()
+        .map(|t| t.id.clone())
+        .unwrap_or_else(|| new_id("t"));
+    let url = body
+        .url
+        .clone()
+        .unwrap_or_else(|| existing.as_ref().and_then(|t| t.url.clone()).unwrap_or_default());
+    let name = body
+        .name
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| existing.as_ref().map(|t| t.name.clone()))
+        .unwrap_or_else(|| format!("目标 {id}"));
+
+    // 凭据：本次提供则实测 + 加密；未提供则沿用原凭据（编辑场景不改密码）
+    //
+    // 注意：实测是 await，**绝不能持有 config 锁**（MutexGuard 跨 await 不但阻塞其它请求，
+    // 且再次加锁会自锁），因此这里按「先实测、后加密」两步走。
+    let provided_user = body
+        .username
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let (enc_user, enc_pass, warning) = match provided_user {
+        Some(user) => {
+            let pass = body.password.clone().unwrap_or_default();
+            if pass.is_empty() {
+                return Json(err("新填写用户名时必须同时提供密码"));
+            }
+            let mut warning = None;
+            if body.test {
+                match plugin.verify(Some(&url), &user, &pass).await {
+                    Ok(real) => warning = Some(format!("连接成功：{real}")),
+                    Err(e) => return Json(err(e)),
+                }
+            }
+            let mgr = state.config.lock().unwrap();
+            match (mgr.encrypt_field(&user), mgr.encrypt_field(&pass)) {
+                (Ok(u), Ok(p)) => (Some(u), Some(p), warning),
+                _ => return Json(err("凭据加密失败")),
+            }
+        }
+        None => {
+            let old = existing.as_ref();
+            if old.map(|t| t.configured()).unwrap_or(false) {
+                (
+                    old.and_then(|t| t.username_enc.clone()),
+                    old.and_then(|t| t.password_enc.clone()),
+                    None,
+                )
+            } else {
+                return Json(err("新目标必须填写用户名与密码"));
+            }
+        }
+    };
+
+    let target = crate::infra::config::TargetConfig {
+        id: id.clone(),
+        name,
+        kind,
+        url: Some(url.trim_end_matches('/').to_string()),
+        username_enc: enc_user,
+        password_enc: enc_pass,
+        enabled: body.enabled.unwrap_or(true),
+    };
+    match cfg.targets.iter_mut().find(|t| t.id == id) {
+        Some(slot) => *slot = target,
+        None => cfg.targets.push(target),
+    }
+    let saved = { state.config.lock().unwrap().save(&cfg) };
+    if let Err(e) = saved {
+        return Json(err(format!("{:#}", e)));
+    }
+    state.reload_targets(&cfg);
+    let t = cfg.target_by_id(&id).cloned().unwrap_or_default();
+    state.audit.record(
+        "target.save",
+        format!("保存目标「{}」（{}）", t.name, t.url.clone().unwrap_or_default()),
+        true,
+        None,
+    );
+    Json(serde_json::json!({ "success": true, "target": target_view(&state, &t), "warning": warning, "error": null }))
+}
+
+/// `POST /api/targets/:id/delete`：删除目标（被任务引用时拒绝）
+async fn target_delete(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    let mut cfg = { state.config.lock().unwrap().load().unwrap_or_default() };
+    let using = cfg.tasks_using_target(&id);
+    if !using.is_empty() {
+        return Json(err(format!(
+            "该目标正被任务使用（{}），请先修改或删除这些任务",
+            using.join("、")
+        )));
+    }
+    let before = cfg.targets.len();
+    cfg.targets.retain(|t| t.id != id);
+    if cfg.targets.len() == before {
+        return Json(err("目标不存在"));
+    }
+    if let Err(e) = state.config.lock().unwrap().save(&cfg) {
+        return Json(err(format!("{:#}", e)));
+    }
+    state.reload_targets(&cfg);
+    state.audit.record("target.delete", format!("删除目标 {id}"), true, None);
+    Json(serde_json::json!({ "success": true, "error": null }))
+}
+
+/// `POST /api/targets/:id/test`：用已保存的凭据实测连通性
+async fn target_test(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    let (target, creds) = {
+        let mgr = state.config.lock().unwrap();
+        let cfg = mgr.load().unwrap_or_default();
+        let Some(t) = cfg.target_by_id(&id).cloned() else {
+            return Json(err("目标不存在"));
+        };
+        let creds = mgr.target_credentials(&t).unwrap_or((None, None));
+        (t, creds)
+    };
+    let Some(plugin) = state.plugins.target_plugin(&target.kind) else {
+        return Json(err(format!("未注册类型为 {} 的目标插件", target.kind)));
+    };
+    let (Some(user), Some(pass)) = creds else {
+        return Json(err("该目标尚未配置用户名/密码"));
+    };
+    match plugin.verify(target.url.as_deref(), &user, &pass).await {
+        Ok(url) => Json(serde_json::json!({ "success": true, "url": url, "error": null })),
+        Err(e) => Json(err(e)),
+    }
+}
+
+// ── 任务管理 API（多任务，ADR-014）────────────────────────────────────
+
+/// `GET /api/tasks`：任务列表（含目标名、就绪状态、下次触发时间）
+async fn tasks_list(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let cfg = { state.config.lock().unwrap().load().unwrap_or_default() };
+    let list: Vec<serde_json::Value> = cfg.tasks.iter().map(|t| task_view(&state, t)).collect();
+    Json(serde_json::json!({
+        "tasks": list,
+        "targets": cfg.targets.iter().map(|t| serde_json::json!({
+            "id": t.id, "name": t.name, "ready": state.targets.is_ready(&t.id), "enabled": t.enabled,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+/// `POST /api/tasks`：新建/更新任务（未传字段保持原值）
+async fn task_save(
+    State(state): State<AppState>,
+    Json(body): Json<TaskSaveRequest>,
+) -> Json<serde_json::Value> {
+    let mut cfg = { state.config.lock().unwrap().load().unwrap_or_default() };
+    // cron 先校验（错误时直接返回，不动配置）
+    if let Some(cron) = &body.schedule_cron {
+        if let Err(e) = crate::domain::scheduler::validate_cron(cron) {
+            return Json(err(e.to_string()));
+        }
+    }
+    let existing = body
+        .id
+        .as_deref()
+        .and_then(|id| cfg.task_by_id(id).cloned());
+    let id = existing
+        .as_ref()
+        .map(|t| t.id.clone())
+        .unwrap_or_else(|| new_id("k"));
+    let target_id = body
+        .target_id
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| existing.as_ref().map(|t| t.target_id.clone()))
+        .or_else(|| cfg.primary_target().map(|t| t.id.clone()))
+        .unwrap_or_else(|| crate::infra::config::DEFAULT_TARGET_ID.to_string());
+    if cfg.target_by_id(&target_id).is_none() {
+        return Json(err(format!("目标不存在：{target_id}")));
+    }
+    let task = crate::infra::config::TaskConfig {
+        id: id.clone(),
+        name: body
+            .name
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| existing.as_ref().map(|t| t.name.clone()))
+            .unwrap_or_else(|| format!("任务 {id}")),
+        enabled: body
+            .enabled
+            .unwrap_or_else(|| existing.as_ref().map(|t| t.enabled).unwrap_or(true)),
+        paths: body
+            .paths
+            .clone()
+            .or_else(|| existing.as_ref().map(|t| t.paths.clone()))
+            .unwrap_or_default(),
+        target_id,
+        target_folder: body
+            .target_folder
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| existing.as_ref().map(|t| t.target_folder.clone()))
+            .unwrap_or_else(|| "fn-backup".to_string()),
+        schedule_cron: match &body.schedule_cron {
+            Some(cron) => {
+                let cron = cron.trim().to_string();
+                if cron.is_empty() {
+                    None
+                } else {
+                    Some(cron)
+                }
+            }
+            None => existing.as_ref().and_then(|t| t.schedule_cron.clone()),
+        },
+        retention: body
+            .retention
+            .as_ref()
+            .map(crate::infra::config::RetentionConfig::from)
+            .or_else(|| existing.as_ref().map(|t| t.retention.clone()))
+            .unwrap_or_default(),
+    };
+    match cfg.tasks.iter_mut().find(|t| t.id == id) {
+        Some(slot) => *slot = task,
+        None => cfg.tasks.push(task),
+    }
+    if let Err(e) = state.config.lock().unwrap().save(&cfg) {
+        return Json(err(format!("{:#}", e)));
+    }
+    let saved = cfg.task_by_id(&id).cloned().unwrap_or_default();
+    state.audit.record(
+        "task.save",
+        format!(
+            "保存任务「{}」：{} 个源，目标 {}，定时 {}",
+            saved.name,
+            saved.paths.len(),
+            saved.target_id,
+            saved.schedule_cron.clone().unwrap_or_else(|| "未启用".to_string())
+        ),
+        true,
+        None,
+    );
+    Json(serde_json::json!({ "success": true, "task": task_view(&state, &saved), "error": null }))
+}
+
+/// `POST /api/tasks/:id/delete`：删除任务（`purge=true` 同时删除它的快照记录）
+async fn task_delete(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Option<Json<TaskDeleteRequest>>,
+) -> Json<serde_json::Value> {
+    let purge = body.map(|b| b.purge).unwrap_or(false);
+    let mut cfg = { state.config.lock().unwrap().load().unwrap_or_default() };
+    let before = cfg.tasks.len();
+    cfg.tasks.retain(|t| t.id != id);
+    if cfg.tasks.len() == before {
+        return Json(err("任务不存在"));
+    }
+    if let Err(e) = state.config.lock().unwrap().save(&cfg) {
+        return Json(err(format!("{:#}", e)));
+    }
+    let purged = if purge {
+        // 快照 key = "{task_id}-{源序号}"：按前缀清理该任务的全部记录
+        state.store.delete_task_snapshots(&id).unwrap_or(0)
+    } else {
+        0
+    };
+    state.audit.record(
+        "task.delete",
+        format!("删除任务 {id}（清理快照记录 {purged} 条）"),
+        true,
+        None,
+    );
+    Json(serde_json::json!({ "success": true, "purged": purged, "error": null }))
+}
+
+/// `POST /api/tasks/:id/run`：立即执行该任务
+async fn task_run(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Json<BackupResponse> {
+    let resp = run_task_now(&state, &id).await;
+    state.audit.record(
+        "task.run",
+        match (&resp.error, resp.skipped) {
+            (Some(e), _) => format!("任务 {id} 备份失败：{e}"),
+            (None, true) => format!("任务 {id} 备份跳过（已有备份在执行）"),
+            (None, false) => format!(
+                "任务 {id} 备份完成：上传 {} 个文件（{}）",
+                resp.uploaded,
+                human_bytes(resp.uploaded_bytes)
+            ),
+        },
+        resp.error.is_none(),
+        None,
+    );
+    Json(resp)
+}
+
 /// 备份运行标志的 RAII 守卫：离开作用域时复位（覆盖提前 return 与 panic 展开）
 struct BackupRunFlag<'a>(&'a std::sync::atomic::AtomicBool);
 
@@ -789,13 +1399,39 @@ impl Drop for BackupRunFlag<'_> {
     }
 }
 
-/// 执行一次备份（可被 HTTP handler 与定时调度器复用）
+/// 执行一次备份（兼容入口：跑**默认任务**）
+pub async fn run_backup_now(state: &AppState) -> BackupResponse {
+    let task_id = {
+        let mgr = state.config.lock().unwrap();
+        mgr.load().ok().and_then(|c| default_task_id(&c))
+    };
+    match task_id {
+        Some(id) => run_task_now(state, &id).await,
+        None => {
+            raise_alert(
+                state,
+                crate::domain::alerts::AlertLevel::Warn,
+                crate::domain::alerts::AlertSource::Backup,
+                "备份未执行：尚未创建任何备份任务".to_string(),
+            );
+            BackupResponse {
+                error: Some("尚未创建任何备份任务，请先在「任务管理」中新建".to_string()),
+                ..Default::default()
+            }
+        }
+    }
+}
+
+/// 执行**指定任务**的一次备份（可被 HTTP handler 与定时调度器复用）
 ///
 /// 返回 BackupResponse（含 uploaded/deleted/orphan_removed/skipped/error）。
 ///
-/// **并发互斥**：定时调度与手动触发共用 `AppState.backup_running`，
-/// 同一时刻只允许一个备份执行；已有备份在跑时立即返回 `skipped = true`。
-pub async fn run_backup_now(state: &AppState) -> BackupResponse {
+/// 快照隔离：`job_id = "{task.id}-{源序号}"`、`account = 目标任务凭据的用户名`，
+/// 因此同一份源在不同任务/目标上互不干扰，各自增量。
+///
+/// **并发互斥**：所有任务共用 `AppState.backup_running`，同一时刻只允许一个备份执行
+/// （避免 NAS 带宽/IO 争用）；已有备份在跑时立即返回 `skipped = true`。
+pub async fn run_task_now(state: &AppState, task_id: &str) -> BackupResponse {
     // 0) 抢占运行标志（CAS）；失败说明已有备份在执行，直接跳过
     use std::sync::atomic::Ordering;
     if state
@@ -811,69 +1447,85 @@ pub async fn run_backup_now(state: &AppState) -> BackupResponse {
     }
     let _running = BackupRunFlag(&state.backup_running);
 
-    // 1) 检查 WebDAV 是否已配置（未配置时 target 为占位适配器，会返回引导错误）
-    let configured = state.target_ready
-        || {
-            let mgr = state.config.lock().unwrap();
-            mgr.load().map(|c| webdav_ready(&c)).unwrap_or(false)
-        };
-    if !configured {
+    // 1) 解析任务与它的目标（未就绪 → 明确提示，不静默失败）
+    let ctx = match task_context(state, task_id) {
+        Ok(c) => c,
+        Err(e) => {
+            raise_alert(
+                state,
+                crate::domain::alerts::AlertLevel::Warn,
+                crate::domain::alerts::AlertSource::Config,
+                format!("备份未执行：{e}"),
+            );
+            return BackupResponse {
+                error: Some(e),
+                ..Default::default()
+            };
+        }
+    };
+    let task_label = if ctx.task.name.is_empty() {
+        ctx.task.id.clone()
+    } else {
+        ctx.task.name.clone()
+    };
+    if !ctx.ready {
+        let msg = format!("任务「{task_label}」的目标未配置凭据，请在「目标管理」中完善后重试");
         raise_alert(
             state,
             crate::domain::alerts::AlertLevel::Warn,
             crate::domain::alerts::AlertSource::Config,
-            "备份未执行：WebDAV 未配置".to_string(),
+            msg.clone(),
         );
         return BackupResponse {
-            error: Some("WebDAV 未配置，请先在设置中填写 WebDAV 地址与凭据".to_string()),
+            error: Some(msg),
             ..Default::default()
         };
     }
 
-    // 2) 读取配置的备份路径（锁操作隔离在同步函数，避免跨 await）
-    let (paths, target_folder, retention_cfg) = read_backup_config(state);
-
+    let paths: Vec<PathBuf> = ctx.task.paths.iter().map(PathBuf::from).collect();
     if paths.is_empty() {
+        let msg = format!("任务「{task_label}」未配置备份路径");
         raise_alert(
             state,
             crate::domain::alerts::AlertLevel::Warn,
             crate::domain::alerts::AlertSource::Backup,
-            "备份未执行：未配置备份路径".to_string(),
+            msg.clone(),
         );
         return BackupResponse {
-            error: Some("未配置备份路径".to_string()),
+            error: Some(msg),
             ..Default::default()
         };
     }
 
-    // 3) 执行多路径备份
-    //    保留策略：启用时构造 RetentionPolicy，备份完成后清理目标端孤儿文件
+    // 2) 保留策略：启用时构造 RetentionPolicy，备份完成后清理该目标上的孤儿文件
+    let target_folder = ctx.task.target_folder.clone();
+    let retention_cfg = ctx.task.retention.clone();
     let retention = if retention_cfg.enabled && retention_cfg.cleanup_unmanaged {
-        let rt = crate::domain::retention::RetentionPolicy::new(
-            state.target.clone(),
-            &target_folder,
-        );
-        let rt = if retention_cfg.min_age_days > 0 {
+        let rt = crate::domain::retention::RetentionPolicy::new(ctx.target.clone(), &target_folder);
+        Some(if retention_cfg.min_age_days > 0 {
             rt.with_min_age_secs(retention_cfg.min_age_days * 86400)
         } else {
             rt
-        };
-        Some(rt)
+        })
     } else {
         None
     };
 
+    // 3) 执行多路径备份（job_id 前缀 = 任务 id → 每任务独立快照）
+    let job_id = ctx.task.id.clone();
+    let account = ctx.account.clone();
     let job = BackupJob {
-        job_id: state.job_id.clone(),
-        account: webdav_username(state),
+        job_id: job_id.clone(),
+        account: account.clone(),
         source: Arc::new(crate::infra::source::local::LocalFsSource::new(&paths[0])),
-        target: state.target.clone(),
+        target: ctx.target.clone(),
         crypto: state.crypto.get(),
         store: state.store.clone(),
         target_prefix: Some(target_folder),
         eventbus: Some(state.eventbus.clone()),
         retention,
     };
+    tracing::info!(task = %task_label, target = %ctx.task.target_id, paths = paths.len(), "开始执行备份任务");
     match job.run_multi(&paths).await {
         Ok(summary) => {
             // 保留策略可选：跟随清空云端回收站（由增强插件实现，如 kzwr）
@@ -897,6 +1549,12 @@ pub async fn run_backup_now(state: &AppState) -> BackupResponse {
                     }
                 });
             }
+            tracing::info!(
+                task = %task_label,
+                uploaded = summary.uploaded,
+                deleted = summary.deleted,
+                "备份任务完成"
+            );
             BackupResponse {
                 uploaded: summary.uploaded,
                 uploaded_bytes: summary.uploaded_bytes,
@@ -913,14 +1571,14 @@ pub async fn run_backup_now(state: &AppState) -> BackupResponse {
                 state,
                 crate::domain::alerts::AlertLevel::Error,
                 crate::domain::alerts::AlertSource::Backup,
-                format!("备份失败：{}", msg),
+                format!("备份失败（任务 {task_label}）：{msg}"),
             );
             // 发布 Failed 终态事件：否则前端任务面板停留在「进行中」永不结束
             state.eventbus.task_event(
                 crate::eventbus::TaskKind::Backup,
                 crate::eventbus::TaskStatus::Failed,
                 None,
-                state.job_id.clone(),
+                job_id,
                 None,
                 0,
                 0,
@@ -935,26 +1593,6 @@ pub async fn run_backup_now(state: &AppState) -> BackupResponse {
                 ..Default::default()
             }
         }
-    }
-}
-
-/// 读取备份配置（同步，锁在函数内释放）
-fn read_backup_config(
-    state: &AppState,
-) -> (Vec<PathBuf>, String, crate::infra::config::RetentionConfig) {
-    let cfg_guard = state.config.lock().unwrap();
-    match cfg_guard.load() {
-        Ok(cfg) => {
-            let paths = cfg.backup.paths.iter().map(PathBuf::from).collect();
-            let folder = cfg.backup.target_folder.clone();
-            let retention = cfg.backup.retention.clone();
-            (paths, folder, retention)
-        }
-        Err(_) => (
-            Vec::new(),
-            state.target_folder.clone(),
-            crate::infra::config::RetentionConfig::default(),
-        ),
     }
 }
 
@@ -1077,51 +1715,134 @@ fn snapshot_children(
     out
 }
 
-/// 按备份源路径取出其快照条目（精确路径匹配优先，其次按目录名匹配）
+/// 恢复范围：把「源路径」定位到某个任务内的某个源（多任务下同一路径可能出现在多个任务）
+struct RestoreScope {
+    task: crate::infra::config::TaskConfig,
+    job_id: String,
+    /// 快照分桶账号 = 该任务目标的用户名（未配置时 ''，兼容旧数据）
+    account: String,
+    target: Arc<dyn crate::infra::storage_trait::TargetStorage>,
+    target_folder: String,
+    ready: bool,
+}
+
+/// 定位「源路径 → 恢复范围」
+///
+/// 匹配顺序：指定任务（`task_id`）→ 按启用任务遍历 → 按全部任务遍历；
+/// 同一任务内先精确匹配路径、再按目录名匹配。
+fn find_restore_scope(
+    state: &AppState,
+    source: &str,
+    task_id: Option<&str>,
+) -> Result<RestoreScope, String> {
+    let (cfg, creds_by_target) = {
+        let mgr = state.config.lock().unwrap();
+        let cfg = mgr.load().map_err(|e| format!("{:#}", e))?;
+        let mut creds = std::collections::HashMap::new();
+        for t in &cfg.targets {
+            let user = mgr
+                .target_credentials(t)
+                .ok()
+                .and_then(|(u, _)| u)
+                .unwrap_or_default();
+            creds.insert(t.id.clone(), user);
+        }
+        (cfg, creds)
+    };
+
+    let root = std::path::Path::new(source);
+    let match_idx = |t: &crate::infra::config::TaskConfig| -> Option<usize> {
+        t.paths
+            .iter()
+            .position(|p| std::path::Path::new(p) == root)
+            .or_else(|| {
+                root.file_name()
+                    .and_then(|n| t.paths.iter().position(|p| std::path::Path::new(p).file_name() == Some(n)))
+            })
+    };
+
+    let candidates: Vec<&crate::infra::config::TaskConfig> = match task_id {
+        Some(id) => cfg
+            .tasks
+            .iter()
+            .filter(|t| t.id == id)
+            .collect(),
+        None => cfg
+            .tasks
+            .iter()
+            .filter(|t| t.enabled)
+            .chain(cfg.tasks.iter().filter(|t| !t.enabled))
+            .collect(),
+    };
+    let task = candidates
+        .into_iter()
+        .find(|t| match_idx(t).is_some())
+        .ok_or_else(|| "该路径不在任何备份任务的源列表中".to_string())?;
+    let idx = match_idx(task).expect("find 已保证命中");
+    tracing::debug!(task = %task.id, idx, source, "定位恢复范围");
+    Ok(RestoreScope {
+        job_id: format!("{}-{}", task.id, idx),
+        account: creds_by_target
+            .get(&task.target_id)
+            .cloned()
+            .unwrap_or_default(),
+        target: state.target_for(&task.target_id),
+        target_folder: task.target_folder.clone(),
+        ready: state.targets.is_ready(&task.target_id),
+        task: task.clone(),
+    })
+}
+
+/// 按备份源路径取出其快照条目（多任务：可传 `task_id` 指定任务）
 fn snapshot_entries_for_source(
     state: &AppState,
     source: &str,
+    task_id: Option<&str>,
 ) -> Result<Vec<crate::infra::persistence::snapshot::SnapshotEntry>, String> {
-    let paths = read_backup_config(state).0;
-    let root = std::path::Path::new(source);
-    let idx = paths
-        .iter()
-        .position(|p| p.as_path() == root)
-        .or_else(|| {
-            root.file_name()
-                .and_then(|n| paths.iter().position(|p| p.file_name() == Some(n)))
-        })
-        .ok_or_else(|| "该路径不在备份配置中".to_string())?;
-    // 只展示当前账号的备份记录；未配置账号时归入默认 ''（旧数据）
-    let account = webdav_username(state).unwrap_or_default();
-    let job_id = format!("{}-{}", state.job_id, idx);
+    let scope = find_restore_scope(state, source, task_id)?;
     state
         .store
-        .load_snapshot(&job_id, &account)
+        .load_snapshot(&scope.job_id, &scope.account)
         .map_err(|e| format!("读取备份快照失败: {:#}", e))
 }
 
-/// 列出配置的备份文件夹及其可恢复概况（计数来自 SQLite 快照，文件明细按需懒加载）
+/// 列出全部任务的全部源文件夹及其可恢复概况（计数来自 SQLite 快照，明细按需懒加载）
 async fn restore_files(State(state): State<AppState>) -> Json<RestoreFilesResponse> {
-    let paths = read_backup_config(&state).0;
-    // 只展示当前账号的备份记录；未配置账号时归入默认 ''（旧数据）
-    let account = webdav_username(&state).unwrap_or_default();
+    let cfg = { state.config.lock().unwrap().load().unwrap_or_default() };
     let mut folders = Vec::new();
 
-    for (i, path) in paths.iter().enumerate() {
-        // 多路径备份时，每个路径的 job_id = "{base}-{i}"
-        let job_id = format!("{}-{}", state.job_id, i);
-        let entries = state.store.load_snapshot(&job_id, &account).unwrap_or_default();
-        let agg = SnapshotAgg::build(&entries);
-        let (file_count, dir_count, total_bytes) = agg.get("");
-
-        folders.push(RestorableFolder {
-            path: path.to_string_lossy().into_owned(),
-            has_backup: file_count > 0,
-            file_count,
-            dir_count,
-            total_bytes,
-        });
+    for task in &cfg.tasks {
+        let account = {
+            let mgr = state.config.lock().unwrap();
+            cfg.target_by_id(&task.target_id)
+                .and_then(|t| mgr.target_credentials(t).ok())
+                .and_then(|(u, _)| u)
+                .unwrap_or_default()
+        };
+        for (i, path) in task.paths.iter().enumerate() {
+            // 每个任务、每个源的快照 key = "{task.id}-{i}"
+            let job_id = format!("{}-{}", task.id, i);
+            let entries = state.store.load_snapshot(&job_id, &account).unwrap_or_default();
+            let agg = SnapshotAgg::build(&entries);
+            let (file_count, dir_count, total_bytes) = agg.get("");
+            folders.push(RestorableFolder {
+                path: path.clone(),
+                has_backup: file_count > 0,
+                file_count,
+                dir_count,
+                total_bytes,
+                task_id: task.id.clone(),
+                task_name: if task.name.is_empty() {
+                    task.id.clone()
+                } else {
+                    task.name.clone()
+                },
+                target_name: cfg
+                    .target_by_id(&task.target_id)
+                    .map(|t| t.name.clone())
+                    .unwrap_or_default(),
+            });
+        }
     }
 
     Json(RestoreFilesResponse { folders, error: None })
@@ -1134,7 +1855,7 @@ async fn restore_tree(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<RestoreTreeQuery>,
 ) -> Json<RestoreTreeResponse> {
-    let entries = match snapshot_entries_for_source(&state, &q.source) {
+    let entries = match snapshot_entries_for_source(&state, &q.source, q.task.as_deref()) {
         Ok(e) => e,
         Err(msg) => {
             return Json(RestoreTreeResponse {
@@ -1194,42 +1915,25 @@ async fn restore_run(
     State(state): State<AppState>,
     body: Option<axum::extract::Json<RestoreRequest>>,
 ) -> Json<RestoreResponse> {
-    let configured = state.target_ready
-        || {
-            let mgr = state.config.lock().unwrap();
-            mgr.load().map(|c| webdav_ready(&c)).unwrap_or(false)
-        };
-    if !configured {
-        raise_alert(
-            &state,
-            crate::domain::alerts::AlertLevel::Warn,
-            crate::domain::alerts::AlertSource::Config,
-            "恢复未执行：WebDAV 未配置".to_string(),
-        );
-        return Json(RestoreResponse {
-            restored: 0,
-            restored_bytes: 0,
-            error: Some("WebDAV 未配置，请先在设置中填写 WebDAV 地址与凭据".to_string()),
-            missing: Vec::new(),
-        });
-    }
-
     // 恢复目标根：优先用前端传入的 source_path（备份源路径，恢复到原位置），否则用默认目录
-    let (mut files, restore_root, restore_all, restore_dir) = match body {
+    let (mut files, restore_root, restore_all, restore_dir, task_hint) = match body {
         Some(Json(req)) => (
             req.files.unwrap_or_default(),
             req.source_path
+                .clone()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| state.default_restore_dir.to_string_lossy().into_owned()),
             req.all,
             req.dir
                 .map(|d| d.trim_matches('/').to_string())
                 .filter(|d| !d.is_empty()),
+            req.task.clone(),
         ),
         None => (
             Vec::new(),
             state.default_restore_dir.to_string_lossy().into_owned(),
             false,
+            None,
             None,
         ),
     };
@@ -1239,26 +1943,42 @@ async fn restore_run(
         .file_name()
         .map(|s| s.to_string_lossy().into_owned());
 
-    // 定位该源路径对应的备份快照：优先精确路径匹配，其次按目录名匹配
-    let paths = read_backup_config(&state).0;
-    let root = std::path::Path::new(&restore_root);
-    let idx = paths
-        .iter()
-        .position(|p| p.as_path() == root)
-        .or_else(|| {
-            root.file_name()
-                .and_then(|n| paths.iter().position(|p| p.file_name() == Some(n)))
+    // 定位该源路径所属的任务与目标（多任务：可指定 task_id）
+    let scope = find_restore_scope(&state, &restore_root, task_hint.as_deref()).ok();
+
+    // 目标就绪校验：按实际命中的任务目标判断（多目标）；未命中任务时退回主目标
+    let ready = match &scope {
+        Some(s) => s.ready,
+        None => {
+            state.primary_ready()
+                || {
+                    let mgr = state.config.lock().unwrap();
+                    mgr.load().map(|c| webdav_ready(&c)).unwrap_or(false)
+                }
+        }
+    };
+    if !ready {
+        raise_alert(
+            &state,
+            crate::domain::alerts::AlertLevel::Warn,
+            crate::domain::alerts::AlertSource::Config,
+            "恢复未执行：目标未配置".to_string(),
+        );
+        return Json(RestoreResponse {
+            restored: 0,
+            restored_bytes: 0,
+            error: Some("目标未配置，请先在「目标管理」中填写地址与凭据".to_string()),
+            missing: Vec::new(),
         });
+    }
 
     // 读取快照元数据：rel_path -> (明文大小, 原始 mtime 秒)
     // 用途：① 展示恢复总大小；② 恢复后回写快照，避免下次备份重复上传
     let mut meta: std::collections::HashMap<String, (u64, i64)> =
         std::collections::HashMap::new();
     let mut snapshot_target = None;
-    if let Some(idx) = idx {
-        let account = webdav_username(&state).unwrap_or_default();
-        let job_id = format!("{}-{}", state.job_id, idx);
-        if let Ok(entries) = state.store.load_snapshot(&job_id, &account) {
+    if let Some(scope) = &scope {
+        if let Ok(entries) = state.store.load_snapshot(&scope.job_id, &scope.account) {
             for e in entries {
                 if !e.is_dir {
                     meta.insert(e.rel_path.clone(), (e.size, e.mtime_secs));
@@ -1267,14 +1987,14 @@ async fn restore_run(
         }
         snapshot_target = Some(crate::domain::restore::RestoreSnapshotTarget {
             store: state.store.clone(),
-            job_id,
-            account,
+            job_id: scope.job_id.clone(),
+            account: scope.account.clone(),
         });
     }
 
     // 「全部恢复」：忽略前端传入的文件列表，取该源路径（可限定子目录）快照中的全部文件
     if restore_all {
-        if idx.is_none() {
+        if scope.is_none() {
             return Json(RestoreResponse {
                 restored: 0,
                 restored_bytes: 0,
@@ -1311,10 +2031,18 @@ async fn restore_run(
         );
     }
 
+    // 目标与目标端前缀按命中的任务取（未命中任务时退回主目标/默认前缀）
+    let (restore_target, restore_prefix): (
+        Arc<dyn crate::infra::storage_trait::TargetStorage>,
+        String,
+    ) = match &scope {
+        Some(s) => (s.target.clone(), s.target_folder.clone()),
+        None => (state.target.clone(), state.target_folder.clone()),
+    };
     let job = RestoreJob {
-        target: state.target.clone(),
+        target: restore_target,
         crypto: state.crypto.get(),
-        target_prefix: Some(state.target_folder.clone()),
+        target_prefix: Some(restore_prefix),
         source_root_name,
         eventbus: Some(state.eventbus.clone()),
         meta,
@@ -1322,11 +2050,22 @@ async fn restore_run(
     };
     match job.run(&files, std::path::Path::new(&restore_root)).await {
         Ok(summary) => {
+            let task_label = scope
+                .as_ref()
+                .map(|s| {
+                    if s.task.name.is_empty() {
+                        s.task.id.clone()
+                    } else {
+                        s.task.name.clone()
+                    }
+                })
+                .unwrap_or_else(|| "(未归属任务)".to_string());
             state.audit.record(
                 "restore.run",
                 format!(
-                    "恢复到 {}：{} 个文件（{}）",
+                    "恢复到 {}（任务 {}）：{} 个文件（{}）",
                     restore_root,
+                    task_label,
                     summary.restored,
                     human_bytes(summary.restored_bytes)
                 ),
@@ -1581,6 +2320,9 @@ async fn audit_clear(
 pub struct PruneMissingRequest {
     /// 备份源路径（与恢复页一致）
     pub source_path: String,
+    /// 指定任务 id（缺省 = 自动按源路径在所有任务中查找）
+    #[serde(default)]
+    pub task: Option<String>,
 }
 
 /// 清理响应
@@ -1616,30 +2358,18 @@ async fn restore_prune(
         resp(0, 0, Vec::new(), Some(e.to_string()))
     }
 
-    let configured = state.target_ready
-        || {
-            let mgr = state.config.lock().unwrap();
-            mgr.load().map(|c| webdav_ready(&c)).unwrap_or(false)
-        };
-    if !configured {
-        return Json(err("WebDAV 未配置，请先在设置中填写 WebDAV 地址与凭据"));
-    }
-
-    // 定位该源路径对应的快照（与恢复页一致的两级匹配）
-    let (paths, target_folder, _) = read_backup_config(&state);
-    let root = std::path::Path::new(&body.source_path);
-    let idx = paths
-        .iter()
-        .position(|p| p.as_path() == root)
-        .or_else(|| {
-            root.file_name()
-                .and_then(|n| paths.iter().position(|p| p.file_name() == Some(n)))
-        });
-    let Some(idx) = idx else {
-        return Json(err("该路径不在备份配置中"));
+    // 定位该源路径所属的任务与目标（多任务：可指定 task_id）
+    let scope = match find_restore_scope(&state, &body.source_path, body.task.as_deref()) {
+        Ok(s) => s,
+        Err(e) => return Json(err(e)),
     };
-    let account = webdav_username(&state).unwrap_or_default();
-    let job_id = format!("{}-{}", state.job_id, idx);
+    if !scope.ready {
+        return Json(err("该任务的目标未配置凭据，请先在「目标管理」中完善"));
+    }
+    let root = std::path::Path::new(&body.source_path);
+    let target_folder = scope.target_folder.clone();
+    let job_id = scope.job_id.clone();
+    let account = scope.account.clone();
     let entries = match state.store.load_snapshot(&job_id, &account) {
         Ok(e) => e,
         Err(e) => return Json(err(format!("读取备份快照失败: {e:#}"))),
@@ -1862,89 +2592,136 @@ async fn setup_check(State(state): State<AppState>) -> Json<SetupCheckResponse> 
         hint: None,
     });
 
-    // 2) WebDAV 配置 + 实连
-    let (cfg, creds) = {
+    // 2) 目标配置 + 实连（多目标：逐个检查）
+    let (cfg, target_creds) = {
         let mgr = state.config.lock().unwrap();
-        (
-            mgr.load().unwrap_or_default(),
-            mgr.webdav_credentials().unwrap_or((None, None)),
-        )
+        let cfg = mgr.load().unwrap_or_default();
+        let mut map = std::collections::HashMap::new();
+        for t in &cfg.targets {
+            map.insert(t.id.clone(), mgr.target_credentials(t).unwrap_or((None, None)));
+        }
+        (cfg, map)
     };
-    if !webdav_ready(&cfg) {
+    if cfg.targets.iter().all(|t| !t.enabled) {
         items.push(CheckItem {
             key: "webdav".to_string(),
-            title: "WebDAV 目标".to_string(),
+            title: "备份目标".to_string(),
             status: "fail".to_string(),
-            detail: "尚未配置 WebDAV 凭据，备份与恢复不可用".to_string(),
+            detail: "尚未启用任何备份目标，备份与恢复不可用".to_string(),
             hint: Some(
-                "前往「设置 → WebDAV 目标」填写账号与应用密码；应用密码请在 https://www.kzwr.com/account/apps 创建，选择「永不过期」与读写权限"
+                "前往「目标管理」新增目标并填写账号与应用密码；应用密码请在 https://www.kzwr.com/account/apps 创建，选择「永不过期」与读写权限"
                     .to_string(),
             ),
         });
     } else {
-        let url = cfg
-            .webdav
-            .url
-            .clone()
-            .unwrap_or_else(|| crate::infra::target::webdav::DEFAULT_URL.to_string());
-        let target = crate::infra::target::webdav::WebdavTarget::new(
-            &url,
-            creds.0.clone().unwrap_or_default().as_str(),
-            creds.1.clone().unwrap_or_default().as_str(),
-        );
-        match target.ping().await {
-            Ok(_) => items.push(CheckItem {
-                key: "webdav".to_string(),
-                title: "WebDAV 目标".to_string(),
-                status: "ok".to_string(),
-                detail: format!("已连接 {}", url),
-                hint: None,
-            }),
-            Err(e) => items.push(CheckItem {
-                key: "webdav".to_string(),
-                title: "WebDAV 目标".to_string(),
-                status: "fail".to_string(),
-                detail: format!("连通性测试失败：{:#}", e),
-                hint: Some(
-                    "请确认应用密码未过期且有读写权限（可在 https://www.kzwr.com/account/apps 重新创建）"
-                        .to_string(),
-                ),
-            }),
+        let mut ok_list: Vec<String> = Vec::new();
+        let mut fail_list: Vec<String> = Vec::new();
+        for t in cfg.targets.iter().filter(|t| t.enabled) {
+            let label = if t.name.is_empty() {
+                t.id.clone()
+            } else {
+                t.name.clone()
+            };
+            let (user, pass) = target_creds.get(&t.id).cloned().unwrap_or((None, None));
+            match (user, pass) {
+                (Some(u), Some(p)) => {
+                    let url = t
+                        .url
+                        .clone()
+                        .unwrap_or_else(|| crate::infra::target::webdav::DEFAULT_URL.to_string());
+                    match crate::infra::target::webdav::WebdavTarget::new(&url, &u, &p)
+                        .ping()
+                        .await
+                    {
+                        Ok(_) => ok_list.push(format!("{label}（{url}）")),
+                        Err(e) => fail_list.push(format!("{label}：{e:#}")),
+                    }
+                }
+                _ => fail_list.push(format!("{label}：未配置凭据")),
+            }
         }
+        let (status, detail, hint) = if fail_list.is_empty() {
+            (
+                "ok",
+                format!("已连接 {} 个目标：{}", ok_list.len(), ok_list.join("、")),
+                None,
+            )
+        } else if ok_list.is_empty() {
+            (
+                "fail",
+                format!("所有目标均不可用：{}", fail_list.join("；")),
+                Some("请确认应用密码未过期且有读写权限（可在 https://www.kzwr.com/account/apps 重新创建）".to_string()),
+            )
+        } else {
+            (
+                "warn",
+                format!(
+                    "{} 个目标可用；{} 个异常：{}",
+                    ok_list.len(),
+                    fail_list.len(),
+                    fail_list.join("；")
+                ),
+                Some("前往「目标管理」逐个测试并修复异常目标".to_string()),
+            )
+        };
+        items.push(CheckItem {
+            key: "webdav".to_string(),
+            title: "备份目标".to_string(),
+            status: status.to_string(),
+            detail,
+            hint,
+        });
     }
 
-    // 3) 备份路径 + 已备份文件数
-    let paths: Vec<String> = cfg.backup.paths.clone();
-    if paths.is_empty() {
+    // 3) 备份路径 + 已备份文件数（多任务：按任务各自的目标账号统计）
+    let total_paths: usize = cfg.tasks.iter().map(|t| t.paths.len()).sum();
+    if total_paths == 0 {
         items.push(CheckItem {
             key: "paths".to_string(),
-            title: "备份路径".to_string(),
+            title: "备份任务".to_string(),
             status: "fail".to_string(),
-            detail: "尚未添加任何备份路径".to_string(),
-            hint: Some("前往「备份」页添加要备份的文件夹".to_string()),
+            detail: "尚未添加任何备份任务/路径".to_string(),
+            hint: Some("前往「任务管理」新建任务并添加要备份的文件夹".to_string()),
         });
     } else {
-        let account = webdav_username(&state).unwrap_or_default();
         let mut files = 0usize;
-        for (i, _) in paths.iter().enumerate() {
-            let job_id = format!("{}-{}", state.job_id, i);
-            if let Ok(entries) = state.store.load_snapshot(&job_id, &account) {
-                files += entries.iter().filter(|e| !e.is_dir).count();
+        let mut tasks_with_backup = 0usize;
+        for task in &cfg.tasks {
+            let account = target_creds
+                .get(&task.target_id)
+                .and_then(|(u, _)| u.clone())
+                .unwrap_or_default();
+            let mut task_files = 0usize;
+            for i in 0..task.paths.len() {
+                let job_id = format!("{}-{}", task.id, i);
+                if let Ok(entries) = state.store.load_snapshot(&job_id, &account) {
+                    task_files += entries.iter().filter(|e| !e.is_dir).count();
+                }
+            }
+            files += task_files;
+            if task_files > 0 {
+                tasks_with_backup += 1;
             }
         }
         items.push(CheckItem {
             key: "paths".to_string(),
-            title: "备份路径".to_string(),
+            title: "备份任务".to_string(),
             status: if files > 0 { "ok" } else { "warn" }.to_string(),
             detail: if files > 0 {
-                format!("{} 个路径，已备份 {} 个文件", paths.len(), files)
+                format!(
+                    "{} 个任务 / {} 个路径；其中 {} 个任务已备份，共 {} 个文件",
+                    cfg.tasks.len(),
+                    total_paths,
+                    tasks_with_backup,
+                    files
+                )
             } else {
-                format!("{} 个路径，但还没有备份记录", paths.len())
+                format!("{} 个任务 / {} 个路径，但还没有备份记录", cfg.tasks.len(), total_paths)
             },
             hint: if files > 0 {
                 None
             } else {
-                Some("前往「备份」页执行一次备份".to_string())
+                Some("前往「任务管理」执行一次备份".to_string())
             },
         });
     }
@@ -1966,27 +2743,58 @@ async fn setup_check(State(state): State<AppState>) -> Json<SetupCheckResponse> 
         },
     });
 
-    // 5) 定时备份
-    let cron = cfg.backup.schedule_cron.clone().unwrap_or_default();
-    if cron.trim().is_empty() {
+    // 5) 定时备份（多任务：汇总各任务启用的 cron）
+    let scheduled: Vec<(String, String)> = cfg
+        .tasks
+        .iter()
+        .filter(|t| t.enabled)
+        .filter_map(|t| {
+            let cron = t.schedule_cron.clone().unwrap_or_default();
+            let cron = cron.trim().to_string();
+            if cron.is_empty() {
+                None
+            } else {
+                Some((
+                    if t.name.is_empty() {
+                        t.id.clone()
+                    } else {
+                        t.name.clone()
+                    },
+                    cron,
+                ))
+            }
+        })
+        .collect();
+    if scheduled.is_empty() {
         items.push(CheckItem {
             key: "schedule".to_string(),
             title: "定时备份".to_string(),
             status: "warn".to_string(),
-            detail: "未启用（仅手动备份）".to_string(),
-            hint: Some("如需无人值守，可在「备份」页设置 cron 表达式".to_string()),
+            detail: "所有任务均未启用定时（仅手动备份）".to_string(),
+            hint: Some("如需无人值守，可在「任务管理」为任务设置 cron 表达式".to_string()),
         });
     } else {
-        let next = crate::domain::scheduler::next_runs(&cron, 1).unwrap_or_default();
+        let detail = scheduled
+            .iter()
+            .map(|(name, cron)| {
+                let next = crate::domain::scheduler::next_runs(cron, 1)
+                    .unwrap_or_default()
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "—".to_string());
+                format!("{name}: {cron}（下次 {next}）")
+            })
+            .collect::<Vec<_>>()
+            .join("；");
         items.push(CheckItem {
             key: "schedule".to_string(),
             title: "定时备份".to_string(),
             status: "ok".to_string(),
             detail: format!(
-                "{}（{}，下次 {})",
-                cron,
+                "{} 个任务已启用（{}）；{}",
+                scheduled.len(),
                 crate::domain::scheduler::timezone_label(),
-                next.first().cloned().unwrap_or_else(|| "—".to_string())
+                detail
             ),
             hint: None,
         });
@@ -2307,12 +3115,29 @@ async fn config_export(
             error: Some("管理员口令错误".to_string()),
         });
     }
-    let (cfg, creds, kzwr_token) = {
+    let (cfg, creds, kzwr_token, bundle_targets) = {
         let mgr = state.config.lock().unwrap();
         let cfg = mgr.load().unwrap_or_default();
         let creds = mgr.webdav_credentials().unwrap_or((None, None));
         let kzwr_token = mgr.kzwr_token().unwrap_or(None);
-        (cfg, creds, kzwr_token)
+        // 全部目标的明文凭据（导出文件本身即敏感件，此函数入口已校验管理员口令）
+        let bundle_targets: Vec<BundleTarget> = cfg
+            .targets
+            .iter()
+            .map(|t| {
+                let (u, p) = mgr.target_credentials(t).unwrap_or((None, None));
+                BundleTarget {
+                    id: t.id.clone(),
+                    name: t.name.clone(),
+                    kind: t.kind.clone(),
+                    url: t.url.clone(),
+                    username: u,
+                    password: p,
+                    enabled: t.enabled,
+                }
+            })
+            .collect();
+        (cfg, creds, kzwr_token, bundle_targets)
     };
     let ks_path = crate::infra::keystore::keystore_path(&state.cfg_dir);
     let age_private_key = crate::infra::keystore::load_keystore(&state.passphrase, &ks_path)
@@ -2338,6 +3163,8 @@ async fn config_export(
         kzwr_access_token: kzwr_token,
         age_private_key,
         key_backed_up: cfg.keys.backed_up,
+        targets: bundle_targets,
+        tasks: cfg.tasks.clone(),
     };
     match serde_json::to_string_pretty(&bundle) {
         Ok(text) => Json(ConfigExportResponse {
@@ -2438,6 +3265,62 @@ async fn config_import(
                 }
             }
         }
+        // 多目标（凭据用当前口令重新加密）
+        if !bundle.targets.is_empty() {
+            let mut targets = Vec::new();
+            for t in &bundle.targets {
+                let enc = |v: &Option<String>| -> Result<Option<String>, String> {
+                    match v.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                        Some(s) => mgr
+                            .encrypt_field(&s)
+                            .map(Some)
+                            .map_err(|_| "目标凭据加密失败".to_string()),
+                        None => Ok(None),
+                    }
+                };
+                let username_enc = match enc(&t.username) {
+                    Ok(v) => v,
+                    Err(e) => return Json(ConfigImportResponse { success: false, error: Some(e) }),
+                };
+                let password_enc = match enc(&t.password) {
+                    Ok(v) => v,
+                    Err(e) => return Json(ConfigImportResponse { success: false, error: Some(e) }),
+                };
+                targets.push(crate::infra::config::TargetConfig {
+                    id: if t.id.is_empty() { new_id("t") } else { t.id.clone() },
+                    name: t.name.clone(),
+                    kind: if t.kind.is_empty() {
+                        "webdav".to_string()
+                    } else {
+                        t.kind.clone()
+                    },
+                    url: t.url.clone(),
+                    username_enc,
+                    password_enc,
+                    enabled: t.enabled,
+                });
+            }
+            cfg.targets = targets;
+        }
+        // 多任务（target_id 失效时回落到首个目标，避免导入后任务不可运行）
+        if !bundle.tasks.is_empty() {
+            let ids: Vec<String> = cfg.targets.iter().map(|t| t.id.clone()).collect();
+            let fallback = ids
+                .first()
+                .cloned()
+                .unwrap_or_else(|| crate::infra::config::DEFAULT_TARGET_ID.to_string());
+            cfg.tasks = bundle
+                .tasks
+                .iter()
+                .map(|t| {
+                    let mut t = t.clone();
+                    if !ids.contains(&t.target_id) {
+                        t.target_id = fallback.clone();
+                    }
+                    t
+                })
+                .collect();
+        }
         if let Err(e) = mgr.save(&cfg) {
             return Json(ConfigImportResponse {
                 success: false,
@@ -2445,10 +3328,14 @@ async fn config_import(
             });
         }
     }
-
-    // 1.5) 通知增强插件重载自身状态（如 kzwr 刷新 access-token，热更新无需重启）
     for p in state.plugins.enhance_plugins() {
         p.reload(&state).await;
+    }
+
+    // 1.6) 目标池重建（导入可能改了目标/任务）
+    {
+        let cfg = { state.config.lock().unwrap().load().unwrap_or_default() };
+        state.reload_targets(&cfg);
     }
 
     // 2) 可选：恢复 age 私钥（热切换，无需重启）
@@ -2526,6 +3413,13 @@ pub fn router(state: AppState) -> Router {
         .route("/config", get(config_get).post(config_save))
         .route("/config/export", post(config_export))
         .route("/config/import", post(config_import))
+        // 多目标 / 多任务（ADR-014）
+        .route("/targets", get(targets_list).post(target_save))
+        .route("/targets/:id/delete", post(target_delete))
+        .route("/targets/:id/test", post(target_test))
+        .route("/tasks", get(tasks_list).post(task_save))
+        .route("/tasks/:id/delete", post(task_delete))
+        .route("/tasks/:id/run", post(task_run))
         .route("/backup/run", post(backup_run))
         .route("/restore/files", get(restore_files))
         .route("/restore/tree", get(restore_tree))

@@ -1,117 +1,122 @@
 //! 定时备份调度（应用编排层）
 //!
-//! 读取配置中的 cron 表达式，后台任务循环计算下次触发时间，
-//! 到点后调用 `run_backup_now` 执行增量备份。
-//! 支持运行中热更新配置（每次循环重新读取 cron，无需重启）。
+//! 多任务（ADR-014）后：**每个启用的任务按各自的 cron 独立触发**。
+//! 调度器维护 `任务 id → (cron, 下次触发时间)`，每轮 tick：
+//! 1. 读取任务列表（支持热更新：新增/删除/停用/改 cron 即时生效）
+//! 2. 重建/清理待触发表
+//! 3. 到点调用 `run_task_now(state, task_id)`
+//!
+//! 并发由 `run_task_now` 内的全局标志（`AppState.backup_running`）保证：
+//! 同一时刻只跑一个备份任务，重叠触发会返回 `skipped`。
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Result;
+use chrono::{DateTime, Local};
 use tracing::{info, warn};
 
 use crate::AppState;
 
 /// 启动定时备份调度器（后台 tokio 任务）
 ///
-/// `interval`：cron 触发时间粒度（秒），用于轮询是否到点，
-/// 通常传 60（cron 最小粒度是分钟）。
+/// `interval_secs`：轮询粒度（秒），cron 最小粒度为分钟，通常传 30。
 pub fn spawn_scheduler(state: AppState, interval_secs: u64) {
     tokio::spawn(async move {
         scheduler_loop(state, interval_secs).await;
     });
-    info!("定时备份调度器已启动");
+    info!("定时备份调度器已启动（每任务独立 cron）");
+}
+
+/// 计算 cron 在 `after` 之后的首次触发时间（宿主本地时区）
+fn first_after(expr: &str, after: DateTime<Local>) -> Option<DateTime<Local>> {
+    croner::Cron::new(expr).parse().ok()?.iter_after(after).next()
 }
 
 /// 调度主循环
 async fn scheduler_loop(state: AppState, interval_secs: u64) {
     let tick = Duration::from_secs(interval_secs.max(10));
+    // 任务 id → (cron 表达式, 下次触发时间)
+    let mut pending: HashMap<String, (String, DateTime<Local>)> = HashMap::new();
 
     loop {
-        // 1) 读取当前 cron 配置（支持热更新）
-        let cron_expr = {
+        // 1) 读取任务列表（热更新）
+        let tasks = {
             let guard = state.config.lock().unwrap();
             match guard.load() {
-                Ok(cfg) => cfg.backup.schedule_cron.unwrap_or_default(),
+                Ok(cfg) => cfg.tasks,
                 Err(e) => {
                     warn!(err = %e, "读取调度配置失败，稍后重试");
-                    String::new()
+                    Vec::new()
                 }
             }
         };
 
-        let cron_expr = cron_expr.trim();
-        if cron_expr.is_empty() {
-            // 未配置定时 → 空闲轮询等待配置
-            tokio::time::sleep(tick).await;
-            continue;
-        }
+        // 启用且配置了 cron 的任务
+        let active: HashMap<String, String> = tasks
+            .iter()
+            .filter(|t| t.enabled)
+            .filter_map(|t| {
+                let cron = t.schedule_cron.clone().unwrap_or_default();
+                let cron = cron.trim().to_string();
+                if cron.is_empty() {
+                    None
+                } else {
+                    Some((t.id.clone(), cron))
+                }
+            })
+            .collect();
 
-        // 2) 解析 cron，计算下次触发时间
-        let parsed = match croner::Cron::new(cron_expr).parse() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(expr = cron_expr, err = %e, "cron 表达式无效，等待配置修正");
-                tokio::time::sleep(tick).await;
+        // 2) 清理：已删除/停用/改了 cron 的任务重新排队
+        pending.retain(|id, (cron, _)| active.get(id).map(|c| c == cron).unwrap_or(false));
+
+        // 3) 为新任务（或 cron 变更的任务）计算下次触发
+        for (id, cron) in &active {
+            if pending.contains_key(id) {
                 continue;
             }
-        };
-
-        let now = chrono::Local::now();
-        let next = match parsed.iter_after(now).next() {
-            Some(t) => t,
-            None => {
-                warn!(expr = cron_expr, "无法计算下次触发时间（cron 永不触发？）");
-                tokio::time::sleep(tick).await;
-                continue;
-            }
-        };
-        let wait = (next - chrono::Local::now()).to_std().unwrap_or(Duration::from_secs(60));
-        info!(expr = cron_expr, next = %next, wait_secs = wait.as_secs(), "下次定时备份");
-
-        // 3) 等到点（分小段 sleep 以便及时响应配置变更）
-        let mut remaining = wait;
-        while remaining > tick {
-            tokio::time::sleep(tick).await;
-            remaining = remaining.saturating_sub(tick);
-            // 中途检查 cron 是否变更（配置热更新）
-            let current = current_cron(&state);
-            if current != cron_expr {
-                info!("cron 配置已变更，重新调度");
-                remaining = Duration::ZERO;
-                break;
+            match first_after(cron, Local::now()) {
+                Some(next) => {
+                    info!(task = %id, expr = %cron, next = %next, "已登记定时备份");
+                    pending.insert(id.clone(), (cron.clone(), next));
+                }
+                None => warn!(task = %id, expr = %cron, "cron 表达式无效或永不触发，已跳过"),
             }
         }
-        if remaining > Duration::ZERO {
-            tokio::time::sleep(remaining).await;
+
+        // 4) 到点触发
+        let now = Local::now();
+        let due: Vec<String> = pending
+            .iter()
+            .filter(|(_, (_, next))| *next <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            // 先把下次触发时间推进，避免执行耗时导致重复触发
+            if let Some((cron, _)) = pending.get(&id).cloned() {
+                if let Some(next) = first_after(&cron, now) {
+                    pending.insert(id.clone(), (cron, next));
+                } else {
+                    pending.remove(&id);
+                }
+            }
+            info!(task = %id, "定时备份触发，开始执行");
+            let resp = crate::http::routes::run_task_now(&state, &id).await;
+            if resp.skipped {
+                warn!(task = %id, "已有备份任务正在执行，跳过本次定时触发");
+            } else if let Some(err) = &resp.error {
+                warn!(task = %id, err = %err, "定时备份执行失败");
+            } else {
+                info!(
+                    task = %id,
+                    uploaded = resp.uploaded,
+                    deleted = resp.deleted,
+                    "定时备份执行完成"
+                );
+            }
         }
 
-        // 4) 到点触发备份
-        //
-        // 运行互斥由 `run_backup_now` 内的全局标志（`AppState.backup_running`）保证：
-        // 若手动触发或上一轮备份仍在执行，本次返回 `skipped`，不会并发跑两份备份。
-        info!("定时备份触发，开始执行");
-        let resp = crate::http::routes::run_backup_now(&state).await;
-        if resp.skipped {
-            warn!("已有备份正在执行，跳过本次定时触发");
-        } else if let Some(err) = &resp.error {
-            warn!(err = %err, "定时备份执行失败");
-        } else {
-            info!(
-                uploaded = resp.uploaded,
-                deleted = resp.deleted,
-                orphan_removed = resp.orphan_removed,
-                "定时备份执行完成"
-            );
-        }
-    }
-}
-
-/// 读取当前 cron 配置
-fn current_cron(state: &AppState) -> String {
-    let guard = state.config.lock().unwrap();
-    match guard.load() {
-        Ok(cfg) => cfg.backup.schedule_cron.unwrap_or_default(),
-        Err(_) => String::new(),
+        tokio::time::sleep(tick).await;
     }
 }
 
@@ -138,7 +143,7 @@ pub fn next_runs(expr: &str, count: usize) -> Result<Vec<String>> {
         .parse()
         .map_err(|e| anyhow::anyhow!("cron 表达式无效: {e}"))?;
     // croner 的时区由传入的 DateTime 决定：用 Local 让表达式按 NAS 本地时间解释
-    let now = chrono::Local::now();
+    let now = Local::now();
     let mut out: Vec<String> = Vec::new();
     for t in cron.iter_after(now).take(count) {
         out.push(t.format("%Y-%m-%d %H:%M").to_string());
@@ -148,7 +153,7 @@ pub fn next_runs(expr: &str, count: usize) -> Result<Vec<String>> {
 
 /// 服务器时区说明（供 UI 标注 cron 的解释基准）
 pub fn timezone_label() -> String {
-    chrono::Local::now().format("%Z (UTC%:z)").to_string()
+    Local::now().format("%Z (UTC%:z)").to_string()
 }
 
 /// 宿主时区相对 UTC 的分钟偏移（如东八区 = 480）。
@@ -156,5 +161,5 @@ pub fn timezone_label() -> String {
 /// 时间戳在传输层统一用 epoch（毫秒，与时区无关），由前端按**宿主时区**展示，
 /// 避免浏览器时区与 NAS 不一致时显示成另一个时间。
 pub fn utc_offset_minutes() -> i64 {
-    chrono::Local::now().offset().local_minus_utc() as i64 / 60
+    Local::now().offset().local_minus_utc() as i64 / 60
 }
