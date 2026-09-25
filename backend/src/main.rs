@@ -88,13 +88,11 @@ async fn main() -> anyhow::Result<()> {
     // 插件注册表（唯一装配点）：内置 WebDAV 目标插件 + kzwr 增强插件（ADR-013）
     let registry = Arc::new(fnos_backup::plugin::PluginRegistry::builtin());
 
-    // 目标存储：由注册表向目标插件索取（未配置时回退占位适配器）
-    let (target, backend_name, target_ready) = {
+    // 配置载入 + 旧版单任务配置迁移（多任务/多目标模型，ADR-014）
+    let initial_cfg = {
         let mgr = config_mgr.lock().unwrap();
-        registry.build_target(&mgr)
+        mgr.load_and_persist_migration().unwrap_or_default()
     };
-    let target = Arc::new(infra::storage_trait::SwapTarget::new(target));
-    info!("目标存储后端: {}（ready={target_ready}）", backend_name);
 
     // 目标文件夹 + 任务 id（默认值，实际由配置决定）
     let target_folder = std::env::var("TRIM_KZWR_FOLDER")
@@ -114,9 +112,22 @@ async fn main() -> anyhow::Result<()> {
 
     let audit = Arc::new(fnos_backup::domain::audit::AuditLog::new(&var_dir));
 
+    // 占位适配器：目标未装配时调用即返回配置提示（服务照常启动，供 UI 完成配置）
+    let unconfigured = |msg: &str| -> Arc<dyn infra::storage_trait::TargetStorage> {
+        Arc::new(infra::storage_trait::UnconfiguredTarget {
+            message: msg.to_string(),
+        })
+    };
+
     let state = AppState {
-        target,
-        target_ready,
+        target: Arc::new(infra::storage_trait::SwapTarget::new(unconfigured(
+            "备份目标未配置，请在「目标管理」中填写地址与凭据",
+        ))),
+        targets: Arc::new(infra::storage_trait::TargetPool::new(unconfigured(
+            "该目标未配置凭据，请在「目标管理」中完善后重试",
+        ))),
+        primary_target_id: Arc::new(std::sync::RwLock::new(String::new())),
+        target_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         plugins: registry,
         kzwr,
         audit,
@@ -138,9 +149,20 @@ async fn main() -> anyhow::Result<()> {
         log_file,
     };
 
-    // 定时备份调度器（后台任务，到点触发备份）
+    // 装配配置中的全部目标（多目标池 + 主目标）
+    {
+        let ready = state.reload_targets(&initial_cfg);
+        info!(
+            targets = initial_cfg.targets.len(),
+            tasks = initial_cfg.tasks.len(),
+            ready,
+            "多任务/多目标已就绪"
+        );
+    }
+
+    // 定时备份调度器（后台任务，按任务各自的 cron 触发）
     let scheduler_state = state.clone();
-    fnos_backup::domain::scheduler::spawn_scheduler(scheduler_state, 60);
+    fnos_backup::domain::scheduler::spawn_scheduler(scheduler_state, 30);
 
     // 启动自检：依次询问各增强插件（如 kzwr 插件校验 access-token，失效则告警）
     {

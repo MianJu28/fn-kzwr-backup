@@ -14,13 +14,28 @@ use serde::{Deserialize, Serialize};
 pub const CONFIG_FILE: &str = "config.toml";
 
 /// 应用配置
+///
+/// ## 多任务 / 多目标（2026-09-26 起）
+///
+/// 主数据是 [`AppConfig::targets`]（远程目的地列表）与 [`AppConfig::tasks`]
+/// （备份任务列表：源路径集 + 目标 + 调度 + 保留策略）。
+/// 旧的单实例字段 [`AppConfig::backup`] / [`AppConfig::webdav`] **保留为兼容镜像**：
+/// - 载入时若 `tasks`/`targets` 为空 → 由旧字段自动迁移（[`AppConfig::migrate`]）
+/// - 保存时把「首个任务/目标」回写进旧字段，便于降级到 0.3.x 仍可读
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
+    /// ⚠️ 兼容镜像（旧版单任务配置）：新代码请用 [`AppConfig::tasks`]
     #[serde(default)]
     pub backup: BackupConfig,
-    /// WebDAV 目标配置（ADR-009：官方 WebDAV，唯一文件管理通道）
+    /// ⚠️ 兼容镜像（旧版单目标配置）：新代码请用 [`AppConfig::targets`]
     #[serde(default)]
     pub webdav: WebdavConfig,
+    /// 远程目标列表（每个目标一套地址 + 凭据，可被多个任务引用）
+    #[serde(default)]
+    pub targets: Vec<TargetConfig>,
+    /// 备份任务列表（每个任务 = 源路径集 + 目标 + cron + 保留策略）
+    #[serde(default)]
+    pub tasks: Vec<TaskConfig>,
     /// 通知配置（监控告警）
     #[serde(default)]
     pub notify: NotifyConfig,
@@ -34,6 +49,184 @@ pub struct AppConfig {
     /// 运行时切换即时生效（日志过滤器热更新），并持久化到配置。
     #[serde(default)]
     pub debug: bool,
+}
+
+/// 迁移后的默认目标 id（旧配置升级时创建）
+pub const DEFAULT_TARGET_ID: &str = "default";
+/// 迁移后的默认任务 id
+///
+/// 刻意取 `default`：它与旧版的 `AppState.job_id`（`TRIM_JOB_ID`，默认 "default"）
+/// 一致，因此快照 key 仍是 `default-0`、`default-1`…——**升级后不会全量重传**。
+pub const DEFAULT_TASK_ID: &str = "default";
+
+/// 远程目标：一个目的地 = 一个目标插件实例 + 一套凭据
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TargetConfig {
+    /// 稳定 id（任务通过它引用目标；创建后不再改变）
+    pub id: String,
+    /// 显示名（如「酷族主账号」）
+    #[serde(default)]
+    pub name: String,
+    /// 目标插件 id（`plugin::api::TargetPlugin::meta().id`，如 `webdav`）
+    #[serde(default = "default_target_kind")]
+    pub kind: String,
+    /// 目标基址（如 https://dav.kzwr.com/dav）
+    #[serde(default)]
+    pub url: Option<String>,
+    /// 用户名（加密存储）
+    #[serde(default)]
+    pub username_enc: Option<String>,
+    /// 密码（加密存储）
+    #[serde(default)]
+    pub password_enc: Option<String>,
+    /// 是否启用（禁用后引用它的任务不可运行）
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_target_kind() -> String {
+    "webdav".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl TargetConfig {
+    /// 凭据是否已配置（用户名 + 密码齐备）
+    pub fn configured(&self) -> bool {
+        self.username_enc.is_some() && self.password_enc.is_some()
+    }
+}
+
+/// 备份任务：源路径集 + 目标 + 调度 + 保留策略
+///
+/// 快照隔离：`job_id = "{task.id}-{源序号}"`、`account = 该目标任务凭据的用户名`，
+/// 因此**每个任务在每个目标上都有独立的快照、增量与保留策略**。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskConfig {
+    /// 稳定 id（快照 job_id 前缀，创建后不可改变）
+    pub id: String,
+    /// 任务名（如「文档备份」）
+    #[serde(default)]
+    pub name: String,
+    /// 是否启用（停用后不参与调度，手动触发也会被拒）
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 备份源路径列表
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// 目标 id（引用 [`AppConfig::targets`]）
+    #[serde(default)]
+    pub target_id: String,
+    /// 目标端前缀文件夹（如 "fn-backup"）
+    #[serde(default = "default_target_folder")]
+    pub target_folder: String,
+    /// 定时备份 cron 表达式（None/空 = 不启用）
+    #[serde(default)]
+    pub schedule_cron: Option<String>,
+    /// 保留策略（孤儿文件清理等）
+    #[serde(default)]
+    pub retention: RetentionConfig,
+}
+
+impl Default for TaskConfig {
+    /// 手写 Default：与 `BackupConfig` 同理，`derive(Default)` 不会采用 serde 的
+    /// `default_target_folder()`，会让 `target_folder` 变空串。
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            enabled: true,
+            paths: Vec::new(),
+            target_id: DEFAULT_TARGET_ID.to_string(),
+            target_folder: default_target_folder(),
+            schedule_cron: None,
+            retention: RetentionConfig::default(),
+        }
+    }
+}
+
+impl AppConfig {
+    /// 旧配置 → 多任务/多目标模型（幂等；返回是否发生了变更）
+    ///
+    /// 迁移规则：
+    /// - 无 `targets`：用旧 `[webdav]` 造一个 id=`default` 的目标（含凭据密文，不重新加密）
+    /// - 无 `tasks` 且旧 `backup.paths` 非空：造一个 id=`default` 的任务
+    ///
+    /// 迁移**不删除**旧字段（继续作为兼容镜像由 [`AppConfig::sync_legacy_mirror`] 更新）。
+    pub fn migrate(&mut self) -> bool {
+        let mut changed = false;
+        if self.targets.is_empty() {
+            self.targets.push(TargetConfig {
+                id: DEFAULT_TARGET_ID.to_string(),
+                name: "默认目标（WebDAV）".to_string(),
+                kind: default_target_kind(),
+                url: self.webdav.url.clone(),
+                username_enc: self.webdav.username_enc.clone(),
+                password_enc: self.webdav.password_enc.clone(),
+                enabled: true,
+            });
+            changed = true;
+        }
+        if self.tasks.is_empty() && !self.backup.paths.is_empty() {
+            self.tasks.push(TaskConfig {
+                id: DEFAULT_TASK_ID.to_string(),
+                name: "默认任务".to_string(),
+                enabled: true,
+                paths: self.backup.paths.clone(),
+                target_id: DEFAULT_TARGET_ID.to_string(),
+                target_folder: self.backup.target_folder.clone(),
+                schedule_cron: self.backup.schedule_cron.clone(),
+                retention: self.backup.retention.clone(),
+            });
+            changed = true;
+        }
+        changed
+    }
+
+    /// 把「首个任务/目标」回写进旧字段（兼容镜像；降级到 0.3.x 也能读到）
+    pub fn sync_legacy_mirror(&mut self) {
+        if let Some(t) = self.targets.first() {
+            self.webdav.url = t.url.clone();
+            self.webdav.username_enc = t.username_enc.clone();
+            self.webdav.password_enc = t.password_enc.clone();
+        }
+        if let Some(t) = self.tasks.first() {
+            self.backup.paths = t.paths.clone();
+            self.backup.target_folder = t.target_folder.clone();
+            self.backup.schedule_cron = t.schedule_cron.clone();
+            self.backup.retention = t.retention.clone();
+        }
+    }
+
+    pub fn target_by_id(&self, id: &str) -> Option<&TargetConfig> {
+        self.targets.iter().find(|t| t.id == id)
+    }
+
+    pub fn task_by_id(&self, id: &str) -> Option<&TaskConfig> {
+        self.tasks.iter().find(|t| t.id == id)
+    }
+
+    /// 主目标：首个启用的目标（kzwr 增强等全局能力绑定它）
+    pub fn primary_target(&self) -> Option<&TargetConfig> {
+        self.targets.iter().find(|t| t.enabled).or(self.targets.first())
+    }
+
+    /// 引用了该目标的任务名（删除目标前检查）
+    pub fn tasks_using_target(&self, target_id: &str) -> Vec<String> {
+        self.tasks
+            .iter()
+            .filter(|t| t.target_id == target_id)
+            .map(|t| {
+                if t.name.is_empty() {
+                    t.id.clone()
+                } else {
+                    t.name.clone()
+                }
+            })
+            .collect()
+    }
 }
 
 /// kzwr REST API 增强功能配置（可选）
@@ -205,45 +398,102 @@ impl ConfigManager {
         }
     }
 
-    /// 加载配置（不存在则返回默认）
+    /// 加载配置（不存在则返回默认）；**顺带做旧配置迁移（仅内存，不落盘）**
     pub fn load(&self) -> Result<AppConfig> {
         if !self.path.exists() {
-            return Ok(AppConfig::default());
+            let mut cfg = AppConfig::default();
+            cfg.migrate();
+            return Ok(cfg);
         }
         let content = std::fs::read_to_string(&self.path).context("读取配置文件失败")?;
-        toml::from_str(&content).context("解析配置失败")
+        let mut cfg: AppConfig = toml::from_str(&content).context("解析配置失败")?;
+        cfg.migrate();
+        Ok(cfg)
     }
 
-    /// 保存配置
+    /// 加载配置；若发生了旧配置迁移则立即落盘（供启动时调用一次）
+    pub fn load_and_persist_migration(&self) -> Result<AppConfig> {
+        if !self.path.exists() {
+            return self.load();
+        }
+        let content = std::fs::read_to_string(&self.path).context("读取配置文件失败")?;
+        let mut cfg: AppConfig = toml::from_str(&content).context("解析配置失败")?;
+        if cfg.migrate() {
+            tracing::info!(
+                targets = cfg.targets.len(),
+                tasks = cfg.tasks.len(),
+                "检测到旧版单任务配置，已迁移为多任务/多目标模型"
+            );
+            self.save(&cfg)?;
+        }
+        Ok(cfg)
+    }
+
+    /// 保存配置（同时刷新旧字段兼容镜像）
     pub fn save(&self, config: &AppConfig) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let content = toml::to_string_pretty(config).context("序列化配置失败")?;
+        let mut cfg = config.clone();
+        cfg.sync_legacy_mirror();
+        let content = toml::to_string_pretty(&cfg).context("序列化配置失败")?;
         std::fs::write(&self.path, content).context("写入配置文件失败")?;
         Ok(())
     }
 
-    /// 读取 WebDAV 凭据（解密）
+    /// 解密某个目标的凭据
     ///
     /// 返回 (用户名, 密码)，任一缺失/为空则为 None。
-    pub fn webdav_credentials(&self) -> Result<(Option<String>, Option<String>)> {
-        let cfg = self.load()?;
+    pub fn target_credentials(
+        &self,
+        target: &TargetConfig,
+    ) -> Result<(Option<String>, Option<String>)> {
         let user = self
-            .decrypt_field(&cfg.webdav.username_enc)?
+            .decrypt_field(&target.username_enc)?
             .filter(|s| !s.is_empty());
         let pass = self
-            .decrypt_field(&cfg.webdav.password_enc)?
+            .decrypt_field(&target.password_enc)?
             .filter(|s| !s.is_empty());
         Ok((user, pass))
     }
 
-    /// 保存 WebDAV 配置（url + 加密凭据）
+    /// 读取**主目标**的凭据（解密；无目标时返回 None）
+    pub fn webdav_credentials(&self) -> Result<(Option<String>, Option<String>)> {
+        let cfg = self.load()?;
+        match cfg.primary_target() {
+            Some(t) => self.target_credentials(t),
+            None => Ok((None, None)),
+        }
+    }
+
+    /// 保存主目标的 WebDAV 配置（url + 加密凭据）；无目标则创建默认目标
     pub fn save_webdav(&self, url: &str, username: &str, password: &str) -> Result<()> {
         let mut cfg = self.load().unwrap_or_default();
-        cfg.webdav.url = Some(url.trim_end_matches('/').to_string());
-        cfg.webdav.username_enc = Some(self.encrypt_field(username)?);
-        cfg.webdav.password_enc = Some(self.encrypt_field(password)?);
+        let enc_user = self.encrypt_field(username)?;
+        let enc_pass = self.encrypt_field(password)?;
+        let url = url.trim_end_matches('/').to_string();
+        if cfg.targets.is_empty() {
+            cfg.targets.push(TargetConfig {
+                id: DEFAULT_TARGET_ID.to_string(),
+                name: "默认目标（WebDAV）".to_string(),
+                kind: default_target_kind(),
+                url: Some(url),
+                username_enc: Some(enc_user),
+                password_enc: Some(enc_pass),
+                enabled: true,
+            });
+        } else {
+            // 主目标（首个启用者）就地更新
+            let idx = cfg
+                .targets
+                .iter()
+                .position(|t| t.enabled)
+                .unwrap_or(0);
+            let t = &mut cfg.targets[idx];
+            t.url = Some(url);
+            t.username_enc = Some(enc_user);
+            t.password_enc = Some(enc_pass);
+        }
         self.save(&cfg)
     }
 

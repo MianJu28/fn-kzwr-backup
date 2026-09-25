@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::infra::config::{AppConfig, ConfigManager};
+use crate::infra::config::{AppConfig, ConfigManager, TargetConfig};
 use crate::infra::storage_trait::TargetStorage;
 
 /// 插件类别
@@ -38,12 +38,18 @@ pub struct PluginMeta {
 pub trait TargetPlugin: Send + Sync {
     fn meta(&self) -> PluginMeta;
 
-    /// 按当前配置构建目标实例；凭据不全时返回 `None`（核心回退到占位适配器）。
+    /// 用**一个具体的目标配置**构建实例（多目标：每个目标一份实例）。
+    /// 凭据不全/配置不适用时返回 `None`（核心回退到占位适配器）。
     /// 返回 `(存储实现, 展示名)`。
-    fn build(&self, mgr: &ConfigManager) -> Option<(Arc<dyn TargetStorage>, String)>;
+    fn build(
+        &self,
+        target: &TargetConfig,
+        mgr: &ConfigManager,
+    ) -> Option<(Arc<dyn TargetStorage>, String)>;
 
-    /// 保存配置前的连通性验证，返回实际使用的地址（基址由插件自行决定）
-    async fn verify(&self, user: &str, pass: &str) -> Result<String, String>;
+    /// 保存配置前的连通性验证，返回实际使用的地址（基址由插件自行决定）；
+    /// `url` 为 `None` 时用插件默认地址。
+    async fn verify(&self, url: Option<&str>, user: &str, pass: &str) -> Result<String, String>;
 
     /// 设置页 UI 描述（默认不出现）
     fn ui(&self) -> Option<PluginUi> {

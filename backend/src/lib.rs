@@ -16,9 +16,9 @@ use age::secrecy::SecretString;
 use domain::alerts::AlertSink;
 use domain::crypto::CryptoSession;
 use eventbus::EventBus;
-use infra::config::ConfigManager;
+use infra::config::{AppConfig, ConfigManager};
 use infra::persistence::snapshot::SnapshotStore;
-use infra::storage_trait::SwapTarget;
+use infra::storage_trait::{SwapTarget, TargetPool, TargetStorage};
 
 /// 可热替换的加密会话（用户在设置中更换 age 密钥后无需重启服务）
 pub struct CryptoSwap {
@@ -67,10 +67,14 @@ impl CryptoSwap {
 /// 应用全局共享状态
 #[derive(Clone)]
 pub struct AppState {
-    /// 目标存储适配器（kzwr 官方 WebDAV，ADR-009；配置保存后可热替换）
+    /// **主目标**适配器（首个启用的目标；全局能力如 kzwr 增强、兼容接口用它）
     pub target: Arc<SwapTarget>,
-    /// 目标是否已配置（凭据就绪；未配置时 target 为占位适配器）
-    pub target_ready: bool,
+    /// **多目标池**：`目标 id → 适配器`（任务按 `target_id` 取自己的实例）
+    pub targets: Arc<TargetPool>,
+    /// 主目标 id（随配置刷新）
+    pub primary_target_id: Arc<RwLock<String>>,
+    /// 主目标是否已配置（凭据就绪；未配置时 target 为占位适配器）
+    pub target_ready: Arc<AtomicBool>,
     /// 备份运行标志（定时调度与手动触发共用：true = 有备份正在执行，并发触发直接跳过）
     pub backup_running: Arc<AtomicBool>,
     /// 加密会话（备份加密/恢复解密；密钥变更后可热替换）
@@ -111,4 +115,66 @@ pub struct AppState {
     pub kzwr: Arc<crate::infra::kzwr_api::client::KzwrClient>,
     /// 操作审计日志（敏感/破坏性操作留痕，存 $TRIM_PKGVAR/audit.log）
     pub audit: Arc<crate::domain::audit::AuditLog>,
+}
+
+impl AppState {
+    /// 按配置重建目标池（启动时、目标/任务配置变更后调用）
+    ///
+    /// 同步更新：目标池、主目标适配器、主目标 id、`target_ready`。
+    /// 返回已就绪（凭据齐备）的目标数量。
+    pub fn reload_targets(&self, cfg: &AppConfig) -> usize {
+        let built = {
+            let mgr = self.config.lock().unwrap();
+            self.plugins.build_targets(cfg, &mgr)
+        };
+        let primary_id = cfg
+            .primary_target()
+            .map(|t| t.id.clone())
+            .unwrap_or_default();
+
+        let mut items: Vec<(String, Arc<dyn TargetStorage>, String)> = Vec::new();
+        let mut ready_count = 0usize;
+        let mut primary: Option<(Arc<dyn TargetStorage>, String, bool)> = None;
+        for b in built {
+            if b.id == primary_id {
+                primary = Some((b.storage.clone(), b.name.clone(), b.ready));
+            }
+            if b.ready {
+                ready_count += 1;
+            }
+            items.push((b.id, b.storage, b.name));
+        }
+        self.targets.replace_all(items);
+
+        let primary_ready = match primary {
+            Some((storage, name, ready)) => {
+                self.target.swap(storage);
+                tracing::info!(target = %primary_id, backend = %name, ready, "主目标已刷新");
+                ready
+            }
+            None => {
+                tracing::info!("配置中没有任何目标（等待用户在「目标管理」中添加）");
+                false
+            }
+        };
+        *self.primary_target_id.write().unwrap() = primary_id;
+        self.target_ready
+            .store(primary_ready, std::sync::atomic::Ordering::Relaxed);
+        ready_count
+    }
+
+    /// 主目标 id（kzwr 增强等全局能力的绑定对象）
+    pub fn primary_target_id(&self) -> String {
+        self.primary_target_id.read().unwrap().clone()
+    }
+
+    /// 取某个目标的适配器（未装配 → 占位适配器，调用即返回配置提示）
+    pub fn target_for(&self, target_id: &str) -> Arc<dyn TargetStorage> {
+        self.targets.get(target_id)
+    }
+
+    /// 主目标是否已就绪
+    pub fn primary_ready(&self) -> bool {
+        self.target_ready.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }

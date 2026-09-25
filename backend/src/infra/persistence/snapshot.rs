@@ -179,6 +179,19 @@ impl SnapshotStore {
         rows.collect()
     }
 
+    /// 删除**某个任务**的全部快照记录（任务删除时可选清理）
+    ///
+    /// 快照 key 形如 `{task_id}-{源序号}`；用前缀匹配覆盖该任务的所有源。
+    /// 返回删除的行数（所有账号维度一并清理）。
+    pub fn delete_task_snapshots(&self, task_id: &str) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM sync_snapshots WHERE job_id = ?1 OR job_id LIKE ?2",
+            rusqlite::params![task_id, format!("{}-%", task_id)],
+        )?;
+        Ok(n)
+    }
+
     /// 删除单条快照记录（云端文件已不存在时清理用）
     ///
     /// 返回是否确有删除（false = 记录本就不存在）

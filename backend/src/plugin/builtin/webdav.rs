@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::infra::config::ConfigManager;
+use crate::infra::config::{ConfigManager, TargetConfig};
 use crate::infra::storage_trait::TargetStorage;
 use crate::infra::target::webdav::{WebdavTarget, DEFAULT_URL};
 use crate::plugin::api::{PluginKind, PluginMeta, PluginUi, TargetPlugin};
@@ -18,18 +18,28 @@ fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
-/// 解析凭据与地址：环境变量 > 加密配置 > 官方默认地址
-fn resolve(mgr: &ConfigManager) -> Option<(String, String, String)> {
-    let cfg = mgr.load().ok()?;
-    let (cfg_user, cfg_pass) = mgr.webdav_credentials().ok()?;
-    let user = env_nonempty("TRIM_DAV_USER")
+/// 解析某个目标的凭据与地址
+///
+/// 优先级：`TRIM_DAV_*` 环境变量（**仅作用于默认目标**，供 NAS 上调试）> 目标自身配置 >
+/// 官方默认地址。
+fn resolve(target: &TargetConfig, mgr: &ConfigManager) -> Option<(String, String, String)> {
+    let (cfg_user, cfg_pass) = mgr.target_credentials(target).ok()?;
+    let is_default = target.id == crate::infra::config::DEFAULT_TARGET_ID;
+    let env = |key: &str| {
+        if is_default {
+            env_nonempty(key)
+        } else {
+            None
+        }
+    };
+    let user = env("TRIM_DAV_USER")
         .or(cfg_user)
         .filter(|s| !s.is_empty())?;
-    let pass = env_nonempty("TRIM_DAV_PASS")
+    let pass = env("TRIM_DAV_PASS")
         .or(cfg_pass)
         .filter(|s| !s.is_empty())?;
-    let url = env_nonempty("TRIM_DAV_URL")
-        .or_else(|| cfg.webdav.url.clone().filter(|s| !s.is_empty()))
+    let url = env("TRIM_DAV_URL")
+        .or_else(|| target.url.clone().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| DEFAULT_URL.to_string());
     Some((url, user, pass))
 }
@@ -47,8 +57,11 @@ impl TargetPlugin for WebdavPlugin {
         }
     }
 
-    fn build(&self, mgr: &ConfigManager) -> Option<(Arc<dyn TargetStorage>, String)> {
-        let (url, user, pass) = resolve(mgr)?;
+    fn build(&self, target: &TargetConfig, mgr: &ConfigManager) -> Option<(Arc<dyn TargetStorage>, String)> {
+        if !target.enabled || target.kind != "webdav" {
+            return None;
+        }
+        let (url, user, pass) = resolve(target, mgr)?;
         Some((
             Arc::new(WebdavTarget::new(&url, &user, &pass)),
             format!("WebDAV（{}）", url),
@@ -66,8 +79,12 @@ impl TargetPlugin for WebdavPlugin {
         })
     }
 
-    async fn verify(&self, user: &str, pass: &str) -> Result<String, String> {
-        let url = env_nonempty("TRIM_DAV_URL").unwrap_or_else(|| DEFAULT_URL.to_string());
+    async fn verify(&self, url: Option<&str>, user: &str, pass: &str) -> Result<String, String> {
+        let url = url
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim_end_matches('/').to_string())
+            .or_else(|| env_nonempty("TRIM_DAV_URL"))
+            .unwrap_or_else(|| DEFAULT_URL.to_string());
         WebdavTarget::new(&url, user, pass)
             .ping()
             .await

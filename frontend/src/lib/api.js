@@ -67,14 +67,35 @@ export const api = {
   runBackup: () => post('/api/backup/run'),
   /** 备份文件夹概况（文件数/文件夹数/总大小） */
   restoreFiles: () => get('/api/restore/files'),
-  /** 按目录懒加载：只取一层子项（目录附递归统计） */
-  restoreTree: (source, dir = '') =>
-    get(`/api/restore/tree?source=${encodeURIComponent(source)}&dir=${encodeURIComponent(dir)}`),
+  /** 按目录懒加载：只取一层子项（目录附递归统计）；task 指定任务（多任务下同一路径可能属于多个任务） */
+  restoreTree: (source, dir = '', task = '') =>
+    get(
+      `/api/restore/tree?source=${encodeURIComponent(source)}&dir=${encodeURIComponent(dir)}` +
+        (task ? `&task=${encodeURIComponent(task)}` : '')
+    ),
   /** 恢复：all=true 时恢复该源路径（可用 dir 限定子目录）下的全部文件 */
-  restore: (files, source_path, all = false, dir = '') =>
-    post('/api/restore/run', { files, source_path, all, dir }),
+  restore: (files, source_path, all = false, dir = '', task = '') =>
+    post('/api/restore/run', { files, source_path, all, dir, ...(task ? { task } : {}) }),
   /** 清理快照中云端已不存在的文件记录（只动快照，不删云端文件） */
-  pruneMissing: (source_path) => post('/api/restore/prune', { source_path }),
+  pruneMissing: (source_path, task = '') =>
+    post('/api/restore/prune', { source_path, ...(task ? { task } : {}) }),
+
+  // ── 多目标 / 多任务（ADR-014）──────────────────────────────────
+  /** 目标列表（凭据不回传，密码只回传「是否已设置」） */
+  targets: () => get('/api/targets'),
+  /** 新建/更新目标（password 缺省 = 不修改凭据；test 默认 true 先实测连通性） */
+  saveTarget: (body) => post('/api/targets', body),
+  deleteTarget: (id) => post(`/api/targets/${encodeURIComponent(id)}/delete`, {}),
+  testTarget: (id) => post(`/api/targets/${encodeURIComponent(id)}/test`, {}),
+  /** 任务列表（含目标名、就绪状态、下次触发时间与可选目标） */
+  tasks: () => get('/api/tasks'),
+  /** 新建/更新任务（未传字段保持原值） */
+  saveTask: (body) => post('/api/tasks', body),
+  /** 删除任务（purge=true 同时清理它的快照记录） */
+  deleteTask: (id, purge = false) =>
+    post(`/api/tasks/${encodeURIComponent(id)}/delete`, { purge }),
+  /** 立即执行某个任务 */
+  runTask: (id) => post(`/api/tasks/${encodeURIComponent(id)}/run`, {}),
 
   // ── 插件（插件自带路由统一挂在 /api/p/<插件id> 下）──────────────
   /** 插件清单（id/名称/类别/可用性/UI 区块描述）—— 前端区块由它驱动 */

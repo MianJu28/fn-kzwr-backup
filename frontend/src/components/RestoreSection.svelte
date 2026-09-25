@@ -31,26 +31,36 @@
   const EMPTY = { open: false, children: {}, expanded: {} };
   const stateOf = (path) => states[path] || EMPTY;
 
+  /**
+   * 文件夹身份键：多任务下同一路径可能出现在多个任务里（分别备份到不同目标），
+   * 因此用「任务 id + 路径」作 UI 状态键，并把它作为参数贯穿树加载/恢复调用。
+   */
+  const keyOf = (f) => `${f.task_id || ''}|${f.path}`;
+  const pathOf = (key) => key.slice(key.indexOf('|') + 1);
+  const taskOf = (key) => key.slice(0, key.indexOf('|'));
+
   function patch(path, changes) {
     states = { ...states, [path]: { ...stateOf(path), ...changes } };
   }
 
   /** 懒加载某目录的直接子项（'' = 文件夹根层） */
-  async function loadDir(folderPath, dirRel) {
-    const st = stateOf(folderPath);
+  async function loadDir(folderKey, dirRel) {
+    const st = stateOf(folderKey);
     const cached = st.children[dirRel];
     if (Array.isArray(cached) || cached === 'loading') return;
 
-    patch(folderPath, { children: { ...st.children, [dirRel]: 'loading' } });
+    patch(folderKey, { children: { ...st.children, [dirRel]: 'loading' } });
     try {
-      const res = onLoadTree ? await onLoadTree(folderPath, dirRel) : { nodes: [] };
+      const res = onLoadTree
+        ? await onLoadTree(pathOf(folderKey), dirRel, taskOf(folderKey))
+        : { nodes: [] };
       if (res && res.error) notify(res.error, false);
-      patch(folderPath, {
-        children: { ...stateOf(folderPath).children, [dirRel]: (res && res.nodes) || [] },
+      patch(folderKey, {
+        children: { ...stateOf(folderKey).children, [dirRel]: (res && res.nodes) || [] },
       });
     } catch (e) {
       notify(`加载目录失败：${e.message}`, false);
-      patch(folderPath, { children: { ...stateOf(folderPath).children, [dirRel]: [] } });
+      patch(folderKey, { children: { ...stateOf(folderKey).children, [dirRel]: [] } });
     }
   }
 
@@ -86,12 +96,12 @@
     msgOk = ok;
   }
 
-  async function runRestore(files, sourcePath, all, dir, label) {
+  async function runRestore(files, folderKey, all, dir, label) {
     working = true;
     msg = '';
     result = null;
     try {
-      const r = await onRestore(files, sourcePath, all, dir);
+      const r = await onRestore(files, pathOf(folderKey), all, dir, taskOf(folderKey));
       result = r;
       if (r && r.error) notify(`恢复失败：${r.error}`, false);
       else {
@@ -123,7 +133,7 @@
     msg = '';
     try {
       const r = onPrune
-        ? await onPrune(folder.path)
+        ? await onPrune(folder.path, folder.task_id || '')
         : { checked: 0, removed: 0, files: [] };
       if (r && r.error) {
         notify(`清理失败：${r.error}`, false);
@@ -135,7 +145,7 @@
           `已清理 ${r.removed} 条失效记录（共检查 ${r.checked} 条）${names ? `：${names}${(r.files || []).length > 3 ? ' 等' : ''}` : ''}`,
           true
         );
-        await refreshFolder(folder.path);
+        await refreshFolder(keyOf(folder));
       }
     } catch (e) {
       notify(`清理失败：${e.message}`, false);
@@ -144,14 +154,14 @@
     }
   }
 
-  const restoreFile = (folderPath, node) =>
-    runRestore([node.rel_path], folderPath, false, '', `文件 ${node.name}：`);
+  const restoreFile = (folderKey, node) =>
+    runRestore([node.rel_path], folderKey, false, '', `文件 ${node.name}：`);
 
-  const restoreDir = (folderPath, node) =>
-    runRestore(null, folderPath, true, node.rel_path, `目录 ${node.name}：`);
+  const restoreDir = (folderKey, node) =>
+    runRestore(null, folderKey, true, node.rel_path, `目录 ${node.name}：`);
 
   const restoreFolder = (folder) =>
-    runRestore(null, folder.path, true, '', `文件夹 ${folder.path} `);
+    runRestore(null, keyOf(folder), true, '', `文件夹 ${folder.path} `);
 
   /** 全部恢复：依次恢复所有「已备份」的文件夹 */
   async function restoreAll() {
@@ -165,7 +175,7 @@
     const failed = [];
     for (const f of backedUp) {
       try {
-        const r = await onRestore(null, f.path, true, '');
+        const r = await onRestore(null, f.path, true, '', f.task_id || '');
         if (r && r.error) failed.push(`${f.path}：${r.error}`);
         else {
           restored += r.restored || 0;
@@ -231,14 +241,15 @@
       </div>
     {:else}
       <div class="folders">
-        {#each restoreFolders as folder (folder.path)}
+        {#each restoreFolders as folder (`${folder.task_id || ''}::${folder.path}`)}
           <!-- 注意：必须在此直接引用 `states`，否则 Svelte 编译器分析不到依赖，展开后不会重渲染 -->
-          {@const st = states[folder.path] || EMPTY}
+          {@const fkey = keyOf(folder)}
+          {@const st = states[fkey] || EMPTY}
           <div class="folder" class:open={st.open}>
             <div class="folder-head">
               <button
                 class="toggle"
-                on:click={() => toggleFolder(folder.path)}
+                on:click={() => toggleFolder(fkey)}
                 disabled={!folder.has_backup}
                 aria-expanded={st.open}
                 aria-label={st.open ? '收起' : '展开'}
@@ -250,6 +261,11 @@
               </button>
               <Icon name="folder" size={15} />
               <span class="folder-name mono">{folder.path}</span>
+              {#if folder.task_name}
+                <span class="badge nowrap" title="所属任务 / 目标">
+                  {folder.task_name}{folder.target_name ? ` → ${folder.target_name}` : ''}
+                </span>
+              {/if}
 
               {#if folder.has_backup}
                 <span class="badge badge-info nowrap">{folder.file_count} 文件</span>
@@ -288,9 +304,9 @@
                       expanded={st.expanded}
                       cache={st.children}
                       busy={busyAll}
-                      onToggle={(n) => toggleDir(folder.path, n)}
-                      onRestoreFile={(n) => restoreFile(folder.path, n)}
-                      onRestoreDir={(n) => restoreDir(folder.path, n)}
+                      onToggle={(n) => toggleDir(fkey, n)}
+                      onRestoreFile={(n) => restoreFile(fkey, n)}
+                      onRestoreDir={(n) => restoreDir(fkey, n)}
                     />
                   {/each}
                 {/if}

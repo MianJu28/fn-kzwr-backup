@@ -170,10 +170,70 @@ impl TargetStorage for UnconfiguredTarget {
     }
 }
 
+/// 多目标池：`目标 id → 已装配的目标存储`
+///
+/// 多任务/多目标（2026-09-26）后，一份配置可含多个目标；任务按 `target_id`
+/// 取用自己的适配器实例，因此**不同目标各自持有独立凭据、各自独立快照/增量**。
+/// 未装配或未配置的目标回退到 `fallback`（占位适配器，调用即返回配置提示）。
+pub struct TargetPool {
+    inner: std::sync::RwLock<std::collections::HashMap<String, Arc<dyn TargetStorage>>>,
+    /// 目标 id → 后端描述（日志与 UI 展示，如 `WebDAV（https://…）`）
+    names: std::sync::RwLock<std::collections::HashMap<String, String>>,
+    fallback: Arc<dyn TargetStorage>,
+}
+
+impl TargetPool {
+    pub fn new(fallback: Arc<dyn TargetStorage>) -> Self {
+        Self {
+            inner: std::sync::RwLock::new(std::collections::HashMap::new()),
+            names: std::sync::RwLock::new(std::collections::HashMap::new()),
+            fallback,
+        }
+    }
+
+    /// 取某个目标的适配器（不存在/未装配 → 占位适配器）
+    pub fn get(&self, id: &str) -> Arc<dyn TargetStorage> {
+        self.inner
+            .read()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| self.fallback.clone())
+    }
+
+    /// 目标是否已装配（凭据齐备且插件可用）
+    pub fn is_ready(&self, id: &str) -> bool {
+        self.inner.read().unwrap().contains_key(id)
+    }
+
+    /// 后端描述（未装配返回 None）
+    pub fn describe(&self, id: &str) -> Option<String> {
+        self.names.read().unwrap().get(id).cloned()
+    }
+
+    /// 已装配的目标 id 列表
+    pub fn ids(&self) -> Vec<String> {
+        self.inner.read().unwrap().keys().cloned().collect()
+    }
+
+    /// 整体替换（配置保存/启动时重建；`items` = (目标id, 适配器, 描述)）
+    pub fn replace_all(&self, items: Vec<(String, Arc<dyn TargetStorage>, String)>) {
+        let mut map = std::collections::HashMap::new();
+        let mut names = std::collections::HashMap::new();
+        for (id, t, name) in items {
+            map.insert(id.clone(), t);
+            names.insert(id, name);
+        }
+        *self.inner.write().unwrap() = map;
+        *self.names.write().unwrap() = names;
+    }
+}
+
 /// 可热替换的目标存储
 ///
 /// WebDAV 凭据经 UI 保存后无需重启即可切换实现（ADR-009）。
 /// 委托当前内部实现；初始为 `UnconfiguredTarget`。
+/// 多目标场景下它代表**主目标**（全局能力如 kzwr 增强、兼容接口用它）。
 pub struct SwapTarget {
     inner: std::sync::RwLock<Arc<dyn TargetStorage>>,
 }

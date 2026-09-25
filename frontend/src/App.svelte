@@ -2,6 +2,8 @@
   import DashboardPage from './views/DashboardPage.svelte';
   import BackupPage from './views/BackupPage.svelte';
   import RestorePage from './views/RestorePage.svelte';
+  import TasksPage from './views/TasksPage.svelte';
+  import TargetsPage from './views/TargetsPage.svelte';
   import SettingsPage from './views/SettingsPage.svelte';
   import AuditPage from './views/AuditPage.svelte';
   import LogsPage from './views/LogsPage.svelte';
@@ -42,6 +44,10 @@
   let scheduleTimezone = '';
   // 插件清单（/api/plugins）：设置页区块由它驱动
   let plugins = [];
+  // 多任务 / 多目标（ADR-014）
+  let tasks = [];
+  let targets = []; // 目标详情（/api/targets）
+  let targetOptions = []; // 目标精简项（/api/tasks 附带，供任务表单下拉）
 
   // 备份 / 恢复
   let busy = false;
@@ -85,6 +91,8 @@
 
   const NAV = [
     { id: 'dashboard', label: '概览', icon: 'grid' },
+    { id: 'tasks', label: '任务', icon: 'package' },
+    { id: 'targets', label: '目标', icon: 'cloud' },
     { id: 'backup', label: '备份', icon: 'upload' },
     { id: 'restore', label: '恢复', icon: 'download' },
     { id: 'settings', label: '设置', icon: 'sliders' },
@@ -94,6 +102,8 @@
 
   const PAGE_META = {
     dashboard: { title: '概览', desc: '备份状态、配置一览与实时任务进度' },
+    tasks: { title: '备份任务', desc: '每个任务 = 源文件夹 + 目标 + 定时 + 保留策略，各自独立增量与快照' },
+    targets: { title: '备份目标', desc: '远程存储目的地与账号凭据，一个目标可被多个任务共用' },
     backup: { title: '备份', desc: '配置备份路径与定时任务，或立即执行一次增量备份' },
     restore: { title: '恢复', desc: '浏览云端备份内容，按文件或目录恢复到原位置' },
     settings: { title: '设置', desc: 'WebDAV 凭据、加密密钥、通知与配置迁移' },
@@ -224,6 +234,34 @@
     }
   }
 
+  /** 多任务/多目标：任务列表 + 可选目标（/api/tasks 一并返回） */
+  async function loadTasks() {
+    try {
+      const d = await api.tasks();
+      tasks = d.tasks || [];
+      targetOptions = d.targets || [];
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
+  /** 目标详情列表（/api/targets：含地址、账号、被引用任务数） */
+  async function loadTargets() {
+    try {
+      const d = await api.targets();
+      targets = d.targets || [];
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
+  /** 任务或目标变更后：刷新任务、目标、配置（legacy 视图）与恢复列表 */
+  async function handleTasksChanged() {
+    await Promise.all([loadTasks(), loadTargets()]);
+    await loadConfig();
+    await loadRestoreFiles();
+  }
+
   async function loadRestoreFiles() {
     try {
       const d = await api.restoreFiles();
@@ -235,7 +273,16 @@
 
   async function loadAll() {
     loading = true;
-    await Promise.all([loadHealth(), loadConfig(), loadUserInfo(), loadKeys(), loadAlerts(), loadRestoreFiles()]);
+    await Promise.all([
+      loadHealth(),
+      loadConfig(),
+      loadUserInfo(),
+      loadKeys(),
+      loadAlerts(),
+      loadRestoreFiles(),
+      loadTasks(),
+      loadTargets(),
+    ]);
     // 依赖 loadConfig 得到的 kzwrConfigured，故串行放在其后
     await loadKzwrUser();
     loading = false;
@@ -503,19 +550,19 @@
 
   /* ── 操作：恢复 ───────────────────────────────────────────── */
 
-  /** 恢复：all=true 时按 sourcePath（可用 dir 限定子目录）全量恢复 */
-  async function handleRestore(files, sourcePath, all = false, dir = '') {
-    return api.restore(files, sourcePath, all, dir);
+  /** 恢复：all=true 时按 sourcePath（可用 dir 限定子目录）全量恢复；task 指定任务 */
+  async function handleRestore(files, sourcePath, all = false, dir = '', task = '') {
+    return api.restore(files, sourcePath, all, dir, task);
   }
 
-  /** 恢复树懒加载：展开目录时按需拉取一层 */
-  async function handleLoadTree(source, dir) {
-    return api.restoreTree(source, dir);
+  /** 恢复树懒加载：展开目录时按需拉取一层；task 指定任务 */
+  async function handleLoadTree(source, dir, task = '') {
+    return api.restoreTree(source, dir, task);
   }
 
   /** 清理快照中云端已不存在的文件记录；完成后刷新概况 */
-  async function handlePruneMissing(sourcePath) {
-    const r = await api.pruneMissing(sourcePath);
+  async function handlePruneMissing(sourcePath, task = '') {
+    const r = await api.pruneMissing(sourcePath, task);
     if (!r || !r.error) await loadRestoreFiles();
     return r;
   }
@@ -749,6 +796,15 @@
               onSetupCheck={handleSetupCheck}
               onGoto={go}
             />
+          {:else if currentPage === 'tasks'}
+            <TasksPage
+              {tasks}
+              {targetOptions}
+              {busy}
+              onChanged={handleTasksChanged}
+            />
+          {:else if currentPage === 'targets'}
+            <TargetsPage {targets} {busy} onChanged={handleTasksChanged} />
           {:else if currentPage === 'backup'}
             <BackupPage
               bind:backupPaths
