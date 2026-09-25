@@ -48,6 +48,9 @@
   let tasks = [];
   let targets = []; // 目标详情（/api/targets）
   let targetOptions = []; // 目标精简项（/api/tasks 附带，供任务表单下拉）
+  // 外置插件（动态库，ADR-013 方案 B）
+  let pluginsEnabledCfg = false;
+  let pluginsDirCfg = '';
 
   // 备份 / 恢复
   let busy = false;
@@ -137,6 +140,8 @@
       // 时间展示统一按宿主（NAS）时区，而不是浏览器时区
       setHostTimezone(d.host_utc_offset_minutes);
       scheduleTimezone = d.schedule_timezone || '';
+      pluginsEnabledCfg = !!d.plugins_enabled;
+      pluginsDirCfg = d.plugins_dir || '';
       backupPaths = d.backup_paths || [];
       targetFolder = d.target_folder || 'fn-backup';
       scheduleCron = d.schedule_cron || '';
@@ -392,6 +397,30 @@
       return d;
     } catch (e) {
       return { success: false, configured: kzwrConfigured, error: e.message };
+    } finally {
+      busy = false;
+    }
+  }
+
+  /** 保存外置插件开关与目录（重启应用后生效） */
+  async function handleSavePlugins(enabled, dir) {
+    busy = true;
+    error = null;
+    try {
+      const d = await api.saveConfig({
+        plugins_enabled: !!enabled,
+        plugins_dir: dir || '',
+      });
+      if (d.error) {
+        error = d.error;
+        return { error: d.error };
+      }
+      pluginsEnabledCfg = !!d.plugins_enabled;
+      pluginsDirCfg = d.plugins_dir || '';
+      return {};
+    } catch (e) {
+      error = e.message;
+      return { error: e.message };
     } finally {
       busy = false;
     }
@@ -837,6 +866,9 @@
             <SettingsPage
               {plugins}
               onPluginDone={handlePluginDone}
+              pluginsEnabled={pluginsEnabledCfg}
+              pluginsDir={pluginsDirCfg}
+              onSavePlugins={handleSavePlugins}
               {webdavConfigured}
               {webdavUrl}
               {webdavUsername}

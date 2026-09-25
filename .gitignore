@@ -13,6 +13,8 @@ session.json
 # 仅忽略根目录 backend/target/ 编译产物；src/infra/target/ 是源码目录，不忽略
 backend/target/
 backend/.cargo/config.toml
+# 外置插件（plugins/<name>）的编译产物；其 Cargo.lock 需提交（保证与宿主依赖一致）
+plugins/*/target/
 
 # ── 前端 ─────────────────────────────────────
 frontend/node_modules/

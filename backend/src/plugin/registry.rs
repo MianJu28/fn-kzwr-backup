@@ -3,6 +3,8 @@
 //! 替代原先硬编码的 `main.rs::build_target()` 与 `routes.rs` 里写死的 `/kzwr/*` 路由。
 //! 核心只问注册表要"当前目标"与"已启用的增强插件"。
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::infra::config::{AppConfig, ConfigManager};
@@ -10,19 +12,63 @@ use crate::infra::storage_trait::{TargetStorage, UnconfiguredTarget};
 
 use super::api::{EnhancePlugin, PluginEntry, TargetPlugin};
 use super::builtin;
+use super::loader::ExternalPluginReport;
 
 pub struct PluginRegistry {
     targets: Vec<Arc<dyn TargetPlugin>>,
     enhances: Vec<Arc<dyn EnhancePlugin>>,
+    /// 外置动态库句柄：**必须保活到进程结束**（Drop 会让已注册的 vtable 悬空）
+    external_libs: Vec<libloading::Library>,
+    /// 外置插件加载报告（供 `/api/plugins` 诊断）
+    external_reports: Vec<ExternalPluginReport>,
+    /// 外置插件 id → 动态库路径（标注来源）
+    external_paths: HashMap<String, String>,
+    /// 扫描过的插件目录（(路径, 来源说明)）
+    plugin_dirs: Vec<(String, String)>,
 }
 
 impl PluginRegistry {
-    /// 载入内置插件（编译期固定；后续改外置加载只需替换这里）
+    /// 载入内置插件（编译期固定）
     pub fn builtin() -> Self {
         Self {
             targets: vec![Arc::new(builtin::webdav::WebdavPlugin)],
             enhances: vec![Arc::new(builtin::kzwr::KzwrPlugin)],
+            external_libs: Vec::new(),
+            external_reports: Vec::new(),
+            external_paths: HashMap::new(),
+            plugin_dirs: Vec::new(),
         }
+    }
+
+    /// 加载外置插件（ADR-013 方案 B：动态库）
+    ///
+    /// 失败只记录诊断，不影响内置能力与其它插件。
+    pub fn load_external(&mut self, dirs: &[(PathBuf, String)]) {
+        self.plugin_dirs = dirs
+            .iter()
+            .map(|(p, s)| (p.to_string_lossy().into_owned(), s.clone()))
+            .collect();
+        let dirs_only: Vec<PathBuf> = dirs.iter().map(|(p, _)| p.clone()).collect();
+        let outcome = super::loader::load_external(&dirs_only);
+        self.targets.extend(outcome.targets);
+        self.enhances.extend(outcome.enhances);
+        self.external_libs.extend(outcome.libs);
+        for r in &outcome.reports {
+            if let (Some(id), true) = (r.id.clone(), r.loaded) {
+                self.external_paths.insert(id, r.path.clone());
+            }
+        }
+        self.external_reports = outcome.reports;
+    }
+
+    /// 外置插件加载报告（诊断）
+    pub fn external_reports(&self) -> &[ExternalPluginReport] {
+        &self.external_reports
+    }
+
+    /// 扫描过的插件目录（(路径, 来源说明)）
+    pub fn plugin_dirs(&self) -> &[(String, String)] {
+        &self.plugin_dirs
     }
 
     /// 按插件 id（目标配置里的 `kind`）取目标插件
@@ -43,8 +89,11 @@ impl PluginRegistry {
         let mut out = Vec::new();
         for p in &self.targets {
             let meta = p.meta();
+            let path = self.external_paths.get(&meta.id).cloned();
             out.push(PluginEntry {
                 api_base: format!("/api/p/{}", meta.id),
+                source: if path.is_some() { "external" } else { "builtin" }.to_string(),
+                path,
                 meta,
                 available: true,
                 ui: p.ui(),
@@ -52,8 +101,11 @@ impl PluginRegistry {
         }
         for p in &self.enhances {
             let meta = p.meta();
+            let path = self.external_paths.get(&meta.id).cloned();
             out.push(PluginEntry {
                 api_base: format!("/api/p/{}", meta.id),
+                source: if path.is_some() { "external" } else { "builtin" }.to_string(),
+                path,
                 available: p.available(cfg),
                 ui: p.ui(),
                 meta,
