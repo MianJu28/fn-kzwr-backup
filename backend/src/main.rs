@@ -142,11 +142,13 @@ async fn main() -> anyhow::Result<()> {
     let scheduler_state = state.clone();
     fnos_backup::domain::scheduler::spawn_scheduler(scheduler_state, 60);
 
-    // 启动时校验 kzwr access-token（已配置时；失效则生成告警提醒用户重新获取）
+    // 启动自检：依次询问各增强插件（如 kzwr 插件校验 access-token，失效则告警）
     {
         let check_state = state.clone();
         tokio::spawn(async move {
-            http::routes::check_kzwr_token(&check_state).await;
+            for p in check_state.plugins.enhance_plugins() {
+                p.on_startup(&check_state).await;
+            }
         });
     }
 
@@ -160,7 +162,9 @@ async fn main() -> anyhow::Result<()> {
                 tokio::time::interval(std::time::Duration::from_secs(30 * 60));
             loop {
                 ticker.tick().await;
-                http::routes::check_kzwr_quota(&quota_state).await;
+                for p in quota_state.plugins.enhance_plugins() {
+                    p.patrol(&quota_state).await;
+                }
             }
         });
     }

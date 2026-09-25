@@ -430,7 +430,11 @@ trait TargetStorage {
 - 首期（方案 D）**编译期装配**：插件随应用一同编译；外置加载（子进程 JSON-RPC / 动态库 / WASM）留作后续，届时只需替换 `PluginRegistry::builtin()` 的来源，trait 与核心不动
 
 **实施顺序**：
-- P1 抽 `plugin-api`；P2 `webdav` 插件化（`build_target` 与保存后的热切换都走注册表）；P3 `kzwr` 增强插件化（路由迁 `/api/p/kzwr/*`）；P4 前端 Section 注册表 + UI Schema；P5 外置加载；P6 文档收尾
+- ✅ P1 抽 `plugin-api`（trait/meta/事件/自检项）
+- ✅ P2 `webdav` 插件化：`main.rs::build_target` 删除，装配与「保存凭据后的热切换」都走注册表；新增 `GET /api/plugins`
+- ✅ P3 `kzwr` 增强插件化：实现（DTO/回收站辅助/3 个 handler/一致性检查/巡检）整体迁入 `plugin/builtin/kzwr.rs`，路由挂 `/api/p/kzwr/*`（旧 `/api/kzwr/*` 下线）；核心通过 trait 钩子调用：`routes()`（插件路由）、`on_startup()`（启动自检）、`patrol()`（周期巡检 + 备份后）、`after_backup()`（清空回收站）、`health_check()`（一键体检项）、`reload()`（配置变更后刷新状态）；`raise_alert/raise_alert_once/human_bytes/webdav_username` 对插件开放为 `pub(crate)`
+- ⏳ P4 前端 Section 注册表 + UI Schema（`/api/plugins` 驱动）；P5 外置加载；P6 文档收尾
+- 遗留（P3b）：`AppState.kzwr` 这个客户端实例仍由核心持有（插件驱动它），后续可移入插件自身
 
 **后果**：
 - (+) 新增远程目标/增强能力不改核心；增强插件禁用后核心仍可正常备份

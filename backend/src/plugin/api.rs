@@ -59,6 +59,18 @@ pub struct EnhanceCaps {
     pub notify: bool,
 }
 
+/// 插件自检项（供「一键体检」汇总；由核心映射成 UI 的检查项）
+#[derive(Debug, Clone, Serialize)]
+pub struct CheckOutcome {
+    /// 检查项标识（默认用插件 id；同一插件可返回多项）
+    pub key: String,
+    pub title: String,
+    /// `ok` | `warn` | `fail`
+    pub status: String,
+    pub detail: String,
+    pub hint: Option<String>,
+}
+
 /// 增强插件：非备份通道的可选能力
 #[async_trait]
 pub trait EnhancePlugin: Send + Sync {
@@ -66,4 +78,32 @@ pub trait EnhancePlugin: Send + Sync {
     fn caps(&self) -> EnhanceCaps;
     /// 是否已可用（如 access-token 已配置）；未就绪时 UI 隐藏相关区块
     fn available(&self, cfg: &AppConfig) -> bool;
+
+    /// 插件自带的 HTTP 子路由；核心统一挂在 `/api/p/<插件id>` 下（默认空）
+    fn routes(&self) -> axum::Router<crate::AppState> {
+        axum::Router::new()
+    }
+
+    /// 启动自检（如 access-token 校验）；失败只告警，不影响启动
+    async fn on_startup(&self, _state: &crate::AppState) {}
+
+    /// 周期性巡检（如空间预警）；由后台定时任务驱动，默认 30 分钟一次
+    async fn patrol(&self, _state: &crate::AppState) {}
+
+    /// 备份成功后的可选动作（如按保留策略清空云端回收站），返回处理计数
+    async fn after_backup(&self, _state: &crate::AppState) -> Option<u64> {
+        None
+    }
+
+    /// 配置变更后重载插件自身状态（如配置导入/保存后刷新 token）；默认无操作
+    async fn reload(&self, _state: &crate::AppState) {}
+
+    /// 「一键体检」自检项（默认不参与）
+    async fn health_check(
+        &self,
+        _state: &crate::AppState,
+        _cfg: &AppConfig,
+    ) -> Vec<CheckOutcome> {
+        Vec::new()
+    }
 }
