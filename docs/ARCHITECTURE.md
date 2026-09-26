@@ -597,7 +597,7 @@ fn-kzwr-backup/
 | **Phase 2 · 增量加密** | mtime 差分 · age 加密 · 流式管道 · 64MB 分块 · SQLite 元数据 | ✅ 完成 | 私钥管理（已用密钥库解决）· 大文件内存 | 完全可逆 |
 | **Phase 3 · 恢复能力** | 选择性恢复 · 恢复向导 UI · 完整性校验 · BLAKE3 严格模式 | ✅ 完成 | 索引膨胀（结合保留策略缓解） | 部分可逆（元数据格式定型需迁移） |
 | **Phase 4 · 生产强化** | 多目标支持 · 保留策略 · 断点续传 · 监控告警 · fnos 服务化 | ✅ 保留策略 / 断点续传 / WebSocket 监控 / `.fpk` 打包 / 监控告警 / 飞牛设备实测均已完成；**多目标支持已于 v0.4.0 落地（ADR-014，含多任务）** | 并发控制 · 资源争用 | 部分可逆 |
-| **Phase 5 · 演进扩展** | 异地恢复 · 密钥轮换 · 插件化 · 可选分布式 | 🔶 插件化进行中（P1–P4 已落地，ADR-013；外置加载 P5 待做）· 其余规划中 | 跨节点一致性 | 视需求启用 |
+| **Phase 5 · 演进扩展** | 异地恢复 · 密钥轮换 · 插件化 · 可选分布式 | 🔶 插件化进行中（ADR-013：P1–P5 外置加载、**目标能力表**、**内置 webdav ABI 化**、**并发回传**均已落地；剩余：插件签名校验、自管数据、kzwr 增强 ABI 化）· 其余规划中 | 跨节点一致性 | 视需求启用 |
 
 **可逆性原则**：Phase 1-2 纯增量能力叠加，决策完全可逆；Phase 3-4 元数据格式定型后部分可逆（需写迁移脚本）；Phase 5 视实际需求启用，避免过早优化。
 
@@ -745,7 +745,10 @@ fn-kzwr-backup/
 | **插件** | 内置插件（编译期） | ✅ | ADR-013 P1–P4：`TargetPlugin`/`EnhancePlugin` 契约 + 注册表装配 + `/api/plugins` 驱动前端区块（`webdav` 目标插件、`kzwr` 增强插件） |
 | | 外置插件（动态库） | ✅ | ADR-013 **方案 B（P5）**：`*.so` + `libloading`；目录 `FN_KZWR_PLUGIN_DIR` > 配置 `plugins.dir` > `$TRIM_PKGETC/plugins` > `$TRIM_APPDEST/plugins`；**默认关闭**（设置页开关，重启生效）；失败只进诊断不影响核心；工具链 `Scripts/build_plugins.sh` |
 | | 稳定 C ABI（免重编） | ✅ | 唯一入口 `fn_kzwr_plugin_abi_v1` + `repr(C)` 函数表 + JSON 数据交换（`plugin/abi.rs` ↔ `plugins/sdk`，插件零第三方依赖）；`abi`+`size` 双校验；**宿主升级不需要重编插件**；契约见 `docs/PLUGIN_ABI.md`；示例 `plugins/example-hello/` |
-| | Rust 直连（进阶） | ✅ | 传 Rust trait 对象，能力最全（可写自定义备份目标）；Rust 无稳定 ABI → 强制「编译期宿主版本 == 运行版本」；示例 `plugins/example-rdirect/` |
+| | ~~Rust 直连（进阶）~~ | ❌ | **已移除（2026-09-26，ADR-013 决策 1）**：Rust 无稳定 ABI、升级必重编，维护两条路径收益为负。删除面：`plugin/sdk.rs`、`plugins/example-rdirect/`、`export_plugin!`、`FN_KZWR_PLUGINS_ALLOW_MISMATCH`。原「只有它能写自定义目标」的限制已由下方**目标能力表**解除 |
+| | 目标能力表（自定义备份目标） | ✅ | `KzwrTargetAbi`（独立符号 `fn_kzwr_plugin_target_v1`）+ `AbiTargetStorage` 适配器；**推块模式**（宿主加密后喂密文，插件不碰明文与密钥）；字节复查 + 看门狗；契约见 `docs/PLUGIN_ABI.md` §9 |
+| | 内置 webdav 目标 ABI 化 | ✅ | **方案 C（2026-09-26）**：内置插件同样提供静态 `KzwrTargetAbi` 表（`builtin/webdav_abi.rs`），由 `WebdavAbiPlugin`（组合 `CApiTarget`）注册；与外部 `.so` 走同一份契约。传输 = 临时文件累积密文 → `write_end` 一次性喂 `WebdavTarget`；NAS 端到端实测备份/恢复均逐字节一致 |
+| | 并发回传（计划式） | ✅ | `plan_begin`/`plan_next`/`plan_end`：目标**自己决定**分批与节奏，宿主按批并发推送。**每插件独立**——能力由插件 `supports_plan()` 声明，开关/并发度按插件 id 存 `plugins.target_parallel`（缺省沿用声明，0/1 关闭，≥2 启用，上限 8）；`POST /api/plugins/:id/parallel`，保存后热重建无需重启；前端控件在各插件自己的卡片 |
 
 ### 11.3 当前实际 Rust 源码结构
 
@@ -852,7 +855,8 @@ frontend/src/
 7. **aarch64 设备实测**：CI 已产出双架构包，需在 aarch64 飞牛设备上验证二进制可用性
 8. **0.4.0 打包与真机回归**：多任务/多目标代码已通过 NAS 端到端测试（rclone 双 WebDAV 目标），但**尚未打包 `.fpk` 装机**；打包后需在真机验证「旧配置自动迁移 + 旧快照继续增量」这一升级路径（NAS 测试用的是构造的 legacy 配置）
 9. ✅ **插件外置加载（ADR-013 P5，方案 B：动态库）**：已落地并通过 NAS 实测（ABI/版本双校验、失败隔离、默认关闭、设置页开关与诊断）
-9b. **插件生态完善（可选）**：插件签名/sha256 白名单、插件市场或一键安装、热加载（当前需重启）、`PluginUi` 增加更多块类型（表格/分组/条件显隐）、稳定 C ABI 增加**定时巡检/通知外发/自定义备份目标**回调（当前 v1 仅增强类：UI/动作/体检/事件）
+9a. ✅ **目标能力表 + 内置 webdav ABI 化 + 并发回传（2026-09-26）**：`KzwrTargetAbi`（推块，插件只碰密文）与 `AbiTargetStorage` 适配器；内置 webdav 改为静态 ABI 表（方案 C），与外部插件同契约；`plan_*` 并发回传按插件独立开关。NAS 端到端实测：备份/恢复逐字节一致、并发开关即时生效、0 panic
+9b. **插件生态完善（可选）**：插件签名/sha256 白名单、插件市场或一键安装、热加载（当前需重启）、`PluginUi` 增加更多块类型（表格/分组/条件显隐）、**插件自管数据**（`plugin_data` + `config_get/set` + 卸载清除）、**kzwr 增强插件 ABI 化**（ADR-013 决策 1 的剩余最大改造面，见 `docs/PLUGIN_PLAN.md` §5.2）
 10. **兼容层收尾**：待旧前端下线后，可移除「首个任务/主目标」兼容分支与 `[backup]`/`[webdav]` 镜像字段（另一大版本）
 
 ### 11.6 飞牛应用打包实现（基于抓取到的飞牛开发文档）
