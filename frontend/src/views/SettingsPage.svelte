@@ -19,8 +19,9 @@
   // 外置插件加载（动态库，ADR-013 方案 B）
   export let pluginsEnabled = false;
   export let pluginsDir = '';
-  export let pluginsParallel = 0; // 上传并发路数（0/1 = 顺序；≥2 = 并发回传）
-  export let onSavePlugins = null; // (enabled, dir, parallel) => Promise<{error?}>
+  export let onSavePlugins = null; // (enabled, dir) => Promise<{error?}>
+  /** 设置某个目标插件的上传并发路数：(pluginId, n) => Promise<{error?}> */
+  export let onSavePluginParallel = null;
 
   /** 插件清单（来自 /api/plugins） */
   export let plugins = [];
@@ -81,6 +82,9 @@
       configuredUrl={webdavUrl}
       configuredUsername={webdavUsername}
       warning={webdavWarning}
+      supportsPlan={!!p.supports_plan}
+      parallel={p.parallel ?? 0}
+      onSaveParallel={(n) => onSavePluginParallel && onSavePluginParallel(p.id, n)}
       {busy}
       onSave={onSaveWebdav}
     />
@@ -101,13 +105,7 @@
 {/each}
 
 <!-- ── 核心区（不属于插件）────────────────────────────────────── -->
-<PluginSection
-  enabled={pluginsEnabled}
-  dir={pluginsDir}
-  uploadParallel={pluginsParallel}
-  {busy}
-  onSave={onSavePlugins}
-/>
+<PluginSection enabled={pluginsEnabled} dir={pluginsDir} {busy} onSave={onSavePlugins} />
 <RetentionSection {retention} kzwrReady={kzwrConfigured} {busy} onSave={onSaveRetention} />
 
 <KeySection

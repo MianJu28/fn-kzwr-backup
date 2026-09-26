@@ -484,9 +484,6 @@ extern "C" fn last_error_json(th: *mut c_void) -> *mut c_char {
 /// 每批发放的文件数（取并发度的数倍，让并发流水线始终有活可干）
 const PLAN_BATCH: usize = 12;
 
-/// 并发回传的并发度上限（防止误设超大值把目标端压垮）
-const MAX_PARALLEL: u32 = 8;
-
 /// `plan_begin` 发放的计划句柄：持有待传清单与游标
 struct DavPlan {
     /// 待传文件的**目标端**相对路径（由宿主在 `job_json` 里给出）
@@ -604,10 +601,16 @@ impl WebdavAbiPlugin {
             component: Some("webdav".to_string()),
             blocks: Vec::new(),
         });
-        // 并发回传**默认关闭**（保守优先）。实际并发度在 `build()` 里按用户配置的
-        // `plugins.upload_parallel` 覆盖 —— 插件实例在启动时装配，那时配置尚未加载。
+        // 内置 WebDAV **具备**并发回传能力（已实现 plan_* 三个回调），但**默认不启用**：
+        // `max_parallel = 0` 表示顺序上传；用户在本插件卡片里配置 ≥2 才会开启。
+        // 是否开启由宿主按「插件 id → 并发度」配置在 build 时决定（见 CApiTarget::caps_for）。
+        let caps = AbiTargetCaps {
+            supports_plan: true,
+            max_parallel: 0,
+            preferred_chunk_kib: 1024,
+        };
         Self {
-            inner: CApiTarget::from_static(abi, meta, AbiTargetCaps::default(), ui),
+            inner: CApiTarget::from_static(abi, meta, caps, ui),
         }
     }
 }
@@ -622,6 +625,10 @@ impl TargetPlugin for WebdavAbiPlugin {
         self.inner.ui()
     }
 
+    fn supports_plan(&self) -> bool {
+        self.inner.supports_plan()
+    }
+
     fn build(
         &self,
         target: &TargetConfig,
@@ -630,14 +637,7 @@ impl TargetPlugin for WebdavAbiPlugin {
         if !target.enabled || target.kind != "webdav" {
             return None;
         }
-        // 并发度取自用户配置 `plugins.upload_parallel`（默认 0 = 顺序上传）
-        let parallel = mgr.load().ok().map(|c| c.plugins.upload_parallel).unwrap_or(0);
-        if parallel >= 2 {
-            let mut caps = self.inner.caps();
-            caps.supports_plan = true;
-            caps.max_parallel = parallel.min(MAX_PARALLEL);
-            return self.inner.with_caps(caps).build(target, mgr);
-        }
+        // 并发度由宿主按「插件 id → 并发度」配置在 inner.build 内处理（每插件独立）
         self.inner.build(target, mgr)
     }
 

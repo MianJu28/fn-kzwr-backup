@@ -55,6 +55,15 @@ pub trait TargetPlugin: Send + Sync {
     fn ui(&self) -> Option<PluginUi> {
         None
     }
+
+    /// 是否支持**并发回传**（计划式上传）
+    ///
+    /// 这是插件**自身的能力声明**（与是否启用无关）：宿主据此决定是否在插件卡片里
+    /// 给出「上传并发路数」设置；真正是否启用由该插件**自己的**并发度配置决定
+    /// （缺省沿用插件声明，0/1 = 关闭，≥2 = 启用）。
+    fn supports_plan(&self) -> bool {
+        false
+    }
 }
 
 /// 增强插件提供的能力（前端据此决定是否渲染对应区块）
@@ -167,6 +176,14 @@ pub struct PluginEntry {
     /// 外置插件的动态库路径（内置为空）
     #[serde(default)]
     pub path: Option<String>,
+    /// 是否支持并发回传（计划式上传；**插件自身能力声明**，非开关）
+    #[serde(default)]
+    pub supports_plan: bool,
+    /// 该插件的上传并发路数（**用户配置，每插件独立**）
+    ///
+    /// `None` = 未配置（沿用插件声明）；`Some(0|1)` = 关闭并发；`Some(≥2)` = 启用并发。
+    #[serde(default)]
+    pub parallel: Option<u32>,
 }
 
 /// 插件自检项（供「一键体检」汇总；由核心映射成 UI 的检查项）

@@ -111,6 +111,9 @@ impl PluginRegistry {
         for p in &self.targets {
             let meta = p.meta();
             let path = self.external_paths.get(&meta.id).cloned();
+            // 并发回传：能力由插件声明，并发度由用户**按插件**配置（缺省沿用声明）
+            let supports_plan = p.supports_plan();
+            let parallel = cfg.plugins.target_parallel.get(&meta.id).copied();
             out.push(PluginEntry {
                 api_base: format!("/api/p/{}", meta.id),
                 source: if path.is_some() { "external" } else { "builtin" }.to_string(),
@@ -118,6 +121,8 @@ impl PluginRegistry {
                 meta,
                 available: true,
                 ui: p.ui(),
+                supports_plan,
+                parallel,
             });
         }
         for p in &self.enhances {
@@ -130,6 +135,8 @@ impl PluginRegistry {
                 available: p.available(cfg),
                 ui: p.ui(),
                 meta,
+                supports_plan: false,
+                parallel: None,
             });
         }
         out

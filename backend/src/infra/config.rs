@@ -81,13 +81,14 @@ pub struct PluginSettings {
     /// 否则拒绝加载（记入 `/api/plugins` 诊断）。留空 = 跳过签名校验（仅信任目录已受控）。
     #[serde(default)]
     pub pubkeys: Vec<String>,
-    /// 目标上传并发路数（并发回传；**默认 0 = 顺序上传**）
+    /// **每个目标插件**各自的上传并发路数（插件 id → 路数）
     ///
-    /// 仅对声明支持 `supports_plan` 的目标插件生效（内置 WebDAV 支持）。
-    /// 0 或 1 = 顺序上传；≥2 = 启用并发回传，该值即并发路数（宿主上限 8）。
-    /// 并发会同时占用多条连接，对 NAS 上行与目标服务端压力更大，故默认保守。
+    /// 并发回传是插件各自的能力，故按插件 id 分别配置：
+    /// 缺省（该 id 不在表中）= 沿用插件自身声明；`0` 或 `1` = 关闭并发回传（顺序上传）；
+    /// `≥2` = 启用并发回传，该值即并发路数（宿主上限 8）。
+    /// 并发会同时占用多条连接，对 NAS 上行与目标服务端压力更大，故内置插件默认不并发。
     #[serde(default)]
-    pub upload_parallel: u32,
+    pub target_parallel: std::collections::BTreeMap<String, u32>,
 }
 
 impl Default for PluginSettings {
@@ -96,7 +97,7 @@ impl Default for PluginSettings {
             enabled: false,
             dir: None,
             pubkeys: Vec::new(),
-            upload_parallel: 0,
+            target_parallel: std::collections::BTreeMap::new(),
         }
     }
 }

@@ -10,12 +10,41 @@
   /** 保存后的提醒（如与 access-token 所属账号不一致） */
   export let warning = '';
   export let onSave = null; // (username, password) => Promise<string>
+  /** 该插件是否支持并发回传（由插件自身能力声明；不支持则不显示并发设置） */
+  export let supportsPlan = false;
+  /** 本插件的上传并发路数（null = 未配置，按 0 处理） */
+  export let parallel = 0;
+  export let onSaveParallel = null; // (n) => Promise<{error?}>
 
   let username = '';
   let password = '';
   let saveMsg = '';
   let saveOk = false;
   let showPassword = false;
+
+  // 并发路数：仅在后端回显值变化时回填，避免覆盖用户输入
+  let formParallel = parallel ?? 0;
+  let parSaving = false;
+  let parMsg = '';
+  let parOk = false;
+  let lastPar = null;
+  function syncParallel(p) {
+    if (p === lastPar) return;
+    lastPar = p;
+    formParallel = p ?? 0;
+  }
+  $: syncParallel(parallel);
+
+  async function saveParallel() {
+    if (!onSaveParallel) return;
+    parSaving = true;
+    parMsg = '';
+    const n = Math.max(0, Math.min(8, Math.floor(Number(formParallel) || 0)));
+    const r = await onSaveParallel(n);
+    parSaving = false;
+    parOk = !r?.error;
+    parMsg = r?.error || `已保存（并发 ${n}），下次备份生效`;
+  }
 
   const DEFAULT_URL = 'https://dav.kzwr.com/dav';
 
@@ -93,6 +122,34 @@
         {/if}
       </label>
     </div>
+
+    {#if supportsPlan}
+      <div class="field par-field">
+        <label for="wd-par">上传并发路数（本插件独立）</label>
+        <div class="field-row">
+          <input
+            id="wd-par"
+            class="input"
+            type="number"
+            min="0"
+            max="8"
+            value={formParallel}
+            on:input={(e) => (formParallel = e.target.value)}
+            disabled={busy}
+          />
+          <button class="btn" on:click={saveParallel} disabled={busy || parSaving}>
+            {parSaving ? '保存中…' : '保存'}
+          </button>
+        </div>
+        <span class="field-hint">
+          0 或 1 = 顺序上传（默认）；≥2 = 并发回传，可缩短大量小文件的备份耗时，但会占用更多连接与带宽。
+          保存后下次备份生效，无需重启。
+        </span>
+        {#if parMsg}
+          <span class={parOk ? 'field-hint' : 'field-error'}>{parMsg}</span>
+        {/if}
+      </div>
+    {/if}
 
     <details class="guide" open={!configured}>
       <summary>如何创建应用密码？（推荐：永不过期 + 读写权限）</summary>
