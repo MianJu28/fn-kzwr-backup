@@ -85,8 +85,6 @@ pub struct ConfigResponse {
     pub plugins_enabled: bool,
     /// 自定义插件目录（空 = 用默认目录）
     pub plugins_dir: String,
-    /// 目标上传并发路数（0/1 = 顺序上传；≥2 = 启用并发回传）
-    pub plugins_upload_parallel: u32,
     /// 告警 Webhook 地址（空 = 不外发）
     pub webhook_url: Option<String>,
     /// Webhook 自定义请求头
@@ -231,9 +229,6 @@ pub struct ConfigSaveRequest {
     /// 自定义插件目录（`:` 分隔多个；空串 = 用默认目录）
     #[serde(default)]
     pub plugins_dir: Option<String>,
-    /// 目标上传并发路数（0/1 = 顺序；≥2 = 并发回传，宿主上限 8）
-    #[serde(default)]
-    pub plugins_upload_parallel: Option<u32>,
 }
 
 /// 备份响应
@@ -630,6 +625,53 @@ async fn plugins_list(State(state): State<AppState>) -> Json<serde_json::Value> 
     }))
 }
 
+/// 设置某个目标插件的上传并发路数（并发回传是**每插件**各自的能力与开关）
+#[derive(Deserialize, Default)]
+pub struct PluginParallelRequest {
+    /// 0/1 = 关闭并发回传（顺序上传）；≥2 = 启用，该值即并发路数
+    #[serde(default)]
+    pub parallel: Option<u32>,
+}
+
+/// `POST /api/plugins/:id/parallel`：设置**该插件**的上传并发路数
+///
+/// 并发回传按插件分别配置（`plugins.target_parallel[插件 id]`），只有声明支持
+/// `supports_plan` 的目标插件可设置。保存后目标池热重建，下次备份即生效。
+async fn plugin_parallel(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Option<axum::extract::Json<PluginParallelRequest>>,
+) -> Json<serde_json::Value> {
+    let Some(plugin) = state.plugins.target_plugin(&id) else {
+        return Json(err(format!("未注册目标插件 {id}")));
+    };
+    if !plugin.supports_plan() {
+        return Json(err(format!("插件 {id} 不支持并发回传")));
+    }
+    let v = body
+        .and_then(|b| b.0.parallel)
+        .unwrap_or(0)
+        .min(crate::plugin::target_abi::MAX_PARALLEL);
+    let cfg = {
+        let mgr = state.config.lock().unwrap();
+        let mut cfg = mgr.load().unwrap_or_default();
+        cfg.plugins.target_parallel.insert(id.clone(), v);
+        if let Err(e) = mgr.save(&cfg) {
+            return Json(err(format!("{:#}", e)));
+        }
+        cfg
+    };
+    // 目标实例按新并发度重建：无需重启
+    state.reload_targets(&cfg);
+    state.audit.record(
+        "plugin.parallel",
+        format!("设置插件 {id} 上传并发路数 {v}"),
+        true,
+        None,
+    );
+    Json(serde_json::json!({ "success": true, "parallel": v, "error": null }))
+}
+
 /// `POST /api/plugins/:id/purge`：卸载清除插件自管数据（ADR-013 决策 2）
 ///
 /// 流程：引用检查（仍被目标 `kind` 或任务所引目标的 `kind` 引用 → 拒绝，并列出引用项）
@@ -949,7 +991,6 @@ fn config_response(
         debug: cfg.debug,
         plugins_enabled: cfg.plugins.enabled,
         plugins_dir: cfg.plugins.dir.clone().unwrap_or_default(),
-        plugins_upload_parallel: cfg.plugins.upload_parallel,
         error,
     }
 }
@@ -983,7 +1024,6 @@ async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
             host_utc_offset_minutes: crate::domain::scheduler::utc_offset_minutes(),
             plugins_enabled: false,
             plugins_dir: String::new(),
-            plugins_upload_parallel: 0,
             webhook_url: None,
             webhook_headers: Vec::new(),
             webhook_body: None,
@@ -1080,9 +1120,6 @@ async fn config_save(
     if let Some(v) = body.plugins_dir {
         let v = v.trim().to_string();
         cfg.plugins.dir = if v.is_empty() { None } else { Some(v) };
-    }
-    if let Some(v) = body.plugins_upload_parallel {
-        cfg.plugins.upload_parallel = v.min(8);
     }
     match cfg_guard.save(&cfg) {
         Ok(_) => {
@@ -3560,6 +3597,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/plugins", get(plugins_list))
         .route("/plugins/:id/purge", post(plugin_purge))
+        .route("/plugins/:id/parallel", post(plugin_parallel))
         .route("/ws", get(ws::ws_handler))
         .route("/webdav/config", post(webdav_save))
         .route("/user/info", get(user_info))

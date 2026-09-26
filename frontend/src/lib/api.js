@@ -103,6 +103,8 @@ export const api = {
   /** 通用插件调用：base 为插件 api_base（如 /api/p/kzwr），path 为插件内路径 */
   pluginGet: (base, path) => get(`${base}${path}`),
   pluginPost: (base, path, body) => post(`${base}${path}`, body || {}),
+  /** 设置某个目标插件的上传并发路数（并发回传，每插件独立） */
+  pluginParallel: (id, parallel) => post(`/api/plugins/${id}/parallel`, { parallel }),
 
   // kzwr 增强插件（非备份通道，可选，需 access-token）
   /** 账号信息（存储空间/套餐；未配置 token 时返回 configured:false + 指引） */

@@ -67,6 +67,9 @@ fn plugin_detail(abi: &'static KzwrTargetAbi, th: *mut c_void, fallback: String)
         .unwrap_or(fallback)
 }
 
+/// 并发回传的并发度上限（防止误设超大值把目标端压垮）
+pub const MAX_PARALLEL: u32 = 8;
+
 /// 目标插件：包装 `export_target_v1` 导出的静态表
 pub struct CApiTarget {
     meta: PluginMeta,
@@ -85,17 +88,33 @@ impl CApiTarget {
         Self { meta, abi, caps, ui }
     }
 
-    /// 当前能力声明（供调用方按用户配置派生副本）
-    pub fn caps(&self) -> AbiTargetCaps {
-        self.caps.clone()
+    /// 是否支持并发回传：插件声明支持，且确实实现了 `plan_begin` / `plan_next`
+    pub fn supports_plan(&self) -> bool {
+        self.caps.supports_plan
+            && self.abi.plan_begin.is_some()
+            && self.abi.plan_next.is_some()
     }
 
-    /// 派生一份**覆盖能力声明**的副本
+    /// 按**本插件**的用户配置覆盖并发回传能力
     ///
-    /// 用于按用户配置（如「上传并发路数」）启用/关闭并发回传：插件实例在启动时装配，
-    /// 那时配置还不可读，故由 `build()` 每次按最新配置派生。
-    pub fn with_caps(&self, caps: AbiTargetCaps) -> Self {
-        Self { meta: self.meta.clone(), abi: self.abi, caps, ui: self.ui.clone() }
+    /// 并发回传是每插件各自的能力与开关（`plugins.target_parallel[插件id]`）：
+    /// - 缺省（未配置）= 沿用插件自身声明；
+    /// - `0` / `1` = 关闭并发回传（顺序上传）；
+    /// - `≥2` = 启用，该值即并发路数（宿主上限 8）。
+    ///
+    /// 在 `build()` 而非构造时读取：插件实例在启动时装配，那时配置尚未加载。
+    fn caps_for(&self, mgr: &ConfigManager) -> AbiTargetCaps {
+        let mut caps = self.caps.clone();
+        if let Some(v) = mgr
+            .load()
+            .ok()
+            .and_then(|c| c.plugins.target_parallel.get(&self.meta.id).copied())
+        {
+            caps.max_parallel = v.min(MAX_PARALLEL);
+            // 插件本身不支持时，即便用户配置了并发度也不启用
+            caps.supports_plan = caps.supports_plan && v >= 2;
+        }
+        caps
     }
 
     /// 校验并从 describe 构造目标插件（由加载器对新发现的目标能力调用）
@@ -183,6 +202,9 @@ impl TargetPlugin for CApiTarget {
     fn ui(&self) -> Option<PluginUi> {
         self.ui.clone()
     }
+    fn supports_plan(&self) -> bool {
+        CApiTarget::supports_plan(self)
+    }
     fn build(&self, target: &TargetConfig, mgr: &ConfigManager) -> Option<(Arc<dyn TargetStorage>, String)> {
         // 解密在调用方/mgr 内完成（与内置目标一致）
         let creds = mgr.target_credentials(target).ok().unwrap_or((None, None));
@@ -195,7 +217,7 @@ impl TargetPlugin for CApiTarget {
         }
         let storage = AbiTargetStorage {
             abi: self.abi,
-            caps: self.caps.clone(),
+            caps: self.caps_for(mgr),
             th: th as usize,
             name: self.meta.name.clone(),
             chunk_size: self.chunk_size(),
@@ -517,9 +539,10 @@ impl TargetStorage for AbiTargetStorage {
     }
 
     fn plan_upload(&self) -> Option<&dyn PlanUpload> {
-        // 仅当目标**同时**声明 supports_plan 并实现了 plan_begin/plan_next 才启用：
-        // 并发回传是增益能力，缺任一回调都退回宿主顺序推块（不作为硬依赖）。
+        // 启用并发回传的三要件：插件声明支持、实现了 plan_begin/plan_next、
+        // 且并发度 ≥2（并发度来自本插件的用户配置，见 `CApiTarget::caps_for`）。
         if self.caps.supports_plan
+            && self.caps.max_parallel >= 2
             && self.abi.plan_begin.is_some()
             && self.abi.plan_next.is_some()
         {

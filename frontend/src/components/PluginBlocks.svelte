@@ -20,6 +20,11 @@
 
   let busy = false;
   let values = {};
+  // 上传并发路数（仅当插件声明支持并发回传时显示；每插件独立）
+  let parallelValue = plugin?.parallel ?? 0;
+  let parBusy = false;
+  let parMsg = '';
+  let parOk = false;
   /** action -> 结果文案 */
   let results = {};
   /** action -> 是否成功 */
@@ -51,6 +56,29 @@
   // 注：Svelte 不允许把 `bind:` 绑到 `obj[key]` 这类成员表达式，故手写 input 事件
   function setValue(field, v) {
     values = { ...values, [field]: v };
+  }
+
+  async function saveParallel() {
+    parBusy = true;
+    parMsg = '';
+    try {
+      const n = Math.max(0, Math.min(8, Math.floor(Number(parallelValue) || 0)));
+      const r = await api.pluginParallel(plugin.id, n);
+      if (r && r.error) {
+        parOk = false;
+        parMsg = r.error;
+        toast.error(r.error);
+      } else {
+        parOk = true;
+        parMsg = `已保存（并发 ${r?.parallel ?? n}），下次备份生效`;
+        toast.success('已保存，下次备份生效');
+      }
+    } catch (e) {
+      parOk = false;
+      parMsg = e.message;
+    } finally {
+      parBusy = false;
+    }
   }
 
   async function action(b) {
@@ -175,6 +203,30 @@
         </div>
       {/if}
     {/each}
+
+    {#if plugin?.supports_plan}
+      <div class="field">
+        <label for="pb-par-{plugin?.id}">上传并发路数（本插件独立）</label>
+        <div class="field-row">
+          <input
+            id="pb-par-{plugin?.id}"
+            type="number"
+            min="0"
+            max="8"
+            value={parallelValue}
+            on:input={(e) => (parallelValue = e.target.value)}
+            disabled={parBusy}
+          />
+          <button class="btn" on:click={saveParallel} disabled={parBusy}>保存</button>
+        </div>
+        <p class="field-hint">
+          0 或 1 = 顺序上传；≥2 = 并发回传（该插件声明支持）。保存后下次备份生效，无需重启。
+        </p>
+        {#if parMsg}
+          <p class={parOk ? 'field-hint' : 'field-error'}>{parMsg}</p>
+        {/if}
+      </div>
+    {/if}
 
     {#if blocks.length === 0}
       <p class="card-desc">该插件暂未声明界面（可在插件清单里补充 <code>ui.blocks</code>）。</p>
