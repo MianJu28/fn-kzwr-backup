@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::infra::config::{AppConfig, ConfigManager, TargetConfig};
 use crate::infra::storage_trait::TargetStorage;
@@ -74,48 +74,61 @@ pub struct EnhanceCaps {
 ///
 /// 内置插件可以只填 `component`（前端有手写组件）；外置插件填 `blocks`，
 /// 由前端通用渲染器渲染 —— 这样新增插件**不需要重新打包前端**。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginUi {
     /// 分区：`settings` | `dashboard`
     pub section: String,
     /// 卡片标题
     pub title: String,
     /// 排序（小的在前）
+    #[serde(default)]
     pub order: i32,
     /// 内置组件名（如 `kzwr`）；前端认识时优先用它，不认识则回退到 `blocks`
+    #[serde(default)]
     pub component: Option<String>,
     /// 通用渲染块
+    #[serde(default)]
     pub blocks: Vec<UiBlock>,
 }
 
 /// 通用 UI 块（schema 驱动，外置插件用）
-#[derive(Debug, Clone, Serialize)]
+///
+/// 这份 schema 同时是**稳定 C ABI（[`crate::plugin::abi`]）交换的 JSON 契约**，
+/// 因此可选字段都带 `#[serde(default)]`：老插件少写字段、新宿主多认字段都不会失败。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UiBlock {
     /// 只读指标（如空间用量）
     Metric {
         label: String,
         value: String,
+        #[serde(default)]
         hint: Option<String>,
     },
     /// 文本/密码输入 + 提交按钮
     Text {
         field: String,
         label: String,
+        #[serde(default)]
         value: Option<String>,
+        #[serde(default)]
         placeholder: Option<String>,
         #[serde(default)]
         secret: bool,
         action: String,
+        #[serde(default)]
         button: String,
     },
     /// 数字输入 + 提交按钮
     Number {
         field: String,
         label: String,
+        #[serde(default)]
         value: Option<i64>,
+        #[serde(default)]
         suffix: Option<String>,
         action: String,
+        #[serde(default)]
         button: String,
     },
     /// 按钮（可带二次确认文案）
@@ -124,6 +137,7 @@ pub enum UiBlock {
         action: String,
         #[serde(default)]
         danger: bool,
+        #[serde(default)]
         confirm: Option<String>,
     },
     /// 开关

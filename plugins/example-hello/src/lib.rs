@@ -1,111 +1,135 @@
-//! 酷族备份 · 外置插件示例（动态库，ADR-013 **方案 B**）
+//! 酷族备份 · 外置插件示例 —— **稳定 C ABI（v1）**
 //!
-//! 这个 crate 演示「不重新打包主程序与前端」即可新增一个功能区块：
-//! 1. 编译为 `cdylib`（`cargo build --release` → `libfn_kzwr_plugin_example.so`）
-//! 2. 放进宿主的插件目录（`$TRIM_PKGETC/plugins/`），并在设置页开启「外置插件加载」
-//! 3. 重启应用后：设置页出现下面的卡片（前端用**通用 UI Schema 渲染**），
-//!    卡片里的按钮调用插件自己的路由 `/api/p/example/hello`
+//! 与 `plugins/example-rdirect/`（Rust 直连）的区别：
 //!
-//! 说明：插件与宿主通过 Rust trait 对象交接，**ABI 不稳定**，因此宿主会校验
-//! 「插件编译时的宿主版本」；升级主程序后请重新编译插件（`Scripts/build_plugins.sh`）。
+//! | | 稳定 C ABI（本插件） | Rust 直连 |
+//! |---|---|---|
+//! | 依赖宿主 crate | 不需要（只依赖 `fn-kzwr-plugin-sdk`） | 需要（`fn-kzwr-backup`） |
+//! | 宿主升级后 | **无需重编插件** | 必须重编（Rust ABI 不稳定） |
+//! | 能力 | 增强类：UI 卡片 / 动作接口 / 体检 / 事件 | 全部（含自定义备份目标） |
+//!
+//! 构建：`bash Scripts/build_plugins.sh` → `libfn_kzwr_plugin_example.so`
+//! 安装：放进 `$TRIM_PKGETC/plugins/`，在设置页开启「外置插件加载」后重启应用。
 
-use async_trait::async_trait;
-use axum::routing::post;
-use axum::Router;
-use serde_json::json;
+use std::os::raw::c_char;
 
-use fnos_backup::AppState;
-use fnos_backup::infra::config::AppConfig;
-use fnos_backup::plugin::api::{
-    CheckOutcome, EnhanceCaps, EnhancePlugin, PluginKind, PluginMeta, PluginUi, UiBlock,
-};
-use fnos_backup::plugin::sdk::PluginHandle;
+use fn_kzwr_plugin_sdk as sdk;
+use serde_json::{json, Value};
 
-/// 示例插件：只做三件事 —— 一张设置卡片、一个自检项、一个自己的接口
-struct ExamplePlugin;
-
-#[async_trait]
-impl EnhancePlugin for ExamplePlugin {
-    fn meta(&self) -> PluginMeta {
-        PluginMeta {
-            id: "example".to_string(),
-            name: "示例外置插件".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            kind: PluginKind::Enhance,
-            // 外置插件：必须为 false，前端/诊断据此标注来源
-            builtin: false,
-            description: "通过动态库（.so）加载的示例插件，演示外置扩展能力".to_string(),
-        }
-    }
-
-    fn caps(&self) -> EnhanceCaps {
-        // 不声明任何内置能力：本插件只提供自己的 UI 与接口
-        EnhanceCaps::default()
-    }
-
-    fn available(&self, _cfg: &AppConfig) -> bool {
-        // 本示例没有依赖配置，始终可用
-        true
-    }
-
-    /// 设置页卡片：前端不认识 `component`（这里是 None），会走通用 UI Schema 渲染
-    fn ui(&self) -> Option<PluginUi> {
-        Some(PluginUi {
-            section: "settings".to_string(),
-            title: "示例外置插件".to_string(),
-            // 排在内置卡片（webdav 10 / kzwr 20）之后
-            order: 90,
-            component: None,
-            blocks: vec![
-                UiBlock::Tips {
-                    text: "这张卡片来自外置插件（动态库 .so）：宿主启动时扫描插件目录并加载，\
-                           无需重新打包主程序与前端即可新增功能区块。"
-                        .to_string(),
-                },
-                UiBlock::Metric {
-                    label: "加载方式".to_string(),
-                    value: "动态库（ADR-013 方案 B）".to_string(),
-                    hint: Some("宿主校验 ABI 版本与编译期宿主版本后才注册".to_string()),
-                },
-                UiBlock::Button {
-                    label: "调用插件接口".to_string(),
-                    action: "/hello".to_string(),
-                    danger: false,
-                    confirm: None,
-                },
-            ],
+/// describe_json：元信息 + UI 卡片（`ui.blocks` 用前端已支持的通用 schema）
+extern "C" fn describe() -> *mut c_char {
+    safe(|| {
+        json!({
+            "id": "example",
+            "name": "示例外置插件（稳定 ABI）",
+            "version": env!("CARGO_PKG_VERSION"),
+            "kind": "enhance",
+            "description": "通过稳定 C ABI（.so 动态库）加载的示例插件：宿主升级后无需重新编译",
+            "caps": { "account": false, "quota": false, "recycle_bin": false, "notify": false },
+            "ui": {
+                "section": "settings",
+                "title": "示例外置插件（稳定 ABI）",
+                "order": 90,
+                "component": null,
+                "blocks": [
+                    {
+                        "type": "tips",
+                        "text": "这张卡片来自外置插件，且插件只依赖**稳定 C ABI 契约**：宿主升级后不需要重新编译插件。"
+                    },
+                    {
+                        "type": "metric",
+                        "label": "加载机制",
+                        "value": "稳定 C ABI v1",
+                        "hint": "宿主按 ABI 版本 + 结构体长度校验，不依赖 Rust ABI"
+                    },
+                    {
+                        "type": "button",
+                        "label": "打个招呼",
+                        "action": "/hello",
+                        "danger": false,
+                        "confirm": null
+                    },
+                    {
+                        "type": "button",
+                        "label": "读取配置快照（目标/任务数）",
+                        "action": "/stats",
+                        "danger": false,
+                        "confirm": null
+                    }
+                ]
+            }
         })
-    }
+        .to_string()
+    })
+}
 
-    /// 插件自带的 HTTP 子路由（宿主统一挂在 `/api/p/<插件id>` 下 → `/api/p/example/hello`）
-    fn routes(&self) -> Router<AppState> {
-        Router::new().route(
-            "/hello",
-            post(|| async {
-                axum::Json(json!({
-                    "success": true,
-                    "message": "你好，来自外置插件的问候（动态库加载成功）",
-                }))
-            }),
-        )
-    }
+/// available_json：本示例不依赖配置，始终可用
+extern "C" fn available(_cfg: *const c_char) -> *mut c_char {
+    safe(|| json!({ "available": true, "reason": null }).to_string())
+}
 
-    /// 「一键体检」自检项
-    async fn health_check(&self, _state: &AppState, _cfg: &AppConfig) -> Vec<CheckOutcome> {
-        vec![CheckOutcome {
-            key: "example_plugin".to_string(),
-            title: "示例外置插件".to_string(),
-            status: "ok".to_string(),
-            detail: "动态库已加载，接口 /api/p/example/hello 可用".to_string(),
-            hint: None,
-        }]
+/// action_json：`action` + `request_json`（= `{"body":…,"cfg":…}`）→ 任意 JSON
+extern "C" fn action(action: *const c_char, request: *const c_char) -> *mut c_char {
+    let action = unsafe { sdk::from_c_str(action) };
+    let request: Value = unsafe { sdk::from_c_str(request) }
+        .parse()
+        .unwrap_or(Value::Null);
+    safe(move || match action.as_str() {
+        "hello" => sdk::json::ok_message("你好，来自稳定 C ABI 插件的问候 👋"),
+        "stats" => {
+            let cfg = request.get("cfg").cloned().unwrap_or(Value::Null);
+            let targets = cfg
+                .get("targets")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let tasks = cfg
+                .get("tasks")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let host = cfg
+                .get("host_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            sdk::json::ok_message(&format!(
+                "宿主 {host}：当前 {targets} 个目标、{tasks} 个任务（插件未重编译即可读到）"
+            ))
+        }
+        other => sdk::json::error(&format!("未知动作：{other}")),
+    })
+}
+
+/// health_json：「一键体检」自检项
+extern "C" fn health(_cfg: *const c_char) -> *mut c_char {
+    safe(|| {
+        json!([{
+            "key": "example_abi",
+            "title": "示例外置插件（稳定 ABI）",
+            "status": "ok",
+            "detail": "稳定 C ABI v1 已加载；动作接口 /api/p/example/hello 可用",
+            "hint": null
+        }])
+        .to_string()
+    })
+}
+
+/// event_json（可选）：生命周期事件
+extern "C" fn event(event: *const c_char, _cfg: *const c_char) -> *mut c_char {
+    let event = unsafe { sdk::from_c_str(event) };
+    safe(move || match event.as_str() {
+        "startup" => json!({ "ok": true, "note": "插件已随宿主启动" }).to_string(),
+        other => json!({ "ok": true, "event": other }).to_string(),
+    })
+}
+
+/// 统一的 panic 兜底：插件内 panic 不允许跨越 FFI 边界
+fn safe(f: impl FnOnce() -> String) -> *mut c_char {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(s) => sdk::to_c_string(s),
+        Err(_) => sdk::to_c_string(sdk::json::error("插件内部错误（panic 已拦截）")),
     }
 }
 
-/// 创建插件实例（由 [`fnos_backup::export_plugin!`] 导出的 C ABI 符号调用）
-fn create() -> PluginHandle {
-    PluginHandle::enhance_only(ExamplePlugin)
-}
-
-// 导出三个 C ABI 符号：ABI 版本 / 宿主版本 / 创建实例
-fnos_backup::export_plugin!(create);
+// 导出稳定 C ABI v1 入口（含生命周期事件）
+sdk::export_plugin_v1!(describe, available, action, health, Some(event));

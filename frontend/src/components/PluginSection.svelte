@@ -102,7 +102,9 @@
       </div>
       <p class="field-hint">
         留空时扫描：<code>$TRIM_PKGETC/plugins</code>（用户放置）与
-        <code>$TRIM_APPDEST/plugins</code>（随应用分发）；同名文件以靠前的目录为准
+        <code>$TRIM_APPDEST/plugins</code>（随应用分发）；同名文件以靠前的目录为准。
+        推荐插件使用<strong>稳定 C ABI</strong>（只依赖冻结的 JSON 契约）——升级本应用后
+        <strong>无需重新编译插件</strong>；Rust 直连插件能力更全但需随本应用同版本重编
       </p>
     </div>
 
@@ -143,6 +145,15 @@
                   </span>
                   {#if r.id}<span class="badge badge-info">{r.id}</span>{/if}
                   {#if r.kind}<span class="meta">{r.kind}</span>{/if}
+                  {#if r.mechanism === 'c-abi-v1'}
+                    <span class="badge badge-ok" title="只依赖冻结的 C ABI 契约：升级本应用无需重编此插件">
+                      稳定 ABI v{r.abi || 1}
+                    </span>
+                  {:else if r.mechanism === 'rust-direct'}
+                    <span class="badge badge-warn" title="Rust 直连：升级本应用后必须重新编译该插件">
+                      Rust 直连
+                    </span>
+                  {/if}
                 </div>
                 {#if r.error}
                   <div class="row-sub"><Icon name="alert" size={13} />{r.error}</div>

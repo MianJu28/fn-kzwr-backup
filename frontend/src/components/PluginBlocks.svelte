@@ -71,7 +71,9 @@
         body[b.field] =
           b.type === 'number' ? Number(v || 0) : b.type === 'toggle' ? !!v : String(v ?? '');
       }
-      const r = await api.pluginPost(plugin.api_base, b.action, body);
+      // 动作路径：容错处理（插件写 "hello" 或 "/hello" 都能调用）
+      const actionPath = b.action.startsWith('/') ? b.action : `/${b.action}`;
+      const r = await api.pluginPost(plugin.api_base, actionPath, body);
       if (r && r.error) {
         mark(b.action, r.error, false);
         toast.error(r.error);
