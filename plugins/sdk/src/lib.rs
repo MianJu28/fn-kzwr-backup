@@ -149,6 +149,131 @@ macro_rules! export_plugin_v1 {
     };
 }
 
+// ── 目标能力表（自定义备份目标）────────────────────────────────────────────
+//
+// 想提供新的备份目的地（对象存储 / 另一家网盘 / 本地目录 …）就实现这张表，
+// 并用 [`export_target_v1!`] 导出 `fn_kzwr_plugin_target_v1`。
+//
+// ⚠️ **字段顺序与类型必须和宿主 `backend/src/plugin/abi.rs` 的 `KzwrTargetAbi` 完全一致**
+// （两边独立定义，靠 `#[repr(C)]` 布局对齐；只能在尾部追加字段）。
+//
+// 数据模型：宿主读明文 → age 加密 → 把**密文**推给插件（推块），
+// 插件**不接触明文与密钥**，也不需要回调宿主。恢复时插件给密文、宿主解密。
+
+use std::os::raw::c_void;
+
+/// 目标能力表（**布局与宿主严格一致**）
+#[repr(C)]
+pub struct KzwrTargetAbi {
+    /// 必须为 [`ABI_VERSION`]
+    pub abi: u32,
+    /// 本结构体字节大小
+    pub size: u32,
+
+    // ── 实例生命周期 ──
+    /// 用 `target_json`（含该目标凭据与插件自管配置）创建实例；返回 NULL = 配置无效
+    pub target_open: extern "C" fn(*const c_char) -> *mut c_void,
+    pub target_close: Option<extern "C" fn(*mut c_void)>,
+
+    // ── 传输（宿主 → 插件，内容为 age 密文） ──
+    /// `rel_path` 为**目标端**相对路径，`total` 为密文总字节（未知为 0）
+    pub write_begin: extern "C" fn(*mut c_void, *const c_char, u64) -> *mut c_void,
+    /// 返回实写字节数（≥0）或负错误码
+    pub write_chunk: extern "C" fn(*mut c_void, *mut c_void, *const u8, u32) -> i32,
+    /// 返回**实写密文字节总数**（宿主会与喂出的字节比对，防静默截断）
+    pub write_end: extern "C" fn(*mut c_void, *mut c_void) -> i64,
+    pub write_abort: Option<extern "C" fn(*mut c_void, *mut c_void)>,
+
+    // ── 读取（插件 → 宿主，内容为 age 密文；用于恢复） ──
+    pub read_begin: extern "C" fn(*mut c_void, *const c_char) -> *mut c_void,
+    /// 返回读到的字节数（>0）、0 = EOF、<0 = 错误码
+    pub read_chunk: extern "C" fn(*mut c_void, *mut c_void, *mut u8, u32) -> i32,
+    pub read_end: Option<extern "C" fn(*mut c_void, *mut c_void) -> i32>,
+
+    // ── 目录与元数据 ──
+    /// `[{"rel_path","size","mtime_secs","is_dir"}]`
+    pub list_json: extern "C" fn(*mut c_void, *const c_char) -> *mut c_char,
+    pub delete: extern "C" fn(*mut c_void, *const c_char) -> i32,
+    pub ensure_dir: Option<extern "C" fn(*mut c_void, *const c_char) -> i32>,
+    pub ping: Option<extern "C" fn(*mut c_void) -> i32>,
+    /// 设置页「测试连接」（实例尚未建立时）
+    pub test_json: Option<extern "C" fn(*const c_char) -> *mut c_char>,
+
+    // ── 插件自管配置（宿主代加密存储，命名空间 = 插件 id） ──
+    pub config_get: Option<extern "C" fn(*const c_char) -> *mut c_char>,
+    pub config_set: Option<extern "C" fn(*const c_char, *const c_char) -> i32>,
+
+    /// 最近一次错误的详情（JSON）
+    pub last_error_json: Option<extern "C" fn(*mut c_void) -> *mut c_char>,
+
+    // ── 并发回传（可选；describe 的 `target.supports_plan=true` 时宿主采用） ──
+    /// `job_json` = `{"upload":[{"rel_path","size","mtime_secs"}]}`
+    pub plan_begin: Option<extern "C" fn(*mut c_void, *const c_char) -> *mut c_void>,
+    /// 下一批要传的**目标端路径**（`[]` = 清单已空）
+    pub plan_next: Option<extern "C" fn(*mut c_void, *mut c_void) -> *mut c_char>,
+    pub plan_end: Option<extern "C" fn(*mut c_void, *mut c_void)>,
+
+    /// 释放本表返回的字符串（宿主调用）
+    pub free_str: extern "C" fn(*mut c_char),
+}
+
+/// 导出**目标能力表**（自定义备份目标）
+///
+/// 参数按结构体字段顺序，**可选回调传 `None`**：
+///
+/// ```ignore
+/// sdk::export_target_v1!(
+///     my_open, Some(my_close),
+///     my_write_begin, my_write_chunk, my_write_end, Some(my_write_abort),
+///     my_read_begin, my_read_chunk, Some(my_read_end),
+///     my_list_json, my_delete, Some(my_ensure_dir), Some(my_ping), Some(my_test_json),
+///     Some(my_last_error),
+///     Some(my_plan_begin), Some(my_plan_next), Some(my_plan_end),
+/// );
+/// ```
+#[macro_export]
+macro_rules! export_target_v1 {
+    (
+        $open:expr, $close:expr,
+        $write_begin:expr, $write_chunk:expr, $write_end:expr, $write_abort:expr,
+        $read_begin:expr, $read_chunk:expr, $read_end:expr,
+        $list_json:expr, $delete:expr, $ensure_dir:expr, $ping:expr, $test_json:expr,
+        $last_error_json:expr,
+        $plan_begin:expr, $plan_next:expr, $plan_end:expr $(,)?
+    ) => {
+        /// 目标能力入口：返回插件持有的静态目标表
+        #[no_mangle]
+        pub extern "C" fn fn_kzwr_plugin_target_v1() -> *const $crate::KzwrTargetAbi {
+            static TABLE: $crate::KzwrTargetAbi = $crate::KzwrTargetAbi {
+                abi: $crate::ABI_VERSION,
+                size: std::mem::size_of::<$crate::KzwrTargetAbi>() as u32,
+                target_open: $open,
+                target_close: $close,
+                write_begin: $write_begin,
+                write_chunk: $write_chunk,
+                write_end: $write_end,
+                write_abort: $write_abort,
+                read_begin: $read_begin,
+                read_chunk: $read_chunk,
+                read_end: $read_end,
+                list_json: $list_json,
+                delete: $delete,
+                ensure_dir: $ensure_dir,
+                ping: $ping,
+                test_json: $test_json,
+                config_get: None,
+                config_set: None,
+                last_error_json: $last_error_json,
+                plan_begin: $plan_begin,
+                plan_next: $plan_next,
+                plan_end: $plan_end,
+                free_str: $crate::free_c_string,
+            };
+            &TABLE
+        }
+    };
+}
+
 /// 常用动作结果构造（避免插件各自手拼 JSON）
 pub mod json {
     /// `{"success":true,"message":…}`

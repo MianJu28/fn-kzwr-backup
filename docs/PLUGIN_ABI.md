@@ -286,11 +286,55 @@ typedef struct KzwrTargetAbi {
   `POST /api/plugins/:id/parallel`，保存后热重建、无需重启
 - 插件本身不支持时（未声明 `supports_plan`），即便用户配了并发度也不会启用
 
-### 9.5 内置 WebDAV 目标即本契约的参考实现
+### 9.5 写一个目标插件（SDK）
 
-`backend/src/plugin/builtin/webdav_abi.rs` 是完整的参考实现：编译期静态表 +
-内部复用 `WebdavTarget` 做协议/分片/重试，对外只暴露推块接口；并实现了 `plan_*`
-（每批 12 个）。写新目标插件时可直接照抄结构。
+SDK 提供了目标表与导出宏，用法与增强插件一致：
+
+```bash
+cp -r plugins/example-localfs plugins/my-target   # 复制示范（本地目录目标）
+bash Scripts/build_plugins.sh                     # → dist/plugins/libmy_target.so
+```
+
+```rust,ignore
+use fn_kzwr_plugin_sdk as sdk;
+
+// 1) describe_json 里声明这是**目标**插件，并给出目标能力
+//    "kind": "target",
+//    "runtime": { "target": "fn_kzwr_plugin_target_v1" },
+//    "target":  { "supports_plan": true, "max_parallel": 4, "preferred_chunk_kib": 1024 }
+
+// 2) 实现回调（详见下方清单），全部用 catch_unwind 包住
+
+// 3) 导出两张表：主表（元信息/UI）+ 目标表（传输能力）
+sdk::export_plugin_v1!(describe, available, action, health);
+
+sdk::export_target_v1!(
+    my_open,           Some(my_close),
+    my_write_begin,    my_write_chunk, my_write_end,    Some(my_write_abort),
+    my_read_begin,     my_read_chunk,  Some(my_read_end),
+    my_list_json,      my_delete,      Some(my_ensure_dir), Some(my_ping), Some(my_test_json),
+    Some(my_last_error),
+    Some(my_plan_begin), Some(my_plan_next), Some(my_plan_end),  // 不支持并发回传就传 None
+);
+```
+
+必填回调：`target_open` / `write_begin` / `write_chunk` / `write_end` /
+`read_begin` / `read_chunk` / `list_json` / `delete`；其余可选（传 `None`）。
+
+⚠️ **务必做路径校验**：`rel_path` 来自清单，插件必须自己拒绝 `..` 之类的越权路径
+（示范插件的 `resolve()` 就是最小实现）。宿主也会校验 `plan_next` 返回的路径属于本次清单，
+但插件侧不能依赖这一点。
+
+### 9.6 参考实现
+
+| 实现 | 位置 | 说明 |
+|---|---|---|
+| 内置 WebDAV 目标 | `backend/src/plugin/builtin/webdav_abi.rs` | 编译期静态表；内部复用 `WebdavTarget` 做协议/分片/重试，对外只暴露推块接口；实现了 `plan_*`（每批 12 个） |
+| 外置「本地目录」目标 | `plugins/example-localfs/` | **外置插件提供备份目标的示范**：写本地目录，演示路径越权防护、临时文件改名落定、并发回传（小文件优先，每批 10 个） |
+
+`plugins/example-localfs/` 的用法：构建后放进插件目录并开启外置加载，
+然后在「目标」页新建目标、类型选 `example-localfs`、**地址填一个本机目录**
+（本插件把 `url` 当目录用，不需要真实账号）。
 
 ---
 
