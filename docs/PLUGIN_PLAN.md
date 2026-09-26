@@ -1,6 +1,12 @@
-# 插件方案（评审后定稿 · 待实现）
+# 插件方案（评审后定稿 · 分批实施中）
 
-> 状态：**已按 2026-09-26 评审决策定稿，尚未实现**。实现完成后并入 `docs/PLUGIN_ABI.md`。
+> 状态：**已按 2026-09-26 评审决策定稿**。实施进度见 §9「实施顺序」：
+>
+> - ✅ **Step 1**（ABI 整改 + 删 Rust 直连）、**Step 2**（目标能力表 + `AbiTargetStorage` 适配器）、
+>   **Step 5-webdav**（内置 webdav 目标 ABI 化，方案 C）、**并发回传**（`plan_*` 接线 +
+>   每插件独立开关）均已完成并通过 NAS 端到端实测；契约已并入 `docs/PLUGIN_ABI.md`。
+> - ⏳ **Step 3**（签名校验）、**Step 4**（插件自管数据）、**Step 5-kzwr**（增强插件 ABI 化）待做。
+>
 > 前置事实：产品未发布、无历史插件 → **直接修改 v1 契约本身**，不做 v1/v2 并存。
 >
 > 相关代码：`backend/src/plugin/{abi,cabi,loader,registry,api}.rs`、`plugins/sdk/`、
@@ -255,16 +261,38 @@ typedef struct KzwrTargetAbi {
 
 ## 9. 实施顺序与估时
 
-| # | 内容 | 估时 |
-|---|---|---|
-| 1 | ABI 整改（`size` 语义、删 kind 硬拒、`runtime` 发现、多段动作名、声明式 alerts）+ 删 Rust 直连（§8） | 0.5 天 |
-| 2 | 目标能力表 + 实例句柄 + `AbiTargetStorage`（`spawn_blocking`、进度换算、错误码映射、字节复查、看门狗、`plan_*` 并发） | 1.2 天 |
-| 3 | 签名校验（`ring`+`sha2`、`.sig` 约定、公钥配置、`Scripts/sign_plugin.sh`） | 0.5 天 |
-| 4 | 插件自管数据（`plugin_data` + `config_get/set` + 卸载清除 + 孤立检测 + 导入导出） | 0.4 天 |
-| 5 | 内置插件 ABI 化：webdav（目标表）+ kzwr（动作/体检/事件/自管配置/告警） | 1.0 天 |
-| 6 | 前端（签名徽标、卸载按钮）+ SDK `export_target_v1!` + 示范插件（本地目录） | 0.5 天 |
-| 7 | 文档合并（`PLUGIN_ABI.md`）+ ADR 补充 | 0.3 天 |
-| | **合计** | **~4.5 天**（含真机端到端） |
+| # | 内容 | 估时 | 状态 |
+|---|---|---|---|
+| 1 | ABI 整改（`size` 语义、删 kind 硬拒、`runtime` 发现、多段动作名、声明式 alerts）+ 删 Rust 直连（§8） | 0.5 天 | ✅ 已完成 |
+| 2 | 目标能力表 + 实例句柄 + `AbiTargetStorage`（`spawn_blocking`、进度换算、错误码映射、字节复查、看门狗、`plan_*` 并发） | 1.2 天 | ✅ 已完成 |
+| 3 | 签名校验（`ring`+`sha2`、`.sig` 约定、公钥配置、`Scripts/sign_plugin.sh`） | 0.5 天 | ⏳ 待做 |
+| 4 | 插件自管数据（`plugin_data` + `config_get/set` + 卸载清除 + 孤立检测 + 导入导出） | 0.4 天 | ⏳ 待做 |
+| 5 | 内置插件 ABI 化：webdav（目标表） | 0.4 天 | ✅ 已完成（方案 C：静态表 + `WebdavAbiPlugin` 组合 `CApiTarget`） |
+| 5b | 内置插件 ABI 化：kzwr（动作/体检/事件/自管配置/告警） | 0.6 天 | ⏳ 待做（最大改造面，见 §5.2） |
+| 6 | 前端（签名徽标、卸载按钮）+ SDK `export_target_v1!` + 示范插件（本地目录） | 0.5 天 | 🔶 部分完成（并发设置已在各插件卡片；签名徽标待 Step 3） |
+| 7 | 文档合并（`PLUGIN_ABI.md`）+ ADR 补充 | 0.3 天 | ✅ 已完成（§9 目标能力表 + §10 诊断） |
+| | **合计** | **~4.5 天**（含真机端到端） | 完成约 55% |
+
+### 已完成部分的实测结论（2026-09-26，NAS）
+
+| 项 | 结果 |
+|---|---|
+| 内置 webdav 走 ABI 推块桥 | 插件注册正常；目标保存（ABI `test_json`）成功 |
+| 备份 | 多文件、跨 256KiB 分块；字节数与源文件一致 |
+| 恢复 | 源文件移走后恢复，`diff -r` 逐字节一致 |
+| 并发回传 | 设某插件并发 3 → 日志出现并发回传；设回 0 → 回到顺序；不支持的插件拒绝设置 |
+| 稳定性 | panic 计数 0 |
+
+### 实施中踩到的坑（已写入 `docs/PLUGIN_ABI.md` §3）
+
+1. **同步回调内禁止 `block_on` 新 runtime** → `extern "C"` 不可 unwind → **进程 abort**。
+   必须派发到专用线程。
+2. 回调签名必须与契约的**原始类型**一致（`write_chunk`/`read_chunk` 的长度是 `uint32_t`，
+   写成 `c_int` 会「expected fn pointer, found fn item」）。
+3. `PlanSession` 必须 `Send`，否则备份 future 失去 `Send`，axum `Handler` 与 `tokio::spawn`
+   连锁失败（报错指向 routes/调度器，根因却在插件层）。
+4. 上传项结构体必须**自有数据**，借用版会触发 HRTB（`FnOnce is not general enough`）。
+5. 并发度只能在 `build()` 读配置 —— 插件实例在启动时装配，那时配置尚未加载。
 
 核心收益不变：`AbiTargetStorage` 只是"函数指针版"的 `TargetStorage`，
 **备份流水线（扫描 / 差分 / 加密 / 快照 / 保留 / 恢复编排）结构不动**。
