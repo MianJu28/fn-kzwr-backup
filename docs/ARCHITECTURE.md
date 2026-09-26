@@ -747,6 +747,7 @@ fn-kzwr-backup/
 | | 稳定 C ABI（免重编） | ✅ | 唯一入口 `fn_kzwr_plugin_abi_v1` + `repr(C)` 函数表 + JSON 数据交换（`plugin/abi.rs` ↔ `plugins/sdk`，插件零第三方依赖）；`abi`+`size` 双校验；**宿主升级不需要重编插件**；契约见 `docs/PLUGIN_ABI.md`；示例 `plugins/example-hello/` |
 | | ~~Rust 直连（进阶）~~ | ❌ | **已移除（2026-09-26，ADR-013 决策 1）**：Rust 无稳定 ABI、升级必重编，维护两条路径收益为负。删除面：`plugin/sdk.rs`、`plugins/example-rdirect/`、`export_plugin!`、`FN_KZWR_PLUGINS_ALLOW_MISMATCH`。原「只有它能写自定义目标」的限制已由下方**目标能力表**解除 |
 | | 目标能力表（自定义备份目标） | ✅ | `KzwrTargetAbi`（独立符号 `fn_kzwr_plugin_target_v1`）+ `AbiTargetStorage` 适配器；**推块模式**（宿主加密后喂密文，插件不碰明文与密钥）；字节复查 + 看门狗；契约见 `docs/PLUGIN_ABI.md` §9 |
+| | 外置插件提供备份目标 | ✅ | SDK `export_target_v1!` 宏 + 静态表，外置 `.so` 也能作为备份目标；示范插件 `plugins/example-localfs/`（本地目录目标，含路径越权防护与并发回传）；NAS 实测：加载 → 建目标 → 备份 30 文件 1600016 字节写入插件管理的目录，并发回传生效 |
 | | 内置 webdav 目标 ABI 化 | ✅ | **方案 C（2026-09-26）**：内置插件同样提供静态 `KzwrTargetAbi` 表（`builtin/webdav_abi.rs`），由 `WebdavAbiPlugin`（组合 `CApiTarget`）注册；与外部 `.so` 走同一份契约。传输 = 临时文件累积密文 → `write_end` 一次性喂 `WebdavTarget`；NAS 端到端实测备份/恢复均逐字节一致 |
 | | 并发回传（计划式） | ✅ | `plan_begin`/`plan_next`/`plan_end`：目标**自己决定**分批与节奏，宿主按批并发推送。**每插件独立**——能力由插件 `supports_plan()` 声明，开关/并发度按插件 id 存 `plugins.target_parallel`（缺省沿用声明，0/1 关闭，≥2 启用，上限 8）；`POST /api/plugins/:id/parallel`，保存后热重建无需重启；前端控件在各插件自己的卡片 |
 
