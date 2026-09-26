@@ -173,9 +173,10 @@ bash Scripts/build_plugins.sh          # → dist/plugins/libmy_plugin.so
 ## 7. 诊断
 
 - `GET /api/plugins` 的 `external` 字段：`enabled` / `dirs`（扫描到的目录与来源）/ `reports[]`（每个 `.so` 的 `loaded`、`mechanism`、`id`、`abi`、`error`）
-- 设置页「外置插件（动态库）」卡片直接展示上述结果，并会用徽标标出 **稳定 ABI v1** 或 **Rust 直连**
+- 设置页「外置插件（动态库）」卡片直接展示上述结果，并用徽标标出 **稳定 ABI v1**（~~Rust 直连~~ 已移除）
 - 日志：`fnos_backup::plugin::loader`（加载/跳过原因）；`fnos_backup::plugin::cabi`（C ABI 接管）
-- 相关环境变量：`FN_KZWR_PLUGINS=1`（开启加载）、`FN_KZWR_PLUGIN_DIR`（指定目录）、`FN_KZWR_PLUGINS_ALLOW_MISMATCH=1`（**仅 Rust 直连**用：强制忽略宿主版本校验）
+- 相关环境变量：`FN_KZWR_PLUGINS=1`（开启加载）、`FN_KZWR_PLUGIN_DIR`（指定目录）
+  （~~`FN_KZWR_PLUGINS_ALLOW_MISMATCH=1`~~ 属已移除的 Rust 直连机制，今已不存在）
 
 ## 8. 安全边界
 

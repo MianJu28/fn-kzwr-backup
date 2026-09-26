@@ -473,8 +473,8 @@ trait TargetStorage {
 - ✅ P3 `kzwr` 增强插件化：实现（DTO/回收站辅助/3 个 handler/一致性检查/巡检）整体迁入 `plugin/builtin/kzwr.rs`，路由挂 `/api/p/kzwr/*`（旧 `/api/kzwr/*` 下线）；核心通过 trait 钩子调用：`routes()`（插件路由）、`on_startup()`（启动自检）、`patrol()`（周期巡检 + 备份后）、`after_backup()`（清空回收站）、`health_check()`（一键体检项）、`reload()`（配置变更后刷新状态）；`raise_alert/raise_alert_once/human_bytes/webdav_username` 对插件开放为 `pub(crate)`
 - ✅ P4 前端插件驱动：`lib/plugins.js`（拉取/缓存 `/api/plugins`、按 `ui.section`+`ui.order` 排序）+ `views/SettingsPage.svelte` 按清单渲染卡片（内置组件映射 `webdav`/`kzwr`，**不认识的名字回退** `components/PluginBlocks.svelte` 通用 UI Schema 渲染：metric / text / number / toggle / button / tips，操作统一 POST `${api_base}${action}`）；接口不可用时用 `FALLBACK_SECTIONS` 兜底，页面不会白屏
 - ✅ **P5 外置加载 = 方案 B：动态库（`*.so`）**（用户 2026-09-26 选定）：
-  - **契约**（`plugin/sdk.rs`）：插件编译为 `cdylib`，导出 3 个 C ABI 符号 —— `fn_kzwr_plugin_abi_version() -> u32`、`fn_kzwr_plugin_host_version() -> *const c_char`、`fn_kzwr_plugin_create() -> *mut PluginHandle`；宏 `export_plugin!(ctor)` 一次生成三者。`PluginHandle { target: Option<Box<dyn TargetPlugin>>, enhance: Option<Box<dyn EnhancePlugin>> }`（同一库可同时提供目标与增强能力）
-  - **加载**（`plugin/loader.rs`）：目录优先级 `FN_KZWR_PLUGIN_DIR` 环境变量 > 配置 `plugins.dir` > `$TRIM_PKGETC/plugins`（用户） > `$TRIM_APPDEST/plugins`（随包）；`libloading` 打开后**先校验 ABI 版本、再校验「插件编译时链接的宿主版本」是否等于运行版本**（Rust trait 对象不是稳定 ABI），不一致则拒绝加载并给出「请重新编译插件」的明确诊断（开发可用 `FN_KZWR_PLUGINS_ALLOW_MISMATCH=1` 强制放行并告警）
+  - ~~**契约**（`plugin/sdk.rs`）：插件编译为 `cdylib`，导出 3 个 C ABI 符号 —— `fn_kzwr_plugin_abi_version() -> u32`、`fn_kzwr_plugin_host_version() -> *const c_char`、`fn_kzwr_plugin_create() -> *mut PluginHandle`；宏 `export_plugin!(ctor)` 一次生成三者。`PluginHandle { target: Option<Box<dyn TargetPlugin>>, enhance: Option<Box<dyn EnhancePlugin>> }`~~ → **已移除（2026-09-26，决策 1）**：Rust 无稳定 ABI、升级必重编。删除面：`plugin/sdk.rs`、`plugins/example-rdirect/`、`export_plugin!`、`FN_KZWR_PLUGINS_ALLOW_MISMATCH`。外置插件契约统一为下方「P5（续）稳定 C ABI v1」
+  - **加载**（`plugin/loader.rs`）：目录优先级 `FN_KZWR_PLUGIN_DIR` 环境变量 > 配置 `plugins.dir` > `$TRIM_PKGETC/plugins`（用户） > `$TRIM_APPDEST/plugins`（随包）；`libloading` 打开后按 **`abi` + `size` 双校验**（`size >= 必需前缀长度`，尾部可选字段逐项探测、缺失视为 NULL）拒绝不匹配的插件。~~再校验「插件编译时链接的宿主版本」是否等于运行版本~~（**该版本闸属已移除的 Rust 直连机制，2026-09-26 起不再存在**）
   - **安全默认**：加载 `*.so` 等价于执行任意本地代码 → **默认关闭**（配置 `plugins.enabled = true` 或 `FN_KZWR_PLUGINS=1` 开启，设置页有开关 + 安全说明）；开关/目录变更**重启生效**（不做运行中热加载，避免已注册 vtable 生命周期问题）；动态库句柄由注册表**保活到进程结束**
   - **失败隔离**：符号缺失 / ABI 不符 / 版本不符 / 未提供实现 → 该文件只进诊断列表（`/api/plugins` 的 `external.reports`），核心与其它插件不受影响
   - **前端**：`components/PluginSection.svelte`（设置页核心区：开关 + 插件目录 + 扫描目录 + 加载结果列表 + 安全警告）；外置插件的功能区块走 P4 的**通用 UI Schema 渲染**（`component: None`）→ 新增插件不必改前端，也不必重新打包
@@ -484,7 +484,7 @@ trait TargetStorage {
   - **决策**：跨边界契约降级为**版本化 C ABI + UTF-8 JSON**（`repr(C)` 静态函数表 + JSON 字符串，参考 nginx 模块 / GStreamer 的做法）。插件只依赖 `plugins/sdk`（**零第三方依赖**），宿主内部随便改，只要 `C_ABI_VERSION` 不变插件就一直可用
   - **契约**（`plugin/abi.rs` ↔ `plugins/sdk`）：唯一入口 `fn_kzwr_plugin_abi_v1() -> *const KzwrPluginAbi`；表内回调 `describe_json` / `available_json` / `action_json` / `health_json` / `event_json`(可选) / `free_str` / `destroy`(可选)；`abi` + `size` 双校验（结构体只增字段）；数据一律 JSON（宿主 `plugin/cabi.rs` 适配成内部 `EnhancePlugin`，前端零改动）
   - **配置快照** `cfg_json`：宿主 → 插件的稳定视图（host_version/时区/targets/tasks/enhance 状态），**不含任何凭据**（口令/token/账号名都不传）
-  - **两条路径并存**：加载器先找稳定入口（`mechanism=c-abi-v1`），否则回退 Rust 直连（`mechanism=rust-direct`，仅它需要版本校验）；`/api/plugins` 与设置页都会标出机制
+  - ~~**两条路径并存**~~ → **已改为机制唯一（2026-09-26）**：加载器只认稳定入口（`mechanism=c-abi-v1`），**不再回退 Rust 直连**（~~`mechanism=rust-direct`~~ 已不存在）；`/api/plugins` 与设置页只标出稳定 ABI
   - 契约文档：[`docs/PLUGIN_ABI.md`](PLUGIN_ABI.md)（冻结的符号/JSON schema/版本演进规则/安全边界）
   - **验证（NAS 实测）**：宿主 0.4.0 下两个示例插件同时加载（`example`=c-abi-v1、`example-rust`=rust-direct），动作接口与体检项均正常；**把宿主版本改到 0.4.1 并只重编宿主**（插件不动）→ 稳定 ABI 插件**仍然加载且动作可用**，Rust 直连插件被拒并提示「改用稳定 C ABI」；前端设置页出现机制徽标与两张插件卡片
 - ⏳ P6 文档收尾（本 ADR 已随 P5 同步；插件契约见 `docs/PLUGIN_ABI.md`）
@@ -498,14 +498,14 @@ trait TargetStorage {
 - (+) **外置插件不改前端**：插件声明的 `ui.blocks` 由前端通用渲染器渲染，新增功能区块无需重新打包前端
 - (-) 多一层 trait/注册表间接；`routes.rs` 里的增强功能路由需逐步迁入插件（P3 已完成）
 - ⚠️ 装配日志必须打在**库 crate**（`fnos_backup::*`）内：`main.rs` 属二进制 crate，其 `info!` 会被默认过滤器挡掉
-- ⚠️ 外置插件与宿主共享 Rust trait 对象（**非稳定 ABI**）：插件必须与宿主同源码/同 toolchain 编译，宿主以「编译期宿主版本 == 运行版本」强制这一约束
+- ~~⚠️ 外置插件与宿主共享 Rust trait 对象（**非稳定 ABI**）：插件必须与宿主同源码/同 toolchain 编译，宿主以「编译期宿主版本 == 运行版本」强制这一约束~~ → **该约束随 Rust 直连机制一并移除（2026-09-26）**。现行唯一机制为稳定 C ABI v1，跨边界只有 `repr(C)` 函数表 + JSON，**不存在 trait 对象共享**
 
 **验证（2026-09-26，NAS 实测）**：
 ① 默认关闭时 `/api/plugins` 的 `external.enabled=false`、无任何外置插件（只有内置 `webdav`/`kzwr`）；
 ② 放入示例插件与一个**伪装成插件的 `libz.so`** 并开启加载 → 示例插件 `loaded=true`（`source=external`、`builtin=false`、UI 3 个 block），伪装库 `loaded=false` + 明确错误「缺少符号 fn_kzwr_plugin_abi_version」，**核心与内置插件不受影响**；
 ③ 插件自己的接口 `POST /api/p/example/hello` 返回自定义文案；一键体检出现插件自检项；
 ④ 走**配置开关**（`POST /api/config {plugins_enabled, plugins_dir}` → 落盘 `[plugins]` → 重启）成功加载，证明不只依赖环境变量；
-⑤ **版本闸**：把宿主版本临时改为 0.4.1（插件仍为 0.4.0 编译）→ 拒绝加载并提示重新编译；加 `FN_KZWR_PLUGINS_ALLOW_MISMATCH=1` 后强制加载并告警；
+⑤ ~~**版本闸**：把宿主版本临时改为 0.4.1（插件仍为 0.4.0 编译）→ 拒绝加载并提示重新编译；加 `FN_KZWR_PLUGINS_ALLOW_MISMATCH=1` 后强制加载并告警~~（**历史验证**：针对已移除的 Rust 直连机制；该环境变量与版本闸今已不存在，稳定 ABI 插件不受宿主版本影响）；
 ⑥ 前端：设置页出现「外置插件（动态库）」管理卡片（开关/目录/扫描目录/加载结果/安全说明）与**示例外置插件卡片**（通用 UI Schema 渲染），点按钮返回插件自定义消息（卡片内 + toast）。
 
 ---
@@ -774,8 +774,10 @@ backend/src/
 │   ├── api.rs           # 内部契约：TargetPlugin/EnhancePlugin/PluginMeta/PluginUi/UiBlock/PluginEntry
 │   ├── abi.rs           # **稳定 C ABI v1 契约**（KzwrPluginAbi 表 + JSON schema + 配置快照）
 │   ├── cabi.rs          # 稳定 C ABI → 内部 EnhancePlugin 适配（动作路由/体检/事件/panic 兜底）
-│   ├── sdk.rs           # Rust 直连外置插件 SDK：ABI 常量 + PluginHandle + export_plugin! 宏
-│   ├── loader.rs        # 加载：目录扫描 + libloading + 稳定入口优先/Rust 直连回退 + 失败隔离
+│   ├── abi.rs           # 稳定 C ABI v1 契约：KzwrPluginAbi（增强）+ KzwrTargetAbi（目标）
+│   ├── cabi.rs          # C ABI → 内部 EnhancePlugin 适配（catch_unwind 兜底、free_str 释放）
+│   ├── target_abi.rs    # KzwrTargetAbi → TargetStorage 适配（AbiTargetStorage）+ 并发回传
+│   ├── loader.rs        # 加载：目录扫描 + libloading + 稳定入口校验 + 失败隔离（已无 Rust 直连回退）
 │   ├── registry.rs      # 唯一装配点：builtin()/load_external()/build_targets()/describe()
 │   └── builtin/
 │       ├── webdav.rs    # 目标插件（默认启用；每个目标一份实例）
@@ -833,9 +835,9 @@ frontend/src/
 - **配置热切换**：UI 保存目标凭据后由注册表**重建目标池**（`AppState::reload_targets`），全部目标即时生效，无需重启（`storage_trait.rs::TargetPool`，ADR-014）
 - **多任务/多目标隔离**：`job_id = "{task.id}-{源序号}"` + `account = 目标任务凭据用户名` → 每个任务在每个目标上都有独立快照/增量/保留策略；目标失败只影响该任务（ADR-014）
 - **升级无感**：旧 `[backup]`/`[webdav]` 配置自动迁移为 `default` 任务/目标，快照 key 不变（`default-0`）→ 装机升级后不会全量重传；旧字段持续作为兼容镜像回写
-- **外置插件安全边界**（ADR-013 方案 B）：加载动态库 = 执行任意本地代码 → 默认关闭、必须由用户在设置页显式开启；宿主以 ABI 版本 + 「编译期宿主版本 == 运行版本」双重校验拒绝不匹配的插件；单个插件加载失败只进诊断，不影响核心；插件开关/目录变更**重启生效**
+- **外置插件安全边界**（ADR-013 方案 B）：加载动态库 = 执行任意本地代码 → 默认关闭、必须由用户在设置页显式开启；宿主以 **`abi` + `size` 双校验**拒绝不匹配的插件（`size >= 必需前缀长度`，尾部可选字段逐项探测、缺失视为 NULL）；单个插件加载失败只进诊断，不影响核心；插件开关/目录变更**重启生效**。（~~「编译期宿主版本 == 运行版本」校验~~ 属已移除的 Rust 直连机制，2026-09-26 起不再存在）
 - **插件前端零改动**：插件通过 `/api/plugins` 的 `ui.blocks`（metric/text/number/toggle/button/tips）声明界面，前端用 `PluginBlocks.svelte` 通用渲染 → 新增插件不必改前端、不必重新打包前端
-- **插件契约冻结（稳定 C ABI v1）**：跨边界只走 `repr(C)` 函数表 + UTF-8 JSON（`docs/PLUGIN_ABI.md` 为权威契约）；`abi`+`size` 双校验、字段只增不改 → **主程序升级不需要重编插件**；破坏性改动才升 `abi` 版本，届时宿主并存 v1/v2。Rust 直连路径保留给需要自定义备份目标的进阶插件（须同版本编译）
+- **插件契约冻结（稳定 C ABI v1）**：跨边界只走 `repr(C)` 函数表 + UTF-8 JSON（`docs/PLUGIN_ABI.md` 为权威契约）；`abi`+`size` 双校验、字段只增不改 → **主程序升级不需要重编插件**；破坏性改动才升 `abi` 版本，届时宿主并存 v1/v2。~~Rust 直连路径保留给需要自定义备份目标的进阶插件（须同版本编译）~~ → **Rust 直连已移除（2026-09-26）**；**自定义备份目标现由目标能力表 `KzwrTargetAbi` 提供**（`docs/PLUGIN_ABI.md` §9，推块模式下插件只碰密文，升级同样免重编）
 - **定时备份**：cron 表达式到点触发，运行中改配置热更新（`domain/scheduler.rs`）；调度循环 await 备份完成后才排下一轮
 - **备份运行互斥**：定时调度与手动触发共用 `AppState.backup_running`（`AtomicBool`，`run_backup_now` 入口 CAS 抢占 + RAII 守卫复位），已有备份在执行时第二次触发立即返回 `skipped = true` 与提示文案，避免并发备份争抢带宽与快照写入
 - **用户信息**：账号记录在配置（username_enc 解密），`/api/user/info` 返回本地账号；WebDAV 无套餐/容量接口

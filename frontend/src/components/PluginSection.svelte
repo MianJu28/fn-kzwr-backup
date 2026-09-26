@@ -149,10 +149,6 @@
                     <span class="badge badge-ok" title="只依赖冻结的 C ABI 契约：升级本应用无需重编此插件">
                       稳定 ABI v{r.abi || 1}
                     </span>
-                  {:else if r.mechanism === 'rust-direct'}
-                    <span class="badge badge-warn" title="Rust 直连：升级本应用后必须重新编译该插件">
-                      Rust 直连
-                    </span>
                   {/if}
                 </div>
                 {#if r.error}
