@@ -3,6 +3,7 @@
 //! TOML 配置存储，敏感字段（kzwr 用户名/密码/token）用口令派生密钥加密后存储。
 //! 支持多备份路径。
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -52,6 +53,13 @@ pub struct AppConfig {
     /// 外置插件（动态库）设置
     #[serde(default)]
     pub plugins: PluginSettings,
+    /// 插件自管数据（ADR-013 决策 2，宿主代加密存储）
+    ///
+    /// 外层键 = 插件 id；内层键值 = 该插件的键值对。值经 [`ConfigManager::encrypt_field`]
+    /// 以 `enc:` 前缀加密后落盘（复用同一口令），读取时由宿主解密后再交给插件。
+    /// 卸载插件（`/api/plugins/:id/purge`）时删除该 id 的整个命名空间。
+    #[serde(default)]
+    pub plugin_data: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
 
 /// 外置插件设置（ADR-013 方案 B：动态库）
@@ -67,6 +75,12 @@ pub struct PluginSettings {
     /// （`$TRIM_PKGETC/plugins`、`$TRIM_APPDEST/plugins`）
     #[serde(default)]
     pub dir: Option<String>,
+    /// 允许加载的插件签名公钥（base64，32 字节 Ed25519 公钥）
+    ///
+    /// 非空时：加载每个 `*.so` 前必须存在同目录 `*.so.sig`，且用任一公钥验签通过，
+    /// 否则拒绝加载（记入 `/api/plugins` 诊断）。留空 = 跳过签名校验（仅信任目录已受控）。
+    #[serde(default)]
+    pub pubkeys: Vec<String>,
 }
 
 impl Default for PluginSettings {
@@ -74,6 +88,7 @@ impl Default for PluginSettings {
         Self {
             enabled: false,
             dir: None,
+            pubkeys: Vec::new(),
         }
     }
 }
@@ -573,6 +588,80 @@ impl ConfigManager {
                 }
             }
         }
+    }
+
+    /// 读取某插件的自管配置值（解密后返回明文；不存在/未配置 → None）
+    ///
+    /// 内部值以 `enc:` 前缀加密存储，这里复用 `decrypt_field` 解密。
+    pub fn plugin_data_get(&self, cfg: &AppConfig, plugin: &str, key: &str) -> Result<Option<String>> {
+        let enc = cfg
+            .plugin_data
+            .get(plugin)
+            .and_then(|m| m.get(key))
+            .cloned();
+        self.decrypt_field(&enc)
+    }
+
+    /// 写入某插件的自管配置值（加密后落库存入 `cfg.plugin_data`；值空则删除该键）
+    ///
+    /// 调用方随后需 `save(&cfg)` 落盘。
+    pub fn plugin_data_set(
+        &self,
+        cfg: &mut AppConfig,
+        plugin: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
+        let entry = cfg.plugin_data.entry(plugin.to_string()).or_default();
+        if value.is_empty() {
+            entry.remove(key);
+            if entry.is_empty() {
+                cfg.plugin_data.remove(plugin);
+            }
+        } else {
+            entry.insert(key.to_string(), self.encrypt_field(value)?);
+        }
+        Ok(())
+    }
+
+    /// 删除某插件的整个自管配置命名空间（卸载清除用）；返回是否删除了东西
+    pub fn plugin_data_remove(&self, cfg: &mut AppConfig, plugin: &str) -> bool {
+        cfg.plugin_data.remove(plugin).is_some()
+    }
+
+    /// 当前有自管数据的插件 id 列表（孤立数据检测用）
+    pub fn plugin_data_ids(&self, cfg: &AppConfig) -> Vec<String> {
+        cfg.plugin_data.keys().cloned().collect()
+    }
+
+    /// 导出用：把指定插件的自管配置全部解密为明文键值对（换机/备份携带；敏感，需管理员口令）
+    pub fn plugin_data_export(
+        &self,
+        cfg: &AppConfig,
+        plugin: &str,
+    ) -> Result<BTreeMap<String, String>> {
+        let mut out = BTreeMap::new();
+        if let Some(m) = cfg.plugin_data.get(plugin) {
+            for (k, enc) in m {
+                if let Some(v) = self.decrypt_field(&Some(enc.clone()))? {
+                    out.insert(k.clone(), v);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// 导入用：把明文键值对重新加密写入某插件的命名空间（调用方随后 `save`）
+    pub fn plugin_data_import(
+        &self,
+        cfg: &mut AppConfig,
+        plugin: &str,
+        kv: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        for (k, v) in kv {
+            self.plugin_data_set(cfg, plugin, k, v)?;
+        }
+        Ok(())
     }
 
     /// 用 passphrase 加密（age scrypt）

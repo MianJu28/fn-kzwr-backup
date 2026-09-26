@@ -13,36 +13,30 @@
 //!   记录到诊断列表（`/api/plugins` 的 `external.reports`），宿主照常启动
 //! - 动态库句柄必须**保活到进程结束**（卸载会让已注册的 vtable 悬空），因此由注册表持有
 
-use std::ffi::CStr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Serialize;
 
-use super::abi::{KzwrPluginAbi, C_ABI_VERSION, SYM_ENTRY_V1};
+use super::abi::{KzwrPluginAbi, KzwrTargetAbi, C_ABI_VERSION, SYM_ENTRY_V1};
 use super::api::{EnhancePlugin, TargetPlugin};
-use super::sdk::{PluginHandle, PLUGIN_ABI_VERSION, SYM_ABI_VERSION, SYM_CREATE, SYM_HOST_VERSION};
 
 /// 单个动态库加载后的插件形态
-pub enum Loaded {
-    /// **稳定 C ABI v1**（推荐）：宿主升级不需要重编插件
-    Stable {
-        plugin: std::sync::Arc<dyn EnhancePlugin>,
-        id: String,
-        name: String,
-        abi: u32,
-    },
-    /// Rust 直连目标插件（进阶：可提供备份目标；需与宿主同版本编译）
-    RustTarget {
-        plugin: std::sync::Arc<dyn TargetPlugin>,
-        id: String,
-        name: String,
-    },
-    /// Rust 直连增强插件（需与宿主同版本编译）
-    RustEnhance {
-        plugin: std::sync::Arc<dyn EnhancePlugin>,
-        id: String,
-        name: String,
-    },
+///
+/// 稳定 C ABI 是**唯一**加载机制（已删 Rust 直连：产品未发布、无兼容包袱）。
+/// 一个 `.so` 可以同时提供增强能力与目标能力：
+/// - `enhance`：`fn_kzwr_plugin_abi_v1` 导出的主表（kind 为 `enhance`/缺省时）
+/// - `target`：`fn_kzwr_plugin_target_v1`（或 describe.runtime.target）导出的目标能力表
+#[derive(Default)]
+pub struct Loaded {
+    /// 增强能力（可选：kind 为 `target` 的纯目标插件为空）
+    pub enhance: Option<std::sync::Arc<dyn EnhancePlugin>>,
+    /// 目标能力（可选：导出了目标能力表才有）
+    pub target: Option<std::sync::Arc<dyn TargetPlugin>>,
+    pub id: String,
+    pub name: String,
+    /// 插件声明的 ABI 版本（本次加载强制等于 C_ABI_VERSION）
+    pub abi: u32,
 }
 
 /// 单个动态库的加载结果（供 `/api/plugins` 诊断与前端展示）
@@ -60,7 +54,7 @@ pub struct ExternalPluginReport {
     pub name: Option<String>,
     /// `target` | `enhance`
     pub kind: Option<String>,
-    /// 加载机制：`c-abi-v1`（稳定契约，宿主升级不用重编）| `rust-direct`（进阶，需同版本编译）
+    /// 加载机制：稳定 C ABI 是唯一机制，恒为 `c-abi-v1`（保留字段便于前端迁移）
     pub mechanism: Option<String>,
     /// 插件声明的 ABI 版本（仅稳定 C ABI 有）
     pub abi: Option<u32>,
@@ -142,15 +136,52 @@ pub struct LoadOutcome {
     pub ids: Vec<String>,
 }
 
-/// 加载全部目录中的外置插件
+/// 校验单个插件的 Ed25519 签名（ADR-013 安全防线）——返回 `Ok(())` 或拒绝原因。
 ///
-/// `allow_version_mismatch`：允许「插件编译期宿主版本 ≠ 运行版本」（仅建议开发时用，
-/// 默认从环境变量 `FN_KZWR_PLUGINS_ALLOW_MISMATCH=1` 读取）。
-pub fn load_external(dirs: &[PathBuf]) -> LoadOutcome {
-    let allow_mismatch = std::env::var("FN_KZWR_PLUGINS_ALLOW_MISMATCH")
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
-        .unwrap_or(false);
+/// - `pubkeys` 非空才强制校验：`<so> 同目录下必须有 <so>.sig`
+///   （`.so` 原始字节的 Ed25519 签名，64 字节），且用任一公钥验签通过；
+/// - `pubkeys` 为空 = 信任已受控目录，跳过硬校验（仍会尝试解析 `.sig`，失败不阻断）；
+/// - 验签失败/缺 `.sig` → `Err`，上层记入诊断并跳过该插件。
+fn verify_plugin(path: &Path, pubkeys: &[String]) -> Result<(), String> {
+    use ring::signature::{UnparsedPublicKey, ED25519};
 
+    // 无配置公钥 → 不强制校验（默认行为，向后兼容）
+    let mut keys: Vec<UnparsedPublicKey<Vec<u8>>> = Vec::new();
+    for b64 in pubkeys {
+        let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+            .map_err(|_| format!("插件公钥不是合法 base64：{b64}"))?;
+        if raw.len() != 32 {
+            return Err(format!("插件公钥必须是 32 字节 Ed25519 公钥，实际 {} 字节", raw.len()));
+        }
+        keys.push(UnparsedPublicKey::new(&ED25519, raw));
+    }
+    if keys.is_empty() {
+        return Ok(());
+    }
+
+    // 同目录、同 basename + `.sig`
+    let mut sig_path = path.as_os_str().to_os_string();
+    sig_path.push(".sig");
+    let sig_path = PathBuf::from(sig_path);
+    if !sig_path.is_file() {
+        return Err(format!("启用了签名校验，但缺少签名文件 {}", sig_path.display()));
+    }
+    let data = std::fs::read(path)
+        .map_err(|e| format!("读取插件 {} 失败：{e}", path.display()))?;
+    let sig = std::fs::read(&sig_path)
+        .map_err(|e| format!("读取签名 {} 失败：{e}", sig_path.display()))?;
+
+    for k in &keys {
+        if k.verify(&data, &sig).is_ok() {
+            tracing::debug!(plugin = %path.display(), "插件签名校验通过");
+            return Ok(());
+        }
+    }
+    Err("插件签名校验失败：签名与任一配置公钥均不匹配".to_string())
+}
+
+/// 加载全部目录中的外置插件
+pub fn load_external(dirs: &[PathBuf], pubkeys: &[String]) -> LoadOutcome {
     let mut out = LoadOutcome {
         targets: Vec::new(),
         enhances: Vec::new(),
@@ -182,41 +213,40 @@ pub fn load_external(dirs: &[PathBuf]) -> LoadOutcome {
                 abi: None,
                 error: None,
             };
-            match load_one(&path, allow_mismatch) {
+            // 签名防线：配置了公钥则强制验签，失败即拒绝加载（不触碰动态库）
+            if let Err(e) = verify_plugin(&path, pubkeys) {
+                tracing::warn!(file = %file, err = %e, "外置插件签名校验未通过（已跳过）");
+                report.error = Some(format!("签名校验未通过：{e}"));
+                out.reports.push(report);
+                continue;
+            }
+            match load_one(&path) {
                 Ok((loaded, lib)) => {
-                    let (id, name, kind, mechanism, abi) = match loaded {
-                        Loaded::Stable {
-                            plugin,
-                            id,
-                            name,
-                            abi,
-                        } => {
-                            out.enhances.push(plugin);
-                            (id, name, "enhance", "c-abi-v1", Some(abi))
-                        }
-                        Loaded::RustTarget { plugin, id, name } => {
-                            out.targets.push(plugin);
-                            (id, name, "target", "rust-direct", None)
-                        }
-                        Loaded::RustEnhance { plugin, id, name } => {
-                            out.enhances.push(plugin);
-                            (id, name, "enhance", "rust-direct", None)
+                    let kind = match (loaded.enhance.is_some(), loaded.target.is_some()) {
+                        (true, true) => "both",
+                        (true, false) => "enhance",
+                        (false, true) => "target",
+                        (false, false) => {
+                            report.error = Some("插件未提供任何能力（enhance 或 target）".to_string());
+                            out.reports.push(report);
+                            continue;
                         }
                     };
+                    if let Some(e) = loaded.enhance {
+                        out.enhances.push(e);
+                    }
+                    if let Some(t) = loaded.target {
+                        out.targets.push(t);
+                    }
                     out.libs.push(lib);
-                    out.ids.push(id.clone());
+                    out.ids.push(loaded.id.clone());
                     report.loaded = true;
-                    report.id = Some(id.clone());
-                    report.name = Some(name);
+                    report.id = Some(loaded.id.clone());
+                    report.name = Some(loaded.name.clone());
                     report.kind = Some(kind.to_string());
-                    report.mechanism = Some(mechanism.to_string());
-                    report.abi = abi;
-                    tracing::info!(
-                        file = %file,
-                        plugin = %id,
-                        mechanism,
-                        "外置插件已加载"
-                    );
+                    report.mechanism = Some("c-abi-v1".to_string());
+                    report.abi = Some(loaded.abi);
+                    tracing::info!(file = %file, plugin = %loaded.id, "外置插件已按稳定 C ABI v1 加载");
                 }
                 Err(e) => {
                     tracing::warn!(file = %file, err = %e, "外置插件加载失败（已跳过，不影响其它插件）");
@@ -232,113 +262,113 @@ pub fn load_external(dirs: &[PathBuf]) -> LoadOutcome {
 /// 加载单个动态库：优先稳定 C ABI v1，回退 Rust 直连
 ///
 /// 返回 (插件形态, 动态库句柄)；动态库句柄需由调用方保活。
-fn load_one(
-    path: &Path,
-    allow_mismatch: bool,
-) -> Result<(Loaded, libloading::Library), String> {
+fn load_one(path: &Path) -> Result<(Loaded, libloading::Library), String> {
     unsafe {
         let lib = libloading::Library::new(path)
             .map_err(|e| format!("打开动态库失败：{e}"))?;
 
-        // ── 路径 1：稳定 C ABI v1（推荐；宿主升级不需要重编插件）──
-        if let Ok(entry) = lib.get::<extern "C" fn() -> *const KzwrPluginAbi>(SYM_ENTRY_V1) {
-            let table = entry();
-            let plugin = super::cabi::CApiEnhance::adopt(table, path.to_string_lossy().into_owned())?;
-            let id = plugin.meta().id;
-            let name = plugin.meta().name;
-            let abi = C_ABI_VERSION;
-            tracing::info!(plugin = %id, "已按稳定 C ABI v1 接管插件（无需与宿主同版本编译）");
-            return Ok((
-                Loaded::Stable {
-                    plugin: std::sync::Arc::new(plugin),
-                    id,
-                    name,
-                    abi,
-                },
-                lib,
-            ));
+        let entry = lib
+            .get::<extern "C" fn() -> *const KzwrPluginAbi>(SYM_ENTRY_V1)
+            .map_err(|e| format!("缺少稳定入口 fn_kzwr_plugin_abi_v1：{e}"))?;
+        let table_ptr = entry();
+        let table_ref = super::cabi::validate_table(table_ptr)?;
+        let describe = super::cabi::describe_of(table_ref)?;
+        let origin = path.to_string_lossy().into_owned();
+
+        // 增强能力：kind 为 `target` 的纯目标插件不建 enhance 适配器
+        let enhance: Option<Arc<dyn super::api::EnhancePlugin>> =
+            if matches!(describe.kind.as_deref(), None | Some("enhance")) {
+                Some(Arc::new(super::cabi::CApiEnhance::adopt(table_ptr, origin.clone())?)
+                    as Arc<dyn super::api::EnhancePlugin>)
+            } else {
+                None
+            };
+
+        // 目标能力：describe_json.runtime.target 声明的符号（缺省 fn_kzwr_plugin_target_v1）
+        let target: Option<Arc<dyn super::api::TargetPlugin>> = {
+            let sym = describe.runtime.target_symbol();
+            match lib.get::<extern "C" fn() -> *const KzwrTargetAbi>(sym.as_bytes()) {
+                Ok(f) => {
+                    let t = f();
+                    if t.is_null() {
+                        None
+                    } else {
+                        Some(Arc::new(super::target_abi::CApiTarget::adopt(
+                            t,
+                            describe.clone(),
+                            &origin,
+                        )?) as Arc<dyn super::api::TargetPlugin>)
+                    }
+                }
+                Err(_) => None,
+            }
+        };
+
+        if enhance.is_none() && target.is_none() {
+            return Err("插件未提供任何能力（enhance 或 target）".to_string());
         }
 
-        load_rust_direct(&lib, allow_mismatch).map(|loaded| (loaded, lib))
+        Ok((
+            Loaded {
+                enhance,
+                target,
+                id: describe.id.clone(),
+                name: describe.name.clone(),
+                abi: C_ABI_VERSION,
+            },
+            lib,
+        ))
     }
 }
 
-/// 路径 2：Rust 直连插件（旧接口；可提供目标插件，但需与宿主同版本编译）
-fn load_rust_direct(
-    lib: &libloading::Library,
-    allow_mismatch: bool,
-) -> Result<Loaded, String> {
-    // SAFETY: 以下均是对**用户显式启用**的本地动态库的调用；符号签名由 ABI 常量约定，
-    // 并在调用前完成 ABI/版本校验。加载不可信代码的风险由用户开启开关时承担（见模块文档）。
-    unsafe {
-        let abi = lib
-            .get::<extern "C" fn() -> u32>(SYM_ABI_VERSION)
-            .map_err(|e| {
-                format!(
-                    "既没有稳定入口 fn_kzwr_plugin_abi_v1，也不是 Rust 直连插件\
-                     （缺少符号 fn_kzwr_plugin_abi_version）：{e}"
-                )
-            })?;
-        let abi = abi();
-        if abi != PLUGIN_ABI_VERSION {
-            return Err(format!(
-                "ABI 版本不匹配（插件 {abi}，宿主 {PLUGIN_ABI_VERSION}）：请用当前版本源码重新编译插件"
-            ));
-        }
+/// 生成测试用 Ed25519 密钥对，返回 (base64 公钥, 私钥)
+#[cfg(test)]
+fn test_key() -> (String, ring::signature::Ed25519KeyPair) {
+    use ring::signature::KeyPair as _;
+    use base64::Engine as _;
+    let rng = ring::rand::SystemRandom::new();
+    let doc = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).expect("generate");
+    let kp = ring::signature::Ed25519KeyPair::from_pkcs8(doc.as_ref()).expect("from_pkcs8");
+    let pubk = base64::engine::general_purpose::STANDARD.encode(kp.public_key().as_ref());
+    (pubk, kp)
+}
 
-        let host_version = lib
-            .get::<extern "C" fn() -> *const std::os::raw::c_char>(SYM_HOST_VERSION)
-            .map_err(|e| format!("缺少符号 fn_kzwr_plugin_host_version：{e}"))?;
-        let raw = host_version();
-        if raw.is_null() {
-            return Err("fn_kzwr_plugin_host_version 返回了空指针".to_string());
-        }
-        let built_for = CStr::from_ptr(raw).to_string_lossy().into_owned();
-        let running = super::sdk::HOST_VERSION;
-        if built_for != running && !allow_mismatch {
-            return Err(format!(
-                "Rust 直连插件编译时链接的宿主版本为 {built_for}，当前运行版本为 {running}：\
-                 Rust ABI 不稳定，请重新编译插件；\
-                 若希望升级后免重编，请改用**稳定 C ABI**（导出 fn_kzwr_plugin_abi_v1，见 plugins/sdk）"
-            ));
-        }
-        if built_for != running {
-            tracing::warn!(
-                built_for = %built_for,
-                running = %running,
-                "外置插件版本与宿主不一致，已按 FN_KZWR_PLUGINS_ALLOW_MISMATCH 强制加载"
-            );
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        let create = lib
-            .get::<extern "C" fn() -> *mut PluginHandle>(SYM_CREATE)
-            .map_err(|e| format!("缺少符号 fn_kzwr_plugin_create：{e}"))?;
-        let raw_handle = create();
-        if raw_handle.is_null() {
-            return Err("fn_kzwr_plugin_create 返回了空指针".to_string());
-        }
-        let handle = Box::from_raw(raw_handle);
-        if handle.is_empty() {
-            return Err("插件未提供任何实现（target/enhance 均为空）".to_string());
-        }
+    #[test]
+    fn verify_signature_accepts_valid_and_rejects_tampered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (pubk, kp) = test_key();
+        let keys = vec![pubk];
 
-        // 目标插件与增强插件可同时提供；此处按「目标优先」登记（增强能力请用稳定 C ABI 插件实现）
-        if let Some(t) = handle.target {
-            let m = t.meta();
-            Ok(Loaded::RustTarget {
-                plugin: std::sync::Arc::from(t),
-                id: m.id,
-                name: m.name,
-            })
-        } else if let Some(e) = handle.enhance {
-            let m = e.meta();
-            Ok(Loaded::RustEnhance {
-                plugin: std::sync::Arc::from(e),
-                id: m.id,
-                name: m.name,
-            })
-        } else {
-            Err("插件未提供任何实现".to_string())
-        }
+        let so = dir.path().join("libfkplug.so");
+        let data = b"fake plugin bytes v1".to_vec();
+        std::fs::write(&so, &data).unwrap();
+
+        // 正确签名 → 通过
+        let sig = kp.sign(&data);
+        std::fs::write(dir.path().join("libfkplug.so.sig"), sig.as_ref()).unwrap();
+        assert!(verify_plugin(&so, &keys).is_ok());
+
+        // 篡改插件内容 → 拒绝（签名不再匹配）
+        let data2 = b"fake plugin bytes v2".to_vec();
+        std::fs::write(&so, &data2).unwrap();
+        assert!(verify_plugin(&so, &keys).is_err());
+
+        // 缺签名文件 → 拒绝
+        std::fs::remove_file(dir.path().join("libfkplug.so.sig")).unwrap();
+        assert!(verify_plugin(&so, &keys).is_err());
+    }
+
+    #[test]
+    fn verify_skips_when_no_pubkeys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let so = dir.path().join("x.so");
+        std::fs::write(&so, b"whatever").unwrap();
+        // 未配置公钥 → 不强制校验
+        let keys: Vec<String> = Vec::new();
+        assert!(verify_plugin(&so, &keys).is_ok());
     }
 }

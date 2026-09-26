@@ -110,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
             for (p, src) in &dirs {
                 info!(dir = %p.display(), source = %src, "扫描外置插件目录");
             }
-            registry_inner.load_external(&dirs);
+            registry_inner.load_external(&dirs, &initial_cfg.plugins.pubkeys);
         }
     } else {
         info!("外置插件加载已关闭（配置 plugins.enabled 或 FN_KZWR_PLUGINS=1 可开启）");

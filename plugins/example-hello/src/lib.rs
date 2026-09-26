@@ -1,9 +1,6 @@
 //! 酷族备份 · 外置插件示例 —— **稳定 C ABI（v1）**
 //!
-//! 与 `plugins/example-rdirect/`（Rust 直连）的区别：
-//!
-//! | | 稳定 C ABI（本插件） | Rust 直连 |
-//! |---|---|---|
+//! 稳定 C ABI 是唯一的插件机制（`plugins/example-rdirect/` 的 Rust 直连已删除）。
 //! | 依赖宿主 crate | 不需要（只依赖 `fn-kzwr-plugin-sdk`） | 需要（`fn-kzwr-backup`） |
 //! | 宿主升级后 | **无需重编插件** | 必须重编（Rust ABI 不稳定） |
 //! | 能力 | 增强类：UI 卡片 / 动作接口 / 体检 / 事件 | 全部（含自定义备份目标） |

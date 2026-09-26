@@ -39,59 +39,66 @@ pub struct CApiEnhance {
     pub path: String,
 }
 
+/// 校验插件主表（空指针 / `abi` 版本 / `size` 必需前缀）
+///
+/// 主表**冻结**（能力用独立表承载），故 `size` 只需 ≥ [`KzwrPluginAbi::REQUIRED_SIZE`]；
+/// 新增能力不要求插件重编。
+pub unsafe fn validate_table(
+    table: *const KzwrPluginAbi,
+) -> Result<&'static KzwrPluginAbi, String> {
+    if table.is_null() {
+        return Err("fn_kzwr_plugin_abi_v1 返回了空指针".to_string());
+    }
+    let t: &'static KzwrPluginAbi = &*table;
+    if t.abi != C_ABI_VERSION {
+        return Err(format!(
+            "插件 ABI 版本为 {}，宿主支持 {C_ABI_VERSION}：请更新插件（或宿主）",
+            t.abi
+        ));
+    }
+    let need = KzwrPluginAbi::REQUIRED_SIZE as usize;
+    if (t.size as usize) < need {
+        return Err(format!(
+            "插件表长度 {} 小于宿主要求的必需前缀 {}（主表冻结：新增能力走独立能力表）",
+            t.size, need
+        ));
+    }
+    Ok(t)
+}
+
+/// 解析并校验插件的 `describe_json`
+pub fn describe_of(t: &'static KzwrPluginAbi) -> Result<AbiDescribe, String> {
+    let raw = call0_opt(AbiTable(t), t.describe_json)
+        .ok_or_else(|| "describe_json 未返回有效 JSON".to_string())?;
+    let describe: AbiDescribe = serde_json::from_str(&raw)
+        .map_err(|e| format!("describe_json 解析失败：{e}"))?;
+    if describe.id.trim().is_empty() {
+        return Err("describe_json 缺少 id".to_string());
+    }
+    Ok(describe)
+}
+
 impl CApiEnhance {
-    /// 校验并接管插件表
+    /// 校验并接管插件主表（enhance 面）
     ///
-    /// - `abi` 必须等于 [`C_ABI_VERSION`]
-    /// - `size` 不得小于宿主已知结构长度（尾部可扩展，但关键字段必须有）
+    /// 目标能力由 [`super::target_abi::CApiTarget::adopt`] 另行接管。
     pub unsafe fn adopt(
         table: *const KzwrPluginAbi,
         path: String,
     ) -> Result<Self, String> {
-        if table.is_null() {
-            return Err("fn_kzwr_plugin_abi_v1 返回了空指针".to_string());
-        }
-        let t: &'static KzwrPluginAbi = &*table;
-        if t.abi != C_ABI_VERSION {
-            return Err(format!(
-                "插件 ABI 版本为 {}，宿主支持 {C_ABI_VERSION}：请更新插件（或宿主）",
-                t.abi
-            ));
-        }
-        if (t.size as usize) < std::mem::size_of::<KzwrPluginAbi>() {
-            return Err(format!(
-                "插件表长度 {} 小于宿主期望 {}（结构体只能追加字段）",
-                t.size,
-                std::mem::size_of::<KzwrPluginAbi>()
-            ));
-        }
+        let t = validate_table(table)?;
         let table = AbiTable(t);
-        let raw = call0_opt(table, t.describe_json)
-            .ok_or_else(|| "describe_json 未返回有效 JSON".to_string())?;
-        let describe: AbiDescribe = serde_json::from_str(&raw)
-            .map_err(|e| format!("describe_json 解析失败：{e}"))?;
-        if describe.id.trim().is_empty() {
-            return Err("describe_json 缺少 id".to_string());
-        }
-        if let Some(kind) = describe.kind.as_deref() {
-            if kind != "enhance" {
-                return Err(format!(
-                    "C ABI v1 仅支持增强插件（kind=enhance），收到 kind={kind}；\
-                     自定义备份目标请使用 Rust 直连路径（见文档）"
-                ));
-            }
-        }
-        Ok(Self {
-            table,
-            describe,
-            path,
-        })
+        let describe = describe_of(t)?;
+        Ok(Self { table, describe, path })
     }
 
-    /// 调用 `available_json`（失败保守视为不可用，避免误判为可用）
+    /// 调用 `available_json`（未实现/失败保守视为不可用，避免误判为可用）
     fn call_available(&self, cfg: &crate::infra::config::AppConfig) -> bool {
+        let Some(f) = self.table.0.available_json else {
+            return false;
+        };
         let cfg_json = CfgSnapshot::from_config(cfg).to_json();
-        let raw = match call1(self.table, self.table.0.available_json, &cfg_json) {
+        let raw = match call1(self.table, f, &cfg_json) {
             Some(s) => s,
             None => return false,
         };
@@ -99,6 +106,34 @@ impl CApiEnhance {
             .ok()
             .and_then(|v| v.get("available").and_then(|x| x.as_bool()))
             .unwrap_or(false)
+    }
+
+    /// 处理事件/体检返回中的**声明式告警**（`alerts: [{level,message}]`）
+    ///
+    /// 插件不再回调宿主，而是把要报的告警随着返回值一起带回来，由宿主去重并落库。
+    fn apply_alerts(&self, state: &AppState, raw: &str) {
+        let Ok(v) = serde_json::from_str::<Value>(raw) else {
+            return;
+        };
+        let Some(alerts) = v.get("alerts").and_then(|x| x.as_array()) else {
+            return;
+        };
+        let id = self.describe.id.clone();
+        for a in alerts {
+            let Some(msg) = a.get("message").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            let level = match a.get("level").and_then(|x| x.as_str()) {
+                Some("error") => crate::domain::alerts::AlertLevel::Error,
+                _ => crate::domain::alerts::AlertLevel::Warn,
+            };
+            crate::http::routes::raise_alert_once(
+                state,
+                level,
+                crate::domain::alerts::AlertSource::Plugin(id.clone()),
+                msg.to_string(),
+            );
+        }
     }
 
     /// 调用生命周期事件（`event_json` 可选实现）
@@ -151,36 +186,45 @@ impl EnhancePlugin for CApiEnhance {
         self.describe.ui.clone()
     }
 
-    /// 动作路由：`/api/p/<插件id>/<action>`（GET 的 query 与 POST 的 body 都按 JSON 传给插件）
+    /// 动作路由：`/api/p/<插件id>/<action...>`（GET 的 query 与 POST 的 body 都按 JSON 传给插件）
+    ///
+    /// 用 `/*action` 通配支持**多段动作名**（如 `trash/empty`），前端 api 拼接零改动。
     fn routes(&self) -> Router<AppState> {
         let table = self.table;
         let get_handler = move |Path(action): Path<String>,
                                 State(state): State<AppState>,
                                 Query(q): Query<HashMap<String, String>>| async move {
+            let action = action.trim_start_matches('/').to_string();
             let body = serde_json::to_string(&q).unwrap_or_else(|_| "{}".to_string());
             axum::Json(action_call(&state, table, &action, &body))
         };
         let post_handler = move |Path(action): Path<String>,
                                  State(state): State<AppState>,
                                  body: Option<axum::Json<Value>>| async move {
+            let action = action.trim_start_matches('/').to_string();
             let body = body
                 .map(|axum::Json(v)| v.to_string())
                 .unwrap_or_else(|| "{}".to_string());
             axum::Json(action_call(&state, table, &action, &body))
         };
-        Router::new().route("/:action", get(get_handler).post(post_handler))
+        Router::new().route("/*action", get(get_handler).post(post_handler))
     }
 
     async fn on_startup(&self, state: &AppState) {
-        self.call_event("startup", &Self::cfg_of(state));
+        if let Some(raw) = self.call_event("startup", &Self::cfg_of(state)) {
+            self.apply_alerts(state, &raw);
+        }
     }
 
     async fn patrol(&self, state: &AppState) {
-        self.call_event("patrol", &Self::cfg_of(state));
+        if let Some(raw) = self.call_event("patrol", &Self::cfg_of(state)) {
+            self.apply_alerts(state, &raw);
+        }
     }
 
     async fn after_backup(&self, state: &AppState) -> Option<u64> {
         let raw = self.call_event("after_backup", &Self::cfg_of(state))?;
+        self.apply_alerts(state, &raw);
         serde_json::from_str::<Value>(&raw)
             .ok()?
             .get("count")?
@@ -188,22 +232,37 @@ impl EnhancePlugin for CApiEnhance {
     }
 
     async fn reload(&self, state: &AppState) {
-        self.call_event("reload", &Self::cfg_of(state));
+        if let Some(raw) = self.call_event("reload", &Self::cfg_of(state)) {
+            self.apply_alerts(state, &raw);
+        }
     }
 
     async fn health_check(
         &self,
-        _state: &AppState,
+        state: &AppState,
         cfg: &crate::infra::config::AppConfig,
     ) -> Vec<CheckOutcome> {
         let cfg_json = CfgSnapshot::from_config(cfg).to_json();
-        let raw = match call1(self.table, self.table.0.health_json, &cfg_json) {
+        let Some(f) = self.table.0.health_json else {
+            return Vec::new();
+        };
+        let raw = match call1(self.table, f, &cfg_json) {
             Some(s) => s,
             None => return Vec::new(),
         };
+        self.apply_alerts(state, &raw);
         serde_json::from_str::<Vec<AbiCheck>>(&raw)
             .map(|v| v.into_iter().map(CheckOutcome::from).collect())
             .unwrap_or_default()
+    }
+
+    /// 卸载清除：调用插件主表的 `destroy` 回调（若实现），供插件清理自身状态。
+    fn destroy(&self) {
+        let Some(f) = self.table.0.destroy else {
+            return;
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        tracing::info!(plugin = %self.describe.id, "插件 destroy 回调已调用（自管数据由宿主随后清除）");
     }
 }
 
@@ -250,7 +309,13 @@ fn action_call(state: &AppState, table: AbiTable, action: &str, body: &str) -> V
     })
     .to_string();
 
-    match call2(table, table.0.action_json, action, &request) {
+    let Some(f) = table.0.action_json else {
+        return serde_json::json!({
+            "success": false,
+            "error": format!("该插件未实现动作入口（action_json）：{action}"),
+        });
+    };
+    match call2(table, f, action, &request) {
         Some(text) => serde_json::from_str::<Value>(&text).unwrap_or_else(|e| {
             serde_json::json!({
                 "success": false,

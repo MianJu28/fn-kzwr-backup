@@ -31,7 +31,7 @@ impl PluginRegistry {
     /// 载入内置插件（编译期固定）
     pub fn builtin() -> Self {
         Self {
-            targets: vec![Arc::new(builtin::webdav::WebdavPlugin)],
+            targets: vec![Arc::new(builtin::webdav_abi::WebdavAbiPlugin::new())],
             enhances: vec![Arc::new(builtin::kzwr::KzwrPlugin)],
             external_libs: Vec::new(),
             external_reports: Vec::new(),
@@ -42,14 +42,15 @@ impl PluginRegistry {
 
     /// 加载外置插件（ADR-013 方案 B：动态库）
     ///
+    /// `pubkeys` 为配置的插件签名公钥（base64，Ed25519）；非空时强制验签每个 `*.so`。
     /// 失败只记录诊断，不影响内置能力与其它插件。
-    pub fn load_external(&mut self, dirs: &[(PathBuf, String)]) {
+    pub fn load_external(&mut self, dirs: &[(PathBuf, String)], pubkeys: &[String]) {
         self.plugin_dirs = dirs
             .iter()
             .map(|(p, s)| (p.to_string_lossy().into_owned(), s.clone()))
             .collect();
         let dirs_only: Vec<PathBuf> = dirs.iter().map(|(p, _)| p.clone()).collect();
-        let outcome = super::loader::load_external(&dirs_only);
+        let outcome = super::loader::load_external(&dirs_only, pubkeys);
         self.targets.extend(outcome.targets);
         self.enhances.extend(outcome.enhances);
         self.external_libs.extend(outcome.libs);
@@ -82,6 +83,26 @@ impl PluginRegistry {
 
     pub fn enhance_plugins(&self) -> &[Arc<dyn EnhancePlugin>] {
         &self.enhances
+    }
+
+    /// 全部已加载插件 id（目标 + 增强；含内置与外部）——孤立数据检测用
+    pub fn plugin_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .targets
+            .iter()
+            .map(|p| p.meta().id.clone())
+            .chain(self.enhances.iter().map(|p| p.meta().id.clone()))
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// 调某插件的 `destroy` 钩子（卸载清除时用；找不到则无操作）
+    pub fn call_destroy(&self, id: &str) {
+        if let Some(p) = self.enhances.iter().find(|p| p.meta().id == id) {
+            p.destroy();
+        }
     }
 
     /// 插件清单（供 `/api/plugins`；**前端唯一的区块数据来源**）

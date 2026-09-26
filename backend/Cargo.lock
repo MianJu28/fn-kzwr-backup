@@ -619,6 +619,7 @@ dependencies = [
  "hyper-util",
  "libloading",
  "reqwest",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",
