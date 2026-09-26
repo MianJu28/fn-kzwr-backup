@@ -61,12 +61,20 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 }
 
 /// 阻塞运行一个返回 [`StorageResult`] 的异步操作，把错误转成可读字符串
+///
+/// ⚠️ **必须派发到专用线程**：C ABI 回调是同步的，而宿主常在 **tokio runtime 线程**上
+/// 调用它们（如 axum handler 里的 `verify`/`test_json`）。若直接 `runtime().block_on()`
+/// 会 panic `Cannot start a runtime from within a runtime`，且 `extern "C"` 帧不允许
+/// unwind → **整个进程 abort**。专用线程上没有 runtime 上下文，可安全 `block_on`。
 fn block_on_res<F, T>(what: &str, f: F) -> Result<T, String>
 where
-    F: Future<Output = StorageResult<T>> + Send,
-    T: Send,
+    F: Future<Output = StorageResult<T>> + Send + 'static,
+    T: Send + 'static,
 {
-    runtime().block_on(f).map_err(|e| format!("{what}: {e}"))
+    match std::thread::spawn(move || runtime().block_on(f)).join() {
+        Ok(r) => r.map_err(|e| format!("{what}: {e}")),
+        Err(_) => Err(format!("{what}: 阻塞工作线程异常退出")),
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -256,12 +264,11 @@ extern "C" fn write_end(th: *mut c_void, h: *mut c_void) -> i64 {
         .chunks(FEED_CHUNK)
         .map(|c| Bytes::copy_from_slice(c))
         .collect();
-    let stream = futures::stream::iter(chunks);
     let noop: ProgressCb = Arc::new(|_, _, _| {});
     let target = inst.target.clone();
-    let res = runtime().block_on(async move {
+    let res = block_on_res("上传", async move {
         target
-            .write_stream_progress(&rel, Box::new(stream), noop)
+            .write_stream_progress(&rel, Box::new(futures::stream::iter(chunks)), noop)
             .await
     });
     match res {
@@ -305,7 +312,7 @@ extern "C" fn read_begin(th: *mut c_void, rel: *const c_char) -> *mut c_void {
     let rel = PathBuf::from(rel);
     let target = inst.target.clone();
     // 把整个密文流收集进内存
-    let res: Result<Vec<u8>, StorageError> = runtime().block_on(async move {
+    let res = block_on_res("读取", async move {
         let mut st = target.read_stream(&rel).await?;
         let mut v = Vec::new();
         while let Some(chunk) = st.next().await {
@@ -365,7 +372,7 @@ extern "C" fn list_json(th: *mut c_void, prefix: *const c_char) -> *mut c_char {
         Err(_) => return std::ptr::null_mut(),
     };
     let target = inst.target.clone();
-    match block_on_res("列出目标", target.list(&prefix)) {
+    match block_on_res("列出目标", async move { target.list(&prefix).await }) {
         Ok(entries) => {
             let arr: Vec<serde_json::Value> = entries
                 .into_iter()
@@ -402,7 +409,7 @@ extern "C" fn delete(th: *mut c_void, path: *const c_char) -> c_int {
     };
     let target = inst.target.clone();
     let path = PathBuf::from(path);
-    match block_on_res("删除目标文件", target.delete(&path)) {
+    match block_on_res("删除目标文件", async move { target.delete(&path).await }) {
         Ok(()) => 0,
         Err(e) => {
             inst.last_error_set(e);
@@ -421,7 +428,7 @@ extern "C" fn ensure_dir(th: *mut c_void, path: *const c_char) -> c_int {
     };
     let target = inst.target.clone();
     let path = PathBuf::from(path);
-    match block_on_res("创建目标目录", target.ensure_dir(&path)) {
+    match block_on_res("创建目标目录", async move { target.ensure_dir(&path).await }) {
         Ok(()) => 0,
         Err(e) => {
             inst.last_error_set(e);
@@ -435,7 +442,7 @@ extern "C" fn ping(th: *mut c_void) -> c_int {
         return -1;
     };
     let target = inst.target.clone();
-    match block_on_res("连通性测试", target.ping()) {
+    match block_on_res("连通性测试", async move { target.ping().await }) {
         Ok(()) => 0,
         Err(e) => {
             inst.last_error_set(e);
@@ -457,7 +464,7 @@ extern "C" fn test_json(raw: *const c_char) -> *mut c_char {
         Err(e) => return cstring_ptr(Some(serde_json::json!({"error": e}).to_string())),
     };
     let target = WebdavTarget::new(&url, user, pass);
-    match block_on_res("连通性测试", target.ping()) {
+    match block_on_res("连通性测试", async move { target.ping().await }) {
         Ok(()) => cstring_ptr(Some(serde_json::json!({"url": url}).to_string())),
         Err(e) => cstring_ptr(Some(serde_json::json!({"error": e}).to_string())),
     }
