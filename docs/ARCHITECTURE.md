@@ -479,7 +479,15 @@ trait TargetStorage {
   - **失败隔离**：符号缺失 / ABI 不符 / 版本不符 / 未提供实现 → 该文件只进诊断列表（`/api/plugins` 的 `external.reports`），核心与其它插件不受影响
   - **前端**：`components/PluginSection.svelte`（设置页核心区：开关 + 插件目录 + 扫描目录 + 加载结果列表 + 安全警告）；外置插件的功能区块走 P4 的**通用 UI Schema 渲染**（`component: None`）→ 新增插件不必改前端，也不必重新打包
   - **工具链**：`Scripts/build_plugins.sh`（构建 `plugins/*` 为 `*.so`）+ `build_fnos_app.sh` 自动把插件放进 `app/plugins/`（`SKIP_PLUGINS=1` 可跳过）；示例插件 `plugins/example-hello/`（增强插件：一张 schema 卡片 + `/api/p/example/hello` 接口 + 体检项）
-- ⏳ P6 文档收尾（本 ADR 已随 P5 同步）
+- ✅ **P5（续）：稳定 C ABI v1 —— 让插件不再随宿主升级重编**（2026-09-26，用户提出）：
+  - **问题**：Rust 直连插件传的是 Rust trait 对象，而 Rust **没有稳定 ABI**（vtable 布局/字段排布随编译器与源码变化）→ 每次升级主程序都要重编插件，只能靠「编译期宿主版本 == 运行版本」拦住不兼容的插件
+  - **决策**：跨边界契约降级为**版本化 C ABI + UTF-8 JSON**（`repr(C)` 静态函数表 + JSON 字符串，参考 nginx 模块 / GStreamer 的做法）。插件只依赖 `plugins/sdk`（**零第三方依赖**），宿主内部随便改，只要 `C_ABI_VERSION` 不变插件就一直可用
+  - **契约**（`plugin/abi.rs` ↔ `plugins/sdk`）：唯一入口 `fn_kzwr_plugin_abi_v1() -> *const KzwrPluginAbi`；表内回调 `describe_json` / `available_json` / `action_json` / `health_json` / `event_json`(可选) / `free_str` / `destroy`(可选)；`abi` + `size` 双校验（结构体只增字段）；数据一律 JSON（宿主 `plugin/cabi.rs` 适配成内部 `EnhancePlugin`，前端零改动）
+  - **配置快照** `cfg_json`：宿主 → 插件的稳定视图（host_version/时区/targets/tasks/enhance 状态），**不含任何凭据**（口令/token/账号名都不传）
+  - **两条路径并存**：加载器先找稳定入口（`mechanism=c-abi-v1`），否则回退 Rust 直连（`mechanism=rust-direct`，仅它需要版本校验）；`/api/plugins` 与设置页都会标出机制
+  - 契约文档：[`docs/PLUGIN_ABI.md`](PLUGIN_ABI.md)（冻结的符号/JSON schema/版本演进规则/安全边界）
+  - **验证（NAS 实测）**：宿主 0.4.0 下两个示例插件同时加载（`example`=c-abi-v1、`example-rust`=rust-direct），动作接口与体检项均正常；**把宿主版本改到 0.4.1 并只重编宿主**（插件不动）→ 稳定 ABI 插件**仍然加载且动作可用**，Rust 直连插件被拒并提示「改用稳定 C ABI」；前端设置页出现机制徽标与两张插件卡片
+- ⏳ P6 文档收尾（本 ADR 已随 P5 同步；插件契约见 `docs/PLUGIN_ABI.md`）
 - 遗留（P3b）：`AppState.kzwr` 这个客户端实例仍由核心持有（插件驱动它），后续可移入插件自身
 - 遗留（P5b）：外置插件**无签名校验**（仅 ABI/版本），只应放可信插件；后续可加 sha256 白名单或签名
 
@@ -735,7 +743,9 @@ fn-kzwr-backup/
 | **多目标** | 备份到多个目标 | ✅ | v0.4.0 起支持（ADR-014）：`targets` 列表 + 目标池；每个目标的凭据独立加密、快照按目标账号分桶、独立增量与保留策略（`GET/POST /api/targets`、`/api/targets/:id/{test,delete}`） |
 | **多任务** | 多个独立备份任务 | ✅ | v0.4.0 起支持（ADR-014）：`tasks` 列表 = 源路径集 + 目标 + cron + 保留策略；每任务独立调度（`domain/scheduler.rs`）与快照（`job_id = "{task.id}-{源序号}"`）；`GET/POST /api/tasks`、`POST /api/tasks/:id/{run,delete}`；前端「任务」「目标」两页 |
 | **插件** | 内置插件（编译期） | ✅ | ADR-013 P1–P4：`TargetPlugin`/`EnhancePlugin` 契约 + 注册表装配 + `/api/plugins` 驱动前端区块（`webdav` 目标插件、`kzwr` 增强插件） |
-| | 外置插件（动态库） | ✅ | ADR-013 **方案 B（P5）**：`*.so` + `libloading`；3 个 C ABI 符号（ABI 版本/宿主版本/创建实例）；**ABI 与编译期宿主版本双重校验**（不匹配拒绝加载）；目录 `FN_KZWR_PLUGIN_DIR` > 配置 `plugins.dir` > `$TRIM_PKGETC/plugins` > `$TRIM_APPDEST/plugins`；**默认关闭**（设置页开关，重启生效）；失败只进诊断不影响核心；工具链 `Scripts/build_plugins.sh` + 示例 `plugins/example-hello/` |
+| | 外置插件（动态库） | ✅ | ADR-013 **方案 B（P5）**：`*.so` + `libloading`；目录 `FN_KZWR_PLUGIN_DIR` > 配置 `plugins.dir` > `$TRIM_PKGETC/plugins` > `$TRIM_APPDEST/plugins`；**默认关闭**（设置页开关，重启生效）；失败只进诊断不影响核心；工具链 `Scripts/build_plugins.sh` |
+| | 稳定 C ABI（免重编） | ✅ | 唯一入口 `fn_kzwr_plugin_abi_v1` + `repr(C)` 函数表 + JSON 数据交换（`plugin/abi.rs` ↔ `plugins/sdk`，插件零第三方依赖）；`abi`+`size` 双校验；**宿主升级不需要重编插件**；契约见 `docs/PLUGIN_ABI.md`；示例 `plugins/example-hello/` |
+| | Rust 直连（进阶） | ✅ | 传 Rust trait 对象，能力最全（可写自定义备份目标）；Rust 无稳定 ABI → 强制「编译期宿主版本 == 运行版本」；示例 `plugins/example-rdirect/` |
 
 ### 11.3 当前实际 Rust 源码结构
 
@@ -758,9 +768,11 @@ backend/src/
 │   ├── retention.rs     # RetentionPolicy (孤儿文件清理)
 │   └── scheduler.rs     # Scheduler (**每任务独立 cron**，ADR-014)
 ├── plugin/              # 插件层（ADR-013）
-│   ├── api.rs           # 契约：TargetPlugin/EnhancePlugin/PluginMeta/PluginUi/UiBlock/PluginEntry
-│   ├── sdk.rs           # 外置插件 SDK（方案 B）：ABI 常量 + PluginHandle + export_plugin! 宏
-│   ├── loader.rs        # 外置插件加载：目录扫描 + libloading + ABI/宿主版本校验 + 失败隔离
+│   ├── api.rs           # 内部契约：TargetPlugin/EnhancePlugin/PluginMeta/PluginUi/UiBlock/PluginEntry
+│   ├── abi.rs           # **稳定 C ABI v1 契约**（KzwrPluginAbi 表 + JSON schema + 配置快照）
+│   ├── cabi.rs          # 稳定 C ABI → 内部 EnhancePlugin 适配（动作路由/体检/事件/panic 兜底）
+│   ├── sdk.rs           # Rust 直连外置插件 SDK：ABI 常量 + PluginHandle + export_plugin! 宏
+│   ├── loader.rs        # 加载：目录扫描 + libloading + 稳定入口优先/Rust 直连回退 + 失败隔离
 │   ├── registry.rs      # 唯一装配点：builtin()/load_external()/build_targets()/describe()
 │   └── builtin/
 │       ├── webdav.rs    # 目标插件（默认启用；每个目标一份实例）
@@ -820,6 +832,7 @@ frontend/src/
 - **升级无感**：旧 `[backup]`/`[webdav]` 配置自动迁移为 `default` 任务/目标，快照 key 不变（`default-0`）→ 装机升级后不会全量重传；旧字段持续作为兼容镜像回写
 - **外置插件安全边界**（ADR-013 方案 B）：加载动态库 = 执行任意本地代码 → 默认关闭、必须由用户在设置页显式开启；宿主以 ABI 版本 + 「编译期宿主版本 == 运行版本」双重校验拒绝不匹配的插件；单个插件加载失败只进诊断，不影响核心；插件开关/目录变更**重启生效**
 - **插件前端零改动**：插件通过 `/api/plugins` 的 `ui.blocks`（metric/text/number/toggle/button/tips）声明界面，前端用 `PluginBlocks.svelte` 通用渲染 → 新增插件不必改前端、不必重新打包前端
+- **插件契约冻结（稳定 C ABI v1）**：跨边界只走 `repr(C)` 函数表 + UTF-8 JSON（`docs/PLUGIN_ABI.md` 为权威契约）；`abi`+`size` 双校验、字段只增不改 → **主程序升级不需要重编插件**；破坏性改动才升 `abi` 版本，届时宿主并存 v1/v2。Rust 直连路径保留给需要自定义备份目标的进阶插件（须同版本编译）
 - **定时备份**：cron 表达式到点触发，运行中改配置热更新（`domain/scheduler.rs`）；调度循环 await 备份完成后才排下一轮
 - **备份运行互斥**：定时调度与手动触发共用 `AppState.backup_running`（`AtomicBool`，`run_backup_now` 入口 CAS 抢占 + RAII 守卫复位），已有备份在执行时第二次触发立即返回 `skipped = true` 与提示文案，避免并发备份争抢带宽与快照写入
 - **用户信息**：账号记录在配置（username_enc 解密），`/api/user/info` 返回本地账号；WebDAV 无套餐/容量接口
@@ -839,7 +852,7 @@ frontend/src/
 7. **aarch64 设备实测**：CI 已产出双架构包，需在 aarch64 飞牛设备上验证二进制可用性
 8. **0.4.0 打包与真机回归**：多任务/多目标代码已通过 NAS 端到端测试（rclone 双 WebDAV 目标），但**尚未打包 `.fpk` 装机**；打包后需在真机验证「旧配置自动迁移 + 旧快照继续增量」这一升级路径（NAS 测试用的是构造的 legacy 配置）
 9. ✅ **插件外置加载（ADR-013 P5，方案 B：动态库）**：已落地并通过 NAS 实测（ABI/版本双校验、失败隔离、默认关闭、设置页开关与诊断）
-9b. **插件生态完善（可选）**：插件签名/sha256 白名单、插件市场或一键安装、热加载（当前需重启）、`PluginUi` 增加更多块类型（表格/分组/条件显隐）
+9b. **插件生态完善（可选）**：插件签名/sha256 白名单、插件市场或一键安装、热加载（当前需重启）、`PluginUi` 增加更多块类型（表格/分组/条件显隐）、稳定 C ABI 增加**定时巡检/通知外发/自定义备份目标**回调（当前 v1 仅增强类：UI/动作/体检/事件）
 10. **兼容层收尾**：待旧前端下线后，可移除「首个任务/主目标」兼容分支与 `[backup]`/`[webdav]` 镜像字段（另一大版本）
 
 ### 11.6 飞牛应用打包实现（基于抓取到的飞牛开发文档）
