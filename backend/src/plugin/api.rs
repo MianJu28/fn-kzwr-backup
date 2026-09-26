@@ -221,4 +221,8 @@ pub trait EnhancePlugin: Send + Sync {
     ) -> Vec<CheckOutcome> {
         Vec::new()
     }
+
+    /// 卸载清除（ADR-013 决策 2）：宿主调用 `/api/plugins/:id/purge` 前调用，让插件释放
+    /// **可选的**自身状态（动态库句柄由宿主保活到进程结束，不会在此卸载）。默认无操作。
+    fn destroy(&self) {}
 }

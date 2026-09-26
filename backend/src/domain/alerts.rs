@@ -18,7 +18,7 @@ pub enum AlertLevel {
 }
 
 /// 告警来源
-#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum AlertSource {
     Backup,
@@ -27,6 +27,8 @@ pub enum AlertSource {
     Config,
     /// kzwr 增强功能（access-token 失效、云端空间预警等）
     Kzwr,
+    /// 插件（声明式回传）：字段为插件 id
+    Plugin(String),
 }
 
 /// 告警条目
@@ -191,7 +193,7 @@ fn render_template(template: &str, alert: &Alert) -> String {
     template
         .replace("{{message}}", &alert.message)
         .replace("{{level}}", level_name(alert.level))
-        .replace("{{source}}", source_name(alert.source))
+        .replace("{{source}}", &source_name(&alert.source))
         .replace("{{ts}}", &alert.ts.to_string())
         .replace("{{id}}", &alert.id.to_string())
 }
@@ -205,12 +207,13 @@ fn level_name(level: AlertLevel) -> &'static str {
 }
 
 /// 告警来源短名（与序列化保持一致）
-fn source_name(source: AlertSource) -> &'static str {
+fn source_name(source: &AlertSource) -> String {
     match source {
-        AlertSource::Backup => "backup",
-        AlertSource::Restore => "restore",
-        AlertSource::Scheduler => "scheduler",
-        AlertSource::Config => "config",
-        AlertSource::Kzwr => "kzwr",
+        AlertSource::Backup => "backup".to_string(),
+        AlertSource::Restore => "restore".to_string(),
+        AlertSource::Scheduler => "scheduler".to_string(),
+        AlertSource::Config => "config".to_string(),
+        AlertSource::Kzwr => "kzwr".to_string(),
+        AlertSource::Plugin(id) => format!("plugin.{id}"),
     }
 }

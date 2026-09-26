@@ -466,6 +466,12 @@ pub struct ConfigBundle {
     /// 多任务（源路径 + 目标引用 + cron + 保留策略）
     #[serde(default)]
     pub tasks: Vec<crate::infra::config::TaskConfig>,
+    /// 插件自管数据（明文键值对；敏感，导出需管理员口令，导入重新加密）
+    #[serde(default)]
+    pub plugin_data: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, String>,
+    >,
 }
 
 /// 导出/导入包里的单个目标（**含明文凭据**，仅存于导出的 JSON 文本）
@@ -590,10 +596,20 @@ async fn health(State(_state): State<AppState>) -> Json<HealthResponse> {
 /// 返回项包含 `available`（是否已可用）与 `ui`（设置页/概览页区块描述），
 /// 前端据此决定渲染哪些卡片、顺序如何、用内置组件还是 `blocks` 通用渲染。
 async fn plugins_list(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let cfg = state.config.lock().unwrap().load().unwrap_or_default();
+    let mgr = state.config.lock().unwrap();
+    let cfg = mgr.load().unwrap_or_default();
     let env_override = crate::plugin::loader::enabled_by_env();
+    // 孤立数据检测：`plugin_data` 里有记录但没有对应已加载插件的 id → 前端提示「清理遗留配置」
+    let loaded = state.plugins.plugin_ids();
+    let orphan_data: Vec<String> = mgr
+        .plugin_data_ids(&cfg)
+        .into_iter()
+        .filter(|id| !loaded.contains(id))
+        .collect();
     Json(serde_json::json!({
         "plugins": state.plugins.describe(&cfg),
+        // 有自管数据但插件未加载的 id（卸载残留；前端据此提示清理）
+        "orphan_data": orphan_data,
         // 外置插件（ADR-013 方案 B：动态库）的开关/目录/加载诊断
         "external": {
             "configured": cfg.plugins.enabled,
@@ -606,6 +622,65 @@ async fn plugins_list(State(state): State<AppState>) -> Json<serde_json::Value> 
                 .collect::<Vec<_>>(),
             "reports": state.plugins.external_reports(),
         }
+    }))
+}
+
+/// `POST /api/plugins/:id/purge`：卸载清除插件自管数据（ADR-013 决策 2）
+///
+/// 流程：引用检查（仍被目标 `kind` 或任务所引目标的 `kind` 引用 → 拒绝，并列出引用项）
+/// → 调插件 `destroy`（若实现，插件自身状态清理）→ 删除该 id 的 `plugin_data` 命名空间
+/// → 记审计。动态库句柄由宿主保活到进程结束，此处不卸载 `.so` 本身。
+async fn plugin_purge(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    let mgr = state.config.lock().unwrap();
+    let mut cfg = mgr.load().unwrap_or_default();
+
+    // 1) 引用检查：`TargetConfig.kind == id`，或某任务所引用目标的 `kind == id`
+    let mut referencing = Vec::new();
+    for t in &cfg.targets {
+        if t.kind == id {
+            let n = if t.name.is_empty() { t.id.clone() } else { t.name.clone() };
+            referencing.push(format!("目标「{n}」"));
+        }
+    }
+    for task in &cfg.tasks {
+        if let Some(t) = cfg.target_by_id(&task.target_id) {
+            if t.kind == id && !task.target_id.is_empty() {
+                let n = if task.name.is_empty() { task.id.clone() } else { task.name.clone() };
+                referencing.push(format!("任务「{n}」"));
+            }
+        }
+    }
+    referencing.sort();
+    referencing.dedup();
+    if !referencing.is_empty() {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": "插件仍被引用，拒绝卸载清除",
+            "referenced_by": referencing,
+        }));
+    }
+
+    // 2) 调插件 `destroy`（自身状态清理；动态库句柄仍由宿主保活）
+    state.plugins.call_destroy(&id);
+
+    // 3) 删除该 id 的 `plugin_data` 命名空间
+    let removed = mgr.plugin_data_remove(&mut cfg, &id);
+    if let Err(e) = mgr.save(&cfg) {
+        return Json(err(format!("{:#}", e)));
+    }
+    state.audit.record(
+        "plugin.purge",
+        format!("卸载清除插件 {id}（{}自管数据）", if removed { "删除了" } else { "无可删" }),
+        true,
+        None,
+    );
+    Json(serde_json::json!({
+        "success": true,
+        "removed": removed,
+        "referenced_by": Vec::<String>::new(),
     }))
 }
 
@@ -3206,6 +3281,18 @@ async fn config_export(
         key_backed_up: cfg.keys.backed_up,
         targets: bundle_targets,
         tasks: cfg.tasks.clone(),
+        plugin_data: (|| {
+            let mgr_ref = state.config.lock().unwrap();
+            let mut out = std::collections::BTreeMap::new();
+            for p in mgr_ref.plugin_data_ids(&cfg) {
+                if let Ok(kv) = mgr_ref.plugin_data_export(&cfg, &p) {
+                    if !kv.is_empty() {
+                        out.insert(p, kv);
+                    }
+                }
+            }
+            out
+        })(),
     };
     match serde_json::to_string_pretty(&bundle) {
         Ok(text) => Json(ConfigExportResponse {
@@ -3362,6 +3449,20 @@ async fn config_import(
                 })
                 .collect();
         }
+        // 插件自管数据（明文键值对重新用当前口令加密；未携带则不覆盖）
+        if !bundle.plugin_data.is_empty() {
+            cfg.plugin_data.clear();
+            for (plugin, kv) in &bundle.plugin_data {
+                for (k, v) in kv {
+                    if let Err(e) = mgr.plugin_data_set(&mut cfg, plugin, k, v) {
+                        return Json(ConfigImportResponse {
+                            success: false,
+                            error: Some(format!("插件自管数据加密失败: {:#}", e)),
+                        });
+                    }
+                }
+            }
+        }
         if let Err(e) = mgr.save(&cfg) {
             return Json(ConfigImportResponse {
                 success: false,
@@ -3448,6 +3549,7 @@ pub fn router(state: AppState) -> Router {
     let mut core = Router::new()
         .route("/health", get(health))
         .route("/plugins", get(plugins_list))
+        .route("/plugins/:id/purge", post(plugin_purge))
         .route("/ws", get(ws::ws_handler))
         .route("/webdav/config", post(webdav_save))
         .route("/user/info", get(user_info))
