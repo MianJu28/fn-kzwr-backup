@@ -33,7 +33,9 @@ use futures::{Stream, StreamExt};
 use serde::Deserialize;
 
 use crate::infra::config::{ConfigManager, TargetConfig};
-use crate::infra::storage_trait::{FileDescriptor, ProgressCb, StorageError, StorageResult, TargetStorage};
+use crate::infra::storage_trait::{
+    FileDescriptor, PlanSession, PlanUpload, ProgressCb, StorageError, StorageResult, TargetStorage,
+};
 use crate::plugin::abi::{AbiDescribe, AbiTargetCaps, KzwrTargetAbi};
 use crate::plugin::api::{PluginMeta, PluginUi, TargetPlugin};
 
@@ -499,6 +501,115 @@ impl TargetStorage for AbiTargetStorage {
             }
         }
         Ok(())
+    }
+
+    fn plan_upload(&self) -> Option<&dyn PlanUpload> {
+        // 仅当目标**同时**声明 supports_plan 并实现了 plan_begin/plan_next 才启用：
+        // 并发回传是增益能力，缺任一回调都退回宿主顺序推块（不作为硬依赖）。
+        if self.caps.supports_plan
+            && self.abi.plan_begin.is_some()
+            && self.abi.plan_next.is_some()
+        {
+            Some(self)
+        } else {
+            None
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 并发回传（计划式）：把「传哪些、一次传几批」的决定权交给目标插件
+// ════════════════════════════════════════════════════════════════════════════
+
+impl PlanUpload for AbiTargetStorage {
+    fn max_parallel(&self) -> usize {
+        if self.caps.max_parallel == 0 {
+            4
+        } else {
+            self.caps.max_parallel as usize
+        }
+    }
+
+    fn begin(&self, manifest: &[FileDescriptor]) -> StorageResult<Box<dyn PlanSession>> {
+        let begin = match (self.abi.plan_begin, self.abi.plan_next) {
+            (Some(b), Some(_)) => b,
+            _ => {
+                return Err(StorageError::Protocol(format!(
+                    "{}: 目标声明 supports_plan 但未实现 plan_begin/plan_next",
+                    self.name
+                )))
+            }
+        };
+        // 清单：只给待传文件（目录不传），带 size/mtime 供插件做批次规划
+        let items: Vec<serde_json::Value> = manifest
+            .iter()
+            .filter(|fd| !fd.is_dir)
+            .map(|fd| {
+                let mtime = fd
+                    .modified
+                    .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                serde_json::json!({
+                    "rel_path": fd.rel_path,
+                    "size": fd.size,
+                    "mtime_secs": mtime,
+                })
+            })
+            .collect();
+        let job = serde_json::json!({ "upload": items }).to_string();
+        let c =
+            CString::new(job).map_err(|_| StorageError::Protocol("job_json 含非法字节".into()))?;
+        let th = self.th as *mut c_void;
+        // SAFETY: plan_begin 由插件导出；th 是 target_open 发放的实例句柄
+        let ph = unsafe { begin(th, c.as_ptr()) };
+        if ph.is_null() {
+            return Err(self.err_from(th, -1, "plan_begin"));
+        }
+        Ok(Box::new(AbiPlanSession {
+            abi: self.abi,
+            th: self.th,
+            // 句柄以 usize 保存：裸指针非 Send，而会话需跨 await 持有（见 PlanSession）
+            ph: ph as usize,
+        }))
+    }
+}
+
+/// 一次规划会话：持有插件发放的计划句柄，**Drop 时自动 `plan_end`**
+/// （提前 break / 出错返回也能结束规划，避免插件侧状态泄漏）
+struct AbiPlanSession {
+    abi: &'static KzwrTargetAbi,
+    th: usize,
+    ph: usize,
+}
+
+impl PlanSession for AbiPlanSession {
+    fn next_batch(&mut self) -> StorageResult<Vec<String>> {
+        let Some(next) = self.abi.plan_next else {
+            return Ok(Vec::new());
+        };
+        let th = self.th as *mut c_void;
+        // SAFETY: ph 由 plan_begin 发放，本会话是其唯一持有者
+        let p = unsafe { next(th, self.ph as *mut c_void) };
+        if p.is_null() {
+            return Ok(Vec::new());
+        }
+        let body = take_cstring(p, self.abi).unwrap_or_default();
+        if body.is_empty() {
+            return Ok(Vec::new());
+        }
+        serde_json::from_str::<Vec<String>>(&body)
+            .map_err(|e| StorageError::Protocol(format!("plan_next 返回无法解析: {e}")))
+    }
+}
+
+impl Drop for AbiPlanSession {
+    fn drop(&mut self) {
+        if let Some(end) = self.abi.plan_end {
+            let th = self.th as *mut c_void;
+            // SAFETY: ph 由 plan_begin 发放，Drop 是最后一次使用
+            unsafe { end(th, self.ph as *mut c_void) };
+        }
     }
 }
 

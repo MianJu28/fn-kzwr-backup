@@ -9,6 +9,7 @@
 //!   5. 保存新快照
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -23,7 +24,7 @@ use crate::domain::retention::RetentionPolicy;
 use crate::domain::sync::SyncSession;
 use crate::infra::persistence::snapshot::{SnapshotEntry, SnapshotStore};
 use crate::infra::storage_trait::{
-    FileDescriptor, ProgressCb, SourceStorage, StorageError, TargetStorage,
+    FileDescriptor, PlanSession, ProgressCb, SourceStorage, StorageError, TargetStorage,
 };
 
 /// 上传进度回调（明文口径）：(本文件已上传明文, 本文件已传输密文, 本请求已用时毫秒)
@@ -147,8 +148,6 @@ impl BackupJob {
             None,
         );
 
-        let mut done: u64 = 0;
-        let mut bytes_done: u64 = 0; // 明文
         let mut summary = BackupSummary::default();
         let mut job_ids: Vec<String> = Vec::new();
 
@@ -174,81 +173,43 @@ impl BackupJob {
                 let _ = self.target.ensure_dir(&tp).await;
             }
 
-            // 2) 上传新增/修改文件（顺序传输；断点续传：每上传完一个文件即时保存其快照）
-            let shared = Arc::new(Mutex::new((done, bytes_done)));
-            for fd in p.changeset.upload.iter().filter(|fd| !fd.is_dir) {
-                {
-                    let mut s = shared.lock().unwrap();
-                    s.0 = done;
-                    s.1 = bytes_done;
-                }
-                let cb = self.plain_progress_cb(
-                    &self.job_id,
-                    &fd.rel_path,
-                    shared.clone(),
-                    grand_total_files,
-                    grand_total_bytes,
-                    fd.size,
-                    meter.clone(),
-                    started,
-                );
-                // 网络类失败自动重试（最多 3 次，线性退避；认证/不存在类不重试）
-                let plain_n = {
-                    let mut out: Result<u64, anyhow::Error> = Err(anyhow::anyhow!("上传未执行"));
-                    for attempt in 1..=crate::domain::NETWORK_RETRY_ATTEMPTS {
-                        out = self
-                            .upload_one(
-                                &*p.source,
-                                &fd.rel_path,
-                                p.target_prefix.as_deref(),
-                                Some(cb.clone()),
-                            )
-                            .await;
-                        match &out {
-                            Ok(_) => break,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "上传 {} 第 {attempt}/{} 次失败: {e:#}",
-                                    fd.rel_path,
-                                    crate::domain::NETWORK_RETRY_ATTEMPTS
-                                );
-                                if !crate::domain::is_retryable_err(e)
-                                    || attempt == crate::domain::NETWORK_RETRY_ATTEMPTS
-                                {
-                                    break;
-                                }
-                                tokio::time::sleep(std::time::Duration::from_millis(
-                                    500 * attempt as u64,
-                                ))
-                                .await;
-                            }
-                        }
-                    }
-                    out?
-                };
-                // 上传**完成后**才计入完成数（避免「未完成就 +1」）
-                done += 1;
-                bytes_done += plain_n;
-                summary.uploaded += 1;
-                summary.uploaded_bytes += plain_n;
-                self.store
-                    .save_entry(&p.job_id, self.account(), &SnapshotEntry::from_fd(fd))?;
-                self.publish(
-                    &self.job_id,
-                    crate::eventbus::TaskStatus::Progress,
-                    Some(crate::eventbus::TaskPhase::Transfer),
-                    Some(fd.rel_path.clone()),
-                    done,
-                    grand_total_files,
-                    bytes_done,
-                    grand_total_bytes,
-                    started.elapsed().as_millis() as u64,
-                    meter.lock().unwrap().speed_bps(),
-                    None,
-                );
-                info!("已上传: {} ({plain_n} B)", fd.rel_path);
-            }
+            // 2) 上传清单在循环**之后**统一处理（见下方 `upload_all`）：
+            //    这样目标能拿到跨所有源的完整清单，做全局并发回传规划。
         }
+
+        // 2) 上传新增/修改文件（顺序 or 并发回传；断点续传：每上传完一个即时存快照）
+        let ctx = Arc::new(UploadCtx {
+            shared: Arc::new(Mutex::new((0u64, 0u64))),
+            total_files: grand_total_files,
+            total_bytes: grand_total_bytes,
+            meter,
+            started,
+            files: AtomicUsize::new(0),
+            bytes: AtomicU64::new(0),
+        });
+        let items: Vec<UploadItem> = prepared
+            .iter()
+            .flat_map(|p| {
+                p.changeset
+                    .upload
+                    .iter()
+                    .filter(|fd| !fd.is_dir)
+                    .map(move |fd| UploadItem {
+                        source: p.source.clone(),
+                        job_id: p.job_id.clone(),
+                        prefix: p.target_prefix.clone(),
+                        fd: fd.clone(),
+                        target_rel: target_path_with(p.target_prefix.as_deref(), &fd.rel_path)
+                            .to_string_lossy()
+                            .into_owned(),
+                    })
+            })
+            .collect();
+        self.upload_all(items, &ctx, &self.job_id).await?;
+        let done = ctx.files.load(Ordering::Relaxed) as u64;
+        let bytes_done = ctx.bytes.load(Ordering::Relaxed);
+        summary.uploaded = ctx.files.load(Ordering::Relaxed);
+        summary.uploaded_bytes = bytes_done;
 
         // 3) 收尾阶段：删除云端多余文件 → 落盘快照 → 保留策略清理孤儿
         //    （单独切到 cleanup 阶段，面板显示「收尾/清理」而不是一直停在传输）
@@ -262,7 +223,7 @@ impl BackupJob {
             bytes_done,
             grand_total_bytes,
             started.elapsed().as_millis() as u64,
-            meter.lock().unwrap().speed_bps(),
+            ctx.meter.lock().unwrap().speed_bps(),
             Some("收尾：清理云端多余文件并保存快照…".to_string()),
         );
 
@@ -339,7 +300,7 @@ impl BackupJob {
             bytes_done,
             grand_total_bytes,
             started.elapsed().as_millis() as u64,
-            meter.lock().unwrap().speed_bps(),
+            ctx.meter.lock().unwrap().speed_bps(),
             None,
         );
 
@@ -463,82 +424,32 @@ impl BackupJob {
             None,
         );
 
-        let mut uploaded = 0usize;
-        let mut uploaded_bytes = 0u64;
-        let shared = Arc::new(Mutex::new((0u64, 0u64)));
-        for fd in &changeset.upload {
-            if fd.is_dir {
-                continue;
-            }
-            // 回调内读取共享计数器作为基准（顺序模式下即当前进度）
-            {
-                let mut s = shared.lock().unwrap();
-                s.0 = uploaded as u64;
-                s.1 = uploaded_bytes;
-            }
-            let cb = self.plain_progress_cb(
-                job_id,
-                &fd.rel_path,
-                shared.clone(),
-                total_upload,
-                total_bytes,
-                fd.size,
-                meter.clone(),
-                started,
-            );
-            // 网络类失败自动重试（最多 3 次，线性退避）
-            let plain_n = {
-                let mut out: Result<u64, anyhow::Error> = Err(anyhow::anyhow!("上传未执行"));
-                for attempt in 1..=crate::domain::NETWORK_RETRY_ATTEMPTS {
-                    out = self
-                        .upload_one(
-                            source,
-                            &fd.rel_path,
-                            self.target_prefix.as_deref(),
-                            Some(cb.clone()),
-                        )
-                        .await;
-                    match &out {
-                        Ok(_) => break,
-                        Err(e) => {
-                            tracing::warn!(
-                                "上传 {} 第 {attempt}/{} 次失败: {e:#}",
-                                fd.rel_path,
-                                crate::domain::NETWORK_RETRY_ATTEMPTS
-                            );
-                            if !crate::domain::is_retryable_err(e)
-                                || attempt == crate::domain::NETWORK_RETRY_ATTEMPTS
-                            {
-                                break;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(
-                                500 * attempt as u64,
-                            ))
-                            .await;
-                        }
-                    }
-                }
-                out?
-            };
-            uploaded += 1;
-            uploaded_bytes += plain_n;
-            self.store
-                .save_entry(job_id, self.account(), &SnapshotEntry::from_fd(fd))?;
-            self.publish(
-                job_id,
-                crate::eventbus::TaskStatus::Progress,
-                Some(crate::eventbus::TaskPhase::Transfer),
-                Some(fd.rel_path.clone()),
-                uploaded as u64,
-                total_upload,
-                uploaded_bytes,
-                total_bytes,
-                started.elapsed().as_millis() as u64,
-                meter.lock().unwrap().speed_bps(),
-                None,
-            );
-            info!("已上传: {} ({plain_n} B)", fd.rel_path);
-        }
+        let ctx = Arc::new(UploadCtx {
+            shared: Arc::new(Mutex::new((0u64, 0u64))),
+            total_files: total_upload,
+            total_bytes,
+            meter,
+            started,
+            files: AtomicUsize::new(0),
+            bytes: AtomicU64::new(0),
+        });
+        let items: Vec<UploadItem> = changeset
+            .upload
+            .iter()
+            .filter(|fd| !fd.is_dir)
+            .map(|fd| UploadItem {
+                source: self.source.clone(),
+                job_id: job_id.to_string(),
+                prefix: self.target_prefix.clone(),
+                fd: fd.clone(),
+                target_rel: target_path_with(self.target_prefix.as_deref(), &fd.rel_path)
+                    .to_string_lossy()
+                    .into_owned(),
+            })
+            .collect();
+        self.upload_all(items, &ctx, job_id).await?;
+        let uploaded = ctx.files.load(Ordering::Relaxed);
+        let uploaded_bytes = ctx.bytes.load(Ordering::Relaxed);
 
         // 4) 收尾阶段：删除云端多余文件 → 保存快照
         self.publish(
@@ -551,7 +462,7 @@ impl BackupJob {
             uploaded_bytes,
             total_bytes,
             started.elapsed().as_millis() as u64,
-            meter.lock().unwrap().speed_bps(),
+            ctx.meter.lock().unwrap().speed_bps(),
             Some("收尾：清理云端多余文件并保存快照…".to_string()),
         );
 
@@ -582,7 +493,7 @@ impl BackupJob {
             uploaded_bytes,
             total_bytes,
             started.elapsed().as_millis() as u64,
-            meter.lock().unwrap().speed_bps(),
+            ctx.meter.lock().unwrap().speed_bps(),
             None,
         );
 
@@ -738,6 +649,206 @@ impl BackupJob {
         }
         Ok(plain_len as u64)
     }
+
+    // ── 上传调度：顺序 or 并发回传 ────────────────────────────────────────
+
+    /// 上传单个文件：重试 → 快照落盘 → 进度发布 → 计数累加（**并发安全**）
+    async fn upload_one_task(
+        &self,
+        item: &UploadItem,
+        ctx: &UploadCtx,
+        event_job: &str,
+    ) -> Result<u64> {
+        let cb = self.plain_progress_cb(
+            event_job,
+            &item.fd.rel_path,
+            ctx.shared.clone(),
+            ctx.total_files,
+            ctx.total_bytes,
+            item.fd.size,
+            ctx.meter.clone(),
+            ctx.started,
+        );
+        // 网络类失败自动重试（最多 3 次，线性退避；认证/不存在类不重试）
+        let plain_n = {
+            let mut out: Result<u64, anyhow::Error> = Err(anyhow::anyhow!("上传未执行"));
+            for attempt in 1..=crate::domain::NETWORK_RETRY_ATTEMPTS {
+                out = self
+                    .upload_one(
+                        &*item.source,
+                        &item.fd.rel_path,
+                        item.prefix.as_deref(),
+                        Some(cb.clone()),
+                    )
+                    .await;
+                match &out {
+                    Ok(_) => break,
+                    Err(e) => {
+                        tracing::warn!(
+                            "上传 {} 第 {attempt}/{} 次失败: {e:#}",
+                            item.fd.rel_path,
+                            crate::domain::NETWORK_RETRY_ATTEMPTS
+                        );
+                        if !crate::domain::is_retryable_err(e)
+                            || attempt == crate::domain::NETWORK_RETRY_ATTEMPTS
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
+                            .await;
+                    }
+                }
+            }
+            out?
+        };
+        // 上传**完成后**才计入（进度回调现读 shared，基准恒为「已完成合计」）
+        {
+            let mut s = ctx.shared.lock().unwrap();
+            s.0 += 1;
+            s.1 += plain_n;
+        }
+        let done_files = ctx.files.fetch_add(1, Ordering::Relaxed) as u64 + 1;
+        let done_bytes = ctx.bytes.fetch_add(plain_n, Ordering::Relaxed) + plain_n;
+        self.store
+            .save_entry(&item.job_id, self.account(), &SnapshotEntry::from_fd(&item.fd))?;
+        self.publish(
+            event_job,
+            crate::eventbus::TaskStatus::Progress,
+            Some(crate::eventbus::TaskPhase::Transfer),
+            Some(item.fd.rel_path.clone()),
+            done_files,
+            ctx.total_files,
+            done_bytes,
+            ctx.total_bytes,
+            ctx.started.elapsed().as_millis() as u64,
+            ctx.meter.lock().unwrap().speed_bps(),
+            None,
+        );
+        info!("已上传: {} ({plain_n} B)", item.fd.rel_path);
+        Ok(plain_n)
+    }
+
+    /// 上传一批文件：目标**支持并发回传**时按其分批并发推送，否则顺序上传
+    ///
+    /// 并发回传下「传哪些、一次传几批」由目标决定（见 [`PlanUpload`]），宿主只按批
+    /// 并发推送；目标不支持或规划失败时自动回退顺序，行为与旧版完全一致。
+    async fn upload_all(
+        &self,
+        items: Vec<UploadItem>,
+        ctx: &UploadCtx,
+        event_job: &str,
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        // 清单用**目标端路径**作键：多源备份时源内相对路径会重名，
+        // 目标端路径才是唯一键；插件原样返回后宿主再反查。
+        let manifest: Vec<FileDescriptor> = items
+            .iter()
+            .map(|it| FileDescriptor {
+                rel_path: it.target_rel.clone(),
+                size: it.fd.size,
+                modified: it.fd.modified,
+                is_dir: false,
+                digest: None,
+            })
+            .collect();
+
+        let mut planned: Option<Box<dyn PlanSession>> = None;
+        let mut parallel = 0usize;
+        if let Some(p) = self.target.plan_upload() {
+            match p.begin(&manifest) {
+                Ok(s) => {
+                    parallel = p.max_parallel().max(1);
+                    planned = Some(s);
+                    info!(
+                        parallel,
+                        count = manifest.len(),
+                        "目标支持并发回传：已提交待传清单"
+                    );
+                }
+                Err(e) => tracing::warn!("并发回传规划失败，回退顺序上传: {e:#}"),
+            }
+        }
+
+        let Some(mut session) = planned else {
+            // 顺序模式（默认）：失败即终止，与旧版一致
+            for it in &items {
+                self.upload_one_task(it, ctx, event_job).await?;
+            }
+            return Ok(());
+        };
+
+        // 并发模式：按目标发放的批次并发推送（并发度由目标声明）
+        let by_target: std::collections::HashMap<&str, usize> = items
+            .iter()
+            .enumerate()
+            .map(|(i, it)| (it.target_rel.as_str(), i))
+            .collect();
+        loop {
+            let batch = match session.next_batch() {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!("取下一批失败，结束并发回传: {e:#}");
+                    break;
+                }
+            };
+            if batch.is_empty() {
+                break; // 清单已发完
+            }
+            let picked: Vec<usize> = batch
+                .iter()
+                .filter_map(|rp| by_target.get(rp.as_str()).copied())
+                .collect();
+            if picked.is_empty() {
+                continue;
+            }
+            // 先构造好 future 再交给 buffer_unordered：既能限制并发度，
+            // 又避开闭包泛型的高阶生命周期推断问题
+            let items_ref = &items;
+            let mut futs = Vec::with_capacity(picked.len());
+            for i in picked {
+                futs.push(async move { self.upload_one_task(&items_ref[i], ctx, event_job).await });
+            }
+            let results = futures::stream::iter(futs)
+                .buffer_unordered(parallel)
+                .collect::<Vec<Result<u64>>>()
+                .await;
+            // 与顺序模式保持同一失败语义：任一文件失败即终止本次备份
+            if let Some(e) = results.into_iter().find_map(|r| r.err()) {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 上传阶段共享上下文（**并发安全**）：完成计数 + 进度基准 + 速度计量
+struct UploadCtx {
+    /// 进度基准 `(已完成文件数, 已完成明文字节)`，由进度回调现读
+    shared: Arc<Mutex<(u64, u64)>>,
+    total_files: u64,
+    total_bytes: u64,
+    meter: Arc<Mutex<SpeedMeter>>,
+    started: Instant,
+    files: AtomicUsize,
+    bytes: AtomicU64,
+}
+
+/// 一个待传文件及其所属子任务上下文
+///
+/// 字段全部**自有**（不带生命周期）：借用版会让传给 `stream::iter(...).map(..)` 的
+/// 闭包触发高阶生命周期（HRTB）推断失败（`FnOnce is not general enough`）。
+struct UploadItem {
+    /// 源存储（多路径时每个源一份）
+    source: Arc<dyn SourceStorage>,
+    /// 快照归属的子任务 id（多路径时为 `{job_id}-{序号}`）
+    job_id: String,
+    /// 目标端前缀
+    prefix: Option<String>,
+    fd: FileDescriptor,
+    /// 目标端相对路径（并发回传清单的唯一键）
+    target_rel: String,
 }
 
 /// 计算目标路径：把相对路径拼上前缀（统一带前导斜杠，如 "/fn-backup/Photos/xxx"）

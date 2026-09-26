@@ -478,6 +478,63 @@ extern "C" fn last_error_json(th: *mut c_void) -> *mut c_char {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// 并发回传（计划式）：把待传清单按批发放，宿主批内并发上传
+// ════════════════════════════════════════════════════════════════════════════
+
+/// 每批发放的文件数（取并发度的数倍，让并发流水线始终有活可干）
+const PLAN_BATCH: usize = 12;
+
+/// `plan_begin` 发放的计划句柄：持有待传清单与游标
+struct DavPlan {
+    /// 待传文件的**目标端**相对路径（由宿主在 `job_json` 里给出）
+    items: Vec<String>,
+    pos: usize,
+}
+
+extern "C" fn plan_begin(th: *mut c_void, job: *const c_char) -> *mut c_void {
+    if th.is_null() || job.is_null() {
+        return std::ptr::null_mut();
+    }
+    let raw = match unsafe { CStr::from_ptr(job) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let items: Vec<String> = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("upload").cloned())
+        .and_then(|u| u.as_array().cloned())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.get("rel_path").and_then(|r| r.as_str()))
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    Box::into_raw(Box::new(DavPlan { items, pos: 0 })) as *mut c_void
+}
+
+extern "C" fn plan_next(_th: *mut c_void, ph: *mut c_void) -> *mut c_char {
+    if ph.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: 由 plan_begin 的 Box::into_raw 分配，plan_end 前唯一持有
+    let p = unsafe { &mut *(ph as *mut DavPlan) };
+    let end = (p.pos + PLAN_BATCH).min(p.items.len());
+    let batch: Vec<&str> = p.items[p.pos..end].iter().map(|s| s.as_str()).collect();
+    p.pos = end;
+    cstring_ptr(serde_json::to_string(&batch).ok())
+}
+
+extern "C" fn plan_end(_th: *mut c_void, ph: *mut c_void) {
+    if !ph.is_null() {
+        // SAFETY: 由 plan_begin 的 Box::into_raw 分配
+        unsafe {
+            drop(Box::from_raw(ph as *mut DavPlan));
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // 静态目标能力表入口
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -504,9 +561,9 @@ pub extern "C" fn fn_kzwr_plugin_target_v1() -> *const KzwrTargetAbi {
         config_get: None,
         config_set: None,
         last_error_json: Some(last_error_json),
-        plan_begin: None,
-        plan_next: None,
-        plan_end: None,
+        plan_begin: Some(plan_begin),
+        plan_next: Some(plan_next),
+        plan_end: Some(plan_end),
         free_str,
     };
     &TABLE
@@ -544,8 +601,15 @@ impl WebdavAbiPlugin {
             component: Some("webdav".to_string()),
             blocks: Vec::new(),
         });
+        // 内置 WebDAV 启用并发回传：批内并发 3 路上传（WebDAV 单连接较慢，
+        // 适度并发能显著缩短大量小文件的备份耗时；设为 supports_plan=false 即回退顺序）
+        let caps = AbiTargetCaps {
+            supports_plan: true,
+            max_parallel: 3,
+            preferred_chunk_kib: 1024,
+        };
         Self {
-            inner: CApiTarget::from_static(abi, meta, AbiTargetCaps::default(), ui),
+            inner: CApiTarget::from_static(abi, meta, caps, ui),
         }
     }
 }

@@ -130,6 +130,37 @@ pub trait TargetStorage: Send + Sync {
 
     /// 测试连接与凭证是否有效
     async fn ping(&self) -> StorageResult<()>;
+
+    /// **可选能力：并发回传（计划式）**。默认 `None` → 宿主按顺序推块。
+    ///
+    /// 与「宿主固定并发」的区别：支持的目标**自己决定分批节奏**（按大小/目录/
+    /// 目标端限速聚合），宿主只按批并发推送、并发度也由目标声明。这样目标端
+    /// 能按自身特性（WebDAV 单连接限速、对象存储多分片等）拿捏吞吐，
+    /// 宿主无需为每个目标硬编码策略。
+    fn plan_upload(&self) -> Option<&dyn PlanUpload> {
+        None
+    }
+}
+
+/// 并发回传（计划式）：目标接管「传哪些、一次传几批」
+///
+/// 生命周期：`begin()` 提交待传清单拿到会话 → 循环 `next_batch()` 直到空数组
+/// → 会话 `Drop` 自动结束规划（异常路径也会调用 `plan_end`）。
+pub trait PlanUpload: Send + Sync {
+    /// 并发上限（0 = 由宿主决定，宿主按 4 处理）
+    fn max_parallel(&self) -> usize;
+
+    /// 提交本次待传清单（含大小与修改时间，供目标做批次规划）
+    fn begin(&self, manifest: &[FileDescriptor]) -> StorageResult<Box<dyn PlanSession>>;
+}
+
+/// 一次规划会话：宿主循环取批次，取到**空数组**即清单已发完
+///
+/// `Send` 必需：会话要在宿主的 async 备份流程里跨 await 持有，
+/// 而非 `Send` 会让整个备份 future 失去 `Send`（axum handler / tokio::spawn 都会失败）。
+pub trait PlanSession: Send {
+    /// 下一批要传的相对路径（源根下的相对路径）
+    fn next_batch(&mut self) -> StorageResult<Vec<String>>;
 }
 
 /// 未配置目标的占位适配器：所有操作返回明确的引导错误
