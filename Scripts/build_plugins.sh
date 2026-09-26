@@ -29,9 +29,16 @@ if [ ! -d "$PLUGINS_DIR" ]; then
 fi
 
 built=0
+skipped=0
 for d in "$PLUGINS_DIR"/*/; do
     [ -f "${d}Cargo.toml" ] || continue
     name="$(basename "$d")"
+    # 只构建动态库插件（crate-type 含 cdylib）；SDK 之类的普通库跳过
+    if ! grep -q 'cdylib' "${d}Cargo.toml"; then
+        echo "==> 跳过 $name（不是 cdylib 插件）"
+        skipped=$((skipped + 1))
+        continue
+    fi
     echo "==> 构建插件 $name"
     # --offline 优先（NAS 上依赖已缓存）；失败再回退联网
     ( cd "$d" && cargo build --release --offline 2>/dev/null || cargo build --release )
@@ -45,5 +52,5 @@ for d in "$PLUGINS_DIR"/*/; do
     built=$((built + 1))
 done
 
-echo "==> 完成：$built 个插件，输出目录 $OUT"
+echo "==> 完成：构建 $built 个插件（跳过 $skipped 个），输出目录 $OUT"
 ls -1 "$OUT" 2>/dev/null || true

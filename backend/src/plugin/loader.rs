@@ -18,7 +18,32 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use super::abi::{KzwrPluginAbi, C_ABI_VERSION, SYM_ENTRY_V1};
+use super::api::{EnhancePlugin, TargetPlugin};
 use super::sdk::{PluginHandle, PLUGIN_ABI_VERSION, SYM_ABI_VERSION, SYM_CREATE, SYM_HOST_VERSION};
+
+/// 单个动态库加载后的插件形态
+pub enum Loaded {
+    /// **稳定 C ABI v1**（推荐）：宿主升级不需要重编插件
+    Stable {
+        plugin: std::sync::Arc<dyn EnhancePlugin>,
+        id: String,
+        name: String,
+        abi: u32,
+    },
+    /// Rust 直连目标插件（进阶：可提供备份目标；需与宿主同版本编译）
+    RustTarget {
+        plugin: std::sync::Arc<dyn TargetPlugin>,
+        id: String,
+        name: String,
+    },
+    /// Rust 直连增强插件（需与宿主同版本编译）
+    RustEnhance {
+        plugin: std::sync::Arc<dyn EnhancePlugin>,
+        id: String,
+        name: String,
+    },
+}
 
 /// 单个动态库的加载结果（供 `/api/plugins` 诊断与前端展示）
 #[derive(Debug, Clone, Serialize)]
@@ -35,6 +60,10 @@ pub struct ExternalPluginReport {
     pub name: Option<String>,
     /// `target` | `enhance`
     pub kind: Option<String>,
+    /// 加载机制：`c-abi-v1`（稳定契约，宿主升级不用重编）| `rust-direct`（进阶，需同版本编译）
+    pub mechanism: Option<String>,
+    /// 插件声明的 ABI 版本（仅稳定 C ABI 有）
+    pub abi: Option<u32>,
     /// 失败原因（`loaded=false` 时）
     pub error: Option<String>,
 }
@@ -149,23 +178,45 @@ pub fn load_external(dirs: &[PathBuf]) -> LoadOutcome {
                 id: None,
                 name: None,
                 kind: None,
+                mechanism: None,
+                abi: None,
                 error: None,
             };
             match load_one(&path, allow_mismatch) {
-                Ok((handle, lib, id, name, kind)) => {
-                    if let Some(t) = handle.target {
-                        out.targets.push(std::sync::Arc::from(t));
-                    }
-                    if let Some(e) = handle.enhance {
-                        out.enhances.push(std::sync::Arc::from(e));
-                    }
+                Ok((loaded, lib)) => {
+                    let (id, name, kind, mechanism, abi) = match loaded {
+                        Loaded::Stable {
+                            plugin,
+                            id,
+                            name,
+                            abi,
+                        } => {
+                            out.enhances.push(plugin);
+                            (id, name, "enhance", "c-abi-v1", Some(abi))
+                        }
+                        Loaded::RustTarget { plugin, id, name } => {
+                            out.targets.push(plugin);
+                            (id, name, "target", "rust-direct", None)
+                        }
+                        Loaded::RustEnhance { plugin, id, name } => {
+                            out.enhances.push(plugin);
+                            (id, name, "enhance", "rust-direct", None)
+                        }
+                    };
                     out.libs.push(lib);
                     out.ids.push(id.clone());
                     report.loaded = true;
-                    report.id = Some(id);
+                    report.id = Some(id.clone());
                     report.name = Some(name);
-                    report.kind = Some(kind);
-                    tracing::info!(file = %file, plugin = %report.id.clone().unwrap_or_default(), "外置插件已加载");
+                    report.kind = Some(kind.to_string());
+                    report.mechanism = Some(mechanism.to_string());
+                    report.abi = abi;
+                    tracing::info!(
+                        file = %file,
+                        plugin = %id,
+                        mechanism,
+                        "外置插件已加载"
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(file = %file, err = %e, "外置插件加载失败（已跳过，不影响其它插件）");
@@ -178,29 +229,56 @@ pub fn load_external(dirs: &[PathBuf]) -> LoadOutcome {
     out
 }
 
-/// 加载单个动态库：校验 ABI/宿主版本 → 创建实例
+/// 加载单个动态库：优先稳定 C ABI v1，回退 Rust 直连
+///
+/// 返回 (插件形态, 动态库句柄)；动态库句柄需由调用方保活。
 fn load_one(
     path: &Path,
     allow_mismatch: bool,
-) -> Result<
-    (
-        PluginHandle,
-        libloading::Library,
-        String,
-        String,
-        String,
-    ),
-    String,
-> {
-    // SAFETY: 以下均是对**用户显式启用**的本地动态库的调用；符号签名由 ABI 常量约定，
-    // 并在调用前完成 ABI/版本校验。加载不可信代码的风险由用户开启开关时承担（见模块文档）。
+) -> Result<(Loaded, libloading::Library), String> {
     unsafe {
         let lib = libloading::Library::new(path)
             .map_err(|e| format!("打开动态库失败：{e}"))?;
 
+        // ── 路径 1：稳定 C ABI v1（推荐；宿主升级不需要重编插件）──
+        if let Ok(entry) = lib.get::<extern "C" fn() -> *const KzwrPluginAbi>(SYM_ENTRY_V1) {
+            let table = entry();
+            let plugin = super::cabi::CApiEnhance::adopt(table, path.to_string_lossy().into_owned())?;
+            let id = plugin.meta().id;
+            let name = plugin.meta().name;
+            let abi = C_ABI_VERSION;
+            tracing::info!(plugin = %id, "已按稳定 C ABI v1 接管插件（无需与宿主同版本编译）");
+            return Ok((
+                Loaded::Stable {
+                    plugin: std::sync::Arc::new(plugin),
+                    id,
+                    name,
+                    abi,
+                },
+                lib,
+            ));
+        }
+
+        load_rust_direct(&lib, allow_mismatch).map(|loaded| (loaded, lib))
+    }
+}
+
+/// 路径 2：Rust 直连插件（旧接口；可提供目标插件，但需与宿主同版本编译）
+fn load_rust_direct(
+    lib: &libloading::Library,
+    allow_mismatch: bool,
+) -> Result<Loaded, String> {
+    // SAFETY: 以下均是对**用户显式启用**的本地动态库的调用；符号签名由 ABI 常量约定，
+    // 并在调用前完成 ABI/版本校验。加载不可信代码的风险由用户开启开关时承担（见模块文档）。
+    unsafe {
         let abi = lib
             .get::<extern "C" fn() -> u32>(SYM_ABI_VERSION)
-            .map_err(|e| format!("缺少符号 fn_kzwr_plugin_abi_version：{e}"))?;
+            .map_err(|e| {
+                format!(
+                    "既没有稳定入口 fn_kzwr_plugin_abi_v1，也不是 Rust 直连插件\
+                     （缺少符号 fn_kzwr_plugin_abi_version）：{e}"
+                )
+            })?;
         let abi = abi();
         if abi != PLUGIN_ABI_VERSION {
             return Err(format!(
@@ -219,8 +297,9 @@ fn load_one(
         let running = super::sdk::HOST_VERSION;
         if built_for != running && !allow_mismatch {
             return Err(format!(
-                "插件编译时链接的宿主版本为 {built_for}，当前运行版本为 {running}：\
-                 Rust ABI 不稳定，请重新编译插件（或设 FN_KZWR_PLUGINS_ALLOW_MISMATCH=1 强制加载）"
+                "Rust 直连插件编译时链接的宿主版本为 {built_for}，当前运行版本为 {running}：\
+                 Rust ABI 不稳定，请重新编译插件；\
+                 若希望升级后免重编，请改用**稳定 C ABI**（导出 fn_kzwr_plugin_abi_v1，见 plugins/sdk）"
             ));
         }
         if built_for != running {
@@ -243,17 +322,23 @@ fn load_one(
             return Err("插件未提供任何实现（target/enhance 均为空）".to_string());
         }
 
-        // 元信息（取自插件自己声明的 meta；目标插件与增强插件二选一即可）
-        let (id, name, kind) = if let Some(t) = &handle.target {
+        // 目标插件与增强插件可同时提供；此处按「目标优先」登记（增强能力请用稳定 C ABI 插件实现）
+        if let Some(t) = handle.target {
             let m = t.meta();
-            (m.id, m.name, "target".to_string())
-        } else if let Some(e) = &handle.enhance {
+            Ok(Loaded::RustTarget {
+                plugin: std::sync::Arc::from(t),
+                id: m.id,
+                name: m.name,
+            })
+        } else if let Some(e) = handle.enhance {
             let m = e.meta();
-            (m.id, m.name, "enhance".to_string())
+            Ok(Loaded::RustEnhance {
+                plugin: std::sync::Arc::from(e),
+                id: m.id,
+                name: m.name,
+            })
         } else {
-            return Err("插件未提供任何实现".to_string());
-        };
-
-        Ok((*handle, lib, id, name, kind))
+            Err("插件未提供任何实现".to_string())
+        }
     }
 }
