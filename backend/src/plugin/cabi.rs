@@ -261,7 +261,7 @@ impl EnhancePlugin for CApiEnhance {
         let Some(f) = self.table.0.destroy else {
             return;
         };
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f()));
         tracing::info!(plugin = %self.describe.id, "插件 destroy 回调已调用（自管数据由宿主随后清除）");
     }
 }

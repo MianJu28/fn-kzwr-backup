@@ -21,13 +21,13 @@
 //!   （方案 A 的固有取舍，用户已确认方案 C 接受）。
 //! - 错误码：与 `KzwrTargetAbi` 约定一致，`int < 0` 为失败，随后宿主调
 //!   `last_error_json` 取详情。
-//! - 字节复查：`write_end` 成功返回**喂入的密文字节总数**（等价实写），宿主会与
-//!   已喂字节比对，防静默截断。
+//! - 字节复查：`write_end` 成功返回**实际上交的密文字节数**，并与宿主喂入总数比对
+//!   （不一致即报错），防静默截断。
 
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::future::Future;
 use std::os::raw::c_int;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
@@ -191,19 +191,19 @@ extern "C" fn write_begin(th: *mut c_void, rel: *const c_char, _total: u64) -> *
         Err(_) => return std::ptr::null_mut(),
     };
     let rel = PathBuf::from(rel);
-    // 创建临时累积文件；`keep()` 把原句柄交付出来，可继续追加写入
-    let mut tmpf = match tempfile::NamedTempFile::new() {
+    // 创建临时累积文件并**持久化**：`keep()` 交付原可写句柄且不再自动删除；
+    // 若只 try_clone 而让 NamedTempFile 析构，文件会被立刻删掉导致 write_end 读回失败。
+    let tmpf = match tempfile::NamedTempFile::new() {
         Ok(t) => t,
         Err(e) => {
             inst.last_error_set(format!("创建密文缓冲临时文件失败: {e}"));
             return std::ptr::null_mut();
         }
     };
-    let tmp_path = tmpf.path().to_path_buf();
-    let tmp = match tmpf.as_file_mut().try_clone() {
-        Ok(f) => f,
+    let (tmp, tmp_path) = match tmpf.keep() {
+        Ok(pair) => pair,
         Err(e) => {
-            inst.last_error_set(format!("复制密文缓冲句柄失败: {e}"));
+            inst.last_error_set(format!("持久化密文缓冲临时文件失败: {e}"));
             return std::ptr::null_mut();
         }
     };
@@ -211,14 +211,14 @@ extern "C" fn write_begin(th: *mut c_void, rel: *const c_char, _total: u64) -> *
     Box::into_raw(Box::new(w)) as *mut c_void
 }
 
-extern "C" fn write_chunk(th: *mut c_void, h: *mut c_void, buf: *const u8, len: c_int) -> c_int {
+extern "C" fn write_chunk(th: *mut c_void, h: *mut c_void, buf: *const u8, len: u32) -> i32 {
     let Some(inst) = (unsafe { th.cast::<DavInstance>().as_ref() }) else {
         return -1;
     };
     let Some(w) = (unsafe { h.cast::<FileWrite>().as_mut() }) else {
         return -1;
     };
-    if buf.is_null() || len <= 0 {
+    if buf.is_null() || len == 0 {
         return 0;
     }
     let len = len as usize;
@@ -229,16 +229,18 @@ extern "C" fn write_chunk(th: *mut c_void, h: *mut c_void, buf: *const u8, len: 
         return -1;
     }
     w.fed += len as u64;
-    len as c_int
+    len as i32
 }
 
 extern "C" fn write_end(th: *mut c_void, h: *mut c_void) -> i64 {
     let Some(inst) = (unsafe { th.cast::<DavInstance>().as_ref() }) else {
         return -1;
     };
-    let Some(w) = (unsafe { Box::from_raw(h.cast::<FileWrite>()) }) else {
+    if h.is_null() {
         return -1;
-    };
+    }
+    // SAFETY: 由 write_begin 的 Box::into_raw 分配，本函数是该句柄的唯一终结者
+    let w = unsafe { Box::from_raw(h.cast::<FileWrite>()) };
     // 读回整块密文
     use std::io::Read;
     let mut data = Vec::new();
@@ -263,7 +265,18 @@ extern "C" fn write_end(th: *mut c_void, h: *mut c_void) -> i64 {
             .await
     });
     match res {
-        Ok(()) => fed as i64,
+        Ok(()) => {
+            // 字节复查：实际上交的密文必须与宿主喂入的完全一致（防静默截断）
+            if data.len() as u64 != fed {
+                inst.last_error_set(format!(
+                    "密文字节复查不一致：缓冲 {} 字节，宿主喂入 {} 字节",
+                    data.len(),
+                    fed
+                ));
+                return -1;
+            }
+            data.len() as i64
+        }
         Err(e) => {
             inst.last_error_set(format!("上传失败: {e}"));
             -1
@@ -312,12 +325,12 @@ extern "C" fn read_begin(th: *mut c_void, rel: *const c_char) -> *mut c_void {
     }
 }
 
-extern "C" fn read_chunk(th: *mut c_void, h: *mut c_void, buf: *mut u8, cap: c_int) -> c_int {
+extern "C" fn read_chunk(th: *mut c_void, h: *mut c_void, buf: *mut u8, cap: u32) -> i32 {
     let _inst = unsafe { th.cast::<DavInstance>().as_ref() };
     let Some(r) = (unsafe { h.cast::<FileRead>().as_mut() }) else {
         return -1;
     };
-    if buf.is_null() || cap <= 0 {
+    if buf.is_null() || cap == 0 {
         return 0;
     }
     let avail = r.data.len().checked_sub(r.pos).unwrap_or(0);
@@ -329,7 +342,7 @@ extern "C" fn read_chunk(th: *mut c_void, h: *mut c_void, buf: *mut u8, cap: c_i
     let dst = unsafe { std::slice::from_raw_parts_mut(buf, n) };
     dst.copy_from_slice(&r.data[r.pos..r.pos + n]);
     r.pos += n;
-    n as c_int
+    n as i32
 }
 
 extern "C" fn read_end(th: *mut c_void, h: *mut c_void) -> c_int {
