@@ -19,7 +19,8 @@
   // 外置插件加载（动态库，ADR-013 方案 B）
   export let pluginsEnabled = false;
   export let pluginsDir = '';
-  export let onSavePlugins = null; // (enabled, dir) => Promise<{error?}>
+  export let pluginsParallel = 0; // 上传并发路数（0/1 = 顺序；≥2 = 并发回传）
+  export let onSavePlugins = null; // (enabled, dir, parallel) => Promise<{error?}>
 
   /** 插件清单（来自 /api/plugins） */
   export let plugins = [];
@@ -100,7 +101,13 @@
 {/each}
 
 <!-- ── 核心区（不属于插件）────────────────────────────────────── -->
-<PluginSection enabled={pluginsEnabled} dir={pluginsDir} {busy} onSave={onSavePlugins} />
+<PluginSection
+  enabled={pluginsEnabled}
+  dir={pluginsDir}
+  uploadParallel={pluginsParallel}
+  {busy}
+  onSave={onSavePlugins}
+/>
 <RetentionSection {retention} kzwrReady={kzwrConfigured} {busy} onSave={onSaveRetention} />
 
 <KeySection

@@ -51,6 +51,7 @@
   // 外置插件（动态库，ADR-013 方案 B）
   let pluginsEnabledCfg = false;
   let pluginsDirCfg = '';
+  let pluginsParallelCfg = 0; // 上传并发路数（0/1 = 顺序；≥2 = 并发回传）
 
   // 备份 / 恢复
   let busy = false;
@@ -142,6 +143,7 @@
       scheduleTimezone = d.schedule_timezone || '';
       pluginsEnabledCfg = !!d.plugins_enabled;
       pluginsDirCfg = d.plugins_dir || '';
+      pluginsParallelCfg = Number(d.plugins_upload_parallel) || 0;
       backupPaths = d.backup_paths || [];
       targetFolder = d.target_folder || 'fn-backup';
       scheduleCron = d.schedule_cron || '';
@@ -403,13 +405,14 @@
   }
 
   /** 保存外置插件开关与目录（重启应用后生效） */
-  async function handleSavePlugins(enabled, dir) {
+  async function handleSavePlugins(enabled, dir, parallel) {
     busy = true;
     error = null;
     try {
       const d = await api.saveConfig({
         plugins_enabled: !!enabled,
         plugins_dir: dir || '',
+        plugins_upload_parallel: Math.max(0, Math.min(8, Math.floor(Number(parallel) || 0))),
       });
       if (d.error) {
         error = d.error;
@@ -417,6 +420,7 @@
       }
       pluginsEnabledCfg = !!d.plugins_enabled;
       pluginsDirCfg = d.plugins_dir || '';
+      pluginsParallelCfg = Number(d.plugins_upload_parallel) || 0;
       return {};
     } catch (e) {
       error = e.message;
@@ -868,6 +872,7 @@
               onPluginDone={handlePluginDone}
               pluginsEnabled={pluginsEnabledCfg}
               pluginsDir={pluginsDirCfg}
+              pluginsParallel={pluginsParallelCfg}
               onSavePlugins={handleSavePlugins}
               {webdavConfigured}
               {webdavUrl}
