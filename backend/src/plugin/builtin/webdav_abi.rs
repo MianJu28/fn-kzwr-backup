@@ -484,6 +484,9 @@ extern "C" fn last_error_json(th: *mut c_void) -> *mut c_char {
 /// 每批发放的文件数（取并发度的数倍，让并发流水线始终有活可干）
 const PLAN_BATCH: usize = 12;
 
+/// 并发回传的并发度上限（防止误设超大值把目标端压垮）
+const MAX_PARALLEL: u32 = 8;
+
 /// `plan_begin` 发放的计划句柄：持有待传清单与游标
 struct DavPlan {
     /// 待传文件的**目标端**相对路径（由宿主在 `job_json` 里给出）
@@ -601,15 +604,10 @@ impl WebdavAbiPlugin {
             component: Some("webdav".to_string()),
             blocks: Vec::new(),
         });
-        // 内置 WebDAV 启用并发回传：批内并发 3 路上传（WebDAV 单连接较慢，
-        // 适度并发能显著缩短大量小文件的备份耗时；设为 supports_plan=false 即回退顺序）
-        let caps = AbiTargetCaps {
-            supports_plan: true,
-            max_parallel: 3,
-            preferred_chunk_kib: 1024,
-        };
+        // 并发回传**默认关闭**（保守优先）。实际并发度在 `build()` 里按用户配置的
+        // `plugins.upload_parallel` 覆盖 —— 插件实例在启动时装配，那时配置尚未加载。
         Self {
-            inner: CApiTarget::from_static(abi, meta, caps, ui),
+            inner: CApiTarget::from_static(abi, meta, AbiTargetCaps::default(), ui),
         }
     }
 }
@@ -631,6 +629,14 @@ impl TargetPlugin for WebdavAbiPlugin {
     ) -> Option<(Arc<dyn TargetStorage>, String)> {
         if !target.enabled || target.kind != "webdav" {
             return None;
+        }
+        // 并发度取自用户配置 `plugins.upload_parallel`（默认 0 = 顺序上传）
+        let parallel = mgr.load().ok().map(|c| c.plugins.upload_parallel).unwrap_or(0);
+        if parallel >= 2 {
+            let mut caps = self.inner.caps();
+            caps.supports_plan = true;
+            caps.max_parallel = parallel.min(MAX_PARALLEL);
+            return self.inner.with_caps(caps).build(target, mgr);
         }
         self.inner.build(target, mgr)
     }

@@ -85,6 +85,8 @@ pub struct ConfigResponse {
     pub plugins_enabled: bool,
     /// 自定义插件目录（空 = 用默认目录）
     pub plugins_dir: String,
+    /// 目标上传并发路数（0/1 = 顺序上传；≥2 = 启用并发回传）
+    pub plugins_upload_parallel: u32,
     /// 告警 Webhook 地址（空 = 不外发）
     pub webhook_url: Option<String>,
     /// Webhook 自定义请求头
@@ -229,6 +231,9 @@ pub struct ConfigSaveRequest {
     /// 自定义插件目录（`:` 分隔多个；空串 = 用默认目录）
     #[serde(default)]
     pub plugins_dir: Option<String>,
+    /// 目标上传并发路数（0/1 = 顺序；≥2 = 并发回传，宿主上限 8）
+    #[serde(default)]
+    pub plugins_upload_parallel: Option<u32>,
 }
 
 /// 备份响应
@@ -944,6 +949,7 @@ fn config_response(
         debug: cfg.debug,
         plugins_enabled: cfg.plugins.enabled,
         plugins_dir: cfg.plugins.dir.clone().unwrap_or_default(),
+        plugins_upload_parallel: cfg.plugins.upload_parallel,
         error,
     }
 }
@@ -977,6 +983,7 @@ async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
             host_utc_offset_minutes: crate::domain::scheduler::utc_offset_minutes(),
             plugins_enabled: false,
             plugins_dir: String::new(),
+            plugins_upload_parallel: 0,
             webhook_url: None,
             webhook_headers: Vec::new(),
             webhook_body: None,
@@ -1073,6 +1080,9 @@ async fn config_save(
     if let Some(v) = body.plugins_dir {
         let v = v.trim().to_string();
         cfg.plugins.dir = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = body.plugins_upload_parallel {
+        cfg.plugins.upload_parallel = v.min(8);
     }
     match cfg_guard.save(&cfg) {
         Ok(_) => {

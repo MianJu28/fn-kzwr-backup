@@ -14,19 +14,23 @@
   export let enabled = false;
   /** 自定义插件目录（`:` 分隔多个；空 = 默认目录） */
   export let dir = '';
+  /** 目标上传并发路数（0/1 = 顺序上传；≥2 = 并发回传） */
+  export let uploadParallel = 0;
   export let busy = false;
-  /** 保存回调：(enabled, dir) => Promise<{error?}> */
+  /** 保存回调：(enabled, dir, parallel) => Promise<{error?}> */
   export let onSave = null;
 
   let info = null; // /api/plugins 的 external 字段
   let loading = false;
   let formEnabled = enabled;
   let formDir = dir;
+  let formParallel = uploadParallel;
   let saved = false;
 
   // 外部值变化时同步表单（同值不覆盖，避免打断输入）
   $: if (enabled !== formEnabled && !saved) formEnabled = enabled;
   $: if (dir !== formDir && !saved) formDir = dir;
+  $: if (uploadParallel !== formParallel && !saved) formParallel = uploadParallel;
 
   async function loadInfo() {
     loading = true;
@@ -45,7 +49,8 @@
   async function save() {
     if (!onSave) return;
     saved = true;
-    const r = await onSave(formEnabled, formDir.trim());
+    const par = Math.max(0, Math.min(8, Math.floor(Number(formParallel) || 0)));
+    const r = await onSave(formEnabled, formDir.trim(), par);
     saved = false;
     if (r && r.error) {
       toast.error(r.error, '保存失败');
@@ -105,6 +110,26 @@
         <code>$TRIM_APPDEST/plugins</code>（随应用分发）；同名文件以靠前的目录为准。
         推荐插件使用<strong>稳定 C ABI</strong>（只依赖冻结的 JSON 契约）——升级本应用后
         <strong>无需重新编译插件</strong>；Rust 直连插件能力更全但需随本应用同版本重编
+      </p>
+    </div>
+
+    <div class="field">
+      <label for="pl-par">上传并发路数（0 或 1 = 顺序上传，≥2 = 并发回传）</label>
+      <div class="field-row">
+        <input
+          id="pl-par"
+          type="number"
+          min="0"
+          max="8"
+          value={formParallel}
+          on:input={(e) => (formParallel = e.target.value)}
+          disabled={busy}
+        />
+      </div>
+      <p class="field-hint">
+        并发回传会同时上传多个文件，可显著缩短大量小文件的备份耗时，但会占用更多连接与带宽。
+        <strong>默认 0（顺序上传）</strong>；建议先设 2~3 试跑，若目标端限流再调回 0。
+        仅对支持该能力的目标生效（内置 WebDAV 支持）；保存后<strong>下次备份</strong>即生效，无需重启。
       </p>
     </div>
 

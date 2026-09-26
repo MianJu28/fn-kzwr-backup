@@ -81,6 +81,13 @@ pub struct PluginSettings {
     /// 否则拒绝加载（记入 `/api/plugins` 诊断）。留空 = 跳过签名校验（仅信任目录已受控）。
     #[serde(default)]
     pub pubkeys: Vec<String>,
+    /// 目标上传并发路数（并发回传；**默认 0 = 顺序上传**）
+    ///
+    /// 仅对声明支持 `supports_plan` 的目标插件生效（内置 WebDAV 支持）。
+    /// 0 或 1 = 顺序上传；≥2 = 启用并发回传，该值即并发路数（宿主上限 8）。
+    /// 并发会同时占用多条连接，对 NAS 上行与目标服务端压力更大，故默认保守。
+    #[serde(default)]
+    pub upload_parallel: u32,
 }
 
 impl Default for PluginSettings {
@@ -89,6 +96,7 @@ impl Default for PluginSettings {
             enabled: false,
             dir: None,
             pubkeys: Vec::new(),
+            upload_parallel: 0,
         }
     }
 }

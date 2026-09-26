@@ -85,6 +85,19 @@ impl CApiTarget {
         Self { meta, abi, caps, ui }
     }
 
+    /// 当前能力声明（供调用方按用户配置派生副本）
+    pub fn caps(&self) -> AbiTargetCaps {
+        self.caps.clone()
+    }
+
+    /// 派生一份**覆盖能力声明**的副本
+    ///
+    /// 用于按用户配置（如「上传并发路数」）启用/关闭并发回传：插件实例在启动时装配，
+    /// 那时配置还不可读，故由 `build()` 每次按最新配置派生。
+    pub fn with_caps(&self, caps: AbiTargetCaps) -> Self {
+        Self { meta: self.meta.clone(), abi: self.abi, caps, ui: self.ui.clone() }
+    }
+
     /// 校验并从 describe 构造目标插件（由加载器对新发现的目标能力调用）
     pub unsafe fn adopt(
         table: *const KzwrTargetAbi,
