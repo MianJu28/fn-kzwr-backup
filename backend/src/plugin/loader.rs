@@ -223,7 +223,11 @@ where
 /// - **默认强制**：即使一个公钥都没配，签名缺失/不匹配一样拒绝加载；
 ///   仅当设置 `FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1`（本机调试）才跳过校验；
 /// - 验签失败/缺 `.sig` → `Err`，上层记入诊断并跳过该插件。
-fn verify_plugin(path: &Path, pubkeys: &[String]) -> Result<(), String> {
+fn verify_plugin(
+    path: &Path,
+    plugin_pubkeys: &std::collections::BTreeMap<String, String>,
+    legacy_pubkeys: &[String],
+) -> Result<(), String> {
     // 调试逃生舱：显式放行未签名插件（打醒目警告，避免误以为已受校验保护）
     if allow_unsigned_by_env() {
         tracing::warn!(
@@ -233,11 +237,33 @@ fn verify_plugin(path: &Path, pubkeys: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    // 信任锚 = 内置官方公钥 ∪ 用户配置公钥（任一验签通过即放行）。
-    // 内置公钥让随包分发的官方插件**开箱即用**；用户自签插件只需追加自己的公钥。
+    // 信任锚 = 内置官方公钥 ∪ **该文件自己的**公钥（一插件一公钥）。
+    //
+    // 关键安全性质：**只查本文件的公钥**，不再让所有插件共用一个公钥池 ——
+    // 否则插件 A 的密钥可以签出能通过校验的插件 B（越权信任）。
+    // 内置官方公钥仍对所有插件有效（随包插件开箱即用）。
+    let file_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let own_key = plugin_pubkeys.get(&file_name);
+
+    // 兼容旧配置的边界：**只有整个 `plugin_pubkeys` 都为空**时才回退到扁平列表
+    // （即「还没迁移到一插件一公钥」的旧安装）。
+    //
+    // 若已经用了新模型，则**未登记的文件就是没有授权公钥** —— 绝不能回退，
+    // 否则「某插件登记了公钥」会让其它未登记插件继续被这个公钥池放行，
+    // 一插件一公钥的隔离性就失效了（这正是本函数要先做隔离的原因）。
+    let migrated = !plugin_pubkeys.is_empty();
+    let fallback: &[String] = if migrated { &[] } else { legacy_pubkeys };
+
     let mut keys = parse_pubkeys(OFFICIAL_PUBKEYS.iter().copied())?;
     let official_n = keys.len();
-    keys.extend(parse_pubkeys(pubkeys.iter().map(|s| s.as_str()))?);
+    if let Some(k) = own_key {
+        keys.extend(parse_pubkeys(std::iter::once(k.as_str()))?);
+    } else {
+        keys.extend(parse_pubkeys(fallback.iter().map(|s| s.as_str()))?);
+    }
     let configured_n = keys.len() - official_n;
 
     // 同目录、同 basename + `.sig`
@@ -260,12 +286,17 @@ fn verify_plugin(path: &Path, pubkeys: &[String]) -> Result<(), String> {
         }
     }
     Err(format!(
-        "插件签名校验失败：签名与内置官方公钥、以及配置的 {configured_n} 个公钥均不匹配"
+        "插件签名校验失败：签名与内置官方公钥、以及为「{file_name}」配置的 {configured_n} 个公钥均不匹配\
+         （一个插件只认它自己的公钥；请在「插件」页为该文件填写正确公钥并用同一私钥签名）"
     ))
 }
 
 /// 加载全部目录中的外置插件
-pub fn load_external(dirs: &[PathBuf], pubkeys: &[String]) -> LoadOutcome {
+pub fn load_external(
+    dirs: &[PathBuf],
+    plugin_pubkeys: &std::collections::BTreeMap<String, String>,
+    legacy_pubkeys: &[String],
+) -> LoadOutcome {
     let mut out = LoadOutcome {
         targets: Vec::new(),
         enhances: Vec::new(),
@@ -302,7 +333,7 @@ pub fn load_external(dirs: &[PathBuf], pubkeys: &[String]) -> LoadOutcome {
                 error: None,
             };
             // 签名防线：默认强制验签，失败即拒绝加载（不触碰动态库）
-            if let Err(e) = verify_plugin(&path, pubkeys) {
+            if let Err(e) = verify_plugin(&path, plugin_pubkeys, legacy_pubkeys) {
                 tracing::warn!(file = %file, err = %e, "外置插件签名校验未通过（已跳过）");
                 report.error = Some(format!("签名校验未通过：{e}"));
                 out.reports.push(report);
@@ -444,6 +475,26 @@ mod tests {
         g
     }
 
+    /// 测试辅助：按**扁平列表**（旧语义，回退用）验签
+    fn verify_legacy(path: &Path, pubkeys: &[String]) -> Result<(), String> {
+        verify_plugin(path, &std::collections::BTreeMap::new(), pubkeys)
+    }
+
+    /// 测试辅助：把公钥绑到某个文件名上（一插件一公钥）
+    fn map_of(key: &str) -> std::collections::BTreeMap<String, String> {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("libstage.so".to_string(), key.to_string());
+        m
+    }
+
+    /// 测试辅助：按**一插件一公钥**登记（文件名为键）
+    fn verify_for(path: &Path, key: &str) -> Result<(), String> {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(name, key.to_string());
+        verify_plugin(path, &m, &[])
+    }
+
     #[test]
     fn verify_signature_accepts_valid_and_rejects_tampered() {
         let _g = no_escape_hatch();
@@ -458,16 +509,16 @@ mod tests {
         // 正确签名 → 通过
         let sig = kp.sign(&data);
         std::fs::write(dir.path().join("libfkplug.so.sig"), sig.as_ref()).unwrap();
-        assert!(verify_plugin(&so, &keys).is_ok());
+        assert!(verify_legacy(&so, &keys).is_ok());
 
         // 篡改插件内容 → 拒绝（签名不再匹配）
         let data2 = b"fake plugin bytes v2".to_vec();
         std::fs::write(&so, &data2).unwrap();
-        assert!(verify_plugin(&so, &keys).is_err());
+        assert!(verify_legacy(&so, &keys).is_err());
 
         // 缺签名文件 → 拒绝
         std::fs::remove_file(dir.path().join("libfkplug.so.sig")).unwrap();
-        assert!(verify_plugin(&so, &keys).is_err());
+        assert!(verify_legacy(&so, &keys).is_err());
     }
 
     /// 决策 3：默认强制验签 —— 一个公钥都没配、也没签名，仍然**拒绝**（不是静默跳过）
@@ -480,7 +531,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let so = dir.path().join("x.so");
         std::fs::write(&so, b"whatever").unwrap();
-        let e = verify_plugin(&so, &[]).expect_err("未签名插件必须拒绝");
+        let e = verify_legacy(&so, &[]).expect_err("未签名插件必须拒绝");
         // 无 `.sig` → 在签名闸门被拒（默认拒绝，不因「没配公钥」而放开）
         assert!(e.contains("缺少签名文件"), "应提示缺签名文件：{e}");
         // 不能断言插件「未签名」之外的东西：文案不该让人去查一个不存在的公钥配置
@@ -526,11 +577,58 @@ mod tests {
         .unwrap();
 
         // 只配用户公钥 → 通过（内置官方公钥不影响用户自签）
-        assert!(verify_plugin(&so, &[user_pub.to_string()]).is_ok());
+        assert!(verify_legacy(&so, &[user_pub.to_string()]).is_ok());
         // 空串/空白项被忽略，不会当成「无效公钥」而报错
-        assert!(verify_plugin(&so, &["".to_string(), "   ".to_string(), user_pub.to_string()]).is_ok());
+        assert!(verify_legacy(&so, &["".to_string(), "   ".to_string(), user_pub.to_string()]).is_ok());
         // 既不给用户公钥、签名也不属于官方 → 拒绝
-        assert!(verify_plugin(&so, &[]).is_err(), "非官方签名不得通过内置公钥");
+        assert!(verify_legacy(&so, &[]).is_err(), "非官方签名不得通过内置公钥");
+    }
+
+    /// **一插件一公钥**：A 的公钥不能验过 B（消除越权信任）
+    ///
+    /// 旧的扁平列表语义是「任一公钥可验任一插件」—— 若插件 A 的私钥泄露，
+    /// 攻击者能用它签出恶意插件 B 并被接受。按文件名绑定公钥后不再成立。
+    #[test]
+    fn per_plugin_key_cannot_verify_other_plugin() {
+        use base64::Engine as _;
+        use ring::signature::KeyPair as _;
+        let _g = no_escape_hatch();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (pub_b64, kp) = test_key();
+
+        // 插件 A：用 kp 签名
+        let so_a = dir.path().join("liba.so");
+        let data_a = b"plugin A payload".to_vec();
+        std::fs::write(&so_a, &data_a).unwrap();
+        std::fs::write(
+            dir.path().join("liba.so.sig"),
+            kp.sign(&data_a).as_ref(),
+        )
+        .unwrap();
+
+        // 插件 B：同一份字节，但文件名不同 → 未登记公钥
+        let so_b = dir.path().join("libb.so");
+        std::fs::write(&so_b, &data_a).unwrap();
+        std::fs::write(dir.path().join("libb.so.sig"), kp.sign(&data_a).as_ref()).unwrap();
+
+        // 只给 A（liba.so）登记公钥，B 完全不登记
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("liba.so".to_string(), pub_b64.clone());
+
+        assert!(
+            verify_plugin(&so_a, &m, &[]).is_ok(),
+            "A 已登记公钥，应通过"
+        );
+        assert!(
+            verify_plugin(&so_b, &m, &[]).is_err(),
+            "B 未登记公钥：不能被 A 的公钥放行（这正是「一插件一公钥」要防的越权信任）"
+        );
+        // 对照：旧的扁平语义下 B 会被放行（说明隔离确实由新逻辑提供）
+        assert!(
+            verify_legacy(&so_b, &[pub_b64.clone()]).is_ok(),
+            "旧的扁平列表语义确实会放行 B —— 所以隔离是新增的保护"
+        );
     }
 
     #[test]
@@ -541,7 +639,7 @@ mod tests {
         let so = dir.path().join("y.so");
         std::fs::write(&so, b"whatever").unwrap();
         std::env::set_var("FN_KZWR_PLUGINS_ALLOW_UNSIGNED", "1");
-        let r = verify_plugin(&so, &[]);
+        let r = verify_legacy(&so, &[]);
         std::env::remove_var("FN_KZWR_PLUGINS_ALLOW_UNSIGNED");
         assert!(r.is_ok(), "逃生舱应放行：{r:?}");
     }
@@ -568,7 +666,7 @@ mod tests {
                 .expect("decode sig"),
         )
         .unwrap();
-        assert!(verify_plugin(&so, &[pubk.to_string()]).is_ok());
+        assert!(verify_legacy(&so, &[pubk.to_string()]).is_ok());
     }
 
     /// 端到端穿过 `load_external`：验证「先验签、后 dlopen」的顺序
@@ -594,7 +692,7 @@ mod tests {
     fn load_external_verifies_before_dlopen() {
         let _g = no_escape_hatch();
         let (dir, pubk) = staged_dir();
-        let out = load_external(&[dir.path().to_path_buf()], &[pubk]);
+        let out = load_external(&[dir.path().to_path_buf()], &map_of(&pubk), &[]);
         assert_eq!(out.reports.len(), 1);
         let r = &out.reports[0];
         assert!(!r.loaded, "假 .so 不该加载成功");
@@ -613,7 +711,7 @@ mod tests {
         let _g = no_escape_hatch();
         let (dir, _pubk) = staged_dir();
         // 只不配**用户**公钥：签名既非官方、也无用户公钥可验 → 默认强制验签，必须在**接触动态库之前**就拒绝
-        let out = load_external(&[dir.path().to_path_buf()], &[]);
+        let out = load_external(&[dir.path().to_path_buf()], &std::collections::BTreeMap::new(), &[]);
         assert_eq!(out.reports.len(), 1);
         let r = &out.reports[0];
         assert!(!r.loaded);
@@ -641,7 +739,7 @@ mod tests {
         // 用「另一把」公钥去验：签名文件存在，但内容不匹配 → 验签失败
         // （该公钥由 `openssl genpkey -algorithm ED25519` 另生成，与签名用的不是同一把）
         let other = "8rjSFauUw9jl/Qu+OvEV5YOZNwL9ZFB2n9eFMaNtwZ4=";
-        let out = load_external(&[dir.path().to_path_buf()], &[other.to_string()]);
+        let out = load_external(&[dir.path().to_path_buf()], &map_of(other), &[]);
         let r = &out.reports[0];
         assert!(!r.loaded, "公钥不匹配应拒绝加载");
         assert_eq!(r.signature, SignatureStatus::Failed);

@@ -75,13 +75,21 @@ pub struct PluginSettings {
     /// （`$TRIM_PKGETC/plugins`、`$TRIM_APPDEST/plugins`）
     #[serde(default)]
     pub dir: Option<String>,
-    /// 允许加载的插件签名公钥（base64，32 字节 Ed25519 公钥）
+    /// **每个插件文件一个公钥**（文件名 → base64 的 32 字节 Ed25519 公钥）
     ///
-    /// 加载每个 `*.so` 前必须存在同目录 `*.so.sig`，且用**任一**公钥验签通过，
-    /// 否则拒绝加载（原因记入 `/api/plugins` 诊断）。
+    /// 键为插件文件名（如 `libmy_plugin.so`）。加载该文件时**只用它自己的公钥**
+    /// （以及内置官方公钥）验签 —— 这就是「一插件一公钥」：
+    /// 插件 A 的公钥**无法**验过插件 B，因此单个插件密钥泄露不会波及其它插件。
     ///
-    /// **留空不放行**：未配置公钥时同样拒绝加载（避免「漏配公钥」静默失去保护）。
-    /// 仅当设置环境变量 `FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1`（本机调试）才跳过校验。
+    /// 为什么用**文件名**而不是插件 id：验签发生在 `dlopen` **之前**，
+    /// 那时还拿不到插件自报的 id，只有路径/文件名可用。
+    #[serde(default)]
+    pub plugin_pubkeys: std::collections::BTreeMap<String, String>,
+    /// ~~扁平公钥列表~~（**已弃用**，保留仅为兼容旧配置）
+    ///
+    /// 语义是「任一公钥可验任一插件」，存在越权信任问题（A 的密钥可签 B）。
+    /// 新配置请用 [`PluginSettings::plugin_pubkeys`]；这里仅作为**未在
+    /// `plugin_pubkeys` 中登记的文件**的回退，避免升级后已有插件全部拒绝加载。
     #[serde(default)]
     pub pubkeys: Vec<String>,
     /// **每个目标插件**各自的上传并发路数（插件 id → 路数）
@@ -115,6 +123,7 @@ impl Default for PluginSettings {
         Self {
             enabled: false,
             dir: None,
+            plugin_pubkeys: std::collections::BTreeMap::new(),
             pubkeys: Vec::new(),
             target_parallel: std::collections::BTreeMap::new(),
             disabled: Vec::new(),

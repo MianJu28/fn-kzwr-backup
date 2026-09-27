@@ -282,16 +282,18 @@
   }
 
   /** 保存外置插件开关、目录与签名公钥（重启应用后生效） */
-  async function handleSavePlugins(enabled, dir, pubkeys) {
+  /**
+   * 保存外置插件**总开关**
+   *
+   * 目录与公钥不再由用户在设置页维护：
+   * - 目录固定用默认位置（少一个「填错就静默不加载」的故障点）；
+   * - 公钥在**安装插件时**随文件一起登记（一插件一公钥），不在这里批量粘贴。
+   */
+  async function handleSavePlugins(enabled) {
     busy = true;
     error = null;
     try {
-      const d = await api.saveConfig({
-        plugins_enabled: !!enabled,
-        plugins_dir: dir || '',
-        // 公钥可增删（留空 = 拒绝加载任何外置插件）
-        ...(pubkeys ? { plugins_pubkeys: pubkeys } : {}),
-      });
+      const d = await api.saveConfig({ plugins_enabled: !!enabled });
       if (d.error) {
         error = d.error;
         return { error: d.error };
@@ -563,8 +565,6 @@
               {plugins}
               onPluginDone={handlePluginDone}
               pluginsEnabled={pluginsEnabledCfg}
-              pluginsDir={pluginsDirCfg}
-              pluginsPubkeys={pluginsPubkeysCfg}
               pluginsAllowUnsigned={pluginsAllowUnsigned}
               onSavePlugins={handleSavePlugins}
               {busy}

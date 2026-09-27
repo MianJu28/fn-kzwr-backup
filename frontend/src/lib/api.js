@@ -115,6 +115,16 @@ export const api = {
    * 仍被目标/任务引用时后端**拒绝**，返回 `referenced_by`（引用项名称列表）。
    */
   pluginPurge: (id) => post(`/api/plugins/${encodeURIComponent(id)}/purge`, {}),
+  /**
+   * 安装外置插件（上传 .so + .so.sig，后端**先验签再落盘**）
+   *
+   * 用 base64 JSON 而不是 multipart：后端未引入 multer，且 `.so` 体积不大。
+   * 安装时提供的公钥会与该文件名绑定（「一插件一公钥」，A 的公钥无法验过 B）。
+   */
+  pluginInstall: (body) => post('/api/plugins/install', body),
+  /** 卸载**外置**插件（删 .so/.sig + 解绑公钥；内置/随包插件不可卸载） */
+  pluginUninstall: (file) =>
+    post(`/api/plugins/${encodeURIComponent(file)}/uninstall`, {}),
   /** 读取该插件的宿主代管配置（`secret` 字段只回传「是否已设置」） */
   pluginData: (id) => get(`/api/plugins/${encodeURIComponent(id)}/data`),
   /** 写入该插件的宿主代管配置（fields 明文，后端加密落盘；remove 为要删除的键） */

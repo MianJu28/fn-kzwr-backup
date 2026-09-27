@@ -31,12 +31,9 @@
 
   // 外置插件加载（动态库，ADR-013 方案 B）
   export let pluginsEnabled = false;
-  export let pluginsDir = '';
-  /** 插件签名公钥（base64 32 字节 Ed25519 公钥，每行一个） */
-  export let pluginsPubkeys = [];
   /** 是否由环境变量放行未签名插件（只读，仅本机调试） */
   export let pluginsAllowUnsigned = false;
-  export let onSavePlugins = null; // (enabled, dir, pubkeys) => Promise<{error?}>
+  export let onSavePlugins = null; // (enabled) => Promise<{error?}>
 
   export let busy = false;
 
@@ -211,8 +208,6 @@
 <!-- ── 外置插件（动态库）管理 ─────────────────────────────────── -->
 <PluginSection
   enabled={pluginsEnabled}
-  dir={pluginsDir}
-  pubkeys={pluginsPubkeys}
   allowUnsigned={pluginsAllowUnsigned}
   {busy}
   onSave={onSavePlugins}

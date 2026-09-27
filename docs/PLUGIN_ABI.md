@@ -258,7 +258,19 @@ bash Scripts/sign_plugin.sh sign dist/plugins           # 生成 <so>.sig（64 �
 - 信任锚 = 内置官方公钥 ∪ `plugins.pubkeys`。注意内置公钥**只证明签发者**，
   不代表代码被审计；用户放置目录里的插件一样要自带有效签名才加载
 - 唯一逃生阀 `FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1` 仅用于本机调试（正式包的生命周期脚本
-  用 `env -i` 白名单启动，不会透传该变量）
+  `env -i` 白名单启动，不会透传该变量）
+- **一插件一公钥**（2026-09-27）：`plugins.plugin_pubkeys` 是「**文件名 → 公钥**」映射，
+  验签时**只查该文件自己的公钥**（外加内置官方公钥）。旧的 `plugins.pubkeys`
+  扁平列表语义是「任一公钥可验任一插件」—— 存在**越权信任**：插件 A 的私钥泄露后，
+  攻击者可用它签出能通过校验的插件 B。改为按文件绑定后不再成立。
+  - 为什么用**文件名**而不是插件 id：验签发生在 `dlopen` **之前**，那时只有路径可用。
+  - `plugins.pubkeys` 保留为**兼容回退**：仅当 `plugin_pubkeys` **整体为空**
+    （即尚未迁移的旧安装）时才生效；一旦用了新模型，**未登记的文件就是没有授权公钥**。
+- **界面安装**：`POST /api/plugins/install`（base64 JSON，非 multipart）→
+  校验文件名/公钥格式 → **先用提供的公钥验签** → 通过后原子写入用户插件目录 →
+  把绑定关系写入 `plugin_pubkeys`。验签失败**绝不落盘**。配套
+  `POST /api/plugins/:file/uninstall` 删除 `.so`/`.sig` 并解绑公钥（内置/随包插件不可删）。
+  - 上传用 base64 而非 multipart：未引入 `multer`，不想为一个上传新增依赖。
 - **运行时启停**（按插件粒度，无需重启）：`POST /api/plugins/<id>/enable`
   `{"enabled":false}` → 写入 `plugins.disabled`，插件立即从 `/api/plugins`、路由分发、
   目标装配与生命周期钩子中消失；`true` 立即恢复。

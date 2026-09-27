@@ -78,15 +78,21 @@ impl PluginRegistry {
 
     /// 加载外置插件（ADR-013 方案 B：动态库）
     ///
-    /// `pubkeys` 为配置的插件签名公钥（base64，Ed25519）；非空时强制验签每个 `*.so`。
+    /// `plugin_pubkeys` 为「文件名 → 公钥」映射（一插件一公钥）；
+    /// `legacy_pubkeys` 是旧的扁平列表，仅对未登记文件回退使用。
     /// 失败只记录诊断，不影响内置能力与其它插件。
-    pub fn load_external(&mut self, dirs: &[(PathBuf, String)], pubkeys: &[String]) {
+    pub fn load_external(
+        &mut self,
+        dirs: &[(PathBuf, String)],
+        plugin_pubkeys: &std::collections::BTreeMap<String, String>,
+        legacy_pubkeys: &[String],
+    ) {
         self.plugin_dirs = dirs
             .iter()
             .map(|(p, s)| (p.to_string_lossy().into_owned(), s.clone()))
             .collect();
         let dirs_only: Vec<PathBuf> = dirs.iter().map(|(p, _)| p.clone()).collect();
-        let outcome = super::loader::load_external(&dirs_only, pubkeys);
+        let outcome = super::loader::load_external(&dirs_only, plugin_pubkeys, legacy_pubkeys);
         self.targets.extend(outcome.targets);
         self.enhances.extend(outcome.enhances);
         self.external_libs.extend(outcome.libs);

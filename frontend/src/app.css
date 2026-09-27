@@ -313,6 +313,19 @@ kbd {
 
 .card-body {
   padding: 0 var(--s5) var(--s5);
+  /* 统一块间距：卡片内容由多种块（alert/stat/field/tips…）拼成，
+   * 若依赖各块自带的 margin，会出现"有的块贴死、有的块过疏"。
+   * 用 flow 布局的 gap 统一节奏（外置插件弹窗内同样受益）。 */
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+}
+/* 由 gap 统一管间距：卡片内容区的直接子元素**清零**自身纵向 margin，
+ * 否则会与 gap 叠加成双倍间距（.field 自带 margin-bottom）。
+ * 只作用于直接子元素，不影响块内部（如 .field 内 label 与输入框的间距）。 */
+.card-body > * {
+  margin-top: 0;
+  margin-bottom: 0;
 }
 .card-foot {
   padding: var(--s4) var(--s5);
@@ -453,7 +466,11 @@ kbd {
 .field:last-child {
   margin-bottom: 0;
 }
-.label {
+/* 字段标题：`.label` 与 `.field > label` 都要覆盖。
+ * 项目里两种写法并存（有的用 class，有的直接 <label>），只写 .label 会让
+ * 那些裸 <label> 变成内联元素、和输入框挤在同一行（截图中的错乱感来源之一）。 */
+.label,
+.field > label {
   display: block;
   font-size: 12.5px;
   font-weight: 580;
@@ -463,6 +480,63 @@ kbd {
 .label .opt {
   font-weight: 450;
   color: var(--text-3);
+}
+/* switch-row 自身是 flex 容器，其内部 label 不应被上面的规则改成块级 */
+.field > label.switch-row {
+  display: flex;
+  margin-bottom: 0;
+}
+
+/* 原生控件也要有样：项目里大量 `<input>` 没有写 `class="input"`，
+ * 早先只给 `.input/.textarea/.select` 上样式，导致这些控件退化成浏览器默认外观
+ * （白底直角、与整体风格割裂 —— 截图中最扎眼的就是它们）。
+ * 这里给原生元素兜底，并排除 checkbox/radio（它们有各自的 switch-row 样式）。 */
+input:where(:not([type='checkbox'], [type='radio'], [type='file'])),
+select,
+textarea {
+  width: 100%;
+  padding: 9px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13.5px;
+  line-height: 1.45;
+  transition: border-color var(--t-fast), box-shadow var(--t-fast), background var(--t-fast);
+}
+input:where(:not([type='checkbox'], [type='radio'], [type='file']))::placeholder,
+textarea::placeholder {
+  color: var(--text-3);
+}
+input:where(:not([type='checkbox'], [type='radio'], [type='file'])):hover:not(:disabled),
+select:hover:not(:disabled),
+textarea:hover:not(:disabled) {
+  border-color: var(--text-3);
+}
+input:where(:not([type='checkbox'], [type='radio'], [type='file'])):focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: var(--ring);
+  background: var(--surface);
+}
+input:where(:not([type='checkbox'], [type='radio'], [type='file'])):disabled,
+select:disabled,
+textarea:disabled {
+  background: var(--surface-3);
+  color: var(--text-3);
+  cursor: not-allowed;
+}
+/* 复选框：统一尺寸与强调色，和开关行对齐 */
+input[type='checkbox'],
+input[type='radio'] {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--primary);
+  cursor: pointer;
+  flex-shrink: 0;
 }
 
 .input,
@@ -516,13 +590,48 @@ kbd {
   min-height: 68px;
 }
 
+/* 一行内的「输入 + 按钮」组合。
+ *
+ * 关键约束：**只有输入类控件才伸缩**。
+ * 早先写成 `.field-row > * { flex: 1 }`，导致按钮/标签也参与平分宽度，
+ * 且会被旁边的 textarea 撑成同高的大色块（就是「巨型保存按钮」的成因）。
+ * 现在：输入控件占满剩余空间，按钮/标签按内容自适应并垂直居中。 */
 .field-row {
   display: flex;
-  gap: var(--s3);
+  align-items: center;
+  gap: var(--s2);
 }
-.field-row > * {
+.field-row > .input,
+.field-row > .textarea,
+.field-row > .select,
+.field-row > input:not([type='checkbox']):not([type='radio']),
+.field-row > select,
+.field-row > textarea {
   flex: 1;
   min-width: 0;
+  width: auto;
+}
+/* 按钮 / 标签 / 说明：不伸缩、不被拉伸 */
+.field-row > .btn,
+.field-row > button,
+.field-row > label,
+.field-row > span,
+.field-row > .field-hint {
+  flex: 0 0 auto;
+}
+/* 多行输入旁边的按钮贴顶，避免被纵向居中到 textarea 中间 */
+.field-row > .textarea ~ .btn,
+.field-row > .textarea ~ button {
+  align-self: flex-start;
+}
+.field-row > label {
+  font-size: 12.5px;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+/* 内联小数值框（如「只清理早于 N 天」）不必占满整行 */
+.field-row > input[type='number'] {
+  max-width: 150px;
 }
 .field-error {
   display: block;
@@ -671,6 +780,7 @@ kbd {
   align-items: flex-start;
   gap: 10px;
   padding: 11px 13px;
+  margin: 0;
   border-radius: var(--r-md);
   border: 1px solid var(--border);
   background: var(--surface-3);
@@ -781,6 +891,7 @@ kbd {
 }
 .stat {
   padding: var(--s4);
+  margin: 0;
   border-radius: var(--r-md);
   background: var(--surface-2);
   border: 1px solid var(--border);

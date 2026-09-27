@@ -96,6 +96,8 @@ pub struct ConfigResponse {
     pub plugins_allow_unsigned: bool,
     /// 被**按插件禁用**的插件 id（运行时启停；见 `PluginSettings::disabled`）
     pub plugins_disabled: Vec<String>,
+    /// **每个插件文件对应的公钥**（文件名 → base64 公钥；一插件一公钥）
+    pub plugins_plugin_pubkeys: std::collections::BTreeMap<String, String>,
     /// 告警 Webhook 地址（空 = 不外发）
     pub webhook_url: Option<String>,
     /// Webhook 自定义请求头
@@ -903,6 +905,211 @@ async fn plugin_set_enabled(
     }))
 }
 
+// ── 插件安装（上传 .so + .sig，绑定该文件的公钥）──────────────────────
+
+/// `POST /api/plugins/install`：安装一个外置插件
+///
+/// body（JSON，**刻意不用 multipart**）：`{ file_name, data_b64, sig_b64, pubkey }`
+/// - 用 base64 而不是 multipart：`multer` 未在依赖里，也不想为一个上传引入新依赖；
+///   `.so` 通常几百 KB，base64 开销可接受。
+///
+/// 流程（**先验签、再落盘**）：
+/// 1. 校验文件名（必须是 `*.so`，且不含路径分隔符 —— 防目录穿越）；
+/// 2. 校验公钥格式（base64 的 32 字节 Ed25519）；
+/// 3. 用**该公钥**验签 `.so`；失败即拒绝（绝不写入未通过校验的文件）；
+/// 4. 原子写入用户插件目录（`$TRIM_PKGETC/plugins`）的 `.so` 与 `.so.sig`；
+/// 5. 把「文件名 → 公钥」写入 `plugins.plugin_pubkeys`（一插件一公钥）。
+///
+/// 注意：插件在**启动时**装配，故安装后需**重启应用**才会加载（响应里已说明）。
+async fn plugin_install(
+    State(state): State<AppState>,
+    Json(body): Json<PluginInstallRequest>,
+) -> Json<serde_json::Value> {
+    use base64::Engine as _;
+    let eng = base64::engine::general_purpose::STANDARD;
+
+    // 1) 文件名：只允许 *.so 且不得携带路径（防目录穿越写任意位置）
+    let file_name = body.file_name.trim().to_string();
+    if file_name.is_empty() {
+        return Json(err("缺少文件名"));
+    }
+    if !file_name.to_ascii_lowercase().ends_with(".so") {
+        return Json(err("只接受 .so 插件文件"));
+    }
+    if file_name.contains('/') || file_name.contains('\\') || file_name.contains("..") {
+        return Json(err("文件名不合法（不得包含路径分隔符）"));
+    }
+
+    // 2) 公钥格式
+    let pubkey = body.pubkey.trim().to_string();
+    if pubkey.is_empty() {
+        return Json(err("请提供用于校验该插件的公钥（base64 的 32 字节 Ed25519 公钥）"));
+    }
+    match eng.decode(&pubkey) {
+        Ok(raw) if raw.len() == 32 => {}
+        Ok(raw) => {
+            return Json(err(format!(
+                "公钥长度不对：Ed25519 公钥应为 32 字节，实际 {} 字节",
+                raw.len()
+            )))
+        }
+        Err(_) => return Json(err("公钥不是合法的 base64")),
+    }
+
+    // 3) 数据与签名
+    let data = match eng.decode(body.data_b64.trim()) {
+        Ok(d) => d,
+        Err(_) => return Json(err("插件内容不是合法的 base64")),
+    };
+    let sig = match eng.decode(body.sig_b64.trim()) {
+        Ok(d) => d,
+        Err(_) => return Json(err("签名不是合法的 base64")),
+    };
+    if data.is_empty() {
+        return Json(err("插件内容为空"));
+    }
+    if sig.len() != 64 {
+        return Json(err(format!(
+            "Ed25519 签名应为 64 字节，实际 {} 字节",
+            sig.len()
+        )));
+    }
+
+    // 3.1) **先验签**：不通过就绝不落盘（避免磁盘上出现无法加载的残留文件）
+    {
+        use ring::signature::{UnparsedPublicKey, ED25519};
+        let raw = eng.decode(&pubkey).unwrap_or_default();
+        let key = UnparsedPublicKey::new(&ED25519, raw);
+        if key.verify(&data, &sig).is_err() {
+            return Json(err(
+                "签名校验未通过：该签名与提供的公钥不匹配（请确认用同一把私钥签名）",
+            ));
+        }
+    }
+
+    // 4) 安装目录：用户插件目录（持久且应用用户可写）
+    let Some(etc) = std::env::var("TRIM_PKGETC").ok().filter(|s| !s.is_empty()) else {
+        return Json(err("无法确定插件安装目录（缺少 TRIM_PKGETC）"));
+    };
+    let dir = std::path::Path::new(&etc).join("plugins");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return Json(err(format!("创建插件目录失败：{e}")));
+    }
+    let so_path = dir.join(&file_name);
+    let sig_path = crate::plugin::loader::sig_path_of(&so_path);
+
+    // 原子写：先写同目录临时文件再 rename，避免半截文件被当成有效插件
+    let write_atomic = |path: &std::path::Path, bytes: &[u8]| -> Result<(), String> {
+        let tmp = path.with_extension("tmp-upload");
+        std::fs::write(&tmp, bytes).map_err(|e| format!("写入 {} 失败：{e}", tmp.display()))?;
+        std::fs::rename(&tmp, path).map_err(|e| format!("替换 {} 失败：{e}", path.display()))?;
+        Ok(())
+    };
+    if let Err(e) = write_atomic(&so_path, &data).and_then(|_| write_atomic(&sig_path, &sig)) {
+        return Json(err(e));
+    }
+
+    // 5) 记录「该文件 → 公钥」，实现一插件一公钥
+    let mgr = state.config.lock().unwrap();
+    let mut cfg = mgr.load().unwrap_or_default();
+    cfg.plugins.plugin_pubkeys.insert(file_name.clone(), pubkey.clone());
+    if let Err(e) = mgr.save(&cfg) {
+        return Json(err(format!("保存公钥配置失败：{e:#}")));
+    }
+    drop(mgr);
+
+    state.audit.record(
+        "plugin.install",
+        format!("安装外置插件 {file_name}（签名校验通过，已绑定公钥）"),
+        true,
+        None,
+    );
+    Json(serde_json::json!({
+        "success": true,
+        "file": file_name,
+        "dir": dir.to_string_lossy(),
+        "path": so_path.to_string_lossy(),
+        "note": "插件已安装并通过签名校验；应用**重启后**才会加载（插件在启动时装配）。",
+    }))
+}
+
+/// `POST /api/plugins/:file/uninstall`：卸载一个**外置**插件（删 .so/.sig + 解绑公钥）
+///
+/// 与 `purge` 的分工：`purge` 清的是**宿主代管数据**；本接口删的是**插件文件本体**。
+/// 内置插件不可卸载（它们的代码编译在宿主里）。
+async fn plugin_uninstall(
+    State(state): State<AppState>,
+    axum::extract::Path(file): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    let file = file.trim().to_string();
+    if file.is_empty() || file.contains('/') || file.contains("..") {
+        return Json(err("文件名不合法"));
+    }
+
+    // 只允许删除**外置**插件（随包/内置的代码在宿主二进制里，删文件没有意义且危险）
+    let Some(etc) = std::env::var("TRIM_PKGETC").ok().filter(|s| !s.is_empty()) else {
+        return Json(err("无法确定插件目录（缺少 TRIM_PKGETC）"));
+    };
+    let dir = std::path::Path::new(&etc).join("plugins");
+    let so_path = dir.join(&file);
+    if !so_path.is_file() {
+        return Json(err(format!(
+            "该文件不在用户插件目录中，无法卸载：{}（内置/随包插件不能卸载）",
+            so_path.display()
+        )));
+    }
+
+    let sig = crate::plugin::loader::sig_path_of(&so_path);
+    let mut removed = Vec::new();
+    for p in [&so_path, &sig] {
+        if p.is_file() {
+            if let Err(e) = std::fs::remove_file(p) {
+                return Json(err(format!("删除 {} 失败：{e}", p.display())));
+            }
+            removed.push(p.to_string_lossy().into_owned());
+        }
+    }
+
+    let mgr = state.config.lock().unwrap();
+    let mut cfg = mgr.load().unwrap_or_default();
+    let untied = cfg.plugins.plugin_pubkeys.remove(&file).is_some();
+    if let Err(e) = mgr.save(&cfg) {
+        return Json(err(format!("保存配置失败：{e:#}")));
+    }
+    drop(mgr);
+
+    state.audit.record(
+        "plugin.uninstall",
+        format!("卸载外置插件 {file}（解绑公钥：{untied}）"),
+        true,
+        None,
+    );
+    Json(serde_json::json!({
+        "success": true,
+        "file": file,
+        "removed": removed,
+        "unbound_pubkey": untied,
+        "note": "已删除插件文件；已加载的代码要等重启应用才真正释放。",
+    }))
+}
+
+/// 安装请求（内容与签名都用 base64，避免引入 multipart 依赖）
+#[derive(Deserialize, Default)]
+pub struct PluginInstallRequest {
+    /// 目标文件名，必须是 `*.so`（如 `libmy_plugin.so`）
+    #[serde(default)]
+    pub file_name: String,
+    /// `.so` 内容的 base64
+    #[serde(default)]
+    pub data_b64: String,
+    /// `<so>.sig` 内容的 base64（64 字节裸 Ed25519 签名）
+    #[serde(default)]
+    pub sig_b64: String,
+    /// 用于校验的公钥（base64 的 32 字节 Ed25519 公钥）
+    #[serde(default)]
+    pub pubkey: String,
+}
+
 // ── 插件自管数据（宿主代存；ADR-013 决策 2）────────────────────────────
 
 /// `GET /api/plugins/:id/data`：回显该插件的自管配置（**密钥只回显是否已设置**）
@@ -1283,6 +1490,7 @@ fn config_response(
         plugins_pubkeys: cfg.plugins.pubkeys.clone(),
         plugins_allow_unsigned: crate::plugin::loader::allow_unsigned_by_env(),
         plugins_disabled: cfg.plugins.disabled.clone(),
+        plugins_plugin_pubkeys: cfg.plugins.plugin_pubkeys.clone(),
         error,
     }
 }
@@ -1319,6 +1527,7 @@ async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
             plugins_pubkeys: Vec::new(),
             plugins_allow_unsigned: crate::plugin::loader::allow_unsigned_by_env(),
             plugins_disabled: Vec::new(),
+            plugins_plugin_pubkeys: std::collections::BTreeMap::new(),
             webhook_url: None,
             webhook_headers: Vec::new(),
             webhook_body: None,
@@ -3957,6 +4166,8 @@ pub fn router(state: AppState) -> Router {
     let mut core = Router::new()
         .route("/health", get(health))
         .route("/plugins", get(plugins_list))
+        .route("/plugins/install", post(plugin_install))
+        .route("/plugins/:file/uninstall", post(plugin_uninstall))
         .route("/plugins/:id/purge", post(plugin_purge))
         // 按插件启用/禁用（运行时生效，无需重启）
         .route("/plugins/:id/enable", post(plugin_set_enabled))

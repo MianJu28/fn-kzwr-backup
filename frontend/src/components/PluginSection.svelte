@@ -2,11 +2,15 @@
   /**
    * 外置插件（动态库）管理卡片
    *
-   * 宿主启动时扫描插件目录（$TRIM_PKGETC/plugins、$TRIM_APPDEST/plugins 或自定义目录），
-   * 用 libloading 加载 *.so、校验稳定 C ABI，并**强制校验 Ed25519 签名**
-   * （ADR-013 决策 3：信任锚 = 宿主内置的官方公钥 ∪ 下方「插件公钥」，任一验签通过即加载）。
-   * 随包插件用官方私钥签名 → **开箱即用、无需配置**；自签插件才需要把公钥填在这里。
-   * 默认关闭（加载动态库 = 执行任意本地代码）；开关变更**需重启应用**生效。
+   * 宿主启动时扫描插件目录，用 libloading 加载 `*.so`、校验稳定 C ABI，
+   * 并**强制校验 Ed25519 签名**（ADR-013 决策 3）。
+   *
+   * 设计取舍（2026-09-27 调整）：
+   * - **插件目录不再让用户配置**：只用默认目录（`$TRIM_PKGETC/plugins` 用户放置、
+   *   `$TRIM_APPDEST/plugins` 随包分发）。少一个配置项就少一类「填错就静默不加载」的故障。
+   * - **安装走界面**：`POST /api/plugins/install` 上传 `.so` + `.so.sig`，
+   *   安装时即用**该插件自己的公钥**验签（一插件一公钥），并把绑定关系落盘。
+   * - 未启用时下方设置**折叠**，避免默认关闭状态下展示一堆无关项。
    */
   import Icon from './Icon.svelte';
   import { api } from '../lib/api.js';
@@ -15,32 +19,33 @@
 
   /** 是否启用外置插件加载（来自 /api/config） */
   export let enabled = false;
-  /** 自定义插件目录（`:` 分隔多个；空 = 默认目录） */
-  export let dir = '';
-  /** 插件签名公钥（base64 的 32 字节 Ed25519 公钥，每行一个） */
-  export let pubkeys = [];
   /** 是否放行未签名插件（仅环境变量 `FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1`；只读） */
   export let allowUnsigned = false;
   export let busy = false;
-  /** 保存回调：(enabled, dir, pubkeys) => Promise<{error?}> */
+  /** 保存回调：(enabled) => Promise<{error?}> */
   export let onSave = null;
 
   let info = null; // /api/plugins 的 external / orphan_data 字段
   let orphanData = [];
   let loading = false;
   let formEnabled = enabled;
-  let formDir = dir;
-  // 公钥每行一个，便于用户从 sign_plugin.sh 的输出直接粘贴
-  let formPubkeys = (pubkeys || []).join('\n');
   let saved = false;
   let purgeBusy = '';
+  /** 正在卸载的插件文件名 */
+  let uninstallBusy = '';
 
-  // 外部值变化时同步表单（同值不覆盖，避免打断输入）
+  // ── 安装表单 ──────────────────────────────────────────────────
+  let showInstall = false;
+  let installing = false;
+  let instName = ''; // 目标文件名（默认取所选 .so 的文件名）
+  let instPubkey = '';
+  let instSo = null; // 选中的 .so File
+  let instSig = null; // 选中的 .sig File（可留空 = 由浏览器按同名推导？不：签名必须显式提供）
+  let instMsg = '';
+  let instOk = false;
+
+  // 启用状态变化时同步表单（同值不覆盖，避免打断输入）
   $: if (enabled !== formEnabled && !saved) formEnabled = enabled;
-  $: if (dir !== formDir && !saved) formDir = dir;
-  $: if ((pubkeys || []).join('\n') !== formPubkeys && !saved) {
-    formPubkeys = (pubkeys || []).join('\n');
-  }
 
   async function loadInfo() {
     loading = true;
@@ -83,18 +88,137 @@
   async function save() {
     if (!onSave) return;
     saved = true;
-    const keys = formPubkeys
-      .split('\n')
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const r = await onSave(formEnabled, formDir.trim(), keys);
+    const r = await onSave(formEnabled);
     saved = false;
     if (r && r.error) {
       toast.error(r.error, '保存失败');
       return;
     }
-    toast.success('已保存，重启应用后生效');
+    toast.success(
+      formEnabled
+        ? '已启用外置插件：重启应用后生效'
+        : '已关闭外置插件加载：重启应用后生效'
+    );
     await loadInfo();
+  }
+
+  // ── 安装：读文件 → base64 → 提交（后端先验签再落盘） ────────────
+
+  /** File → base64（去掉 data URL 前缀） */
+  function fileToB64(file) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onerror = () => reject(new Error(`读取 ${file.name} 失败`));
+      r.onload = () => {
+        const s = String(r.result);
+        const i = s.indexOf(',');
+        resolve(i >= 0 ? s.slice(i + 1) : s);
+      };
+      r.readAsDataURL(file);
+    });
+  }
+
+  function pickSo(e) {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    instSo = f;
+    // 默认文件名取所选 .so 的名字（用户可改，但一般不用）
+    if (!instName) instName = f.name;
+    instMsg = '';
+  }
+
+  function pickSig(e) {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    instSig = f;
+    instMsg = '';
+  }
+
+  async function install() {
+    instMsg = '';
+    instOk = false;
+    if (!instSo) {
+      instMsg = '请先选择插件文件（.so）';
+      return;
+    }
+    if (!instSig) {
+      instMsg = '请同时选择签名文件（<插件名>.so.sig）—— 宿主强制验签，缺签名无法安装';
+      return;
+    }
+    const name = (instName || instSo.name).trim();
+    if (!name.toLowerCase().endsWith('.so')) {
+      instMsg = '文件名必须以 .so 结尾';
+      return;
+    }
+    if (!instPubkey.trim()) {
+      instMsg = '请填写用于校验该插件的公钥（用签名私钥对应的公钥）';
+      return;
+    }
+    installing = true;
+    try {
+      const [data_b64, sig_b64] = await Promise.all([
+        fileToB64(instSo),
+        fileToB64(instSig),
+      ]);
+      const r = await api.pluginInstall({
+        file_name: name,
+        data_b64,
+        sig_b64,
+        pubkey: instPubkey.trim(),
+      });
+      if (r && r.error) {
+        instMsg = r.error;
+        toast.error(r.error, '安装失败');
+      } else {
+        instOk = true;
+        instMsg = `已安装 ${name}；重启应用后加载。`;
+        toast.success(`${name} 已安装并通过签名校验`, '安装成功');
+        // 复位表单
+        instSo = null;
+        instSig = null;
+        instPubkeysReset();
+        showInstall = false;
+        await loadInfo();
+      }
+    } catch (e) {
+      instMsg = e.message;
+      toast.error(e.message);
+    } finally {
+      installing = false;
+    }
+  }
+
+  function instPubkeysReset() {
+    instName = '';
+    instPubkey = '';
+  }
+
+  /** 卸载**外置**插件：删除 .so/.sig 并解绑其公钥（内置/随包插件删不掉） */
+  async function uninstall(file) {
+    const yes = await confirmDialog({
+      title: `卸载插件 ${file}？`,
+      message:
+        '将从插件目录删除该 .so 与其签名文件，并解绑它的公钥。\n' +
+        '若它仍被目标或任务使用，那些任务会失效（建议先停用相关任务）。\n\n' +
+        '注意：已加载到内存的代码要等**重启应用**才真正释放。',
+      confirmText: '卸载',
+      danger: true,
+    });
+    if (!yes) return;
+    uninstallBusy = file;
+    try {
+      const r = await api.pluginUninstall(file);
+      if (r && r.error) {
+        toast.error(r.error, '卸载失败');
+      } else {
+        toast.success(`${file} 已卸载`, '重启应用后彻底释放');
+        await loadInfo();
+      }
+    } catch (e) {
+      toast.error(e.message);
+    } finally {
+      uninstallBusy = '';
+    }
   }
 
   async function refresh() {
@@ -147,6 +271,7 @@
   </div>
 
   <div class="card-body">
+    <!-- 总开关：关闭时折叠下方全部设置 -->
     <label class="switch-row">
       <input
         type="checkbox"
@@ -154,52 +279,79 @@
         on:change={(e) => (formEnabled = e.target.checked)}
         disabled={busy}
       />
-      <span>启用外置插件加载（重启应用后生效）</span>
+      <span>启用外置插件加载<em class="opt">（重启应用后生效）</em></span>
     </label>
 
-    <div class="field">
-      <label for="pl-dir">插件目录（可选，多个用 : 分隔）</label>
-      <div class="field-row">
-        <input
-          id="pl-dir"
-          placeholder="留空则用默认目录 $TRIM_PKGETC/plugins"
-          value={formDir}
-          on:input={(e) => (formDir = e.target.value)}
-          disabled={busy}
-        />
+    {#if formEnabled !== enabled}
+      <div class="alert alert-info">
+        <Icon name="info" size={15} />
+        <div class="alert-body">
+          开关已改动但<strong>尚未保存</strong>。
+          <button class="btn btn-sm btn-primary inline" on:click={save} disabled={busy}>保存并生效</button>
+        </div>
       </div>
-      <p class="field-hint">
-        留空时扫描：<code>$TRIM_PKGETC/plugins</code>（用户放置）与
-        <code>$TRIM_APPDEST/plugins</code>（随应用分发）；同名文件以靠前的目录为准。
-        推荐插件使用<strong>稳定 C ABI</strong>（只依赖冻结的 JSON 契约）——升级本应用后
-        <strong>无需重新编译插件</strong>
-      </p>
-    </div>
+    {/if}
 
-    <div class="field">
-      <label for="pl-pubkeys">插件公钥（每行一个，base64 的 32 字节 Ed25519 公钥）</label>
-      <div class="field-row">
-        <textarea
-          id="pl-pubkeys"
-          class="textarea mono"
-          rows="3"
-          placeholder="例如：YCzDjlN5uEHPulgwyGWnZYpYV3P7O1xPNpTT0zAkv+A=&#10;只填自签插件的公钥；随包官方插件已内置公钥，无需填写"
-          value={formPubkeys}
-          on:input={(e) => (formPubkeys = e.target.value)}
-          disabled={busy}
-        />
-        <button class="btn btn-primary" on:click={save} disabled={busy}>保存</button>
-        <button class="btn btn-ghost" on:click={refresh} disabled={loading}>刷新</button>
-      </div>
+    {#if !formEnabled}
       <p class="field-hint">
-        <strong>随包插件无需填写</strong>：它们由官方私钥签名，宿主已内置对应公钥
-        （随包示例插件开箱即用）。这里只填<strong>你自己签的</strong>插件的公钥。
-        用 <code>Scripts/sign_plugin.sh keygen</code> 生成密钥对（私钥保密、勿入库），
-        把输出的公钥粘贴到这里；再用 <code>Scripts/sign_plugin.sh sign &lt;插件目录&gt;</code>
-        为每个 <code>.so</code> 生成同名 <code>.so.sig</code>。公钥可填多个（任一匹配即通过）。
-        <strong>未签名、或验签失败的插件一律不加载</strong>——留空并不等于放行。
+        未启用：不会加载任何外置插件。下面的安装与管理在启用后才可用。
       </p>
-    </div>
+    {:else}
+      <!-- 安装插件：上传 .so + .so.sig，并填写该插件的公钥（一插件一公钥） -->
+      <div class="install-block">
+        <div class="install-head">
+          <div class="grow">
+            <div class="install-title">安装插件</div>
+            <p class="field-hint">
+              选择插件文件 <code>.so</code> 与它的签名 <code>.so.sig</code>，
+              并填写<strong>该插件的公钥</strong>。安装时会先验签，不通过不会写入磁盘。
+            </p>
+          </div>
+          <button class="btn btn-sm btn-primary" on:click={() => (showInstall = !showInstall)} disabled={busy || installing}>
+            <Icon name={showInstall ? 'minus' : 'plus'} size={14} />{showInstall ? '收起' : '安装插件'}
+          </button>
+        </div>
+
+        {#if showInstall}
+          <div class="install-form">
+            <div class="field">
+              <label for="pl-so">插件文件（.so）</label>
+              <input id="pl-so" type="file" accept=".so" on:change={pickSo} disabled={installing} />
+            </div>
+            <div class="field">
+              <label for="pl-sig">签名文件（.so.sig）</label>
+              <input id="pl-sig" type="file" accept=".sig" on:change={pickSig} disabled={installing} />
+              <p class="field-hint">
+                用 <code>Scripts/sign_plugin.sh sign &lt;插件.so&gt;</code> 生成（与所选私钥同源）。
+              </p>
+            </div>
+            <div class="field">
+              <label for="pl-name">安装文件名</label>
+              <input id="pl-name" placeholder="默认取所选文件名" value={instName}
+                on:input={(e) => (instName = e.target.value)} disabled={installing} />
+            </div>
+            <div class="field">
+              <label for="pl-pub">该插件的公钥（base64 的 32 字节 Ed25519 公钥）</label>
+              <input id="pl-pub" class="mono" placeholder="例如：YCzDjlN5uEHPulgwyGWnZYpYV3P7O1xPNpTT0zAkv+A="
+                value={instPubkey} on:input={(e) => (instPubkey = e.target.value)} disabled={installing} />
+              <p class="field-hint">
+                用 <code>Scripts/sign_plugin.sh pubkey</code> 打印。
+                <strong>一个插件只认它自己的公钥</strong>——其它插件的公钥无法通过校验。
+              </p>
+            </div>
+            {#if instMsg}
+              <p class={instOk ? 'field-hint ok' : 'field-error'}>{instMsg}</p>
+            {/if}
+            <div class="row-actions">
+              <button class="btn btn-primary" on:click={install} disabled={installing}>
+                {installing ? '校验并安装中…' : '校验并安装'}
+              </button>
+              <button class="btn btn-ghost" on:click={() => (showInstall = false)} disabled={installing}>取消</button>
+            </div>
+          </div>
+        {/if}
+      </div>
+    {/if}
 
     {#if allowUnsigned}
       <div class="alert alert-warn">
@@ -234,7 +386,7 @@
 
     {#if info}
       <div class="row-sub">
-        <span class="meta"><b>扫描目录</b>{(info.dirs || []).length} 个</span>
+        <span class="meta"><b>扫描目录</b>{(info.dirs || []).length} 个（固定，无需配置）</span>
         <span class="meta"><b>加载结果</b>{(info.reports || []).filter((r) => r.loaded).length} 成功 /
           {(info.reports || []).filter((r) => !r.loaded).length} 失败</span>
         {#if info.env_override !== null && info.env_override !== undefined}
@@ -273,8 +425,8 @@
                 {:else if r.path}
                   <div class="row-sub"><code>{r.path}</code></div>
                 {/if}
-                {#if r.id}
-                  <div class="row-sub">
+                <div class="row-sub">
+                  {#if r.id}
                     <button
                       class="btn btn-ghost btn-sm"
                       on:click={() => purge(r.id)}
@@ -283,8 +435,16 @@
                     >
                       {purgeBusy === r.id ? '清除中…' : '清除代管数据'}
                     </button>
-                  </div>
-                {/if}
+                  {/if}
+                  <button
+                    class="btn btn-ghost btn-sm danger"
+                    on:click={() => uninstall(r.file)}
+                    disabled={uninstallBusy === r.file}
+                    title="从插件目录删除该 .so 与其签名，并解绑公钥（内置/随包插件删不掉）"
+                  >
+                    {uninstallBusy === r.file ? '卸载中…' : '卸载插件'}
+                  </button>
+                </div>
               </div>
             </div>
           {/each}
@@ -319,3 +479,74 @@
     {/if}
   </div>
 </section>
+
+<style>
+  .grow {
+    flex: 1;
+    min-width: 0;
+  }
+  .opt {
+    font-weight: 400;
+    color: var(--text-3);
+    font-style: normal;
+  }
+  .inline {
+    margin-left: 8px;
+  }
+  .field-hint.ok {
+    color: var(--success);
+  }
+
+  /* 安装区：浅色面板，与插件列表区分 */
+  .install-block {
+    padding: var(--s3) var(--s4);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+  }
+  .install-head {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--s3);
+  }
+  .install-title {
+    font-size: 13.5px;
+    font-weight: 620;
+    color: var(--text);
+  }
+  .install-head .field-hint {
+    margin-top: 2px;
+  }
+  .install-form {
+    margin-top: var(--s3);
+    padding-top: var(--s3);
+    border-top: 1px dashed var(--border);
+  }
+  /* 文件选择框：原生 file input 很突兀，统一外观 */
+  .install-form input[type='file'] {
+    padding: 7px 10px;
+    font-size: 12.5px;
+    color: var(--text-2);
+    background: var(--surface);
+    cursor: pointer;
+  }
+  .install-form input[type='file']::file-selector-button {
+    margin-right: 10px;
+    padding: 5px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--r-sm);
+    background: var(--surface-3);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 12.5px;
+    cursor: pointer;
+    transition: background var(--t-fast);
+  }
+  .install-form input[type='file']::file-selector-button:hover {
+    background: var(--surface-hover);
+  }
+  .row-actions {
+    display: flex;
+    gap: var(--s2);
+  }
+</style>
