@@ -51,6 +51,26 @@
     'settings'
   );
 
+  /**
+   * 汇总插件的只读概览信息（供卡片主体渲染）
+   *
+   * 卡片只展示 `metric` / `tips`；可编辑项（text/number/toggle/button）一律进设置弹窗，
+   * 避免卡片被表单撑长、多个插件互相淹没。
+   */
+  function pluginStats(p) {
+    const blocks = (p.ui && p.ui.blocks) || [];
+    return {
+      metrics: blocks.filter((b) => b.type === 'metric'),
+      tips: blocks
+        .filter((b) => b.type === 'tips')
+        .map((b) => b.text)
+        .join(' '),
+      count: blocks.filter((b) =>
+        ['text', 'number', 'toggle', 'button'].includes(b.type)
+      ).length,
+    };
+  }
+
   /** 打开某插件的设置弹窗（从最新清单取，避免用过期的对象快照） */
   function openSettings(p) {
     editing = plugins.find((x) => x.id === p.id) || p;
@@ -103,69 +123,90 @@
 </script>
 
 <!-- ── 插件卡片区（概览 + 设置/启停入口）──────────────────────── -->
-{#each pluginSections as p (p.id)}
-  <section class="card" class:is-off={p.disabled}>
-    <div class="card-head">
-      <div class="icon-wrap" class:off={p.disabled}><Icon name="package" size={18} /></div>
-      <div class="grow">
-        <h2 class="card-title">
-          {p.ui?.title || p.name || p.id}
-          {#if p.disabled}
-            <span class="badge badge-warn">已停用</span>
-          {:else if !p.available}
-            <span class="badge">未启用</span>
-          {:else}
-            <span class="badge badge-ok">已启用</span>
-          {/if}
-        </h2>
-        <p class="card-desc">
-          <code>{p.id}</code>
-          {#if p.source === 'external'}· 外置动态库{:else}· 内置{/if}
-          {#if p.ui?.blocks?.length}· {p.ui.blocks.length} 个设置项{/if}
-        </p>
-      </div>
-    </div>
-
+{#if pluginSections.length === 0}
+  <section class="card">
     <div class="card-body">
-      <!-- 概览：卡片上只放只读信息（指标/提示），可编辑项统一进弹窗 -->
-      <div class="summary">
-        {#each p.ui?.blocks || [] as b, i (i)}
-          {#if b.type === 'metric'}
-            <div class="stat">
-              <div class="stat-label">{b.label}</div>
-              <div class="stat-value">{b.value || '—'}</div>
-              {#if b.hint}<div class="stat-sub">{b.hint}</div>{/if}
-            </div>
-          {:else if b.type === 'tips'}
-            <p class="card-desc tips">{b.text}</p>
-          {/if}
-        {/each}
+      <div class="empty">
+        <div class="icon-wrap"><Icon name="package" size={20} /></div>
+        <strong>没有可用插件</strong>
+        插件清单尚未加载完成，或所有插件都未加载。可在下方开启外置插件加载后重启应用。
       </div>
-      {#if !p.ui?.blocks?.length}
-        <p class="card-desc">该插件暂未声明界面。</p>
-      {/if}
-    </div>
-
-    <div class="card-foot foot">
-      <button class="btn btn-sm" on:click={() => openSettings(p)} disabled={busy || p.disabled}>
-        <Icon name="sliders" size={14} />设置
-      </button>
-      <button
-        class="btn btn-sm {p.disabled ? 'btn-primary' : 'btn-ghost danger'}"
-        on:click={() => toggleEnabled(p)}
-        disabled={busy || toggling === p.id}
-      >
-        {#if toggling === p.id}
-          <span class="spin"></span>处理中
-        {:else if p.disabled}
-          <Icon name="zap" size={14} />启用
-        {:else}
-          <Icon name="x" size={14} />停用
-        {/if}
-      </button>
     </div>
   </section>
-{/each}
+{/if}
+
+<div class="plugin-grid">
+  {#each pluginSections as p (p.id)}
+    {@const ps = pluginStats(p)}
+    <article class="plugin-card" class:off={p.disabled}>
+      <!-- 顶部：图标 + 标题 + 状态；右侧一个悬浮的启停开关 -->
+      <header class="pc-head">
+        <span class="pc-icon" class:ok={!p.disabled && p.available} class:off={p.disabled}>
+          <Icon name={p.kind === 'target' ? 'cloud' : 'zap'} size={19} />
+        </span>
+        <div class="pc-title-wrap">
+          <h3 class="pc-title">{p.ui?.title || p.name || p.id}</h3>
+          <div class="pc-meta">
+            <code>{p.id}</code>
+            <span class="dot-sep">·</span>
+            <span>{p.source === 'external' ? '外置' : '内置'}</span>
+            <span class="dot-sep">·</span>
+            <span>{p.kind === 'target' ? '备份目标' : '增强能力'}</span>
+          </div>
+        </div>
+        <span class="pc-state" class:on={!p.disabled && p.available} class:off={p.disabled}>
+          {p.disabled ? '已停用' : p.available ? '运行中' : '待配置'}
+        </span>
+      </header>
+
+      <!-- 主体：只读概览（指标 / 提示） -->
+      <div class="pc-body">
+        {#if ps.metrics.length}
+          <div class="pc-metrics">
+            {#each ps.metrics as m, i (i)}
+              <div class="pc-metric">
+                <span class="pc-metric-k">{m.label}</span>
+                <span class="pc-metric-v">{m.value || '—'}</span>
+                {#if m.hint}<span class="pc-metric-h">{m.hint}</span>{/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
+        {#if ps.tips}
+          <p class="pc-tip">{ps.tips}</p>
+        {/if}
+        {#if !ps.metrics.length && !ps.tips}
+          <p class="pc-tip muted">该插件未声明概览信息。</p>
+        {/if}
+      </div>
+
+      <!-- 底部操作条 -->
+      <footer class="pc-foot">
+        <span class="pc-items">
+          {#if ps.count}<Icon name="sliders" size={13} />{ps.count} 项设置{/if}
+        </span>
+        <div class="pc-actions">
+          <button class="btn btn-sm" on:click={() => openSettings(p)} disabled={busy || p.disabled}>
+            <Icon name="sliders" size={14} />设置
+          </button>
+          <button
+            class="btn btn-sm {p.disabled ? 'btn-primary' : 'btn-ghost danger'}"
+            on:click={() => toggleEnabled(p)}
+            disabled={busy || toggling === p.id}
+          >
+            {#if toggling === p.id}
+              <span class="spin"></span>
+            {:else if p.disabled}
+              <Icon name="zap" size={14} />启用
+            {:else}
+              <Icon name="x" size={14} />停用
+            {/if}
+          </button>
+        </div>
+      </footer>
+    </article>
+  {/each}
+</div>
 
 <!-- ── 外置插件（动态库）管理 ─────────────────────────────────── -->
 <PluginSection
@@ -185,31 +226,251 @@
 />
 
 <style>
-  .grow {
-    flex: 1;
-    min-width: 0;
+  /* ── 插件卡片网格 ────────────────────────────────────────────────
+     自适应多列：宽屏并排、窄屏单列。卡片本身不套用全局 .card，
+     以便实现「图标 + 状态胶囊 + 指标块 + 底部操作条」的紧凑版式。 */
+  .plugin-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: var(--s4);
   }
-  /* 停用的插件整卡降透明度，一眼看出不可用 */
-  .card.is-off {
-    opacity: 0.72;
+
+  .plugin-card {
+    display: flex;
+    flex-direction: column;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    box-shadow: var(--sh-1);
+    overflow: hidden;
+    transition:
+      box-shadow 180ms ease,
+      transform 180ms ease,
+      border-color 180ms ease;
   }
-  .icon-wrap.off {
+  .plugin-card:hover {
+    box-shadow: var(--sh-2);
+    transform: translateY(-1px);
+    border-color: var(--border-strong);
+  }
+  /* 停用：整卡降饱和 + 降透明度，一眼可辨 */
+  .plugin-card.off {
+    opacity: 0.68;
+    background: var(--surface-2);
+  }
+  .plugin-card.off:hover {
+    transform: none;
+    box-shadow: var(--sh-1);
+  }
+
+  /* 顶部：左侧一条品牌色渐变条，强化「这是一个功能模块」的感觉 */
+  .pc-head {
+    position: relative;
+    display: flex;
+    align-items: flex-start;
+    gap: var(--s3);
+    padding: var(--s4) var(--s4) var(--s3);
+  }
+  .pc-head::before {
+    content: '';
+    position: absolute;
+    inset: 0 0 auto;
+    height: 3px;
+    background: linear-gradient(90deg, var(--primary), #8b5cf6 60%, transparent);
+    opacity: 0.9;
+  }
+  .plugin-card.off .pc-head::before {
+    background: var(--border-strong);
+  }
+
+  .pc-icon {
+    display: grid;
+    place-items: center;
+    width: 40px;
+    height: 40px;
+    flex-shrink: 0;
+    border-radius: var(--r-md);
+    background: var(--surface-3);
+    color: var(--text-3);
+    border: 1px solid var(--border);
+  }
+  .pc-icon.ok {
+    background: var(--primary-soft);
+    color: var(--primary);
+    border-color: var(--primary-soft-border);
+  }
+  .pc-icon.off {
     background: var(--surface-3);
     color: var(--text-3);
   }
-  .summary {
+
+  .pc-title-wrap {
+    flex: 1;
+    min-width: 0;
+  }
+  .pc-title {
+    margin: 0;
+    font-size: 14.5px;
+    font-weight: 660;
+    line-height: 1.35;
+    letter-spacing: -0.01em;
+  }
+  .pc-meta {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 3px;
+    font-size: 11.5px;
+    color: var(--text-3);
+  }
+  .pc-meta code {
+    font-size: 11px;
+    padding: 1px 5px;
+    border-radius: var(--r-xs);
+    background: var(--surface-3);
+    color: var(--text-2);
+  }
+  .dot-sep {
+    opacity: 0.5;
+  }
+
+  /* 状态胶囊：运行中 = 绿点呼吸；停用 = 灰；待配置 = 琥珀 */
+  .pc-state {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    flex-shrink: 0;
+    padding: 3px 9px;
+    border-radius: var(--r-full);
+    font-size: 11px;
+    font-weight: 600;
+    background: var(--surface-3);
+    color: var(--text-3);
+    border: 1px solid var(--border);
+  }
+  .pc-state::before {
+    content: '';
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+  .pc-state.on {
+    background: var(--success-soft);
+    color: var(--success);
+    border-color: var(--success-border);
+  }
+  .pc-state.on::before {
+    animation: breathe 2.4s ease-in-out infinite;
+  }
+  .pc-state.off {
+    background: var(--surface-3);
+    color: var(--text-3);
+  }
+  @keyframes breathe {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
+  }
+
+  /* 主体：指标块用两列网格，数值用等宽字体便于对齐 */
+  .pc-body {
+    flex: 1;
+    padding: 0 var(--s4) var(--s4);
+  }
+  .pc-metrics {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: var(--s2);
+  }
+  .pc-metric {
     display: flex;
     flex-direction: column;
-    gap: var(--s2);
+    gap: 2px;
+    padding: 9px 11px;
+    border-radius: var(--r-md);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
   }
-  .tips {
-    margin: 0;
+  .pc-metric-k {
+    font-size: 11px;
+    font-weight: 560;
+    color: var(--text-3);
   }
-  .foot {
+  .pc-metric-v {
+    font-size: 14px;
+    font-weight: 640;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+    word-break: break-all;
+  }
+  .pc-metric-h {
+    font-size: 11px;
+    color: var(--text-3);
+    line-height: 1.45;
+  }
+  .pc-tip {
+    margin: var(--s2) 0 0;
+    font-size: 12px;
+    line-height: 1.65;
+    color: var(--text-3);
+  }
+  .pc-tip.muted {
+    opacity: 0.75;
+  }
+
+  /* 底部操作条：设置项计数在左，按钮在右 */
+  .pc-foot {
     display: flex;
-    justify-content: flex-end;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s2);
+    padding: var(--s3) var(--s4);
+    background: var(--surface-2);
+    border-top: 1px solid var(--border);
+  }
+  .pc-items {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11.5px;
+    color: var(--text-3);
+  }
+  .pc-actions {
+    display: flex;
     gap: var(--s2);
   }
+
+  /* 空状态 */
+  .empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--s2);
+    padding: var(--s6) var(--s4);
+    text-align: center;
+    color: var(--text-3);
+    font-size: 13px;
+  }
+  .empty strong {
+    color: var(--text-2);
+    font-size: 14px;
+  }
+  .empty .icon-wrap {
+    display: grid;
+    place-items: center;
+    width: 44px;
+    height: 44px;
+    border-radius: var(--r-full);
+    background: var(--surface-3);
+    color: var(--text-3);
+  }
+
   .spin {
     width: 12px;
     height: 12px;
@@ -222,6 +483,19 @@
   @keyframes spin {
     to {
       transform: rotate(360deg);
+    }
+  }
+
+  /* 窄屏：单列，卡片内边距收窄 */
+  @media (max-width: 560px) {
+    .plugin-grid {
+      grid-template-columns: 1fr;
+    }
+    .pc-head,
+    .pc-body,
+    .pc-foot {
+      padding-left: var(--s3);
+      padding-right: var(--s3);
     }
   }
 </style>

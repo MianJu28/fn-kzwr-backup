@@ -26,11 +26,6 @@
 
   let busy = false;
   let values = {};
-  // 上传并发路数（仅当插件声明支持并发回传时显示；每插件独立）
-  let parallelValue = plugin?.parallel ?? 0;
-  let parBusy = false;
-  let parMsg = '';
-  let parOk = false;
   /** action -> 结果文案 */
   let results = {};
   /** action -> 是否成功 */
@@ -63,6 +58,49 @@
     metrics = {};
     loadHostData();
     loadMetrics();
+    loadEchoes();
+  }
+
+  /**
+   * 载入**表单回显**（`text` / `number` / `toggle` 的 `echo`）
+   *
+   * 插件描述里的 `value` 只是**静态默认值** —— 插件并不知道自己持久化过什么，
+   * 所以必须再 GET `echo` 拿真实值，否则表单永远显示默认值
+   * （典型症状：阈值改完再打开又变回 85，像是"没保存"）。
+   *
+   * 安全：`secret: true` 的字段**不回填明文**，只用 `configured` 显示
+   * 「已设置（留空则保持不变）」；普通字段用 `value` 回填。
+   */
+  async function loadEchoes() {
+    const withEcho = blocks.filter(
+      (b) => (b.type === 'text' || b.type === 'number' || b.type === 'toggle') && b.echo
+    );
+    if (withEcho.length === 0) return;
+    const next = { ...values };
+    const hints = {};
+    await Promise.all(
+      withEcho.map(async (b) => {
+        const path = b.echo.startsWith('/') ? b.echo : `/${b.echo}`;
+        try {
+          const r = await api.pluginGet(plugin.api_base, path);
+          if (!r || r.error) return; // 读不到则保留静态默认值
+          if (b.secret) {
+            // 密钥：只提示是否已设置，绝不回填值
+            if (r.configured) hints[b.field] = r.hint || '已设置（留空则保持不变，输入新值可覆盖）';
+            else if (r.hint) hints[b.field] = r.hint;
+            return;
+          }
+          if (r.value !== undefined && r.value !== null) {
+            next[b.field] = b.type === 'toggle' ? r.value === true || r.value === 'true' : String(r.value);
+          }
+          if (r.hint) hints[b.field] = r.hint;
+        } catch (e) {
+          /* 保留静态默认值 */
+        }
+      })
+    );
+    values = next;
+    placeholders = { ...placeholders, ...hints };
   }
 
   /**
@@ -138,29 +176,6 @@
   // 注：Svelte 不允许把 `bind:` 绑到 `obj[key]` 这类成员表达式，故手写 input 事件
   function setValue(field, v) {
     values = { ...values, [field]: v };
-  }
-
-  async function saveParallel() {
-    parBusy = true;
-    parMsg = '';
-    try {
-      const n = Math.max(0, Math.min(8, Math.floor(Number(parallelValue) || 0)));
-      const r = await api.pluginParallel(plugin.id, n);
-      if (r && r.error) {
-        parOk = false;
-        parMsg = r.error;
-        toast.error(r.error);
-      } else {
-        parOk = true;
-        parMsg = `已保存（并发 ${r?.parallel ?? n}），下次备份生效`;
-        toast.success('已保存，下次备份生效');
-      }
-    } catch (e) {
-      parOk = false;
-      parMsg = e.message;
-    } finally {
-      parBusy = false;
-    }
   }
 
   async function action(b) {
@@ -322,30 +337,6 @@
         </div>
       {/if}
     {/each}
-
-    {#if plugin?.supports_plan}
-      <div class="field">
-        <label for="pb-par-{plugin?.id}">上传并发路数（本插件独立）</label>
-        <div class="field-row">
-          <input
-            id="pb-par-{plugin?.id}"
-            type="number"
-            min="0"
-            max="8"
-            value={parallelValue}
-            on:input={(e) => (parallelValue = e.target.value)}
-            disabled={parBusy}
-          />
-          <button class="btn" on:click={saveParallel} disabled={parBusy}>保存</button>
-        </div>
-        <p class="field-hint">
-          0 或 1 = 顺序上传；≥2 = 并发回传（该插件声明支持）。保存后下次备份生效，无需重启。
-        </p>
-        {#if parMsg}
-          <p class={parOk ? 'field-hint' : 'field-error'}>{parMsg}</p>
-        {/if}
-      </div>
-    {/if}
 
     {#if blocks.length === 0}
       <p class="card-desc">该插件暂未声明界面（可在插件清单里补充 <code>ui.blocks</code>）。</p>

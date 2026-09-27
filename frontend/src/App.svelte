@@ -557,7 +557,7 @@
               onChanged={handleTasksChanged}
             />
           {:else if currentPage === 'targets'}
-            <TargetsPage {targets} {busy} onChanged={handleTasksChanged} />
+            <TargetsPage {targets} {plugins} {busy} onChanged={handleTasksChanged} />
           {:else if currentPage === 'plugins'}
             <PluginsPage
               {plugins}

@@ -4,6 +4,10 @@
    *
    * 一个目标 = 一个地址 + 一套账号凭据；多个任务可共用同一个目标。
    * 每个目标在云端各自独立（快照按「目标账号」分桶），互不影响。
+   *
+   * **上传并发**（并发回传）也在这里配置：它是目标类型（插件）的能力，
+   * 但开关属于「这个目标用几条连接」，与地址/凭据同属一个目标的属性，
+   * 故与凭据放在同一处编辑，而不是散落在插件页。
    */
   import Icon from '../components/Icon.svelte';
   import { api } from '../lib/api.js';
@@ -12,6 +16,8 @@
 
   /** 目标列表（由外层载入后传入，加载完会回调 onChanged 让外层刷新） */
   export let targets = [];
+  /** 插件清单（查目标类型是否支持并发回传、以及当前并发度） */
+  export let plugins = [];
   export let busy = false;
   export let onChanged = null; // () => Promise
 
@@ -23,6 +29,44 @@
   let testing = null; // 正在测试的目标 id
   let formMsg = '';
   let formOk = true;
+  /** 并发度：正在保存的目标 id（与目标保存分开，互不影响） */
+  let parSaving = null;
+
+  /** 按目标类型（插件 id）查插件条目 */
+  function pluginOf(kind) {
+    return (plugins || []).find((p) => p.id === kind) || null;
+  }
+
+  /** 该目标类型是否支持并发回传（插件自身能力声明，非用户开关） */
+  function supportsPlan(kind) {
+    const p = pluginOf(kind);
+    return !!(p && p.supports_plan);
+  }
+
+  /** 该目标类型当前的并发度（0/1 = 顺序；≥2 = 并发） */
+  function parallelOf(kind) {
+    const p = pluginOf(kind);
+    return (p && p.parallel) || 0;
+  }
+
+  /** 保存某目标类型的上传并发路数（并发度按**插件**配置，同类型目标共用） */
+  async function saveParallel(kind, n) {
+    parSaving = kind;
+    try {
+      const v = Math.max(0, Math.min(8, Math.floor(Number(n) || 0)));
+      const r = await api.pluginParallel(kind, v);
+      if (r && r.error) {
+        toast.error(r.error);
+        return;
+      }
+      toast.success(v >= 2 ? `已启用并发回传（${v} 路），下次备份生效` : '已改为顺序上传，下次备份生效');
+      if (onChanged) await onChanged();
+    } catch (e) {
+      toast.error(e.message);
+    } finally {
+      parSaving = null;
+    }
+  }
 
   function startCreate() {
     editing = { id: '', name: '', kind: 'webdav', url: DEFAULT_URL, username: '', password: '', enabled: true };
@@ -165,6 +209,11 @@
             <code>{t.backend || t.url || '—'}</code>
             {#if t.username}<span class="meta"><b>账号</b>{t.username}</span>{/if}
             <span class="meta"><b>被引用</b>{t.tasks || 0} 个任务</span>
+            {#if supportsPlan(t.kind)}
+              <span class="meta">
+                <b>上传并发</b>{parallelOf(t.kind) >= 2 ? `${parallelOf(t.kind)} 路` : '顺序'}
+              </span>
+            {/if}
           </div>
         </div>
         <div class="row-actions">
@@ -175,6 +224,28 @@
           <button class="btn btn-sm btn-danger" on:click={() => remove(t)} disabled={busy}>删除</button>
         </div>
       </div>
+
+      <!-- 该目标类型的上传并发（能力由插件声明；值按插件配置，同类型目标共用） -->
+      {#if supportsPlan(t.kind)}
+        <div class="parallel-row">
+          <div class="grow">
+            <div class="parallel-label">上传并发路数</div>
+            <p class="field-hint">
+              0 或 1 = 顺序上传；≥2 = 并发回传（最多 8）。同一类型的目标共用该设置；
+              保存后下次备份生效，无需重启。并发会同时占用多条连接。
+            </p>
+          </div>
+          <input
+            class="parallel-input"
+            type="number"
+            min="0"
+            max="8"
+            value={parallelOf(t.kind)}
+            disabled={parSaving === t.kind}
+            on:change={(e) => saveParallel(t.kind, e.target.value)}
+          />
+        </div>
+      {/if}
     {/each}
 
     {#if editing}
@@ -232,3 +303,30 @@
     {/if}
   </div>
 </section>
+
+<style>
+  /* 上传并发：紧贴所属目标的卡片下方，视觉上归入该目标 */
+  .parallel-row {
+    display: flex;
+    align-items: center;
+    gap: var(--s3);
+    margin: calc(-1 * var(--s2)) 0 var(--s3);
+    padding: var(--s3) var(--s4);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+  }
+  .parallel-row .field-hint {
+    margin: 2px 0 0;
+  }
+  .parallel-label {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text-2);
+  }
+  .parallel-input {
+    width: 76px;
+    flex-shrink: 0;
+    text-align: center;
+  }
+</style>

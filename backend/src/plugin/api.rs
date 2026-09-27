@@ -160,6 +160,17 @@ pub enum UiBlock {
         /// 缺省/其它 = 插件自己的路由处理
         #[serde(default)]
         scope: Option<String>,
+        /// **回显**：渲染时 GET 该路径（相对 `api_base`）取真实值，覆盖 `value`。
+        ///
+        /// `value` 只是描述里的**静态默认值**，插件的持久化配置它并不知道；
+        /// 没有 `echo` 的话表单永远显示默认值（如阈值恒为 85），用户改完再打开就"丢"了。
+        ///
+        /// 响应契约 `{"value": ..., "configured": bool, "hint": "..."}`：
+        /// - `secret: true` 的字段**不回填明文**，只用 `configured` 显示
+        ///   「已设置（留空则保持不变）」占位；
+        /// - 普通字段用 `value` 回填；`hint` 可覆盖占位符。
+        #[serde(default)]
+        echo: Option<String>,
     },
     /// 数字输入 + 提交按钮
     Number {
@@ -175,6 +186,9 @@ pub enum UiBlock {
         /// 见 [`UiBlock::Text::scope`]
         #[serde(default)]
         scope: Option<String>,
+        /// 见 [`UiBlock::Text::echo`]
+        #[serde(default)]
+        echo: Option<String>,
     },
     /// 按钮（可带二次确认文案）
     Button {
@@ -194,6 +208,9 @@ pub enum UiBlock {
         /// 见 [`UiBlock::Text::scope`]
         #[serde(default)]
         scope: Option<String>,
+        /// 见 [`UiBlock::Text::echo`]
+        #[serde(default)]
+        echo: Option<String>,
     },
     /// 只读提示
     Tips { text: String },

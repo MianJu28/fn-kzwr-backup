@@ -49,8 +49,8 @@ impl EnhancePlugin for KzwrPlugin {
         axum::Router::new()
             .route("/user", axum::routing::get(kzwr_user))
             .route("/space", axum::routing::get(kzwr_space))
-            .route("/token", axum::routing::post(kzwr_token_save))
-            .route("/quota", axum::routing::post(kzwr_quota_save))
+            .route("/token", axum::routing::post(kzwr_token_save).get(kzwr_token_echo))
+            .route("/quota", axum::routing::post(kzwr_quota_save).get(kzwr_quota_echo))
             .route("/trash/empty", axum::routing::post(kzwr_trash_empty))
     }
 
@@ -103,6 +103,8 @@ impl EnhancePlugin for KzwrPlugin {
                     button: "保存".to_string(),
                     // kzwr 的 access-token 由插件自己的 `/token` 路由处理（非宿主代存）
                     scope: None,
+                    // 回显「是否已配置」（密钥不回明文，只显示已设置）
+                    echo: Some("/token".to_string()),
                 },
                 UiBlock::Number {
                     field: "percent".to_string(),
@@ -113,6 +115,8 @@ impl EnhancePlugin for KzwrPlugin {
                     button: "保存".to_string(),
                     // 由插件自己的 `/quota` 路由处理（写入 cfg.kzwr.quota_warn_percent）
                     scope: None,
+                    // 回填**真实**阈值（描述里的 value 只是静态默认值）
+                    echo: Some("/quota".to_string()),
                 },
                 UiBlock::Button {
                     label: "清空云端回收站".to_string(),
@@ -482,6 +486,21 @@ pub struct KzwrQuotaResponse {
     /// 实际生效的阈值（已裁剪）
     pub percent: u64,
     pub error: Option<String>,
+}
+
+/// 表单**回显**响应（对应 `UiBlock::Text/Number/Toggle` 的 `echo` GET）
+///
+/// 插件描述里的 `value` 只是**静态默认值** —— 插件并不知道自己持久化过什么，
+/// 所以表单渲染时要按 `echo` 拿真实值。安全约束：**密钥字段永不回传明文**，
+/// 只回 `configured`，由前端显示「已设置（留空则保持不变）」。
+#[derive(Serialize, Default)]
+pub struct KzwrEchoResponse {
+    /// 普通字段的真实值（密钥字段恒为 `None`）
+    pub value: Option<serde_json::Value>,
+    /// 是否已配置（密钥字段用它做「已设置」提示）
+    pub configured: bool,
+    /// 可选：覆盖前端占位符的文案
+    pub hint: Option<String>,
 }
 
 /// 空间用量（供 UI Schema 的动态 `metric` 块读取）
@@ -981,6 +1000,46 @@ async fn kzwr_quota_save(
             error: Some(format!("保存失败: {:#}", e)),
         }),
     }
+}
+
+/// kzwr 增强：回显**空间预警阈值**（`UiBlock::Number` 的 `echo`）
+///
+/// 插件描述里的 `value` 是写死的静态默认值，真实值存在 `cfg.kzwr.quota_warn_percent`；
+/// 没有这条 GET，表单永远显示默认值 —— 用户改完再打开就「看不到自己设过的值」。
+async fn kzwr_quota_echo(State(state): State<AppState>) -> Json<KzwrEchoResponse> {
+    let percent = {
+        let mgr = state.config.lock().unwrap();
+        mgr.load()
+            .map(|c| c.kzwr.quota_warn_percent)
+            .unwrap_or_default()
+    };
+    Json(KzwrEchoResponse {
+        value: Some(serde_json::json!(percent)),
+        configured: percent > 0,
+        hint: if percent == 0 {
+            Some("当前已关闭预警（填 1-100 可开启）".to_string())
+        } else {
+            None
+        },
+    })
+}
+
+/// kzwr 增强：回显 **access-token 是否已配置**（`UiBlock::Text` 的 `echo`）
+///
+/// **绝不回传 token 明文**（凭据永不回显是本项目的硬约束），只回 `configured`，
+/// 由前端显示「已设置（留空则保持不变）」。
+async fn kzwr_token_echo(State(state): State<AppState>) -> Json<KzwrEchoResponse> {
+    let configured = kzwr_token_of(&state).is_some();
+    Json(KzwrEchoResponse {
+        // 密钥字段不回填，恒为 None
+        value: None,
+        configured,
+        hint: if configured {
+            Some("已设置（留空则保持不变，输入新值可覆盖）".to_string())
+        } else {
+            Some("未配置；浏览器登录酷族后从 Cookie 复制".to_string())
+        },
+    })
 }
 
 /// kzwr 增强：读取云端空间用量（供 UI Schema 的动态 `metric` 块用）
