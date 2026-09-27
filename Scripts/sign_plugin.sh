@@ -13,7 +13,7 @@
 #                                                     #   私钥 sign.key 必须保密、勿入库）
 #   Scripts/sign_plugin.sh sign   <so 文件|目录> [...] # 就地生成 "<so>.sig"
 #   Scripts/sign_plugin.sh verify <so 文件|目录> [...] # 用同目录 .sig 自检（需 openssl pkeyutl -verify）
-#   Scripts/sign_plugin.sh pubkey [密钥目录]           # 打印 base64 公钥（填到配置项 plugins.pubkeys）
+#   Scripts/sign_plugin.sh pubkey [私钥文件|密钥目录]   # 打印 base64 公钥（填到配置项 plugins.pubkeys）
 #
 # 典型流程：
 #   1) Scripts/sign_plugin.sh keygen
@@ -132,7 +132,13 @@ main() {
       ;;
     pubkey)
       need_openssl
-      pubkey_b64 "$KEY_FILE"
+      # 可选参数：私钥文件或密钥目录（用来核对「这把私钥对应哪把公钥」，
+      # 例如确认签名私钥与宿主内置的官方公钥是否配对）
+      local target="${1:-}"
+      case "$target" in
+        "") pubkey_b64 "$KEY_FILE" ;;
+        *) if [ -d "$target" ]; then pubkey_b64 "$target/sign.key"; else pubkey_b64 "$target"; fi ;;
+      esac
       echo
       ;;
     sign)

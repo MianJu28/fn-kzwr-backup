@@ -152,13 +152,24 @@ pub struct LoadOutcome {
     pub ids: Vec<String>,
 }
 
-/// 校验单个插件的 Ed25519 签名（ADR-013 安全防线）——返回 `Ok(())` 或拒绝原因。
+/// 内置**官方发布公钥**（编译期内置的信任锚）
 ///
-/// - **默认强制校验**（ADR-013 决策 3）：`<so> 同目录下必须有 <so>.sig`
-///   （`.so` 原始字节的 Ed25519 签名，64 字节），且用 `pubkeys` 中任一公钥验签通过；
-/// - `pubkeys` 为空同样拒绝加载（避免「漏配公钥」静默失去保护）；
-/// - 仅 `FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1`（本机调试）跳过校验；
-/// - 验签失败/缺 `.sig` → `Err`，上层记入诊断并跳过该插件。
+/// 随包分发的插件（`$TRIM_APPDEST/plugins/*.so`）由发布流程用**官方私钥**签名，
+/// 公钥硬编码在此，用户**无需做任何配置**即可让随包插件通过强制验签
+/// （否则「默认强制验签 + 默认无公钥」会让随包示例插件一律加载失败）。
+///
+/// 与 `plugins.pubkeys` 的关系：**取并集**。任一来源验签通过即放行，因此
+/// - 官方插件：靠此内置公钥；
+/// - 用户自签插件：把自签公钥填进设置页「插件公钥」。
+///
+/// 安全边界：内置公钥只验证「是否由官方私钥签发」，**不等于**官方审计过插件代码；
+/// 用户目录（`$TRIM_PKGETC/plugins`，应用用户可写）里的插件仍必须自带有效签名，
+/// 否则一样被拒——这正是签名闸门要防的「本地落一个 .so 就被执行」。
+pub const OFFICIAL_PUBKEYS: &[&str] = &[
+    // 发布签名公钥（base64 的 32 字节裸 Ed25519 公钥）
+    "Ao+3UdUTLFLv3TA5Oc2PRQhmzQHWG7OAZxdAToyATw8=",
+];
+
 /// 是否放行**未签名**插件（仅本机调试用）
 ///
 /// `FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1` 时跳过全部签名校验。默认**不放行**：ADR-013
@@ -181,17 +192,38 @@ pub fn sig_path_of(path: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
-/// 用 `pubkeys` 校验插件动态库的 Ed25519 签名（ADR-013 决策 3）
+/// 解析 base64 公钥列表为 `ring` 公钥（保持顺序，跳过空串）
+fn parse_pubkeys<'a, I>(keys_b64: I) -> Result<Vec<ring::signature::UnparsedPublicKey<Vec<u8>>>, String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    use ring::signature::{UnparsedPublicKey, ED25519};
+    let mut keys = Vec::new();
+    for b64 in keys_b64 {
+        let b64 = b64.trim();
+        if b64.is_empty() {
+            continue;
+        }
+        let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+            .map_err(|_| format!("插件公钥不是合法 base64：{b64}"))?;
+        if raw.len() != 32 {
+            return Err(format!("插件公钥必须是 32 字节 Ed25519 公钥，实际 {} 字节", raw.len()));
+        }
+        keys.push(UnparsedPublicKey::new(&ED25519, raw));
+    }
+    Ok(keys)
+}
+
+/// 校验插件动态库的 Ed25519 签名（ADR-013 决策 3）——返回 `Ok(())` 或拒绝原因
 ///
-/// - 公钥来自 `plugins.pubkeys`（base64 的 32 字节裸 Ed25519 公钥，可多个）；
-/// - 签名文件为同目录同名的 `<so>.sig`（`.so` 原始字节的 64 字节裸签名）；
-///   签名由 `Scripts/sign_plugin.sh sign` 生成，与 `ring` 验签**格式互通**；
-/// - **默认强制**：`pubkeys` 为空也拒绝加载（否则「忘记配公钥」会静默变成无校验）；
+/// - **信任锚 = 内置官方公钥 `OFFICIAL_PUBKEYS` ∪ 配置的 `plugins.pubkeys`**，
+///   任一公钥验签通过即放行（内置公钥让随包插件开箱即用，无需用户配置）；
+/// - 签名文件为同目录同名的 `<so>.sig`（`.so` 原始字节的 64 字节裸签名，
+///   由 `Scripts/sign_plugin.sh sign` 用 openssl 生成，与 `ring` 验签格式互通）；
+/// - **默认强制**：即使一个公钥都没配，签名缺失/不匹配一样拒绝加载；
 ///   仅当设置 `FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1`（本机调试）才跳过校验；
 /// - 验签失败/缺 `.sig` → `Err`，上层记入诊断并跳过该插件。
 fn verify_plugin(path: &Path, pubkeys: &[String]) -> Result<(), String> {
-    use ring::signature::{UnparsedPublicKey, ED25519};
-
     // 调试逃生舱：显式放行未签名插件（打醒目警告，避免误以为已受校验保护）
     if allow_unsigned_by_env() {
         tracing::warn!(
@@ -201,30 +233,20 @@ fn verify_plugin(path: &Path, pubkeys: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut keys: Vec<UnparsedPublicKey<Vec<u8>>> = Vec::new();
-    for b64 in pubkeys {
-        let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
-            .map_err(|_| format!("插件公钥不是合法 base64：{b64}"))?;
-        if raw.len() != 32 {
-            return Err(format!("插件公钥必须是 32 字节 Ed25519 公钥，实际 {} 字节", raw.len()));
-        }
-        keys.push(UnparsedPublicKey::new(&ED25519, raw));
-    }
-    if keys.is_empty() {
-        // 默认强制：未配置公钥时**拒绝**，而不是静默跳过。
-        // 文案只说「无法校验」，不断言插件未签名——签名可能完好，只是没有公钥可验。
-        return Err(format!(
-            "未配置插件公钥（plugins.pubkeys），无法校验插件签名，已拒绝加载 {}；\
-             请用 Scripts/sign_plugin.sh keygen 生成密钥、把公钥填入设置页，\
-             并执行 Scripts/sign_plugin.sh sign 对插件签名（本机调试可设 FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1 放行）",
-            path.display()
-        ));
-    }
+    // 信任锚 = 内置官方公钥 ∪ 用户配置公钥（任一验签通过即放行）。
+    // 内置公钥让随包分发的官方插件**开箱即用**；用户自签插件只需追加自己的公钥。
+    let mut keys = parse_pubkeys(OFFICIAL_PUBKEYS.iter().copied())?;
+    let official_n = keys.len();
+    keys.extend(parse_pubkeys(pubkeys.iter().map(|s| s.as_str()))?);
+    let configured_n = keys.len() - official_n;
 
     // 同目录、同 basename + `.sig`
     let sig_path = sig_path_of(path);
     if !sig_path.is_file() {
-        return Err(format!("启用了签名校验，但缺少签名文件 {}", sig_path.display()));
+        return Err(format!(
+            "启用了签名校验，但缺少签名文件 {}（自签插件请执行 Scripts/sign_plugin.sh sign）",
+            sig_path.display()
+        ));
     }
     let data = std::fs::read(path)
         .map_err(|e| format!("读取插件 {} 失败：{e}", path.display()))?;
@@ -237,7 +259,9 @@ fn verify_plugin(path: &Path, pubkeys: &[String]) -> Result<(), String> {
             return Ok(());
         }
     }
-    Err("插件签名校验失败：签名与任一配置公钥均不匹配".to_string())
+    Err(format!(
+        "插件签名校验失败：签名与内置官方公钥、以及配置的 {configured_n} 个公钥均不匹配"
+    ))
 }
 
 /// 加载全部目录中的外置插件
@@ -446,19 +470,67 @@ mod tests {
         assert!(verify_plugin(&so, &keys).is_err());
     }
 
+    /// 决策 3：默认强制验签 —— 一个公钥都没配、也没签名，仍然**拒绝**（不是静默跳过）
+    ///
+    /// 内置官方公钥不等于「放行一切」：它只让**官方签名**有效，未签名插件照旧被拒。
     #[test]
-    fn verify_rejects_when_no_pubkeys_configured() {
-        // 决策 3：默认强制验签 —— 未配置公钥也要**拒绝**（不是静默跳过）
+    fn verify_rejects_unsigned_without_configured_pubkeys() {
         let _g = env_lock();
         std::env::remove_var("FN_KZWR_PLUGINS_ALLOW_UNSIGNED");
         let dir = tempfile::tempdir().expect("tempdir");
         let so = dir.path().join("x.so");
         std::fs::write(&so, b"whatever").unwrap();
-        let keys: Vec<String> = Vec::new();
-        let e = verify_plugin(&so, &keys).expect_err("未配置公钥时必须拒绝");
-        assert!(e.contains("未配置插件公钥"), "错误文案应说明原因：{e}");
-        // 不能断言插件「未签名」：签名可能完好，只是无公钥可验（文案误导会让人白查签名）
-        assert!(!e.contains("已拒绝加载未签名"), "不应断言插件未签名：{e}");
+        let e = verify_plugin(&so, &[]).expect_err("未签名插件必须拒绝");
+        // 无 `.sig` → 在签名闸门被拒（默认拒绝，不因「没配公钥」而放开）
+        assert!(e.contains("缺少签名文件"), "应提示缺签名文件：{e}");
+        // 不能断言插件「未签名」之外的东西：文案不该让人去查一个不存在的公钥配置
+        assert!(!e.contains("未配置插件公钥"), "内置公钥已存在，不该再报「未配置公钥」：{e}");
+    }
+
+    /// 内置官方公钥必须是**格式正确**的 32 字节 Ed25519 公钥
+    ///
+    /// 它是随包插件的唯一信任锚：写错一个字符 → 所有随包插件静默加载失败，
+    /// 而现象只是「插件没出现」，极难定位。这里把格式钉死在测试里。
+    #[test]
+    fn official_pubkeys_are_wellformed() {
+        use base64::Engine as _;
+        assert!(!OFFICIAL_PUBKEYS.is_empty(), "必须内置至少一把官方公钥");
+        for k in OFFICIAL_PUBKEYS {
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(k)
+                .unwrap_or_else(|_| panic!("官方公钥不是合法 base64：{k}"));
+            assert_eq!(raw.len(), 32, "官方公钥必须是 32 字节：{k}");
+        }
+        // 能被 ring 接受（构造不 panic 即说明长度/格式可用）
+        assert_eq!(parse_pubkeys(OFFICIAL_PUBKEYS.iter().copied()).unwrap().len(), OFFICIAL_PUBKEYS.len());
+    }
+
+    /// 信任锚是**并集**：用户自签公钥与内置官方公钥都有效，且空串被忽略
+    #[test]
+    fn trust_anchor_is_union_of_official_and_configured() {
+        let _g = no_escape_hatch();
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let so = dir.path().join("libunion.so");
+        // 必须与下方固定向量签名的**原始内容**逐字节一致（签名是对内容做的）
+        let data = b"openssl-signed plugin payload".to_vec();
+        std::fs::write(&so, &data).unwrap();
+
+        // 用 openssl 固定向量当「用户自签」：官方公钥验不过它，用户公钥可以
+        let user_pub = "YCzDjlN5uEHPulgwyGWnZYpYV3P7O1xPNpTT0zAkv+A=";
+        let sig_b64 = "xP25Ugz2aLM0pR9N/ZKDnRyMuM5tpoO/1YdR4bQCFYlNdygKg6udM0MW9KwyPjT7zopp5MnFM4YwJ6+fNX5WDg==";
+        std::fs::write(
+            dir.path().join("libunion.so.sig"),
+            base64::engine::general_purpose::STANDARD.decode(sig_b64).unwrap(),
+        )
+        .unwrap();
+
+        // 只配用户公钥 → 通过（内置官方公钥不影响用户自签）
+        assert!(verify_plugin(&so, &[user_pub.to_string()]).is_ok());
+        // 空串/空白项被忽略，不会当成「无效公钥」而报错
+        assert!(verify_plugin(&so, &["".to_string(), "   ".to_string(), user_pub.to_string()]).is_ok());
+        // 既不给用户公钥、签名也不属于官方 → 拒绝
+        assert!(verify_plugin(&so, &[]).is_err(), "非官方签名不得通过内置公钥");
     }
 
     #[test]
@@ -540,7 +612,7 @@ mod tests {
     fn load_external_rejects_at_signature_gate() {
         let _g = no_escape_hatch();
         let (dir, _pubk) = staged_dir();
-        // 不配公钥 → 默认强制验签，必须在**接触动态库之前**就拒绝
+        // 只不配**用户**公钥：签名既非官方、也无用户公钥可验 → 默认强制验签，必须在**接触动态库之前**就拒绝
         let out = load_external(&[dir.path().to_path_buf()], &[]);
         assert_eq!(out.reports.len(), 1);
         let r = &out.reports[0];

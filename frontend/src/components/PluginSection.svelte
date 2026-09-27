@@ -4,7 +4,8 @@
    *
    * 宿主启动时扫描插件目录（$TRIM_PKGETC/plugins、$TRIM_APPDEST/plugins 或自定义目录），
    * 用 libloading 加载 *.so、校验稳定 C ABI，并**强制校验 Ed25519 签名**
-   * （ADR-013 决策 3：公钥取自下方「插件公钥」，未配置公钥则拒绝加载任何插件）。
+   * （ADR-013 决策 3：信任锚 = 宿主内置的官方公钥 ∪ 下方「插件公钥」，任一验签通过即加载）。
+   * 随包插件用官方私钥签名 → **开箱即用、无需配置**；自签插件才需要把公钥填在这里。
    * 默认关闭（加载动态库 = 执行任意本地代码）；开关变更**需重启应用**生效。
    */
   import Icon from './Icon.svelte';
@@ -74,7 +75,7 @@
       cls: 'badge-danger',
       text: r.sig_file ? '验签失败' : '未签名',
       title: r.sig_file
-        ? '签名与配置的公钥不匹配（公钥错误或插件被篡改）'
+        ? '签名与内置官方公钥、以及配置的公钥均不匹配（公钥错误或插件被篡改）'
         : '缺少同名 .sig 文件，请用 Scripts/sign_plugin.sh sign 生成',
     };
   }
@@ -182,7 +183,7 @@
           id="pl-pubkeys"
           class="textarea mono"
           rows="3"
-          placeholder="例如：YCzDjlN5uEHPulgwyGWnZYpYV3P7O1xPNpTT0zAkv+A=&#10;留空 = 拒绝加载任何外置插件"
+          placeholder="例如：YCzDjlN5uEHPulgwyGWnZYpYV3P7O1xPNpTT0zAkv+A=&#10;只填自签插件的公钥；随包官方插件已内置公钥，无需填写"
           value={formPubkeys}
           on:input={(e) => (formPubkeys = e.target.value)}
           disabled={busy}
@@ -191,10 +192,12 @@
         <button class="btn btn-ghost" on:click={refresh} disabled={loading}>刷新</button>
       </div>
       <p class="field-hint">
+        <strong>随包插件无需填写</strong>：它们由官方私钥签名，宿主已内置对应公钥
+        （随包示例插件开箱即用）。这里只填<strong>你自己签的</strong>插件的公钥。
         用 <code>Scripts/sign_plugin.sh keygen</code> 生成密钥对（私钥保密、勿入库），
         把输出的公钥粘贴到这里；再用 <code>Scripts/sign_plugin.sh sign &lt;插件目录&gt;</code>
         为每个 <code>.so</code> 生成同名 <code>.so.sig</code>。公钥可填多个（任一匹配即通过）。
-        <strong>留空时不会加载任何外置插件。</strong>
+        <strong>未签名、或验签失败的插件一律不加载</strong>——留空并不等于放行。
       </p>
     </div>
 

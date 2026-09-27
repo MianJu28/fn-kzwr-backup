@@ -5,7 +5,11 @@
 > - ✅ **Step 1**（ABI 整改 + 删 Rust 直连）、**Step 2**（目标能力表 + `AbiTargetStorage` 适配器）、
 >   **Step 5-webdav**（内置 webdav 目标 ABI 化，方案 C）、**并发回传**（`plan_*` 接线 +
 >   每插件独立开关）均已完成并通过 NAS 端到端实测；契约已并入 `docs/PLUGIN_ABI.md`。
-> - ⏳ **Step 3**（签名校验）、**Step 4**（插件自管数据）、**Step 5-kzwr**（增强插件 ABI 化）待做。
+> - ✅ **Step 3**（签名校验 + 内置官方公钥 + 随包插件默认签名）、
+>   **Step 4**（插件自管数据：`plugin_data` + `/api/plugins/:id/data` + `/purge` + 孤立检测）、
+>   **Step 6**（前端签名徽标 / 卸载按钮 / SDK `export_target_v1!` / `example-localfs` 示范插件）
+>   均已完成（2026-09-27）。
+> - ⏳ **Step 5-kzwr**（增强插件 ABI 化，见 §5.2）待做——这是唯一剩余的改造项。
 >
 > 前置事实：产品未发布、无历史插件 → **直接修改 v1 契约本身**，不做 v1/v2 并存。
 >
@@ -23,7 +27,6 @@
 | 6 | 加**心跳**（卡死检测） |
 | 7 | 插件**上报实写字节**，宿主复查 |
 | 9 | 加**签名校验** |
-
 ---
 
 ## 0. 一句话
@@ -162,13 +165,64 @@ typedef struct KzwrTargetAbi {
 
 ### 3.4 签名校验（决策 9）
 
-- 文件约定：`<plugin>.so` + `<plugin>.so.sig`（**Ed25519 签名，覆盖 .so 的 SHA-256**，hex 编码）
-- 公钥来源：配置 `plugins.pubkeys: [hex…]`（支持多个，便于官方公钥 + 用户自签）+ 可选编译期内置官方公钥
-- 加载顺序：**先验签，通过才 dlopen**；失败 → `loaded=false, error="签名校验失败"`，不影响其它插件与核心
-- 逃生阀：`FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1`（仅本地开发）
-- 依赖：**零新增下载** —— `ring`（Ed25519 verify）与 `sha2`（哈希）已在 `Cargo.lock` 中，
-  只需提升为直接依赖（`ed25519-dalek` 不在 lock 内，不引入）
-- 工具：`Scripts/sign_plugin.sh`（openssl / ssh-keygen 生成密钥与签名）+ 发布流程写入文档
+> **实现状态：已完成**（`backend/src/plugin/loader.rs` + `Scripts/sign_plugin.sh`）。
+> 下文的算法/编码以**实现为准**修正过一次：初版设计写的是「对 .so 的 SHA-256 摘要签名、hex 公钥」，
+> 落地时简化为**直接对 .so 原始字节签名、base64 公钥**（少一层哈希，openssl 与 ring 直接互通）。
+
+- 文件约定：`<plugin>.so` + `<plugin>.so.sig`
+  —— **Ed25519 签名，直接覆盖 `.so` 的原始字节**，`.sig` 为 **64 字节裸签名**
+- 公钥编码：`plugins.pubkeys` 里是 **base64 的 32 字节裸 Ed25519 公钥**（不是 hex、不是 PEM）
+- 公钥来源：**内置官方公钥（编译期常量 `loader::OFFICIAL_PUBKEYS`）∪ 配置 `plugins.pubkeys`**
+  - 取**并集**、任一验签通过即放行：随包插件靠内置公钥**开箱即用**（用户零配置），
+    用户自签插件只需把自己的公钥填进设置页
+  - 内置公钥只证明「由官方私钥签发」，**不等于**官方审计过插件代码；用户目录里的插件仍需自带有效签名
+- 加载顺序：**先验签，通过才 dlopen**（有测试钉住：验签失败的插件绝不触发 `dlopen`）；
+  失败 → `loaded=false, error="签名校验未通过：…"`，不影响其它插件与核心
+- **默认强制**：`pubkeys` 为空也照样拒绝未签名/验签失败的插件
+  （否则「忘记配公钥」会静默退化成无校验）
+- 逃生阀：`FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1`（仅本地开发；生产 `cmd/main` 用 `env -i` 白名单启动，
+  该变量不会被透传，因此无法在正式安装里误开）
+- 依赖：**零新增下载** —— 只用已在依赖树里的 `ring`（Ed25519 verify）与 `base64`；
+  `ed25519-dalek` **未引入**
+- 工具链：`Scripts/sign_plugin.sh`（`keygen|sign|verify|pubkey`，基于 `openssl pkeyutl -sign -rawin`）
+  + `Scripts/build_plugins.sh` **默认签名**（私钥 `Scripts/keys/sign.key` 存在即启用），
+  并核对私钥与内置官方公钥是否配对（不配对直接报错，避免打出「全部加载失败」的包）
+- 私钥保管：`Scripts/keys/sign.key` 由 `.gitignore`（`*.key`）排除，**只存在于发布机**；
+  仓库里只有**公钥**（内置锚点）
+
+---
+
+### 3.4.1 随包插件「默认签名」的信任锚（实现补充）
+
+**问题**：§3.4 的「默认强制验签」与「随包示例插件」直接冲突 ——
+出厂状态下 `plugins.pubkeys` 是空的，用户一开启插件加载，**随包插件会全部被拒绝**，
+而现象只是「插件列表里什么都没有」，用户无从判断是没签名、没公钥、还是文件没放对。
+
+**方案**：宿主内置**官方发布公钥**作为信任锚，`build_plugins.sh` 默认用官方私钥签名。
+
+| 环节 | 做法 |
+|---|---|
+| 信任锚 | `loader::OFFICIAL_PUBKEYS`（编译期常量，base64 裸 Ed25519 公钥）。**已验证**：空 `pubkeys` 下随包插件 `signature=verified`、`loaded=true` |
+| 私钥 | `Scripts/keys/sign.key`，**不入库**（`.gitignore` 的 `*.key` 命中）。仓库里只有公钥 |
+| 签名时机 | `Scripts/build_plugins.sh` 默认签名（私钥存在即启用）；`SKIP_SIGN=1` 显式跳过；`build_fnos_app.sh` 打包后会检查 `app/plugins/*.so` 是否都有 `.sig` 并告警 |
+| 漂移守卫 | 构建前核对「私钥公钥 ↔ `OFFICIAL_PUBKEYS`」是否配对，不配对**直接报错**（否则会打出插件全失效的包，且难定位）。第三方自建可设 `ALLOW_KEY_MISMATCH=1` 绕开，把公钥交给用户填进设置页 |
+| 用户自签 | 公钥填 `plugins.pubkeys`；与内置公钥**取并集**，任一验签通过即放行 |
+
+**为什么不放「公钥文件」到 `$TRIM_PKGETC/plugins/` 旁边**：该目录在 `install_init` 里被
+`chown -R` 给应用用户，**应用用户可写** → 把锚点放在那里等于没有锚点
+（能落 `.so` 的攻击者也能顺手改掉公钥文件）。公钥必须编译进二进制才可信。
+
+**边界声明**：内置公钥只证明「由官方私钥签发」，**不等于官方审计过插件代码**。
+用户目录（`$TRIM_PKGETC/plugins`）里的插件仍必须自带有效签名才加载 —— 这正是签名闸门
+要防的「本地落一个 .so 就被执行」。
+
+### 3.4.2 已知限制
+
+- **`plugin_data` 不随配置导入导出**：`ConfigBundle` 未加该字段 → 换机/恢复配置会丢插件自管配置（§6）。
+- **插件启用状态与公钥改动需重启应用**：`load_external` 只在启动时调用一次（无热重载）。
+- **CI 不构建插件**：`.github/workflows/build-fnos-app.yml` 手工组装包、**不含 `plugins/`**，
+  也没有签名步骤 → 官方 `.fpk` 目前**不带插件**。要在发布包里带签名插件，
+  需在 CI 中注入私钥（`secrets`）并调用 `build_plugins.sh`。
 
 ---
 
@@ -221,28 +275,37 @@ typedef struct KzwrTargetAbi {
 
 ---
 
-## 6. 插件自管数据（决策 2）
+## 6. 插件自管数据（决策 2）—— **已实现**
 
 - 落点：`AppConfig` 新增 `plugin_data: BTreeMap<String, BTreeMap<String, String>>`（外层键 = 插件 id），
   值用现有 `ConfigManager::encrypt_field`（`enc:` 前缀）加密存储，复用同一口令派生。
-- 读取：`config_get(key)` → 解密后返回明文给插件；`config_set(key, value)` → 加密落盘。
-- **卸载清除**：新增 `POST /api/plugins/:id/purge`（二次确认）→ 调用插件 `destroy`（若有）→ 删除
+- **读写通道（实现口径）**：`KzwrTargetAbi` 上的 `config_get` / `config_set` 两个函数指针**仍是预留位**
+  （SDK 导出为 `None`，宿主未接回调）。实际通道是**宿主代存 + 配置注入**：
+  - 前端：`describe_json.ui.blocks[]` 里给 `text`/`number` 块标 **`scope: "host"`** →
+    `PluginBlocks.svelte` 改投 `POST /api/plugins/<id>/data`
+  - 写入：`plugin_data_set`（`{"fields": {...}, "remove": [...]}`）→ 加密落盘 → 记审计 `plugin.data`
+  - 读取：装配目标/任务实例时按命名空间解密 → 注入 `target_json.config`（插件读 `config.<键>`）；
+    前端回显走 `GET /api/plugins/<id>/data`，值**脱敏**（只答 `redacted`/是否已设置）
+  - 改完调 `state.reload_targets(&cfg)`，无需重启应用
+- **卸载清除**：`POST /api/plugins/:id/purge`（二次确认）→ 调用插件 `destroy`（若有）→ 删除
   该 id 的 `plugin_data` 命名空间 → 记审计。若仍有目标（`TargetConfig.kind`）或任务引用该插件 →
-  **拒绝卸载**并列出引用项（与 `target_delete` 的保护语义一致）。
-- **孤立数据检测**：启动时比对"有 `plugin_data` 但没有对应已加载插件"的 id → 在设置页提示"清理遗留配置"。
-- **导入导出**：`ConfigBundle`（`routes.rs:429-469`）新增 `plugin_data` 字段，
-  `config_export`（`:3191-3209`）/ `config_import`（`:3246-3364`）同步，否则换机会丢插件配置。
+  **拒绝卸载**并列出引用项（`目标「…」` / `任务「…」`，与 `target_delete` 的保护语义一致）。
+- **孤立数据检测**：启动时比对"有 `plugin_data` 但没有对应已加载插件"的 id → `orphan_data[]`
+  （`GET /api/plugins`）→ 设置页提示"清理遗留配置"。
+- **导入导出**：`ConfigBundle` 增补 `plugin_data` 字段的计划**未落地** ——
+  目前导出/导入不含插件自管数据，换机会丢插件配置（已知限制，待补）。
 
 ---
 
-## 7. 前端改动
+## 7. 前端改动 —— **已实现**
 
-| 位置 | 改动 |
-|---|---|
-| `components/PluginSection.svelte:148-156` | 机制徽标（`c-abi-v1` / `rust-direct`）→ 改为**签名状态**徽标（`已签名/未签名/验签失败`）+ 卸载按钮 |
-| `lib/plugins.js` | 无语义改动（`ui` / `api_base` 驱动不变）；`BUILTIN_COMPONENTS` 保留 |
-| `lib/api.js:109-113` | kzwr 三个方法**URL 不变**（多段动作名兼容）；可后续统一收敛到 `pluginGet/pluginPost` |
-| `views/SettingsPage.svelte:77-99` | 内置组件（`webdav`/`kzwr`）与 `PluginBlocks` 回退逻辑保留 |
+| 位置 | 改动 | 状态 |
+|---|---|---|
+| `components/PluginSection.svelte` | 机制徽标（`c-abi-v1` / `rust-direct`）→ **签名状态**徽标（`已签名/未签名/验签失败`）+ 公钥编辑框 + 卸载按钮 + 孤立数据提示 | ✅ |
+| `components/PluginBlocks.svelte` | 新增 `scope: "host"` 分支：该字段不投插件 `action`，改投 `POST /api/plugins/<id>/data`；打开时回显（值已脱敏 → 占位「已设置（留空则保持不变…）」） | ✅ |
+| `lib/api.js` | 新增 `pluginData` / `pluginDataSet` / `pluginPurge`；kzwr 三个方法 URL 不变（多段动作名兼容） | ✅ |
+| `views/SettingsPage.svelte` | 向 `PluginSection` 传 `pubkeys` / `allowUnsigned` | ✅ |
+| `lib/plugins.js` | 无语义改动（`ui` / `api_base` 驱动不变）；`BUILTIN_COMPONENTS` 保留 | — |
 
 ---
 
@@ -265,13 +328,13 @@ typedef struct KzwrTargetAbi {
 |---|---|---|---|
 | 1 | ABI 整改（`size` 语义、删 kind 硬拒、`runtime` 发现、多段动作名、声明式 alerts）+ 删 Rust 直连（§8） | 0.5 天 | ✅ 已完成 |
 | 2 | 目标能力表 + 实例句柄 + `AbiTargetStorage`（`spawn_blocking`、进度换算、错误码映射、字节复查、看门狗、`plan_*` 并发） | 1.2 天 | ✅ 已完成 |
-| 3 | 签名校验（`ring`+`sha2`、`.sig` 约定、公钥配置、`Scripts/sign_plugin.sh`） | 0.5 天 | ⏳ 待做 |
-| 4 | 插件自管数据（`plugin_data` + `config_get/set` + 卸载清除 + 孤立检测 + 导入导出） | 0.4 天 | ⏳ 待做 |
+| 3 | 签名校验（`ring` + `.sig` 约定 + 公钥配置 + 内置官方公钥 + `Scripts/sign_plugin.sh`） | 0.5 天 | ✅ 已完成（算法按实现修正：对 .so 原始字节签名、base64 公钥，见 §3.4） |
+| 4 | 插件自管数据（`plugin_data` + `plugin_data_json` + 卸载清除 + 孤立检测 + 导入导出） | 0.4 天 | ✅ 已完成（`/api/plugins/:id/data`、`/purge`，前端设置页可编辑） |
 | 5 | 内置插件 ABI 化：webdav（目标表） | 0.4 天 | ✅ 已完成（方案 C：静态表 + `WebdavAbiPlugin` 组合 `CApiTarget`） |
 | 5b | 内置插件 ABI 化：kzwr（动作/体检/事件/自管配置/告警） | 0.6 天 | ⏳ 待做（最大改造面，见 §5.2） |
-| 6 | 前端（签名徽标、卸载按钮）+ SDK `export_target_v1!` + 示范插件（本地目录） | 0.5 天 | 🔶 部分完成（并发设置已在各插件卡片；签名徽标待 Step 3） |
+| 6 | 前端（签名徽标、卸载按钮）+ SDK `export_target_v1!` + 示范插件（本地目录） | 0.5 天 | ✅ 已完成（签名徽标含「已签名/未签名/验签失败」三态；`plugins/example-localfs` 示范目标插件） |
 | 7 | 文档合并（`PLUGIN_ABI.md`）+ ADR 补充 | 0.3 天 | ✅ 已完成（§9 目标能力表 + §10 诊断） |
-| | **合计** | **~4.5 天**（含真机端到端） | 完成约 55% |
+| | **合计** | **~4.5 天**（含真机端到端） | 完成约 90%（仅余 5b kzwr ABI 化 + 真机回归） |
 
 ### 已完成部分的实测结论（2026-09-26，NAS）
 
@@ -299,12 +362,20 @@ typedef struct KzwrTargetAbi {
 
 ---
 
-## 10. 剩余待定（3 条，均为小决策；我给出的默认可直接采用）
+## 10. 剩余待定（3 条，均为小决策；**已全部采纳下文默认值并落地**）
+
+> 状态：**已定案**（2026-09-27）。三条默认值均已在代码中实现，并在真机/本地实例上验证：
+> 1. `cfg_json`/`target_json` 含 `username`、**绝不含密码**；
+> 2. 插件被目标/任务引用时 `/api/plugins/:id/purge` **拒绝卸载**，并列出引用项（`目标「…」`/`任务「…」`）；
+> 3. 签名**默认强制**（空 `pubkeys` 也拒绝），唯一逃生阀是 `FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1`。
 
 1. **`cfg_json` 是否包含目标用户名**：kzwr 插件需要展示"当前绑定账号"（现用 `webdav_username(state)`）。
-   默认建议：**只给 username，不给密码**（目标管理页本来就回显用户名）。
-2. **卸载与引用冲突**：插件仍被目标/任务引用时，默认**拒绝卸载**（列出引用项）。
-3. **签名是否强制**：默认**强制**（未签名即拒载），仅 `FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1` 放行本地开发。
+   定案：**只给 username，不给密码**（目标管理页本来就回显用户名）。
+2. **卸载与引用冲突**：插件仍被目标/任务引用时，**拒绝卸载**（列出引用项）。
+3. **签名是否强制**：**强制**（未签名即拒载），仅 `FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1` 放行本地开发。
+   配套：随包插件由 `Scripts/build_plugins.sh` **默认用官方私钥签名**，
+   宿主内置官方公钥（`loader::OFFICIAL_PUBKEYS`）作为信任锚 → 用户零配置即可加载；
+   发布流程会核对「签名私钥 ↔ 内置公钥」配对（不配对直接报错，避免打出插件全失效的包）。
 
 ---
 

@@ -115,7 +115,8 @@ typedef struct KzwrPluginAbi {
   "utc_offset_minutes": 480,
   "targets": [
     { "id": "default", "name": "默认目标（WebDAV）", "kind": "webdav",
-      "url": "https://dav.kzwr.com/dav", "enabled": true, "ready": true, "primary": true }
+      "url": "https://dav.kzwr.com/dav", "username": "me@example.com",
+      "enabled": true, "ready": true, "primary": true }
   ],
   "tasks": [
     { "id": "default", "name": "默认任务", "enabled": true, "paths": ["/vol1/…"],
@@ -125,7 +126,24 @@ typedef struct KzwrPluginAbi {
 }
 ```
 
-口令、access-token、账号名**永不外传**（`ready` 表示凭据是否齐备）。
+口令、access-token **永不外传**（`ready` 表示凭据是否齐备）。
+`username` **会**传给插件（目标管理页本来就回显它）——这是决策 10-1 的定案。
+
+### 4.2.1 `target_json.config`：插件自管配置（决策 2）
+
+纯目标插件没有自己的 HTTP 路由，因此它提供设置表单、并持久化自己那份配置的唯一途径是
+**宿主代存**（命名空间 = 插件 id）：
+
+| 环节 | 机制 |
+|---|---|
+| 前端声明 | `describe_json.ui.blocks[]` 里给 `text`/`number` 块加 **`scope: "host"`** → 该字段提交给宿主而非插件的 `action` |
+| 写入 | `POST /api/plugins/<id>/data`（body：`{"fields": {键: 值}, "remove": [键]}`），值经 `ConfigManager::encrypt_field` **加密**落盘到 `AppConfig.plugin_data[<id>]` |
+| 读取 | 打开实例时按命名空间解密，注入 `target_json.config`（插件侧读 `config.<键>`）；前端回显走 `GET /api/plugins/<id>/data`（值**脱敏**，只答 `redacted`/是否已设置） |
+| 卸载 | `POST /api/plugins/<id>/purge`：该插件仍被任一目标（`TargetConfig.kind`）或任务引用时**拒绝**，并列出引用项 |
+| 孤立检测 | 启动时比对「有 `plugin_data` 但没有已加载插件」的 id → `GET /api/plugins` 的 `orphan_data[]`，设置页提示清理 |
+
+> 注意：`KzwrTargetAbi.config_get` / `config_set` 两个函数指针**目前是预留位**
+> （SDK 导出时为 `None`，宿主未实现回调）。插件请走上表的 `target_json.config` 通道。
 
 ### 4.3 `available_json` / `health_json` / `action_json` / `event_json`
 
@@ -167,21 +185,45 @@ cp -r plugins/example-hello plugins/my-plugin
 # 4) 构建
 bash Scripts/build_plugins.sh          # → dist/plugins/libmy_plugin.so
 
-# 5) 安装：放进 $TRIM_PKGETC/plugins/，设置页开启「外置插件加载」后重启应用
+# 5) 签名（强制验签，必做）
+#    官方私钥（仓库/Scripts/keys/sign.key）不存在时，build_plugins.sh 会提示未签名；
+#    自签流程：
+bash Scripts/sign_plugin.sh keygen                      # 生成 Scripts/keys/sign.key 并打印公钥
+bash Scripts/sign_plugin.sh sign dist/plugins           # 生成 <so>.sig（64 字节裸 Ed25519 签名）
+#    再把打印出的公钥填进 设置页 →「插件公钥」（plugins.pubkeys）
+
+# 6) 安装：放进 $TRIM_PKGETC/plugins/，设置页开启「外置插件加载」后重启应用
 ```
+
+> 随包插件（`$TRIM_APPDEST/plugins/`）由发布流程用**官方私钥**签名，宿主内置对应公钥
+> （`loader::OFFICIAL_PUBKEYS`）→ 开箱即用，用户无需配置任何公钥。
+> 自签插件则必须把公钥填进 `plugins.pubkeys`（内置公钥与用户公钥是**并集**关系）。
 
 ## 7. 诊断
 
-- `GET /api/plugins` 的 `external` 字段：`enabled` / `dirs`（扫描到的目录与来源）/ `reports[]`（每个 `.so` 的 `loaded`、`mechanism`、`id`、`abi`、`error`）
-- 设置页「外置插件（动态库）」卡片直接展示上述结果，并用徽标标出 **稳定 ABI v1**（~~Rust 直连~~ 已移除）
-- 日志：`fnos_backup::plugin::loader`（加载/跳过原因）；`fnos_backup::plugin::cabi`（C ABI 接管）
-- 相关环境变量：`FN_KZWR_PLUGINS=1`（开启加载）、`FN_KZWR_PLUGIN_DIR`（指定目录）
+- `GET /api/plugins` 的 `external` 字段：`enabled` / `dirs`（扫描到的目录与来源）/ `reports[]`
+  （每个 `.so` 的 `loaded`、`mechanism`、`id`、`abi`、`error`、
+  **`signature`**（`verified` / `unsigned` / `failed`）、**`sig_file`**（`.sig` 是否存在））
+- 设置页「外置插件（动态库）」卡片直接展示上述结果，并用徽标标出 **稳定 ABI v1**
+  （~~Rust 直连~~ 已移除）与**签名三态**（已签名 / 未签名 / 验签失败）
+- `sig_file=false` + `signature=failed` 是「压根没签名」；`sig_file=true` + `signature=failed`
+  是「签名对不上」（可能被篡改）——两者风险不同，前端文案必须区分
+- 日志：`fnos_backup::plugin::loader`（加载/跳过原因、验签结果）；`fnos_backup::plugin::cabi`（C ABI 接管）
+- 相关环境变量：`FN_KZWR_PLUGINS=1`（开启加载）、`FN_KZWR_PLUGIN_DIR`（指定目录）、
+  `FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1`（**仅本机调试**：跳过验签）
   （~~`FN_KZWR_PLUGINS_ALLOW_MISMATCH=1`~~ 属已移除的 Rust 直连机制，今已不存在）
 
 ## 8. 安全边界
 
 - 加载 `.so` 等价于**执行任意本地代码**：默认关闭，必须由用户在设置页显式开启
-- 目前**没有签名校验**（只有 ABI/版本校验）→ 只放可信插件
+- **默认强制验签**（ADR-013 决策 9）：Ed25519 签名覆盖 `.so` **原始字节**，
+  签名文件 `<so>.sig`（64 字节裸签名），公钥为 base64 的 32 字节裸 Ed25519 公钥；
+  **先验签、通过才 `dlopen`**，验签失败的插件绝不进入动态库加载阶段
+- 信任锚 = 内置官方公钥 ∪ `plugins.pubkeys`。注意内置公钥**只证明签发者**，
+  不代表代码被审计；用户放置目录里的插件一样要自带有效签名才加载
+- 唯一逃生阀 `FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1` 仅用于本机调试（正式包的生命周期脚本
+  用 `env -i` 白名单启动，不会透传该变量）
+- 私钥 `Scripts/keys/sign.key` 被 `.gitignore` 排除，只应存在于发布机；仓库内只有公钥
 
 ---
 
@@ -229,7 +271,6 @@ typedef struct KzwrTargetAbi {
     int    (*config_set)(const char *key, const char *value); /* 可选 */
 
     char  *(*last_error_json)(void *th);               /* 可选：错误详情 */
-
     /* —— 并发回传（可选能力，见 9.4） —— */
     void  *(*plan_begin)(void *th, const char *job_json);
     char  *(*plan_next)(void *th, void *ph);           /* ["目标端路径", …]；[] = 清单已空 */

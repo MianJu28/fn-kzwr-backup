@@ -9,6 +9,10 @@
 # 用法：
 #   ./Scripts/build_plugins.sh [输出目录]
 #
+# 签名：宿主**默认强制验签**（ADR-013 决策 3），因此本脚本**默认签名**——
+# 只要 Scripts/keys/sign.key 存在（发布私钥），产出的每个 .so 都会带上 `<so>.sig`，
+# 用户无需任何配置即可加载随包插件。私钥不在时退回未签名并给出提示。
+#
 # 依赖：cargo
 #
 # 插件走**稳定 C ABI v1**（唯一机制）：跨边界只有 `repr(C)` 函数表 + UTF-8 JSON，
@@ -17,12 +21,46 @@
 #
 # 环境变量：
 #   CARGO_TARGET_DIR  可指定共享构建目录
+#   SIGN_KEY          签名私钥路径（**默认** Scripts/keys/sign.key，存在即启用）
+#   SKIP_SIGN=1       显式跳过签名（产出未签名插件，仅供本机调试）
+#   ALLOW_KEY_MISMATCH=1  允许「私钥与宿主内置官方公钥不配对」（第三方自建分发用）
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${1:-$ROOT/dist/plugins}"
 PLUGINS_DIR="$ROOT/plugins"
+DEFAULT_KEY="$ROOT/Scripts/keys/sign.key"
+
+# 默认用发布私钥签名：随包插件必须带 `.sig` 才能在「默认强制验签」下加载。
+# 私钥不存在（如 CI/第三方）则退回未签名，并给出明确提示（见文末）。
+if [ "${SKIP_SIGN:-0}" = "1" ]; then
+    SIGN_KEY=""
+elif [ -z "${SIGN_KEY:-}" ] && [ -f "$DEFAULT_KEY" ]; then
+    SIGN_KEY="$DEFAULT_KEY"
+fi
+# 必须 export：sign_plugin.sh 是**子进程**，只认环境变量里的 SIGN_KEY
+export SIGN_KEY
+
+# 漂移守卫：随包插件靠宿主**编译期内置**的官方公钥（loader.rs 的 OFFICIAL_PUBKEYS）
+# 通过验签。若签名私钥与内置公钥不是一对，插件会被全部拒绝加载，而现象只是
+# 「插件列表里什么都没有」——这里提前把不一致喊出来。
+if [ -n "${SIGN_KEY:-}" ]; then
+    loader_rs="$ROOT/backend/src/plugin/loader.rs"
+    key_pub="$(bash "$ROOT/Scripts/sign_plugin.sh" pubkey "$SIGN_KEY" 2>/dev/null | tr -d '[:space:]')"
+    if [ -n "$key_pub" ] && [ -f "$loader_rs" ] && [ "${ALLOW_KEY_MISMATCH:-0}" != "1" ]; then
+        if ! grep -qF "\"$key_pub\"" "$loader_rs"; then
+            echo "ERROR: 签名私钥与宿主内置官方公钥不一致：" >&2
+            echo "       私钥 $SIGN_KEY 的公钥为 $key_pub" >&2
+            echo "       该公钥未出现在 $loader_rs 的 OFFICIAL_PUBKEYS 中" >&2
+            echo "       → 随包插件将无法通过强制验签。三种修法：" >&2
+            echo "         1) 换回官方私钥（Scripts/keys/sign.key）" >&2
+            echo "         2) 把该公钥补进 OFFICIAL_PUBKEYS 后重新编译宿主" >&2
+            echo "         3) 自建分发：设 ALLOW_KEY_MISMATCH=1，让用户把公钥填进设置页「插件公钥」" >&2
+            exit 1
+        fi
+    fi
+fi
 
 mkdir -p "$OUT"
 
@@ -85,23 +123,22 @@ for d in "$PLUGINS_DIR"/*/; do
     echo "    -> $(basename "$so")"
     built=$((built + 1))
 
-    # 可选：构建后立即签名（设 SIGN_KEY=<私钥路径> 即启用）。
-    # 决策 3 默认强制验签，未签名的插件在正式环境会被拒绝加载；
-    # 自建分发时用同一把私钥签名，用户端只需填公钥。
+    # 构建后签名（默认启用，见文件头）：默认强制验签下，未签名插件在正式环境会被拒绝加载。
     if [ -n "${SIGN_KEY:-}" ]; then
         if bash "$ROOT/Scripts/sign_plugin.sh" sign "$OUT/$(basename "$so")" >/dev/null 2>&1; then
             echo "    -> 已签名 $(basename "$so").sig"
         else
-            echo "    ⚠️ 签名失败（SIGN_KEY=$SIGN_KEY）；该插件将无法通过强制验签" >&2
+            echo "ERROR: 签名失败（SIGN_KEY=$SIGN_KEY）；该插件将无法通过强制验签" >&2
+            exit 1
         fi
     fi
 done
 
-# 未提供 SIGN_KEY 时提示后果，避免「打包后插件全部加载失败」的困惑
+# 未签名时的提示与后果说明，避免「打包后插件全部加载失败」的困惑
 if [ -z "${SIGN_KEY:-}" ]; then
-    echo "==> 提示：未设置 SIGN_KEY，产出为**未签名**插件；"
+    echo "==> 提示：未找到签名私钥（$DEFAULT_KEY），产出为**未签名**插件；"
     echo "    正式环境默认强制验签（ADR-013 决策 3）会拒绝加载它们。"
-    echo "    自签：SIGN_KEY=<私钥> $0 $OUT"
+    echo "    自签：SIGN_KEY=<私钥> $0 $OUT（或放入 $DEFAULT_KEY）"
 fi
 
 echo "==> 完成：构建 $built 个插件（跳过 $skipped 个），输出目录 $OUT"
