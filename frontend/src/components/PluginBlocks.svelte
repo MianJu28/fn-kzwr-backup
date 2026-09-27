@@ -29,6 +29,10 @@
   let results = {};
   /** action -> 是否成功 */
   let oks = {};
+  /** field -> 覆盖用的占位符（宿主代管的密钥只提示「已设置」） */
+  let placeholders = {};
+  /** 插件未加载，宿主无法区分密钥字段 → 所有已存值均只提示「已设置」 */
+  let hostRedacted = false;
 
   $: blocks = (plugin && plugin.ui && plugin.ui.blocks) || [];
 
@@ -46,6 +50,45 @@
     values = next;
     results = {};
     oks = {};
+    placeholders = {};
+    hostRedacted = false;
+    loadHostData();
+  }
+
+  /**
+   * 载入宿主代管配置并回填 `scope: "host"` 的字段
+   *
+   * `secret: true` 的字段后端只回传「是否已设置」（布尔），此时**不回填输入框**
+   * （明文拿不到，也不该拿到），改在占位符上提示「已设置，留空则不修改」。
+   */
+  async function loadHostData() {
+    if (!blocks.some((b) => b.scope === 'host')) return;
+    let data = {};
+    try {
+      const d = await api.pluginData(plugin.id);
+      data = (d && d.data) || {};
+      // `redacted`：插件未加载时后端无法区分哪些键是密钥，故全部按密钥处理
+      if (d && d.redacted) hostRedacted = true;
+    } catch (e) {
+      return; // 读取失败不阻断渲染（用户仍可重新填写保存）
+    }
+    const next = { ...values };
+    const hints = {};
+    for (const b of blocks) {
+      if (b.scope !== 'host' || !b.field) continue;
+      const v = data[b.field];
+      if (v === undefined || v === null) continue;
+      if (typeof v === 'boolean') {
+        // 密钥：只提示是否已设置（布尔值本身不构成「已填内容」）
+        hints[b.field] = v ? '已设置（留空则保持不变，输入新值可覆盖）' : '';
+      } else if (b.type === 'toggle') {
+        next[b.field] = v === 'true' || v === true;
+      } else {
+        next[b.field] = String(v);
+      }
+    }
+    values = next;
+    placeholders = { ...placeholders, ...hints };
   }
 
   function mark(action, text, ok) {
@@ -99,6 +142,29 @@
         body[b.field] =
           b.type === 'number' ? Number(v || 0) : b.type === 'toggle' ? !!v : String(v ?? '');
       }
+      // 宿主代存（`scope: "host"`）：纯目标插件没有自己的路由，字段值提交到
+      // `/api/plugins/<id>/data`，由宿主加密落盘并注入 `target_json.config`。
+      // 空字符串 = 删除该键（便于清除已保存的凭据）。
+      if (b.scope === 'host') {
+        const fields = {};
+        const remove = [];
+        for (const [k, v] of Object.entries(body)) {
+          const s = typeof v === 'boolean' ? (v ? 'true' : 'false') : String(v ?? '');
+          if (s === '') remove.push(k);
+          else fields[k] = s;
+        }
+        const r = await api.pluginDataSet(plugin.id, fields, remove);
+        if (r && r.error) {
+          mark(b.action, r.error, false);
+          toast.error(r.error);
+        } else {
+          mark(b.action, '已保存（下次备份生效）', true);
+          toast.success('已保存');
+          if (b.field && b.type !== 'toggle') values = { ...values, [b.field]: '' };
+          if (onDone) await onDone();
+        }
+        return;
+      }
       // 动作路径：容错处理（插件写 "hello" 或 "/hello" 都能调用）
       const actionPath = b.action.startsWith('/') ? b.action : `/${b.action}`;
       const r = await api.pluginPost(plugin.api_base, actionPath, body);
@@ -137,6 +203,16 @@
   </div>
 
   <div class="card-body">
+    {#if hostRedacted}
+      <div class="alert alert-warn">
+        <Icon name="shield_alert" size={15} />
+        <div class="alert-body">
+          该插件当前<strong>未加载</strong>，宿主无法判断哪些字段是密钥，
+          因此已保存的值一律只显示「是否已设置」，不显示明文。
+          输入新值即可覆盖，留空则保持不变。
+        </div>
+      </div>
+    {/if}
     {#each blocks as b, i (i)}
       {#if b.type === 'tips'}
         <div class="alert alert-info">
@@ -158,7 +234,7 @@
             <input
               id="pb-{plugin?.id}-{b.field}"
               type={b.type === 'number' ? 'number' : b.secret ? 'password' : 'text'}
-              placeholder={b.placeholder || ''}
+              placeholder={placeholders[b.field] || b.placeholder || ''}
               value={values[b.field] ?? ''}
               on:input={(e) => setValue(b.field, e.target.value)}
               disabled={busy}

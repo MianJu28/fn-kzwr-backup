@@ -105,6 +105,17 @@ export const api = {
   pluginPost: (base, path, body) => post(`${base}${path}`, body || {}),
   /** 设置某个目标插件的上传并发路数（并发回传，每插件独立） */
   pluginParallel: (id, parallel) => post(`/api/plugins/${id}/parallel`, { parallel }),
+  /**
+   * 卸载清除该插件的宿主代管数据（ADR-013 决策 2）
+   *
+   * 仍被目标/任务引用时后端**拒绝**，返回 `referenced_by`（引用项名称列表）。
+   */
+  pluginPurge: (id) => post(`/api/plugins/${encodeURIComponent(id)}/purge`, {}),
+  /** 读取该插件的宿主代管配置（`secret` 字段只回传「是否已设置」） */
+  pluginData: (id) => get(`/api/plugins/${encodeURIComponent(id)}/data`),
+  /** 写入该插件的宿主代管配置（fields 明文，后端加密落盘；remove 为要删除的键） */
+  pluginDataSet: (id, fields, remove = []) =>
+    post(`/api/plugins/${encodeURIComponent(id)}/data`, { fields, remove }),
 
   // kzwr 增强插件（非备份通道，可选，需 access-token）
   /** 账号信息（存储空间/套餐；未配置 token 时返回 configured:false + 指引） */

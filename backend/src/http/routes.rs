@@ -85,6 +85,15 @@ pub struct ConfigResponse {
     pub plugins_enabled: bool,
     /// 自定义插件目录（空 = 用默认目录）
     pub plugins_dir: String,
+    /// 插件签名公钥（base64 的 32 字节 Ed25519 公钥，可多个）
+    ///
+    /// 公钥不是秘密（可公开分发），故明文回显，便于用户在设置页增删。
+    pub plugins_pubkeys: Vec<String>,
+    /// 是否放行未签名插件（仅本机调试：来自 `FN_KZWR_PLUGINS_ALLOW_UNSIGNED`）
+    ///
+    /// 只读项：仅回显**环境变量**状态，不提供前端开关（决策 3 要求默认强制验签，
+    /// 否则一次误操作就可能让验签形同虚设）。
+    pub plugins_allow_unsigned: bool,
     /// 告警 Webhook 地址（空 = 不外发）
     pub webhook_url: Option<String>,
     /// Webhook 自定义请求头
@@ -229,6 +238,12 @@ pub struct ConfigSaveRequest {
     /// 自定义插件目录（`:` 分隔多个；空串 = 用默认目录）
     #[serde(default)]
     pub plugins_dir: Option<String>,
+    /// 插件签名公钥（base64 的 32 字节 Ed25519 公钥；**改动需重启应用生效**）
+    ///
+    /// 传空数组 = 清空公钥（此时默认策略会拒绝加载任何外置插件，除非设了
+    /// `FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1`）。不传则保持原值。
+    #[serde(default)]
+    pub plugins_pubkeys: Option<Vec<String>>,
 }
 
 /// 备份响应
@@ -731,8 +746,125 @@ async fn plugin_purge(
     }))
 }
 
-// ── 多任务 / 多目标（ADR-014）辅助 ──────────────────────────────────────
+// ── 插件自管数据（宿主代存；ADR-013 决策 2）────────────────────────────
 
+/// `GET /api/plugins/:id/data`：回显该插件的自管配置（**密钥只回显是否已设置**）
+///
+/// 纯目标插件没有 `routes()`（`/api/p/<id>/*` 只挂在增强插件上），因此它声明的
+/// `ui.blocks` 表单无处提交；本路由即该表单的**宿主代存端点**：前端把
+/// `scope: "host"` 的字段 POST 到这里，值经 `plugin_data` 加密落盘，并注入到
+/// 目标实例的 `target_json.config`（见 `ConfigManager::plugin_data_json`）。
+///
+/// 安全：`secret: true` 的字段只返回 `true/false`（是否已设置），不回传明文——
+/// 页面不需要、也不应该拿到插件凭据。
+async fn plugin_data_get(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    let mgr = state.config.lock().unwrap();
+    let cfg = mgr.load().unwrap_or_default();
+    // 哪些键属于密钥：由插件自己声明的 UI 决定（secret 字段）。
+    // 注意 `target_plugin` 对**未加载**的插件返回 `None`（例如 .so 已删除 = 孤立数据的场景）。
+    // 此时无法判断哪些键是密钥，必须 **fail-closed**：一律按密钥处理、只回传布尔值。
+    // 否则「插件没加载」会静默降级成「明文回显全部凭据」。
+    let loaded_ui = state.plugins.target_plugin(&id).and_then(|p| p.ui());
+    let redacted = loaded_ui.is_none();
+    let secret_fields: Vec<String> = loaded_ui
+        .map(|ui| {
+            ui.blocks
+                .iter()
+                .filter_map(|b| match b {
+                    crate::plugin::api::UiBlock::Text { field, secret: true, .. } => {
+                        Some(field.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let kv = mgr.plugin_data_export(&cfg, &id).unwrap_or_default();
+    let data: serde_json::Map<String, serde_json::Value> = kv
+        .into_iter()
+        .map(|(k, v)| {
+            let val = if redacted || secret_fields.contains(&k) {
+                serde_json::json!(!v.is_empty())
+            } else {
+                serde_json::json!(v)
+            };
+            (k, val)
+        })
+        .collect();
+    Json(serde_json::json!({
+        "success": true,
+        "data": data,
+        // 插件未加载 → 上表所有值均已按密钥处理（前端据此换提示文案）
+        "redacted": redacted,
+        "error": null,
+    }))
+}
+
+/// 宿主代存写入请求：`{"fields": {"root": "/mnt/x"}, "remove": ["token"]}`
+#[derive(Deserialize, Default)]
+pub struct PluginDataSetRequest {
+    #[serde(default)]
+    pub fields: std::collections::BTreeMap<String, String>,
+    /// 要删除的键（空值亦可删除）
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+/// `POST /api/plugins/:id/data`：写入该插件的自管配置（加密落盘 + 热重建目标）
+///
+/// 保存后目标池会重建，使新配置在**下一次备份**即生效（无需重启）。
+/// 允许给**未加载**的插件写数据（先配好、再放 `.so`）；这也与孤立数据检测相容。
+async fn plugin_data_set(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Option<axum::extract::Json<PluginDataSetRequest>>,
+) -> Json<serde_json::Value> {
+    let req = body.map(|b| b.0).unwrap_or_default();
+    if req.fields.is_empty() && req.remove.is_empty() {
+        return Json(err("没有需要保存的字段"));
+    }
+    // 键名限定：不许空键/路径分隔符等（命名空间键会被注入 target_json.config）
+    for k in req.fields.keys().chain(req.remove.iter()) {
+        if k.trim().is_empty() || k.len() > 64 || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return Json(err(format!("非法的配置键：{k}")));
+        }
+    }
+    let cfg = {
+        let mgr = state.config.lock().unwrap();
+        let mut cfg = mgr.load().unwrap_or_default();
+        // 空值 = 删除该键（`plugin_data_set` 既有语义）
+        for (k, v) in &req.fields {
+            if let Err(e) = mgr.plugin_data_set(&mut cfg, &id, k, v) {
+                return Json(err(format!("{:#}", e)));
+            }
+        }
+        for k in &req.remove {
+            if let Err(e) = mgr.plugin_data_set(&mut cfg, &id, k, "") {
+                return Json(err(format!("{:#}", e)));
+            }
+        }
+        if let Err(e) = mgr.save(&cfg) {
+            return Json(err(format!("{:#}", e)));
+        }
+        cfg
+    };
+    // 目标实例按新配置重建（下一次备份生效；无需重启）
+    state.reload_targets(&cfg);
+    // 审计只记**键名与数量**，绝不记值（可能含插件凭据）
+    let keys: Vec<&str> = req.fields.keys().map(|s| s.as_str()).collect();
+    state.audit.record(
+        "plugin.data",
+        format!("保存插件 {id} 自管配置（{} 项：{}）", keys.len(), keys.join("、")),
+        true,
+        None,
+    );
+    Json(serde_json::json!({ "success": true, "saved": keys.len(), "error": null }))
+}
+
+// ── 多任务 / 多目标（ADR-014）辅助 ──────────────────────────────────────
 /// 通用 JSON 错误响应（`{success:false, error}`）
 fn err(e: impl std::fmt::Display) -> serde_json::Value {
     serde_json::json!({ "success": false, "error": e.to_string() })
@@ -991,6 +1123,8 @@ fn config_response(
         debug: cfg.debug,
         plugins_enabled: cfg.plugins.enabled,
         plugins_dir: cfg.plugins.dir.clone().unwrap_or_default(),
+        plugins_pubkeys: cfg.plugins.pubkeys.clone(),
+        plugins_allow_unsigned: crate::plugin::loader::allow_unsigned_by_env(),
         error,
     }
 }
@@ -1024,6 +1158,8 @@ async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
             host_utc_offset_minutes: crate::domain::scheduler::utc_offset_minutes(),
             plugins_enabled: false,
             plugins_dir: String::new(),
+            plugins_pubkeys: Vec::new(),
+            plugins_allow_unsigned: crate::plugin::loader::allow_unsigned_by_env(),
             webhook_url: None,
             webhook_headers: Vec::new(),
             webhook_body: None,
@@ -1120,6 +1256,40 @@ async fn config_save(
     if let Some(v) = body.plugins_dir {
         let v = v.trim().to_string();
         cfg.plugins.dir = if v.is_empty() { None } else { Some(v) };
+    }
+    // 插件签名公钥：**先校验格式**再落盘。若存入非法公钥，加载器会认为「已配置」
+    // 而逐个验签失败，等于把插件全锁死；这里提前拦下并给出明确原因。
+    if let Some(v) = body.plugins_pubkeys {
+        use base64::Engine as _;
+        let mut cleaned: Vec<String> = Vec::new();
+        let mut invalid: Option<String> = None;
+        for (i, k) in v.iter().enumerate() {
+            let k = k.trim();
+            if k.is_empty() {
+                continue; // 前端可能留空行，忽略
+            }
+            match base64::engine::general_purpose::STANDARD.decode(k) {
+                Ok(raw) if raw.len() == 32 => cleaned.push(k.to_string()),
+                Ok(raw) => {
+                    invalid = Some(format!(
+                        "第 {} 个插件公钥长度不对：Ed25519 公钥应为 32 字节，实际 {} 字节",
+                        i + 1,
+                        raw.len()
+                    ));
+                    break;
+                }
+                Err(_) => {
+                    invalid = Some(format!("第 {} 个插件公钥不是合法 base64", i + 1));
+                    break;
+                }
+            }
+        }
+        if let Some(e) = invalid {
+            let resp = config_response(&cfg, webdav_ready(&cfg), wuser, kzwr_on, Some(e));
+            return Json(resp);
+        }
+        cleaned.dedup();
+        cfg.plugins.pubkeys = cleaned;
     }
     match cfg_guard.save(&cfg) {
         Ok(_) => {
@@ -1286,7 +1456,16 @@ async fn target_save(
             }
             let mut warning = None;
             if body.test {
-                match plugin.verify(Some(&url), &user, &pass).await {
+                // 与 `build()` 注入同一份自管配置（锁只在此短暂持有）
+                let plugin_cfg = {
+                    let mgr = state.config.lock().unwrap();
+                    let cfg = mgr.load().unwrap_or_default();
+                    mgr.plugin_data_json(&cfg, &plugin.meta().id)
+                };
+                match plugin
+                    .verify_with_config(Some(&url), &user, &pass, plugin_cfg)
+                    .await
+                {
                     Ok(real) => warning = Some(format!("连接成功：{real}")),
                     Err(e) => return Json(err(e)),
                 }
@@ -1385,7 +1564,17 @@ async fn target_test(
     let (Some(user), Some(pass)) = creds else {
         return Json(err("该目标尚未配置用户名/密码"));
     };
-    match plugin.verify(target.url.as_deref(), &user, &pass).await {
+    // 自管配置需与 `build()` 注入的**同一份**（否则目标把连接参数放在 config 里时测连不准）。
+    // 锁在此处短暂获取后立即释放——`MutexGuard` 不可跨 `await`。
+    let plugin_cfg = {
+        let mgr = state.config.lock().unwrap();
+        let cfg = mgr.load().unwrap_or_default();
+        mgr.plugin_data_json(&cfg, &plugin.meta().id)
+    };
+    match plugin
+        .verify_with_config(target.url.as_deref(), &user, &pass, plugin_cfg)
+        .await
+    {
         Ok(url) => Json(serde_json::json!({ "success": true, "url": url, "error": null })),
         Err(e) => Json(err(e)),
     }
@@ -3598,6 +3787,8 @@ pub fn router(state: AppState) -> Router {
         .route("/plugins", get(plugins_list))
         .route("/plugins/:id/purge", post(plugin_purge))
         .route("/plugins/:id/parallel", post(plugin_parallel))
+        // 插件自管数据（宿主代存）：纯目标插件没有自己的路由，表单提交走这里
+        .route("/plugins/:id/data", get(plugin_data_get).post(plugin_data_set))
         .route("/ws", get(ws::ws_handler))
         .route("/webdav/config", post(webdav_save))
         .route("/user/info", get(user_info))

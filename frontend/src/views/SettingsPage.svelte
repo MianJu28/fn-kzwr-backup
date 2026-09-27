@@ -19,7 +19,11 @@
   // 外置插件加载（动态库，ADR-013 方案 B）
   export let pluginsEnabled = false;
   export let pluginsDir = '';
-  export let onSavePlugins = null; // (enabled, dir) => Promise<{error?}>
+  /** 插件签名公钥（base64 32 字节 Ed25519；空 = 拒绝加载任何外置插件） */
+  export let pluginsPubkeys = [];
+  /** 是否由环境变量放行未签名插件（只读，仅本机调试） */
+  export let pluginsAllowUnsigned = false;
+  export let onSavePlugins = null; // (enabled, dir, pubkeys) => Promise<{error?}>
   /** 设置某个目标插件的上传并发路数：(pluginId, n) => Promise<{error?}> */
   export let onSavePluginParallel = null;
 
@@ -105,7 +109,14 @@
 {/each}
 
 <!-- ── 核心区（不属于插件）────────────────────────────────────── -->
-<PluginSection enabled={pluginsEnabled} dir={pluginsDir} {busy} onSave={onSavePlugins} />
+<PluginSection
+  enabled={pluginsEnabled}
+  dir={pluginsDir}
+  pubkeys={pluginsPubkeys}
+  allowUnsigned={pluginsAllowUnsigned}
+  {busy}
+  onSave={onSavePlugins}
+/>
 <RetentionSection {retention} kzwrReady={kzwrConfigured} {busy} onSave={onSaveRetention} />
 
 <KeySection

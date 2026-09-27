@@ -644,4 +644,15 @@ impl TargetPlugin for WebdavAbiPlugin {
     async fn verify(&self, url: Option<&str>, user: &str, pass: &str) -> Result<String, String> {
         self.inner.verify(url, user, pass).await
     }
+
+    async fn verify_with_config(
+        &self,
+        url: Option<&str>,
+        user: &str,
+        pass: &str,
+        config: serde_json::Value,
+    ) -> Result<String, String> {
+        // 内置 WebDAV 无自管配置（`config` 恒为空）；转发以保持契约一致
+        self.inner.verify_with_config(url, user, pass, config).await
+    }
 }

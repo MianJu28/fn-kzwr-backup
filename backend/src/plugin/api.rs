@@ -51,6 +51,23 @@ pub trait TargetPlugin: Send + Sync {
     /// `url` 为 `None` 时用插件默认地址。
     async fn verify(&self, url: Option<&str>, user: &str, pass: &str) -> Result<String, String>;
 
+    /// 同 [`Self::verify`]，但额外带上该插件的**自管配置命名空间**（已解密）
+    ///
+    /// 目标插件可能把连接参数放在自管配置里（而不是 `url`），「测试连接」必须用与
+    /// `build()` 相同的 `config` 才准确。默认实现忽略 `config`、保持向后兼容；
+    /// 内置 WebDAV 无自管配置，因此无需覆盖。
+    ///
+    /// **调用方不得把 `config` 写入日志**（可能含插件自有凭据）。
+    async fn verify_with_config(
+        &self,
+        url: Option<&str>,
+        user: &str,
+        pass: &str,
+        _config: serde_json::Value,
+    ) -> Result<String, String> {
+        self.verify(url, user, pass).await
+    }
+
     /// 设置页 UI 描述（默认不出现）
     fn ui(&self) -> Option<PluginUi> {
         None
@@ -127,6 +144,10 @@ pub enum UiBlock {
         action: String,
         #[serde(default)]
         button: String,
+        /// 值由谁保管：`host` = 宿主代存（`plugin_data` 命名空间，加密落盘）；
+        /// 缺省/其它 = 插件自己的路由处理
+        #[serde(default)]
+        scope: Option<String>,
     },
     /// 数字输入 + 提交按钮
     Number {
@@ -139,6 +160,9 @@ pub enum UiBlock {
         action: String,
         #[serde(default)]
         button: String,
+        /// 见 [`UiBlock::Text::scope`]
+        #[serde(default)]
+        scope: Option<String>,
     },
     /// 按钮（可带二次确认文案）
     Button {
@@ -155,6 +179,9 @@ pub enum UiBlock {
         label: String,
         value: bool,
         action: String,
+        /// 见 [`UiBlock::Text::scope`]
+        #[serde(default)]
+        scope: Option<String>,
     },
     /// 只读提示
     Tips { text: String },

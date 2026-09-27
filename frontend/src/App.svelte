@@ -51,6 +51,10 @@
   // 外置插件（动态库，ADR-013 方案 B）
   let pluginsEnabledCfg = false;
   let pluginsDirCfg = '';
+  /** 插件签名公钥（base64 32 字节 Ed25519；空 = 拒绝加载任何外置插件） */
+  let pluginsPubkeysCfg = [];
+  /** 是否由环境变量放行未签名插件（只读，仅本机调试） */
+  let pluginsAllowUnsigned = false;
 
   // 备份 / 恢复
   let busy = false;
@@ -142,6 +146,8 @@
       scheduleTimezone = d.schedule_timezone || '';
       pluginsEnabledCfg = !!d.plugins_enabled;
       pluginsDirCfg = d.plugins_dir || '';
+      pluginsPubkeysCfg = d.plugins_pubkeys || [];
+      pluginsAllowUnsigned = !!d.plugins_allow_unsigned;
       backupPaths = d.backup_paths || [];
       targetFolder = d.target_folder || 'fn-backup';
       scheduleCron = d.schedule_cron || '';
@@ -402,14 +408,16 @@
     }
   }
 
-  /** 保存外置插件开关与目录（重启应用后生效） */
-  async function handleSavePlugins(enabled, dir) {
+  /** 保存外置插件开关、目录与签名公钥（重启应用后生效） */
+  async function handleSavePlugins(enabled, dir, pubkeys) {
     busy = true;
     error = null;
     try {
       const d = await api.saveConfig({
         plugins_enabled: !!enabled,
         plugins_dir: dir || '',
+        // 公钥可增删（留空 = 拒绝加载任何外置插件）
+        ...(pubkeys ? { plugins_pubkeys: pubkeys } : {}),
       });
       if (d.error) {
         error = d.error;
@@ -417,6 +425,7 @@
       }
       pluginsEnabledCfg = !!d.plugins_enabled;
       pluginsDirCfg = d.plugins_dir || '';
+      pluginsPubkeysCfg = d.plugins_pubkeys || [];
       return {};
     } catch (e) {
       error = e.message;
@@ -890,6 +899,8 @@
               onPluginDone={handlePluginDone}
               pluginsEnabled={pluginsEnabledCfg}
               pluginsDir={pluginsDirCfg}
+              pluginsPubkeys={pluginsPubkeysCfg}
+              pluginsAllowUnsigned={pluginsAllowUnsigned}
               onSavePlugins={handleSavePlugins}
               onSavePluginParallel={handleSavePluginParallel}
               {webdavConfigured}

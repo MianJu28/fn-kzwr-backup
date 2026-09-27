@@ -40,15 +40,23 @@ fi
 echo "==> [1/4] Build backend (release, musl static) ..."
 # fnOS embedded Linux needs musl static linking to avoid glibc dependency issues.
 # Set MUSL_TARGET=0 to fall back to default glibc (local WSL dev only).
+#
+# 输出目录同样遵循 CARGO_TARGET_DIR/--target：CI 常把构建产物集中到共享目录，
+# 若这里写死 backend/target 就会「明明构建成功却说找不到二进制」。
+TARGET_ROOT="${CARGO_TARGET_DIR:-$BACKEND_DIR/target}"
+case "$TARGET_ROOT" in
+    /*) ;;
+    *) TARGET_ROOT="$BACKEND_DIR/$TARGET_ROOT" ;;
+esac
 if [ "${MUSL_TARGET:-1}" = "1" ]; then
     if ! rustup target list --installed 2>/dev/null | grep -q x86_64-unknown-linux-musl; then
         rustup target add x86_64-unknown-linux-musl 2>&1 | tail -1
     fi
     ( cd "$BACKEND_DIR" && cargo build --release --target x86_64-unknown-linux-musl )
-    BIN_REL="$BACKEND_DIR/target/x86_64-unknown-linux-musl/release/fn-kzwr-backup"
+    BIN_REL="$TARGET_ROOT/x86_64-unknown-linux-musl/release/fn-kzwr-backup"
 else
     ( cd "$BACKEND_DIR" && cargo build --release )
-    BIN_REL="$BACKEND_DIR/target/release/fn-kzwr-backup"
+    BIN_REL="$TARGET_ROOT/release/fn-kzwr-backup"
 fi
 
 echo "==> [2/4] Build frontend ..."

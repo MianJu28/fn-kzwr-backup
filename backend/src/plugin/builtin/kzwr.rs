@@ -86,6 +86,8 @@ impl EnhancePlugin for KzwrPlugin {
                     secret: true,
                     action: "/token".to_string(),
                     button: "保存".to_string(),
+                    // kzwr 的 access-token 由插件自己的 `/token` 路由处理（非宿主代存）
+                    scope: None,
                 },
                 UiBlock::Button {
                     label: "清空云端回收站".to_string(),

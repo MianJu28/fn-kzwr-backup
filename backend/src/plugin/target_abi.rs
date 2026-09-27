@@ -162,8 +162,17 @@ impl CApiTarget {
         (kib * 1024).clamp(64 * 1024, 16 * 1024 * 1024)
     }
 
-    /// 构造 `target_json`（含该目标凭据，仅传给 `target_open`/`test_json`，不落日志）
-    fn target_json(&self, target: &TargetConfig, user: &str, pass: &str) -> String {
+    /// 构造 `target_json`（含该目标凭据，仅传给 `target_open`，不落日志）
+    ///
+    /// `config` 是该插件的自管配置命名空间（宿主代加密存储，此处已解密）：插件从这里读
+    /// 自己的设置（如 `config.root`）。**整体不得写日志。**
+    fn target_json(
+        &self,
+        target: &TargetConfig,
+        user: &str,
+        pass: &str,
+        config: serde_json::Value,
+    ) -> String {
         serde_json::json!({
             "id": target.id,
             "name": target.name,
@@ -171,7 +180,8 @@ impl CApiTarget {
             "url": target.url.clone().unwrap_or_default(),
             "username": user,
             "password": pass,
-            "config": {}, // 插件命名空间键值（宿主代存）在实例建立前注入的位置
+            // 插件自管配置（命名空间 = 插件 id；宿主代加密存储，此处解密注入）
+            "config": config,
         })
         .to_string()
     }
@@ -209,7 +219,11 @@ impl TargetPlugin for CApiTarget {
         // 解密在调用方/mgr 内完成（与内置目标一致）
         let creds = mgr.target_credentials(target).ok().unwrap_or((None, None));
         let (user, pass) = (creds.0.as_deref().unwrap_or(""), creds.1.as_deref().unwrap_or(""));
-        let json = self.target_json(target, user, pass);
+        // 插件自管配置（命名空间 = 插件 id）解密后注入 `target_json.config`。
+        // 注意：此处在 config 锁内（`reload_targets` 持锁调用），只能读、不能写。
+        let cfg = mgr.load().unwrap_or_default();
+        let config = mgr.plugin_data_json(&cfg, &self.meta.id);
+        let json = self.target_json(target, user, pass, config);
         let c = CString::new(json).ok()?;
         let th = unsafe { (self.abi.target_open)(c.as_ptr()) };
         if th.is_null() {
@@ -226,12 +240,24 @@ impl TargetPlugin for CApiTarget {
         Some((Arc::new(storage), target.name.clone()))
     }
     async fn verify(&self, url: Option<&str>, user: &str, pass: &str) -> Result<String, String> {
+        // 无自管配置上下文时按空配置测试（兼容既有调用方）
+        self.verify_with_config(url, user, pass, serde_json::Value::Object(Default::default()))
+            .await
+    }
+    async fn verify_with_config(
+        &self,
+        url: Option<&str>,
+        user: &str,
+        pass: &str,
+        config: serde_json::Value,
+    ) -> Result<String, String> {
         if let Some(test) = self.abi.test_json {
             let json = serde_json::json!({
                 "url": url.unwrap_or_default(),
                 "username": user,
                 "password": pass,
-                "config": {},
+                // 插件自管配置（命名空间 = 插件 id，已解密）——与 `target_open` 同一契约
+                "config": config,
             })
             .to_string();
             let c = CString::new(json).map_err(|e| e.to_string())?;

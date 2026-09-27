@@ -77,8 +77,11 @@ pub struct PluginSettings {
     pub dir: Option<String>,
     /// 允许加载的插件签名公钥（base64，32 字节 Ed25519 公钥）
     ///
-    /// 非空时：加载每个 `*.so` 前必须存在同目录 `*.so.sig`，且用任一公钥验签通过，
-    /// 否则拒绝加载（记入 `/api/plugins` 诊断）。留空 = 跳过签名校验（仅信任目录已受控）。
+    /// 加载每个 `*.so` 前必须存在同目录 `*.so.sig`，且用**任一**公钥验签通过，
+    /// 否则拒绝加载（原因记入 `/api/plugins` 诊断）。
+    ///
+    /// **留空不放行**：未配置公钥时同样拒绝加载（避免「漏配公钥」静默失去保护）。
+    /// 仅当设置环境变量 `FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1`（本机调试）才跳过校验。
     #[serde(default)]
     pub pubkeys: Vec<String>,
     /// **每个目标插件**各自的上传并发路数（插件 id → 路数）
@@ -660,6 +663,28 @@ impl ConfigManager {
         Ok(out)
     }
 
+    /// 把某插件的自管配置解密为 **JSON 对象**（注入目标 `target_json.config`）
+    ///
+    /// 这是插件读取自管配置的**唯一受支持路径**：宿主在建立实例前把命名空间解密后
+    /// 放进 `target_json.config`，插件用 `config.root` 这类键读取（见 `example-localfs`）。
+    /// 解密失败/无数据 → 空对象，插件应回退到 `url` 等既有字段。
+    ///
+    /// **返回值含插件自有凭据，调用方不得写入日志。**
+    pub fn plugin_data_json(&self, cfg: &AppConfig, plugin: &str) -> serde_json::Value {
+        match self.plugin_data_export(cfg, plugin) {
+            Ok(kv) => serde_json::Value::Object(
+                kv.into_iter()
+                    .map(|(k, v)| (k, serde_json::Value::String(v)))
+                    .collect(),
+            ),
+            Err(e) => {
+                // 只记插件 id 与错误，**不记键值**
+                tracing::warn!(plugin = %plugin, err = %e, "插件自管配置解密失败，按空配置注入");
+                serde_json::Value::Object(serde_json::Map::new())
+            }
+        }
+    }
+
     /// 导入用：把明文键值对重新加密写入某插件的命名空间（调用方随后 `save`）
     pub fn plugin_data_import(
         &self,
@@ -719,4 +744,87 @@ fn decode_base64(s: &str) -> Result<Vec<u8>> {
 #[allow(dead_code)]
 fn _use_secret(s: &SecretString) {
     let _ = s.expose_secret();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 建一个临时配置目录的 `ConfigManager`（口令任意，测试内自洽）
+    fn mgr() -> (tempfile::TempDir, ConfigManager) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = ConfigManager::new(dir.path(), SecretString::from("test-pass".to_string()));
+        (dir, m)
+    }
+
+    /// A1+A2 闭环：`plugin_data_set` 加密落库 → `plugin_data_json` 解密注入 `target_json.config`
+    ///
+    /// 这条链路此前是**断的**：路由能写入、`target_json` 却硬编码 `"config": {}`，
+    /// 于是插件永远读到空配置。这里把「写入 → 落盘 → 重新加载 → 注入」全程走一遍。
+    #[test]
+    fn plugin_data_round_trips_into_target_json_config() {
+        let (_d, m) = mgr();
+        let mut cfg = AppConfig::default();
+
+        m.plugin_data_set(&mut cfg, "example-localfs", "root", "/vol1/backup")
+            .expect("set root");
+        m.plugin_data_set(&mut cfg, "example-localfs", "token", "s3cr3t")
+            .expect("set token");
+
+        // 落库的值必须是密文（不能明文躺在配置文件里）
+        let stored = cfg.plugin_data.get("example-localfs").expect("namespace");
+        assert_ne!(stored.get("token").unwrap(), "s3cr3t", "凭据必须加密存储");
+        assert!(stored.get("token").unwrap().starts_with("enc:"), "应带 enc: 前缀");
+
+        // 解密导出 → 明文键值对
+        let kv = m.plugin_data_export(&cfg, "example-localfs").expect("export");
+        assert_eq!(kv.get("root").map(String::as_str), Some("/vol1/backup"));
+        assert_eq!(kv.get("token").map(String::as_str), Some("s3cr3t"));
+
+        // 注入形态：JSON 对象（插件侧读 config.root）
+        let j = m.plugin_data_json(&cfg, "example-localfs");
+        assert_eq!(j.get("root").and_then(|v| v.as_str()), Some("/vol1/backup"));
+        assert_eq!(j.get("token").and_then(|v| v.as_str()), Some("s3cr3t"));
+
+        // 落盘 → 重新加载后依然可解密（确保口令/盐随文件持久化正确）
+        m.save(&cfg).expect("save");
+        let reloaded = m.load().expect("load");
+        let j2 = m.plugin_data_json(&reloaded, "example-localfs");
+        assert_eq!(
+            j2.get("root").and_then(|v| v.as_str()),
+            Some("/vol1/backup"),
+            "重启后插件仍应读到配置"
+        );
+    }
+
+    /// 空值 = 删除该键；命名空间空了则整体移除（避免留下空壳被当成「孤立数据」）
+    #[test]
+    fn plugin_data_set_empty_value_deletes_key() {
+        let (_d, m) = mgr();
+        let mut cfg = AppConfig::default();
+        m.plugin_data_set(&mut cfg, "p", "k", "v").unwrap();
+        assert!(cfg.plugin_data.contains_key("p"));
+
+        m.plugin_data_set(&mut cfg, "p", "k", "").unwrap();
+        assert!(!cfg.plugin_data.contains_key("p"), "空值应删除键并清掉空命名空间");
+    }
+
+    /// 未配置的插件 → 空对象（插件据此回退到 `url` 等既有字段，而不是报错）
+    #[test]
+    fn plugin_data_json_empty_for_unknown_plugin() {
+        let (_d, m) = mgr();
+        let cfg = AppConfig::default();
+        let j = m.plugin_data_json(&cfg, "nope");
+        assert!(j.as_object().expect("object").is_empty());
+    }
+
+    /// `plugin_data_remove`（卸载清除）返回是否真的删了东西
+    #[test]
+    fn plugin_data_remove_reports_whether_it_deleted() {
+        let (_d, m) = mgr();
+        let mut cfg = AppConfig::default();
+        m.plugin_data_set(&mut cfg, "p", "k", "v").unwrap();
+        assert!(m.plugin_data_remove(&mut cfg, "p"), "首次删除应返回 true");
+        assert!(!m.plugin_data_remove(&mut cfg, "p"), "再次删除应返回 false");
+    }
 }

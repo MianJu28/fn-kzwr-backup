@@ -474,6 +474,19 @@ extern "C" fn describe() -> *mut c_char {
                         "label": "并发回传",
                         "value": "已支持（每批 10 个）",
                         "hint": "插件自己决定分批顺序（小文件优先），宿主按并发度上传"
+                    },
+                    {
+                        // `scope: "host"` = 值由**宿主代存**：前端提交到
+                        // `/api/plugins/example-localfs/data`，加密落盘到 plugin_data，
+                        // 再解密注入 `target_json.config`（插件侧读 `config.root`）。
+                        // 纯目标插件没有自己的路由，故这是它提供设置表单的唯一途径。
+                        "type": "text",
+                        "field": "root",
+                        "label": "默认目录（可选）",
+                        "placeholder": "留空则用目标地址里的路径",
+                        "action": "save_root",
+                        "button": "保存",
+                        "scope": "host"
                     }
                 ]
             }

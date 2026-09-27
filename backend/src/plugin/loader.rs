@@ -39,6 +39,18 @@ pub struct Loaded {
     pub abi: u32,
 }
 
+/// 插件签名校验状态（供 `/api/plugins` 诊断与前端徽标）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureStatus {
+    /// 验签通过（配置了公钥且签名匹配）
+    Verified,
+    /// 未签名：已由 `FN_KZWR_PLUGINS_ALLOW_UNSIGNED` 显式放行（仅本机调试）
+    Unsigned,
+    /// 验签失败/缺签名/未配公钥（该插件已被拒绝加载）
+    Failed,
+}
+
 /// 单个动态库的加载结果（供 `/api/plugins` 诊断与前端展示）
 #[derive(Debug, Clone, Serialize)]
 pub struct ExternalPluginReport {
@@ -58,6 +70,10 @@ pub struct ExternalPluginReport {
     pub mechanism: Option<String>,
     /// 插件声明的 ABI 版本（仅稳定 C ABI 有）
     pub abi: Option<u32>,
+    /// 签名校验状态（`verified` | `unsigned` | `failed`）
+    pub signature: SignatureStatus,
+    /// 是否存在同目录同名 `<so>.sig` 文件（供前端区分「未签名」与「签名不匹配」）
+    pub sig_file: bool,
     /// 失败原因（`loaded=false` 时）
     pub error: Option<String>,
 }
@@ -138,14 +154,53 @@ pub struct LoadOutcome {
 
 /// 校验单个插件的 Ed25519 签名（ADR-013 安全防线）——返回 `Ok(())` 或拒绝原因。
 ///
-/// - `pubkeys` 非空才强制校验：`<so> 同目录下必须有 <so>.sig`
-///   （`.so` 原始字节的 Ed25519 签名，64 字节），且用任一公钥验签通过；
-/// - `pubkeys` 为空 = 信任已受控目录，跳过硬校验（仍会尝试解析 `.sig`，失败不阻断）；
+/// - **默认强制校验**（ADR-013 决策 3）：`<so> 同目录下必须有 <so>.sig`
+///   （`.so` 原始字节的 Ed25519 签名，64 字节），且用 `pubkeys` 中任一公钥验签通过；
+/// - `pubkeys` 为空同样拒绝加载（避免「漏配公钥」静默失去保护）；
+/// - 仅 `FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1`（本机调试）跳过校验；
+/// - 验签失败/缺 `.sig` → `Err`，上层记入诊断并跳过该插件。
+/// 是否放行**未签名**插件（仅本机调试用）
+///
+/// `FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1` 时跳过全部签名校验。默认**不放行**：ADR-013
+/// 决策 3 要求外置插件默认强制验签（`plugins.pubkeys` 未配置时也拒绝加载，避免
+/// 「忘了配公钥 = 静默无校验」）。正式安装请勿设置该变量。
+pub fn allow_unsigned_by_env() -> bool {
+    matches!(
+        std::env::var("FN_KZWR_PLUGINS_ALLOW_UNSIGNED")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+/// 插件签名文件路径：同目录、同 basename + `.sig`
+pub fn sig_path_of(path: &Path) -> PathBuf {
+    let mut p = path.as_os_str().to_os_string();
+    p.push(".sig");
+    PathBuf::from(p)
+}
+
+/// 用 `pubkeys` 校验插件动态库的 Ed25519 签名（ADR-013 决策 3）
+///
+/// - 公钥来自 `plugins.pubkeys`（base64 的 32 字节裸 Ed25519 公钥，可多个）；
+/// - 签名文件为同目录同名的 `<so>.sig`（`.so` 原始字节的 64 字节裸签名）；
+///   签名由 `Scripts/sign_plugin.sh sign` 生成，与 `ring` 验签**格式互通**；
+/// - **默认强制**：`pubkeys` 为空也拒绝加载（否则「忘记配公钥」会静默变成无校验）；
+///   仅当设置 `FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1`（本机调试）才跳过校验；
 /// - 验签失败/缺 `.sig` → `Err`，上层记入诊断并跳过该插件。
 fn verify_plugin(path: &Path, pubkeys: &[String]) -> Result<(), String> {
     use ring::signature::{UnparsedPublicKey, ED25519};
 
-    // 无配置公钥 → 不强制校验（默认行为，向后兼容）
+    // 调试逃生舱：显式放行未签名插件（打醒目警告，避免误以为已受校验保护）
+    if allow_unsigned_by_env() {
+        tracing::warn!(
+            plugin = %path.display(),
+            "FN_KZWR_PLUGINS_ALLOW_UNSIGNED 已启用：跳过插件签名校验（仅限本机调试）"
+        );
+        return Ok(());
+    }
+
     let mut keys: Vec<UnparsedPublicKey<Vec<u8>>> = Vec::new();
     for b64 in pubkeys {
         let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
@@ -156,13 +211,18 @@ fn verify_plugin(path: &Path, pubkeys: &[String]) -> Result<(), String> {
         keys.push(UnparsedPublicKey::new(&ED25519, raw));
     }
     if keys.is_empty() {
-        return Ok(());
+        // 默认强制：未配置公钥时**拒绝**，而不是静默跳过。
+        // 文案只说「无法校验」，不断言插件未签名——签名可能完好，只是没有公钥可验。
+        return Err(format!(
+            "未配置插件公钥（plugins.pubkeys），无法校验插件签名，已拒绝加载 {}；\
+             请用 Scripts/sign_plugin.sh keygen 生成密钥、把公钥填入设置页，\
+             并执行 Scripts/sign_plugin.sh sign 对插件签名（本机调试可设 FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1 放行）",
+            path.display()
+        ));
     }
 
     // 同目录、同 basename + `.sig`
-    let mut sig_path = path.as_os_str().to_os_string();
-    sig_path.push(".sig");
-    let sig_path = PathBuf::from(sig_path);
+    let sig_path = sig_path_of(path);
     if !sig_path.is_file() {
         return Err(format!("启用了签名校验，但缺少签名文件 {}", sig_path.display()));
     }
@@ -211,15 +271,25 @@ pub fn load_external(dirs: &[PathBuf], pubkeys: &[String]) -> LoadOutcome {
                 kind: None,
                 mechanism: None,
                 abi: None,
+                signature: SignatureStatus::Failed,
+                // 与验签结果无关：先如实记录是否存在 `.sig`，前端据此区分
+                // 「签名不匹配」与「根本没签名」（写反会把被篡改的插件显示成未签名）
+                sig_file: sig_path_of(&path).is_file(),
                 error: None,
             };
-            // 签名防线：配置了公钥则强制验签，失败即拒绝加载（不触碰动态库）
+            // 签名防线：默认强制验签，失败即拒绝加载（不触碰动态库）
             if let Err(e) = verify_plugin(&path, pubkeys) {
                 tracing::warn!(file = %file, err = %e, "外置插件签名校验未通过（已跳过）");
                 report.error = Some(format!("签名校验未通过：{e}"));
                 out.reports.push(report);
                 continue;
             }
+            // 走到这里说明验签通过（或逃生舱放行）
+            report.signature = if allow_unsigned_by_env() {
+                SignatureStatus::Unsigned
+            } else {
+                SignatureStatus::Verified
+            };
             match load_one(&path) {
                 Ok((loaded, lib)) => {
                     let kind = match (loaded.enhance.is_some(), loaded.target.is_some()) {
@@ -337,8 +407,22 @@ fn test_key() -> (String, ring::signature::Ed25519KeyPair) {
 mod tests {
     use super::*;
 
+    /// 串行化会读写进程级环境变量的测试（`cargo test` 默认多线程）
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        L.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 已配置公钥时的验签测试不受逃生舱影响（显式清掉，避免外部环境串味）
+    fn no_escape_hatch() -> std::sync::MutexGuard<'static, ()> {
+        let g = env_lock();
+        std::env::remove_var("FN_KZWR_PLUGINS_ALLOW_UNSIGNED");
+        g
+    }
+
     #[test]
     fn verify_signature_accepts_valid_and_rejects_tampered() {
+        let _g = no_escape_hatch();
         let dir = tempfile::tempdir().expect("tempdir");
         let (pubk, kp) = test_key();
         let keys = vec![pubk];
@@ -363,12 +447,137 @@ mod tests {
     }
 
     #[test]
-    fn verify_skips_when_no_pubkeys() {
+    fn verify_rejects_when_no_pubkeys_configured() {
+        // 决策 3：默认强制验签 —— 未配置公钥也要**拒绝**（不是静默跳过）
+        let _g = env_lock();
+        std::env::remove_var("FN_KZWR_PLUGINS_ALLOW_UNSIGNED");
         let dir = tempfile::tempdir().expect("tempdir");
         let so = dir.path().join("x.so");
         std::fs::write(&so, b"whatever").unwrap();
-        // 未配置公钥 → 不强制校验
         let keys: Vec<String> = Vec::new();
-        assert!(verify_plugin(&so, &keys).is_ok());
+        let e = verify_plugin(&so, &keys).expect_err("未配置公钥时必须拒绝");
+        assert!(e.contains("未配置插件公钥"), "错误文案应说明原因：{e}");
+        // 不能断言插件「未签名」：签名可能完好，只是无公钥可验（文案误导会让人白查签名）
+        assert!(!e.contains("已拒绝加载未签名"), "不应断言插件未签名：{e}");
+    }
+
+    #[test]
+    fn verify_allows_unsigned_with_env_escape_hatch() {
+        // `FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1` 时放行未签名插件（本机调试）
+        let _g = env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let so = dir.path().join("y.so");
+        std::fs::write(&so, b"whatever").unwrap();
+        std::env::set_var("FN_KZWR_PLUGINS_ALLOW_UNSIGNED", "1");
+        let r = verify_plugin(&so, &[]);
+        std::env::remove_var("FN_KZWR_PLUGINS_ALLOW_UNSIGNED");
+        assert!(r.is_ok(), "逃生舱应放行：{r:?}");
+    }
+
+    /// 与 `Scripts/sign_plugin.sh`（openssl Ed25519）的**互操作性**：
+    /// 脚本产出的是 32 字节裸公钥的 base64 与 64 字节裸签名，必须能被 `ring` 验过。
+    #[test]
+    fn verify_accepts_openssl_ed25519_signature() {
+        use base64::Engine as _;
+        let _g = no_escape_hatch();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let so = dir.path().join("libosign.so");
+        let data = b"openssl-signed plugin payload".to_vec();
+        std::fs::write(&so, &data).unwrap();
+
+        // 固定向量：由 `openssl genpkey -algorithm ED25519` + `pkeyutl -sign -rawin` 生成，
+        // 公钥为 `openssl pkey -pubout -outform DER` 末 32 字节的 base64（脚本同一算法）。
+        let pubk = "YCzDjlN5uEHPulgwyGWnZYpYV3P7O1xPNpTT0zAkv+A=";
+        let sig_b64 = "xP25Ugz2aLM0pR9N/ZKDnRyMuM5tpoO/1YdR4bQCFYlNdygKg6udM0MW9KwyPjT7zopp5MnFM4YwJ6+fNX5WDg==";
+        std::fs::write(
+            dir.path().join("libosign.so.sig"),
+            base64::engine::general_purpose::STANDARD
+                .decode(sig_b64)
+                .expect("decode sig"),
+        )
+        .unwrap();
+        assert!(verify_plugin(&so, &[pubk.to_string()]).is_ok());
+    }
+
+    /// 端到端穿过 `load_external`：验证「先验签、后 dlopen」的顺序
+    ///
+    /// 用假 `.so`（不是真动态库）+ 真签名，观察两种结果：
+    /// - 公钥正确 → 过了签名闸门，之后才因「不是动态库」失败（错误里应出现 dlopen 相关字样）；
+    /// - 不配公钥 → 在签名闸门就被拦下，**根本不会尝试 dlopen**（错误里不应有 dlopen 字样）。
+    fn staged_dir() -> (tempfile::TempDir, String) {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let so = dir.path().join("libstage.so");
+        std::fs::write(&so, b"openssl-signed plugin payload").unwrap();
+        let sig_b64 = "xP25Ugz2aLM0pR9N/ZKDnRyMuM5tpoO/1YdR4bQCFYlNdygKg6udM0MW9KwyPjT7zopp5MnFM4YwJ6+fNX5WDg==";
+        std::fs::write(
+            dir.path().join("libstage.so.sig"),
+            base64::engine::general_purpose::STANDARD.decode(sig_b64).expect("decode sig"),
+        )
+        .unwrap();
+        (dir, "YCzDjlN5uEHPulgwyGWnZYpYV3P7O1xPNpTT0zAkv+A=".to_string())
+    }
+
+    #[test]
+    fn load_external_verifies_before_dlopen() {
+        let _g = no_escape_hatch();
+        let (dir, pubk) = staged_dir();
+        let out = load_external(&[dir.path().to_path_buf()], &[pubk]);
+        assert_eq!(out.reports.len(), 1);
+        let r = &out.reports[0];
+        assert!(!r.loaded, "假 .so 不该加载成功");
+        // 签名字段应为 verified：说明它**通过了**签名闸门，是后来 dlopen 才失败的
+        assert_eq!(r.signature, SignatureStatus::Verified, "应通过验签：{:?}", r.error);
+        assert!(r.sig_file);
+        let e = r.error.clone().unwrap_or_default();
+        assert!(
+            e.contains("动态库") || e.contains("dlopen") || e.contains("打开"),
+            "错误应来自 dlopen 阶段：{e}"
+        );
+    }
+
+    #[test]
+    fn load_external_rejects_at_signature_gate() {
+        let _g = no_escape_hatch();
+        let (dir, _pubk) = staged_dir();
+        // 不配公钥 → 默认强制验签，必须在**接触动态库之前**就拒绝
+        let out = load_external(&[dir.path().to_path_buf()], &[]);
+        assert_eq!(out.reports.len(), 1);
+        let r = &out.reports[0];
+        assert!(!r.loaded);
+        assert_eq!(r.signature, SignatureStatus::Failed);
+        let e = r.error.clone().unwrap_or_default();
+        assert!(e.contains("签名校验未通过"), "应被签名闸门拦下：{e}");
+        assert!(
+            !e.contains("动态库") && !e.contains("dlopen"),
+            "不该走到 dlopen：{e}"
+        );
+        assert!(out.targets.is_empty() && out.enhances.is_empty());
+    }
+
+    /// 验签失败时 `sig_file` 必须如实反映**文件是否存在**
+    ///
+    /// 前端用 `sig_file` 区分「签名不匹配（可能被篡改）」与「压根没签名」。
+    /// 若这里恒为 false，被篡改的插件会被显示成「未签名」——恰好在最需要
+    /// 提示风险时给出误导性文案。
+    #[test]
+    fn report_marks_sig_file_even_when_verification_fails() {
+        use base64::Engine as _;
+        let _g = no_escape_hatch();
+        let (dir, _pubk) = staged_dir();
+        let so = dir.path().join("libstage.so");
+        // 用「另一把」公钥去验：签名文件存在，但内容不匹配 → 验签失败
+        // （该公钥由 `openssl genpkey -algorithm ED25519` 另生成，与签名用的不是同一把）
+        let other = "8rjSFauUw9jl/Qu+OvEV5YOZNwL9ZFB2n9eFMaNtwZ4=";
+        let out = load_external(&[dir.path().to_path_buf()], &[other.to_string()]);
+        let r = &out.reports[0];
+        assert!(!r.loaded, "公钥不匹配应拒绝加载");
+        assert_eq!(r.signature, SignatureStatus::Failed);
+        assert!(r.sig_file, "`.sig` 确实存在，不能报成「未签名」");
+        assert!(so.exists() && sig_path_of(&so).exists());
+        // 顺带确认签名文件确实是 64 字节裸签名（与文档/脚本契约一致）
+        let raw = std::fs::read(sig_path_of(&so)).unwrap();
+        assert_eq!(raw.len(), 64);
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(other).unwrap().len(), 32);
     }
 }

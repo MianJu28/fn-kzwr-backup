@@ -43,17 +43,66 @@ for d in "$PLUGINS_DIR"/*/; do
         continue
     fi
     echo "==> 构建插件 $name"
-    # --offline 优先（NAS 上依赖已缓存）；失败再回退联网
-    ( cd "$d" && cargo build --release --offline 2>/dev/null || cargo build --release )
-    so="$(find "$d/target/release" -maxdepth 1 -name '*.so' -print -quit 2>/dev/null || true)"
-    if [ -z "$so" ]; then
-        echo "ERROR: 插件 $name 未产出 *.so（确认 crate-type = [\"cdylib\"]）" >&2
-        exit 1
+    # --offline 优先（NAS 上依赖已缓存）；失败再回退联网。
+    # 错误信息要留住：否则构建失败只会看到「未产出 *.so」，排查时无从下手。
+    log="$(mktemp)"
+    if ! ( cd "$d" && cargo build --release --offline ) >"$log" 2>&1; then
+        echo "    离线构建失败，回退联网重试…" >&2
+        if ! ( cd "$d" && cargo build --release ) >"$log" 2>&1; then
+            echo "ERROR: 插件 $name 构建失败：" >&2
+            tail -30 "$log" >&2
+            rm -f "$log"
+            exit 1
+        fi
+    fi
+    rm -f "$log"
+    # 输出目录：遵循 CARGO_TARGET_DIR（相对路径按 cargo 规则以插件目录为基准解析）。
+    # 本脚本文件头对外承诺支持该变量，这里必须真的认它，否则共享构建目录时找不到 .so。
+    target_dir="${CARGO_TARGET_DIR:-target}"
+    case "$target_dir" in
+        /*) ;;
+        *) target_dir="$d$target_dir" ;;
+    esac
+    # 精确算出本插件应产出的文件名，而不是 `find -quit` 撞运气：
+    # 共用 CARGO_TARGET_DIR 时同级目录里躺着**所有**插件的 .so，取第一个会把
+    # 别的插件拷成本插件（静默发错二进制）。
+    libname="$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "${d}Cargo.toml" | tail -1)"
+    so="$target_dir/release/lib${libname}.so"
+    if [ ! -f "$so" ]; then
+        # lib.name 未显式声明时 cargo 会用包名（连字符转下划线）；两种都试过再报错
+        pkgname="$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "${d}Cargo.toml" | head -1)"
+        alt="$target_dir/release/lib$(printf '%s' "$pkgname" | tr '-' '_').so"
+        if [ -f "$alt" ]; then
+            so="$alt"
+        else
+            echo "ERROR: 插件 $name 未产出 *.so（确认 crate-type = [\"cdylib\"]）" >&2
+            echo "       期望文件：$so" >&2
+            echo "       目录内容：$(ls -1 "$target_dir/release" 2>/dev/null | grep '\.so$' | tr '\n' ' ')" >&2
+            exit 1
+        fi
     fi
     cp -f "$so" "$OUT/"
     echo "    -> $(basename "$so")"
     built=$((built + 1))
+
+    # 可选：构建后立即签名（设 SIGN_KEY=<私钥路径> 即启用）。
+    # 决策 3 默认强制验签，未签名的插件在正式环境会被拒绝加载；
+    # 自建分发时用同一把私钥签名，用户端只需填公钥。
+    if [ -n "${SIGN_KEY:-}" ]; then
+        if bash "$ROOT/Scripts/sign_plugin.sh" sign "$OUT/$(basename "$so")" >/dev/null 2>&1; then
+            echo "    -> 已签名 $(basename "$so").sig"
+        else
+            echo "    ⚠️ 签名失败（SIGN_KEY=$SIGN_KEY）；该插件将无法通过强制验签" >&2
+        fi
+    fi
 done
+
+# 未提供 SIGN_KEY 时提示后果，避免「打包后插件全部加载失败」的困惑
+if [ -z "${SIGN_KEY:-}" ]; then
+    echo "==> 提示：未设置 SIGN_KEY，产出为**未签名**插件；"
+    echo "    正式环境默认强制验签（ADR-013 决策 3）会拒绝加载它们。"
+    echo "    自签：SIGN_KEY=<私钥> $0 $OUT"
+fi
 
 echo "==> 完成：构建 $built 个插件（跳过 $skipped 个），输出目录 $OUT"
 ls -1 "$OUT" 2>/dev/null || true
