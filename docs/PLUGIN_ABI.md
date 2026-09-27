@@ -123,6 +123,17 @@ typedef struct KzwrPluginAbi {
   - **`secret: true` 的字段必须只回 `configured`**，`value` 留 `null`
     （凭据永不回显是本项目的硬约束），前端会显示「已设置（留空则保持不变）」；
   - 同一条路径可同时服务 POST（保存）与 GET（回显），如 kzwr 的 `/quota`。
+  - **如何区分读与写**：`action_json` 的信封里带 `method`（`"GET"` / `"POST"`）。
+    同一个 action 路径在「渲染回显」与「用户点保存」时都会被调用，插件**必须**按
+    `method` 分流，否则 GET 会被当成写入。示例见 `plugins/example-hello/` 的
+    `/greeting`（GET 只读、POST 保存）。
+
+    ```json
+    { "body": { … }, "cfg": { … }, "method": "GET" }
+    ```
+
+    > `method` 是 2026-09-27 补入的：在此之前信封只有 `body`/`cfg`，
+    > 外置插件**无法**区分读写，因而无法实现上面的 `echo` 契约。
 - **动态 `metric`**：`metric` 块可带 `action`（如 `"/space"`），前端渲染时会 `GET`
   该路径，并用响应里的 `{"value": "...", "hint": "..."}` 覆盖静态文案 ——
   用于「空间用量」这类**实时数字**，避免为一个数字写专用前端组件。

@@ -361,6 +361,18 @@ typedef struct KzwrTargetAbi {
 
 净减约 2000 行（19 文件，+441/−2461）。删除的组件均已在重构前确认无引用。
 
+### 7.4 `echo` 示范与 ABI 补强（2026-09-27，v0.4.3）
+
+给 `plugins/example-hello/` 补了**可照抄的 `echo` 示范**：`/greeting` 一个路径同时服务
+GET（读，供回显）与 POST（写，保存），并在 `ui.blocks` 里声明 `echo: "/greeting"`。
+
+写这个示范时发现**我自己的契约有缺口**：`action_json` 的信封原先只有 `body` + `cfg`，
+外置插件**无法区分 GET 与 POST** —— 也就是说 §7.3 新增的 `echo` 契约对外置插件
+**根本无法实现**。已补入 `method` 字段（`"GET"` / `"POST"`），示范即按它分流。
+
+顺带修掉一个脚本缺陷：`build_plugins.sh` 里的 `PLUGIN_TARGET` 在**直接调用**该脚本时
+（不经 `build_fnos_app.sh`）未定义，裸引用会因 `set -u` 报 `unbound variable` 而中断构建。
+
 ### 7.3 体验修正（2026-09-27，v0.4.2）
 
 | 项 | 处理 |

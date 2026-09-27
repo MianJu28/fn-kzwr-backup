@@ -105,8 +105,10 @@ for d in "$PLUGINS_DIR"/*/; do
         *) target_dir="$d$target_dir" ;;
     esac
     # 指定 PLUGIN_TARGET 时产物在 <target>/<triple>/release/ 下
+    # 注：必须写 `${PLUGIN_TARGET:-}` —— 本脚本被**直接调用**（不经 build_fnos_app.sh）时
+    # 该变量未定义，裸引用会因 `set -u` 报 "unbound variable" 而中断构建。
     out_sub="release"
-    [ -n "$PLUGIN_TARGET" ] && out_sub="$PLUGIN_TARGET/release"
+    [ -n "${PLUGIN_TARGET:-}" ] && out_sub="$PLUGIN_TARGET/release"
     # 精确算出本插件应产出的文件名，而不是 `find -quit` 撞运气：
     # 共用 CARGO_TARGET_DIR 时同级目录里躺着**所有**插件的 .so，取第一个会把
     # 别的插件拷成本插件（静默发错二进制）。

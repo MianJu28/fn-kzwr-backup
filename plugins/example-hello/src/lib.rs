@@ -6,7 +6,18 @@
 //! | 能力 | 增强类：UI 卡片 / 动作接口 / 体检 / 事件 | 全部（含自定义备份目标） |
 //!
 //! 构建：`bash Scripts/build_plugins.sh` → `libfn_kzwr_plugin_example.so`
-//! 安装：放进 `$TRIM_PKGETC/plugins/`，在设置页开启「外置插件加载」后重启应用。
+//! 安装：放进 `$TRIM_PKGETC/plugins/`，在「插件」页开启「外置插件加载」后重启应用。
+//!
+//! ## 本示例演示的两个要点
+//!
+//! 1. **动作接口**：`describe.ui.blocks` 里的 `button` → `action_json`（`/hello`、`/stats`）。
+//! 2. **表单读/写（`echo` 回显契约）**：`/greeting` 一个路径同时服务
+//!    - **GET** = 读：返回 `{"value": …, "hint": …}`，供前端回显（宿主在信封里给 `method`）
+//!    - **POST** = 写：把 `body.value` 存进插件自己的进程内状态，回 `{"success": true}`
+//!
+//!    只声明 `value`（静态默认值）而不实现 `echo` 的话，表单**永远显示默认值** ——
+//!    用户改完再打开就"看不到自己设的值"。密钥类字段则应只回 `configured` 布尔，
+//!    **绝不回明文**（见 `docs/PLUGIN_ABI.md` §4.2）。
 
 use std::os::raw::c_char;
 
@@ -40,6 +51,19 @@ extern "C" fn describe() -> *mut c_char {
                         "hint": "宿主按 ABI 版本 + 结构体长度校验，不依赖 Rust ABI"
                     },
                     {
+                        // `echo: "/greeting"` = 渲染时 GET 该路径取**真实值**回填。
+                        // `value` 只是描述里的静态默认值（插件并不知道自己存过什么），
+                        // 不写 echo 的话表单永远显示这个默认值。
+                        "type": "text",
+                        "field": "value",
+                        "label": "打招呼用的称呼",
+                        "value": "世界",
+                        "placeholder": "如：世界",
+                        "action": "/greeting",
+                        "button": "保存",
+                        "echo": "/greeting"
+                    },
+                    {
                         "type": "button",
                         "label": "打个招呼",
                         "action": "/hello",
@@ -65,13 +89,65 @@ extern "C" fn available(_cfg: *const c_char) -> *mut c_char {
     safe(|| json!({ "available": true, "reason": null }).to_string())
 }
 
-/// action_json：`action` + `request_json`（= `{"body":…,"cfg":…}`）→ 任意 JSON
+/// 示例用的进程内状态（演示「插件自己保管配置」）
+///
+/// 真实插件应把配置持久化到自己的存储（或走宿主代存 `scope: "host"`）；
+/// 这里用 `Mutex<Option<String>>` 只为把「读回自己写过的值」这条链路演示清楚。
+static GREETING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// action_json：`action` + `request_json`（= `{"body":…,"cfg":…,"method":…}`）→ 任意 JSON
+///
+/// **`method` 用来区分读与写**：同一个 action 路径在 GET（渲染回显）与
+/// POST（用户点保存）时都会被调用，插件必须自己分流，否则 GET 会被当成写入。
 extern "C" fn action(action: *const c_char, request: *const c_char) -> *mut c_char {
     let action = unsafe { sdk::from_c_str(action) };
     let request: Value = unsafe { sdk::from_c_str(request) }
         .parse()
         .unwrap_or(Value::Null);
+    let method = request
+        .get("method")
+        .and_then(|v| v.as_str())
+        .unwrap_or("POST")
+        .to_ascii_uppercase();
     safe(move || match action.as_str() {
+        // ── 读/写同一个路径：GET 回显、POST 保存 ──────────────────────
+        //
+        // `describe.ui.blocks` 里该字段声明了 `echo: "/greeting"`，
+        // 前端渲染时会 GET 这里拿真实值 —— 所以 GET 分支**必须只读**。
+        "greeting" => {
+            if method == "GET" {
+                let v = GREETING.lock().ok().and_then(|g| g.clone());
+                json!({
+                    // 已保存 → 回真实值；没存过 → 回 null，前端用静态默认值兜底
+                    "value": v,
+                    "hint": if GREETING.lock().map(|g| g.is_some()).unwrap_or(false) {
+                        "已保存（改完记得点保存）"
+                    } else {
+                        "还没设置过，填一个试试"
+                    },
+                })
+                .to_string()
+            } else {
+                let v = request
+                    .get("body")
+                    .and_then(|b| b.get("value"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let trimmed = v.trim().to_string();
+                match GREETING.lock() {
+                    Ok(mut g) => {
+                        *g = if trimmed.is_empty() { None } else { Some(trimmed.clone()) };
+                        sdk::json::ok_message(if trimmed.is_empty() {
+                            "已清除"
+                        } else {
+                            "已保存"
+                        })
+                    }
+                    Err(_) => sdk::json::error("插件内部状态不可用"),
+                }
+            }
+        }
         "hello" => sdk::json::ok_message("你好，来自稳定 C ABI 插件的问候 👋"),
         "stats" => {
             let cfg = request.get("cfg").cloned().unwrap_or(Value::Null);

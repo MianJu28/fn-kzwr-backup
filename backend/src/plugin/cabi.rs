@@ -196,7 +196,7 @@ impl EnhancePlugin for CApiEnhance {
                                 Query(q): Query<HashMap<String, String>>| async move {
             let action = action.trim_start_matches('/').to_string();
             let body = serde_json::to_string(&q).unwrap_or_else(|_| "{}".to_string());
-            axum::Json(action_call(&state, table, &action, &body))
+            axum::Json(action_call(&state, table, &action, &body, "GET"))
         };
         let post_handler = move |Path(action): Path<String>,
                                  State(state): State<AppState>,
@@ -205,7 +205,7 @@ impl EnhancePlugin for CApiEnhance {
             let body = body
                 .map(|axum::Json(v)| v.to_string())
                 .unwrap_or_else(|| "{}".to_string());
-            axum::Json(action_call(&state, table, &action, &body))
+            axum::Json(action_call(&state, table, &action, &body, "POST"))
         };
         Router::new().route("/*action", get(get_handler).post(post_handler))
     }
@@ -301,11 +301,14 @@ impl From<AbiCheck> for CheckOutcome {
 ///
 /// 契约：宿主把 `request_json = {"body": <前端提交的 JSON>, "cfg": <配置快照>}`
 /// 交给插件的 `action_json(action, request_json)`，插件返回任意 JSON（原样回给前端）。
-fn action_call(state: &AppState, table: AbiTable, action: &str, body: &str) -> Value {
+fn action_call(state: &AppState, table: AbiTable, action: &str, body: &str, method: &str) -> Value {
     let body_value: Value = serde_json::from_str(body).unwrap_or_else(|_| serde_json::json!({}));
     let request = serde_json::json!({
         "body": body_value,
         "cfg": serde_json::from_str::<Value>(&cfg_json_of(state)).unwrap_or_else(|_| serde_json::json!({})),
+        // HTTP 动词：插件据此区分「读」（GET，用于表单回显 `echo`）
+        // 与「写」（POST，保存）。缺了它插件无法实现回显契约。
+        "method": method,
     })
     .to_string();
 
