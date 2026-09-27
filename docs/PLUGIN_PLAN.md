@@ -218,7 +218,11 @@ typedef struct KzwrTargetAbi {
 
 ### 3.4.2 已知限制
 
-- **`plugin_data` 不随配置导入导出**：`ConfigBundle` 未加该字段 → 换机/恢复配置会丢插件自管配置（§6）。
+- ~~**`plugin_data` 不随配置导入导出**~~：**已实现**（此前文档误标为未落地，实际在
+  Step 5-webdav 提交中已加入 `ConfigBundle.plugin_data`）。
+  导出：`config_export` 遍历 `plugin_data_ids` 逐个 `plugin_data_export`（明文导出）；
+  导入：用**当前口令重新加密**后写回（未携带则不覆盖）。
+  ⚠️ 注意导出的是**明文**：换机迁移时口令保护强度取决于导出文件本身的保密性。
 - **插件启用状态与公钥改动需重启应用**：`load_external` 只在启动时调用一次（无热重载）。
 - **ARM 交叉编译未经真机验证**：CI 的 `aarch64-unknown-linux-gnu` 腿已按标准交叉编译配置写好
   （`gcc-aarch64-linux-gnu` + `CARGO_TARGET_*_LINKER`/`CC_*`），但手头没有 ARM 设备可验证。
@@ -323,8 +327,9 @@ typedef struct KzwrTargetAbi {
   **拒绝卸载**并列出引用项（`目标「…」` / `任务「…」`，与 `target_delete` 的保护语义一致）。
 - **孤立数据检测**：启动时比对"有 `plugin_data` 但没有对应已加载插件"的 id → `orphan_data[]`
   （`GET /api/plugins`）→ 设置页提示"清理遗留配置"。
-- **导入导出**：`ConfigBundle` 增补 `plugin_data` 字段的计划**未落地** ——
-  目前导出/导入不含插件自管数据，换机会丢插件配置（已知限制，待补）。
+- **导入导出**：**已实现**（此前文档误标为未落地）。`ConfigBundle` 含 `plugin_data` 字段；
+  导出时以**明文**写出（`plugin_data_export`），导入时用**当前口令重新加密**写回，
+  未携带则不覆盖。⚠️ 导出的明文意味着导出文件需自行保密。
 
 ---
 
