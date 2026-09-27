@@ -32,11 +32,16 @@
 //! `request_json`（动作入参）固定为：
 //!
 //! ```json
-//! { "body": { …前端提交的 JSON（GET 时是 query 键值对）… }, "cfg": { …配置快照… } }
+//! { "body": { …前端提交的 JSON（GET 时是 query 键值对）… }, "cfg": { …配置快照… },
+//!   "method": "GET" | "POST" }
 //! ```
 //!
-//! **告警是「声明式回传」**：插件不回调宿主，而是在 `health_json` / `event_json` 的返回值里
-//! 带上 `alerts` 数组，由宿主负责去重与落库（见 `cabi::apply_alerts`）。
+//! **告警是「声明式回传」**：插件不回调宿主，而是在 `health_json` / `event_json` /
+//! `action_json` 的返回值里带上 `alerts` 数组，由宿主负责去重与落库（见 `cabi::apply_side_effects`）。
+//!
+//! `cfg.self_config` 是**本插件自己的**明文配置（隔离：只含本插件命名空间，不含其它
+//! 插件的键，也不含宿主凭据）；`cfg.after_backup_task` 只在 `after_backup` 事件里有值，
+//! 表示「刚才完成的是哪个任务」，插件据此套用该任务自己的回收站门槛。
 //!
 //! ## 约定
 //!
@@ -278,8 +283,8 @@ impl From<AbiCaps> for crate::plugin::api::EnhanceCaps {
 
 /// 传给插件的配置快照（`cfg_json`）
 ///
-/// **不含密码 / token**：只给「是否启用、是否就绪」与用户名（供界面展示绑定账号）。
-/// 插件自有凭据请走 [`KzwrTargetAbi::config_set`] 或 `target_json`。
+/// 除 `self_config`（**本插件自己的**明文配置）外**不含密码 / token**：
+/// 其它凭据一律不给，插件自有凭据走 `self_config` 或 [`KzwrTargetAbi::config_set`]。
 #[derive(Default, Clone)]
 pub struct CfgSnapshot {
     /// 宿主版本（插件可用于日志/兼容判断）
@@ -292,8 +297,22 @@ pub struct CfgSnapshot {
     pub targets: Vec<CfgTarget>,
     /// 任务（id/名称/是否启用/源路径/目标/目录/定时）
     pub tasks: Vec<CfgTask>,
-    /// kzwr access-token 是否已配置（增强能力是否可用）
-    pub kzwr_token_configured: bool,
+    /// **本插件自己的**配置（明文键值对，已解密）
+    ///
+    /// 这是「插件读取自身设置的唯一受支持路径」对**增强插件**的对应物
+    /// （目标插件走 `target_json.config`）。
+    ///
+    /// **隔离性由宿主保证**：只填 `cfg.plugin_data[<本插件 id>]`，
+    /// **绝不包含**其它插件的键，也不包含密码等宿主私有凭据。
+    /// 调用方（宿主）注入，插件侧只读。
+    ///
+    /// 注意：这里**含明文**（含插件自有凭据），**调用方不得写入日志**。
+    pub self_config: std::collections::BTreeMap<String, String>,
+    /// 触发本次 `after_backup` 事件的任务 id（其它事件为 `None`）
+    ///
+    /// 有了它，插件才能知道「刚才那次备份是哪个任务」，从而套用**该任务自己的**
+    /// 回收站门槛（`recycle_max_gb` / `recycle_min_age_days`），而不是所有任务共用一套。
+    pub after_backup_task: Option<String>,
 }
 
 /// 配置快照里的目标
@@ -320,6 +339,12 @@ pub struct CfgTask {
     pub target_id: String,
     pub target_folder: String,
     pub schedule_cron: String,
+    /// 保留策略：备份后是否清空云端回收站（由支持该能力的增强插件实现）
+    pub empty_recycle_bin: bool,
+    /// 回收站占用超过该 GB 数才清理（0 = 不限制，总是清理）
+    pub recycle_max_gb: u64,
+    /// 只清理删除时间早于该天数的回收站条目（0 = 不限制）
+    pub recycle_min_age_days: u64,
 }
 
 impl CfgSnapshot {
@@ -361,10 +386,33 @@ impl CfgSnapshot {
                     target_id: t.target_id.clone(),
                     target_folder: t.target_folder.clone(),
                     schedule_cron: t.schedule_cron.clone().unwrap_or_default(),
+                    empty_recycle_bin: t.retention.empty_recycle_bin,
+                    recycle_max_gb: t.retention.recycle_max_gb,
+                    recycle_min_age_days: t.retention.recycle_min_age_days,
                 })
                 .collect(),
-            kzwr_token_configured: cfg.kzwr.access_token_enc.is_some(),
+            // 明文自配置由调用方随后用 `with_self_config` 填（需要 ConfigManager 才能解密）
+            self_config: std::collections::BTreeMap::new(),
+            after_backup_task: None,
         }
+    }
+
+    /// 填入**本插件自己的**配置（明文）
+    ///
+    /// `plugin_id` 用来定位命名空间 —— 这是隔离的关键：只有该插件自己的键值会被放入，
+    /// 因此插件**无法**通过 `cfg` 读到其它插件的配置（它们根本不在这份快照里）。
+    pub fn with_self_config(mut self, cfg: &crate::infra::config::AppConfig, plugin_id: &str, mgr: &crate::infra::config::ConfigManager) -> Self {
+        // 解密失败 → 空配置（与 plugin_data_json 同口径：插件应回退到默认值）
+        if let Ok(kv) = mgr.plugin_data_export(cfg, plugin_id) {
+            self.self_config = kv;
+        }
+        self
+    }
+
+    /// 标记「本次 `after_backup` 事件由哪个任务触发」
+    pub fn with_after_backup_task(mut self, task_id: &str) -> Self {
+        self.after_backup_task = Some(task_id.to_string());
+        self
     }
 
     /// 填入目标用户名（`目标 id → 用户名`；不在表里的保持空串）
@@ -410,6 +458,9 @@ impl CfgSnapshot {
                     "target_id": t.target_id,
                     "target_folder": t.target_folder,
                     "schedule_cron": t.schedule_cron,
+                    "empty_recycle_bin": t.empty_recycle_bin,
+                    "recycle_max_gb": t.recycle_max_gb,
+                    "recycle_min_age_days": t.recycle_min_age_days,
                 })
             })
             .collect();
@@ -420,7 +471,10 @@ impl CfgSnapshot {
             "utc_offset_minutes": self.utc_offset_minutes,
             "targets": targets,
             "tasks": tasks,
-            "enhance": { "kzwr_token_configured": self.kzwr_token_configured },
+            // 本插件自己的明文配置（隔离：只含本插件命名空间；**含凭据，禁止写日志**）
+            "self_config": self.self_config,
+            // 仅 after_backup 事件有值：告诉插件「刚才完成的是哪个任务」
+            "after_backup_task": self.after_backup_task,
         })
         .to_string()
     }

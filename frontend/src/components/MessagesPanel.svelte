@@ -16,8 +16,25 @@
     restore: '恢复',
     scheduler: '定时',
     config: '配置',
-    kzwr: '增强',
   };
+
+  /**
+   * 告警来源标签
+   *
+   * 核心的 `AlertSource` 序列化成字符串（`backup`/`restore`/…），插件来源则是
+   * serde 的外包枚举对象（`{"plugin":"kzwr"}`）。这里两种形状都吃，并把插件 id
+   * 显示成「插件·<id>」——前端不需要知道装了哪些插件，也没有插件专属映射表。
+   */
+  function sourceText(source) {
+    if (typeof source === 'string') return SOURCE_TEXT[source] || source;
+    if (source && typeof source === 'object') {
+      const id = source.plugin;
+      if (id) return `插件·${id}`;
+      const k = Object.keys(source)[0];
+      if (k) return SOURCE_TEXT[k] || k;
+    }
+    return '消息';
+  }
   const COLLAPSED = 3;
   let expanded = false;
 
@@ -56,7 +73,7 @@
       {#each shown as a (a.id)}
         <li class:err={a.level === 'error'}>
           <Icon name={a.level === 'error' ? 'x-circle' : 'alert'} size={13} />
-          <span class="tag">{SOURCE_TEXT[a.source] || a.source}</span>
+          <span class="tag">{sourceText(a.source)}</span>
           <span class="msg">{a.message}</span>
           <span class="ts mono">{fmtTime(a.ts)}</span>
         </li>

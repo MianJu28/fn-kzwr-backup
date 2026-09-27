@@ -23,6 +23,9 @@ pub mod loader;
 pub mod registry;
 pub mod target_abi;
 
+#[cfg(test)]
+mod contract_tests;
+
 pub use api::{EnhanceCaps, EnhancePlugin, PluginKind, PluginMeta, TargetPlugin};
 pub use loader::ExternalPluginReport;
 pub use registry::PluginRegistry;

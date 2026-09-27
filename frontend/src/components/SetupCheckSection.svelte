@@ -16,15 +16,29 @@
     skip: 'info',
   };
   const PAGE_OF = {
-    // 凭据在「目标」页管理（多目标模型）；插件相关在「插件」页
+    // **核心**检查项的跳转页（凭据在「目标」页管理：多目标模型）
     webdav: 'targets',
     key: 'settings',
-    kzwr: 'plugins',
-    quota: 'plugins',
     // 源路径与定时都是**任务级**配置
     paths: 'tasks',
     schedule: 'tasks',
   };
+
+  /**
+   * 体检项 → 该去哪个页面修
+   *
+   * - **带点号的 key 一律来自插件**（插件体检项命名约定 `<插件id>[.<子项>]`，
+   *   多账号插件还会带账号后缀，如 `kzwr.a1f3`）→ 跳「插件」页；
+   * - 核心项按上表精确匹配。两者都不匹配则不显示跳转按钮。
+   * 这样前端不需要知道装了哪些插件，也没有任何插件专属逻辑。
+   */
+  function pageOf(key) {
+    if (!key) return '';
+    const k = String(key);
+    const base = k.split('.')[0];
+    if (PAGE_OF[base]) return PAGE_OF[base];
+    return k.includes('.') ? 'plugins' : '';
+  }
 
   $: items = (result && result.items) || [];
   $: failCount = result ? result.fail_count : 0;
@@ -76,10 +90,10 @@
               {#if it.hint}
                 <div class="hint">
                   <Icon name="arrow-right" size={12} />{it.hint}
-                  {#if PAGE_OF[it.key] && onGoto}
+                  {#if pageOf(it.key) && onGoto}
                     <button
                       class="btn btn-sm btn-ghost inline"
-                      on:click={() => onGoto(PAGE_OF[it.key])}
+                      on:click={() => onGoto(pageOf(it.key))}
                     >
                       前往处理
                     </button>
@@ -98,7 +112,7 @@
       {#if result}
         {okCount} 项通过 · {warnCount} 项建议 · {failCount} 项异常
       {:else}
-        首次检查会实际连接 WebDAV 与酷族接口，约需数秒
+        首次检查会实际连接 WebDAV 与各已启用插件的接口，约需数秒
       {/if}
     </span>
     <button class="btn btn-primary" on:click={run} disabled={busy || running || !onCheck}>

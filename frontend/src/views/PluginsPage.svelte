@@ -51,9 +51,58 @@
   /**
    * 汇总插件的只读概览信息（供卡片主体渲染）
    *
-   * 卡片只展示 `metric` / `tips`；可编辑项（text/number/toggle/button）一律进设置弹窗，
-   * 避免卡片被表单撑长、多个插件互相淹没。
+   * 卡片只展示 `metric` / `tips`；可编辑项（text/number/toggle/button/accounts）一律进
+   * 设置弹窗，避免卡片被表单撑长、多个插件互相淹没。
    */
+  /**
+   * 动态指标的实时值：`插件 id + action 路径` → `{value, hint}`
+   *
+   * `metric` 块声明里的 `value` 只是**静态占位文案**（插件不知道自己持久化过什么，
+   * 更不知道远端账号的实时用量）。卡片要显示真实数字就必须按声明去 GET ——
+   * 与设置弹窗（`PluginBlocks.loadMetrics`）同一份契约，因此任何插件声明
+   * `metric.action` 都能直接活起来，前端不需要认识任何插件。
+   */
+  let liveMetrics = {};
+
+  async function loadLiveMetrics(list) {
+    const jobs = [];
+    for (const p of list || []) {
+      // 停用的插件路由是 404（宿主按 is_disabled 拦），不必发请求
+      if (p.disabled) continue;
+      if (!p.api_base) continue;
+      for (const b of (p.ui && p.ui.blocks) || []) {
+        if (b.type !== 'metric' || !b.action) continue;
+        const path = b.action.startsWith('/') ? b.action : `/${b.action}`;
+        const key = `${p.id}|${b.action}`;
+        jobs.push(
+          api
+            .pluginGet(p.api_base, path)
+            .then((r) => {
+              if (r && !r.error && r.value) {
+                liveMetrics = {
+                  ...liveMetrics,
+                  [key]: { value: String(r.value), hint: r.hint ? String(r.hint) : '' },
+                };
+              } else if (r && r.error) {
+                // 读取失败如实显示（例如「未配置账号」），但保留兜底文案
+                liveMetrics = {
+                  ...liveMetrics,
+                  [key]: { value: String(r.value || '读取失败'), hint: String(r.error) },
+                };
+              }
+            })
+            .catch(() => {
+              /* 网络失败：保留静态文案，不打断渲染 */
+            }),
+        );
+      }
+    }
+    if (jobs.length) await Promise.all(jobs);
+  }
+
+  // 清单变化时拉一次实时值（弹窗内操作完成后由 onPluginDone 触发父级重取）
+  $: if (plugins && plugins.length) loadLiveMetrics(plugins);
+
   function pluginStats(p) {
     const blocks = (p.ui && p.ui.blocks) || [];
     return {
@@ -63,7 +112,7 @@
         .map((b) => b.text)
         .join(' '),
       count: blocks.filter((b) =>
-        ['text', 'number', 'toggle', 'button'].includes(b.type)
+        ['text', 'number', 'toggle', 'button', 'accounts'].includes(b.type)
       ).length,
     };
   }
@@ -161,10 +210,13 @@
         {#if ps.metrics.length}
           <div class="pc-metrics">
             {#each ps.metrics as m, i (i)}
+              {@const live = m.action ? liveMetrics[`${p.id}|${m.action}`] : null}
               <div class="pc-metric">
                 <span class="pc-metric-k">{m.label}</span>
-                <span class="pc-metric-v">{m.value || '—'}</span>
-                {#if m.hint}<span class="pc-metric-h">{m.hint}</span>{/if}
+                <span class="pc-metric-v">{(live && live.value) || m.value || '—'}</span>
+                {#if (live && live.hint) || m.hint}
+                  <span class="pc-metric-h">{(live && live.hint) || m.hint}</span>
+                {/if}
               </div>
             {/each}
           </div>

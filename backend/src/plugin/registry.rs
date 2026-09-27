@@ -53,10 +53,13 @@ pub struct PluginRegistry {
 
 impl PluginRegistry {
     /// 载入内置插件（编译期固定）
+    ///
+    /// 增强类插件**一律外置**（走稳定 C ABI 的 `.so`，见 `plugins/kzwr`）：
+    /// 核心不掺任何厂商专属逻辑，kzwr 的凭据、动作、告警全在插件自己那侧。
     pub fn builtin() -> Self {
         Self {
             builtin_targets: vec![Arc::new(builtin::webdav_abi::WebdavAbiPlugin::new())],
-            builtin_enhances: vec![Arc::new(builtin::kzwr::KzwrPlugin)],
+            builtin_enhances: Vec::new(),
             external: std::sync::RwLock::new(None),
             disabled: std::sync::RwLock::new(std::collections::HashSet::new()),
         }
@@ -282,7 +285,7 @@ impl PluginRegistry {
     ///
     /// **包含被禁用的插件**（`disabled: true`）：插件页需要列出它们以便重新启用。
     /// 其它消费方（目标装配、路由分发、生命周期钩子）走的是过滤后的接口。
-    pub fn describe(&self, cfg: &AppConfig) -> Vec<PluginEntry> {
+    pub fn describe(&self, cfg: &AppConfig, mgr: &ConfigManager) -> Vec<PluginEntry> {
         let ext = self.external.read().unwrap();
         let ext_paths = ext.as_ref().map(|s| &s.paths);
         let mut out = Vec::new();
@@ -322,7 +325,7 @@ impl PluginRegistry {
                 api_base: format!("/api/p/{}", meta.id),
                 source: if path.is_some() { "external" } else { "builtin" }.to_string(),
                 path,
-                available: !disabled && p.available(cfg),
+                available: !disabled && p.available(cfg, mgr),
                 disabled,
                 ui: p.ui(),
                 meta,
@@ -396,55 +399,59 @@ pub struct BuiltTarget {
 mod tests {
     use super::*;
 
+    /// 临时目录的 `ConfigManager`（口令任意，测试内自洽）
+    fn mgr() -> (tempfile::TempDir, ConfigManager) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = ConfigManager::new(
+            dir.path(),
+            age::secrecy::SecretString::from("test-pass".to_string()),
+        );
+        (dir, m)
+    }
+
     /// 按插件禁用应把插件从「活动集合」中摘除，但**保留在清单里**以便重新启用
     ///
     /// 这是运行时启停的核心语义：查询接口过滤、`describe` 保留并标注。
+    /// 增强插件已全部外置（`.so`），故这里只用内置 webdav 目标验证启停语义。
     #[test]
     fn disable_filters_queries_but_keeps_entry_in_list() {
+        let (_dir, mgr) = mgr();
         let reg = PluginRegistry::builtin();
         let cfg = AppConfig::default();
 
-        // 内置 webdav（目标）与 kzwr（增强）默认都可用
+        // 内置 webdav（目标）默认可用；增强插件不再由核心内置
         assert!(reg.target_plugin("webdav").is_some());
-        assert!(reg.enhance_plugin_enabled("kzwr").is_some());
         assert_eq!(reg.target_plugins().len(), 1);
-        assert_eq!(reg.enhance_plugins().len(), 1);
+        assert!(
+            reg.enhance_plugins().is_empty(),
+            "核心不应内置任何增强插件（kzwr 已外置为 .so）"
+        );
 
-        // 禁用两者
-        let n = reg.set_disabled(&["webdav".into(), "kzwr".into()]);
-        assert_eq!(n, 2);
+        // 禁用
+        let n = reg.set_disabled(&["webdav".into()]);
+        assert_eq!(n, 1);
 
         // 查询接口：视为不存在
         assert!(reg.target_plugin("webdav").is_none(), "被禁用的目标插件不应可取到");
-        assert!(
-            reg.enhance_plugin_enabled("kzwr").is_none(),
-            "被禁用的增强插件不应参与路由分发"
-        );
         assert!(reg.target_plugins().is_empty());
-        assert!(reg.enhance_plugins().is_empty(), "生命周期钩子不应再被调用");
 
         // 管理接口：仍可取到（否则无法重新启用 / 诊断）
         assert!(reg.target_plugin_any("webdav").is_some());
-        assert!(reg.enhance_plugin_any("kzwr").is_some());
 
         // 清单：仍在，且标注 disabled
-        let list = reg.describe(&cfg);
-        assert_eq!(list.len(), 2, "被禁用的插件仍要出现在清单里");
+        let list = reg.describe(&cfg, &mgr);
+        assert_eq!(list.len(), 1, "被禁用的插件仍要出现在清单里");
         for e in &list {
             assert!(e.disabled, "{} 应标注 disabled", e.meta.id);
-            assert!(!e.available, "{} 被禁用时 available 应为 false", e.meta.id);
         }
 
         // 孤立数据检测不应把被禁用插件的数据当成遗留：plugin_ids 含禁用者
-        let ids = reg.plugin_ids();
-        assert!(ids.contains(&"webdav".to_string()));
-        assert!(ids.contains(&"kzwr".to_string()));
+        assert!(reg.plugin_ids().contains(&"webdav".to_string()));
 
         // 重新启用 → 立即恢复
         reg.set_disabled(&[]);
         assert!(reg.target_plugin("webdav").is_some());
-        assert!(reg.enhance_plugin_enabled("kzwr").is_some());
-        assert!(reg.describe(&cfg).iter().all(|e| !e.disabled));
+        assert!(reg.describe(&cfg, &mgr).iter().all(|e| !e.disabled));
     }
 
     /// 空串与空白项应被忽略（前端传空行不应误禁用某插件）

@@ -25,8 +25,6 @@ pub enum AlertSource {
     Restore,
     Scheduler,
     Config,
-    /// kzwr 增强功能（access-token 失效、云端空间预警等）
-    Kzwr,
     /// 插件（声明式回传）：字段为插件 id
     Plugin(String),
 }
@@ -213,7 +211,6 @@ fn source_name(source: &AlertSource) -> String {
         AlertSource::Restore => "restore".to_string(),
         AlertSource::Scheduler => "scheduler".to_string(),
         AlertSource::Config => "config".to_string(),
-        AlertSource::Kzwr => "kzwr".to_string(),
         AlertSource::Plugin(id) => format!("plugin.{id}"),
     }
 }

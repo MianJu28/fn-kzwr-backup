@@ -3,12 +3,13 @@
    * 插件通用渲染器（UI Schema）
    *
    * 当后端返回的 `ui.component` 不是前端内置组件时使用：按 `ui.blocks` 渲染
-   * 指标 / 输入 / 按钮 / 开关 / 提示，操作统一 POST 到 `${api_base}${action}`。
+   * 指标 / 输入 / 按钮 / 开关 / 提示 / 多账号列表，操作统一 POST 到 `${api_base}${action}`。
    * 目的：**外置插件不需要重新打包前端**也能提供设置界面。
    *
    * 样式复用 app.css 的全局类（card / field / btn / stat / alert），与内置卡片观感一致。
    */
   import Icon from './Icon.svelte';
+  import PluginAccounts from './PluginAccounts.svelte';
   import { api } from '../lib/api.js';
   import { toast } from '../lib/toast.js';
   import { confirmDialog } from '../lib/confirm.js';
@@ -322,6 +323,8 @@
             <p class={oks[b.action] ? 'field-hint' : 'field-error'}>{results[b.action]}</p>
           {/if}
         </div>
+      {:else if b.type === 'accounts'}
+        <PluginAccounts {plugin} block={b} {busy} {onDone} />
       {:else if b.type === 'button'}
         <div class="field">
           <button

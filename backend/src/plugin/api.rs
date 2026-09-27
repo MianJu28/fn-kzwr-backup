@@ -212,8 +212,87 @@ pub enum UiBlock {
         #[serde(default)]
         echo: Option<String>,
     },
+    /// **多账号列表**（通用 CRUD 区块）
+    ///
+    /// 用于「一个插件管多份凭据」的场景（如 kzwr 多账号）：前端不需要为每个插件
+    /// 写专属组件，只按下面的**数据契约**渲染增删改查界面。
+    ///
+    /// 数据契约（都以 `api_base` 为前缀，动作由插件的 `action_json` 实现）：
+    /// - `GET  {list}` → `{"accounts":[{"id","name","configured":bool,"meta":{…}}]}`
+    /// - `POST {add}`  body `{"name":…,"token":…}` → `{"success":bool,"message"|"error"}`
+    /// - `POST {update}` body `{"id":…,"name":…,"token":…}`（token 空 = 不修改）
+    /// - `POST {remove}` body `{"id":…}`
+    ///
+    /// 安全：**列表永不回传明文 token**，只给 `configured`；`secret_label` 决定输入框
+    /// 标题（如「access-token」），留空即保持「已设置」占位。
+    Accounts {
+        /// 列表读取路径（相对 `api_base`，GET）
+        list: String,
+        /// 新增动作（POST）
+        add: String,
+        /// 修改动作（POST）
+        update: String,
+        /// 删除动作（POST）
+        remove: String,
+        /// 区块标题
+        #[serde(default)]
+        label: String,
+        /// 凭据字段名（提交体里的键，如 `token`）
+        #[serde(default = "default_account_credential_field")]
+        credential_field: String,
+        /// 凭据输入框标题
+        #[serde(default)]
+        credential_label: String,
+        /// 凭据输入框占位提示（去哪拿、怎么拿）
+        #[serde(default)]
+        credential_placeholder: Option<String>,
+        /// 是否允许添加多个（`false` = 只有一条时隐藏「新增」）
+        #[serde(default = "default_true_for_accounts")]
+        multiple: bool,
+        /// 每项右侧的「其它编辑项」动作（如按账号设阈值）；留空则无
+        #[serde(default)]
+        edit_action: Option<String>,
+        /// 该编辑动作提交的数值字段名（配合 `edit_action`，如 `percent`）
+        #[serde(default = "default_account_edit_field")]
+        edit_field: String,
+        /// 编辑项的输入框标题（如「空间预警阈值」）
+        #[serde(default)]
+        edit_label: String,
+        /// 编辑项单位后缀（如 `%`）
+        #[serde(default)]
+        edit_suffix: Option<String>,
+        /// 编辑项的补充说明（如「0 = 关闭该账号的预警」）
+        #[serde(default)]
+        edit_hint: Option<String>,
+        /// 编辑项取值范围（含端点；前端做原生约束）
+        #[serde(default = "default_account_edit_min")]
+        edit_min: u64,
+        #[serde(default = "default_account_edit_max")]
+        edit_max: u64,
+    },
     /// 只读提示
     Tips { text: String },
+}
+
+fn default_true_for_accounts() -> bool {
+    true
+}
+
+fn default_account_credential_field() -> String {
+    "token".to_string()
+}
+
+/// 账号区块「编辑项」的缺省字段名与取值范围
+fn default_account_edit_field() -> String {
+    "percent".to_string()
+}
+
+fn default_account_edit_min() -> u64 {
+    0
+}
+
+fn default_account_edit_max() -> u64 {
+    100
 }
 
 /// 插件清单条目（供 `/api/plugins`；前端唯一的数据来源）
@@ -266,7 +345,10 @@ pub trait EnhancePlugin: Send + Sync {
     fn meta(&self) -> PluginMeta;
     fn caps(&self) -> EnhanceCaps;
     /// 是否已可用（如 access-token 已配置）；未就绪时 UI 隐藏相关区块
-    fn available(&self, cfg: &AppConfig) -> bool;
+    ///
+    /// `mgr` 用来解密**本插件自己的** `plugin_data`（注入快照的 `self_config`）。
+    /// **调用方不得把注入结果写入日志**（含明文凭据）。
+    fn available(&self, cfg: &AppConfig, mgr: &ConfigManager) -> bool;
 
     /// 插件自带的 HTTP 子路由；核心统一挂在 `/api/p/<插件id>` 下（默认空）
     fn routes(&self) -> axum::Router<crate::AppState> {
@@ -280,7 +362,10 @@ pub trait EnhancePlugin: Send + Sync {
     async fn patrol(&self, _state: &crate::AppState) {}
 
     /// 备份成功后的可选动作（如按保留策略清空云端回收站），返回处理计数
-    async fn after_backup(&self, _state: &crate::AppState) -> Option<u64> {
+    ///
+    /// `task_id` 是**刚完成备份的那个任务**：回收站门槛按任务配置，
+    /// 插件从快照的 `tasks[].recycle_*`（或顶层 `after_backup_task`）里取。
+    async fn after_backup(&self, _state: &crate::AppState, _task_id: &str) -> Option<u64> {
         None
     }
 

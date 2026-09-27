@@ -35,7 +35,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 
 use crate::infra::config::{ConfigManager, TargetConfig};
-use crate::infra::storage_trait::{ProgressCb, StorageError, StorageResult, TargetStorage};
+use crate::infra::storage_trait::{ProgressCb, StorageResult, TargetStorage};
 use crate::infra::target::webdav::{WebdavTarget, DEFAULT_URL};
 
 use super::super::abi::{AbiTargetCaps, C_ABI_VERSION, KzwrTargetAbi};

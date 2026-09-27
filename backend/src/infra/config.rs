@@ -1,6 +1,6 @@
 //! 配置管理（数据归属：配置 → $TRIM_PKGETC）
 //!
-//! TOML 配置存储，敏感字段（kzwr 用户名/密码/token）用口令派生密钥加密后存储。
+//! TOML 配置存储，敏感字段（目标凭据、插件自管数据 `plugin_data`）用口令派生密钥加密后存储。
 //! 支持多备份路径。
 
 use std::collections::BTreeMap;
@@ -43,9 +43,7 @@ pub struct AppConfig {
     /// 密钥配置（私钥备份状态）
     #[serde(default)]
     pub keys: KeyConfig,
-    /// kzwr REST API 增强功能配置（可选，非备份通道）
-    #[serde(default)]
-    pub kzwr: KzwrConfig,
+
     /// 调试日志：开启后输出详细日志（请求/响应明细等），便于问题定位。
     /// 运行时切换即时生效（日志过滤器热更新），并持久化到配置。
     #[serde(default)]
@@ -309,35 +307,6 @@ impl AppConfig {
     }
 }
 
-/// kzwr REST API 增强功能配置（可选）
-///
-/// 备份/恢复仍走官方 WebDAV（ADR-009）；此处的 `access-token` 仅用于
-/// WebDAV 提供不了的增强能力：账号存储空间信息、回收站查看/清空等。
-/// 用户在浏览器登录 kzwr 后，从 Cookie 的 `access-token` 复制值填入设置页。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KzwrConfig {
-    /// access-token（加密存储）
-    #[serde(default)]
-    pub access_token_enc: Option<String>,
-    /// 云端空间占用预警阈值（百分比，0 = 关闭）；达到该值生成告警
-    #[serde(default = "default_quota_warn_percent")]
-    pub quota_warn_percent: u64,
-}
-
-fn default_quota_warn_percent() -> u64 {
-    85
-}
-
-impl Default for KzwrConfig {
-    /// 手写 Default：与 BackupConfig 同理，`#[derive(Default)]` 不会采用
-    /// serde 的 default 函数，会让预警阈值默认成 0（= 关闭）。
-    fn default() -> Self {
-        Self {
-            access_token_enc: None,
-            quota_warn_percent: default_quota_warn_percent(),
-        }
-    }
-}
 
 /// 备份配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -577,25 +546,7 @@ impl ConfigManager {
         self.save(&cfg)
     }
 
-    /// 读取 kzwr access-token（解密；未配置或为空返回 None）
-    pub fn kzwr_token(&self) -> Result<Option<String>> {
-        let cfg = self.load()?;
-        Ok(self
-            .decrypt_field(&cfg.kzwr.access_token_enc)?
-            .filter(|s| !s.is_empty()))
-    }
 
-    /// 保存 kzwr access-token（加密存储；传空串则清除）
-    pub fn save_kzwr_token(&self, token: &str) -> Result<()> {
-        let mut cfg = self.load().unwrap_or_default();
-        let token = token.trim();
-        if token.is_empty() {
-            cfg.kzwr.access_token_enc = None;
-        } else {
-            cfg.kzwr.access_token_enc = Some(self.encrypt_field(token)?);
-        }
-        self.save(&cfg)
-    }
 
     /// 加密敏感字段（返回 "enc:<密文>"）
     pub fn encrypt_field(&self, plain: &str) -> Result<String> {
@@ -781,6 +732,83 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let m = ConfigManager::new(dir.path(), SecretString::from("test-pass".to_string()));
         (dir, m)
+    }
+
+    /// 0.4.4 的真实配置文件必须能被 0.4.5 载入（升级即服务启动，不能解析失败）
+    ///
+    /// 迁移把 `[kzwr]` 段连同 `access_token_enc` / `quota_warn_percent` 一并从宿主删除，
+    /// 但**已安装用户的 config.toml 里还留着这一段**。若解析器严格拒绝未知段，
+    /// 升级后服务直接起不来 —— 这是本次迁移最致命的一种回归，故用**完整形状**钉死：
+    /// 除 `[kzwr]` 外，其余各段（目标/任务/通知/插件数据）必须**一个都不丢**。
+    #[test]
+    fn legacy_kzwr_section_is_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            r#"
+[webdav]
+url = "https://dav.example.com/dav"
+username = "enc:AAAA"
+password = "enc:BBBB"
+
+[[targets]]
+id = "default"
+name = "默认目标（WebDAV）"
+kind = "webdav"
+base_url = "https://dav.example.com/dav"
+enabled = true
+
+[[tasks]]
+id = "default"
+name = "默认任务"
+paths = ["/vol1/1000/video"]
+target_id = "default"
+target_folder = "fn-backup"
+schedule_cron = "0 2 * * *"
+
+[tasks.retention]
+enabled = true
+empty_recycle_bin = true
+recycle_max_gb = 20
+recycle_min_age_days = 7
+
+[notify]
+webhook_url = "https://example.com/hook"
+
+[keys]
+backed_up = true
+
+[plugins]
+enabled = true
+
+# ── 0.4.4 遗留：增强功能的宿主配置段，0.4.5 起归插件（必须被忽略） ──
+[kzwr]
+access_token_enc = "enc:ZZZZ"
+quota_warn_percent = 85
+
+[plugin_data.example]
+greeting = "enc:CCCC"
+"#,
+        )
+        .expect("write");
+        let m = ConfigManager::new(dir.path(), SecretString::from("p".to_string()));
+        let cfg = m.load().expect("含遗留 [kzwr] 段的配置应能载入");
+        assert_eq!(cfg.webdav.url.as_deref(), Some("https://dav.example.com/dav"));
+        // 其余各段完好
+        assert_eq!(cfg.targets.len(), 1, "目标列表应完好");
+        assert_eq!(cfg.tasks.len(), 1, "任务列表应完好");
+        assert_eq!(cfg.tasks[0].retention.recycle_max_gb, 20, "任务级回收站门槛应完好");
+        assert!(cfg.tasks[0].retention.empty_recycle_bin, "保留策略开关应完好");
+        assert!(cfg.plugins.enabled, "外置插件开关应完好");
+        assert_eq!(
+            cfg.plugin_data.keys().collect::<Vec<_>>(),
+            vec!["example"],
+            "其它插件的自管数据不得受迁移影响"
+        );
+        // 迁移是**不搬运**旧 token 的（用户重填）：这里确认宿主确实不再持有该段，
+        // 而不是「还在但没人读」——留着只会让导出包继续带敏感明文。
+        let text = toml::to_string(&cfg).expect("重新序列化");
+        assert!(!text.contains("quota_warn_percent"), "遗留 [kzwr] 段应在下次保存时消失：{text}");
     }
 
     /// A1+A2 闭环：`plugin_data_set` 加密落库 → `plugin_data_json` 解密注入 `target_json.config`

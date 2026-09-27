@@ -49,8 +49,6 @@ pub struct WebdavSaveRequest {
 pub struct WebdavSaveResponse {
     pub success: bool,
     pub url: Option<String>,
-    /// 账号一致性提醒（如 WebDAV 账号与已配置的 kzwr access-token 账号不同）
-    pub warning: Option<String>,
     pub error: Option<String>,
 }
 
@@ -71,10 +69,6 @@ pub struct ConfigResponse {
     pub webdav_username: Option<String>,
     /// 保留策略（目标端孤儿文件清理，非敏感）
     pub retention: RetentionView,
-    /// 是否已配置 kzwr access-token（增强功能；token 本身永不返回）
-    pub kzwr_token_configured: bool,
-    /// 云端空间占用预警阈值（百分比，0 = 关闭）
-    pub kzwr_quota_warn_percent: u64,
     /// 定时任务未来 5 次触发时间（服务器本地时区；空 = 未启用）
     pub schedule_next: Vec<String>,
     /// 服务器时区说明（cron 按此时区解释）
@@ -230,9 +224,6 @@ pub struct ConfigSaveRequest {
     pub retention_recycle_max_gb: Option<u64>,
     #[serde(default)]
     pub retention_recycle_min_age_days: Option<u64>,
-    /// kzwr 云端空间预警阈值（百分比，0 = 关闭）
-    #[serde(default)]
-    pub kzwr_quota_warn_percent: Option<u64>,
     /// 调试日志开关（不传则保持原值）
     #[serde(default)]
     pub debug: Option<bool>,
@@ -471,9 +462,6 @@ pub struct ConfigBundle {
     pub webdav_username: Option<String>,
     #[serde(default)]
     pub webdav_password: Option<String>,
-    /// kzwr access-token（增强功能：存储空间/回收站；可选）
-    #[serde(default)]
-    pub kzwr_access_token: Option<String>,
     /// age 私钥（恢复配置后可继续解密既有备份）
     #[serde(default)]
     pub age_private_key: Option<String>,
@@ -626,7 +614,7 @@ async fn plugins_list(State(state): State<AppState>) -> Json<serde_json::Value> 
         .filter(|id| !loaded.contains(id))
         .collect();
     Json(serde_json::json!({
-        "plugins": state.plugins.describe(&cfg),
+        "plugins": state.plugins.describe(&cfg, &mgr),
         // 有自管数据但插件未加载的 id（卸载残留；前端据此提示清理）
         "orphan_data": orphan_data,
         // 被禁用的插件 id（前端置灰 + 允许重新启用）
@@ -1444,7 +1432,6 @@ async fn webdav_save(
         return Json(WebdavSaveResponse {
             success: false,
             url: None,
-            warning: None,
             error: Some("用户名、密码均不能为空".to_string()),
         });
     }
@@ -1454,7 +1441,6 @@ async fn webdav_save(
         return Json(WebdavSaveResponse {
             success: false,
             url: None,
-            warning: None,
             error: Some("未注册 webdav 目标插件".to_string()),
         });
     };
@@ -1467,8 +1453,7 @@ async fn webdav_save(
             return Json(WebdavSaveResponse {
                 success: false,
                 url: None,
-                warning: None,
-                error: Some(e),
+                    error: Some(e),
             })
         }
     };
@@ -1483,23 +1468,15 @@ async fn webdav_save(
             // 热刷新目标池（无需重启服务）：由注册表按当前配置重新装配全部目标
             let cfg = { state.config.lock().unwrap().load().unwrap_or_default() };
             state.reload_targets(&cfg);
-            // 账号一致性：已配置 access-token 时，核对 WebDAV 账号与 API 账号
-            // （该能力属于 kzwr 增强插件）
-            let warning = crate::plugin::builtin::kzwr::check_account_consistency(&state).await;
             state.audit.record(
                 "webdav.credentials",
-                format!(
-                    "保存 WebDAV 凭据（账号 {}）{}",
-                    body.username.trim(),
-                    if warning.is_some() { "；账号与 access-token 不一致" } else { "" }
-                ),
+                format!("保存 WebDAV 凭据（账号 {}）", body.username.trim()),
                 true,
                 None,
             );
             Json(WebdavSaveResponse {
                 success: true,
                 url: Some(url),
-                warning,
                 error: None,
             })
         }
@@ -1513,8 +1490,7 @@ async fn webdav_save(
             Json(WebdavSaveResponse {
                 success: false,
                 url: Some(url),
-                warning: None,
-                error: Some(format!("{:#}", e)),
+                    error: Some(format!("{:#}", e)),
             })
         }
     }
@@ -1526,7 +1502,7 @@ fn config_response(
     cfg: &crate::infra::config::AppConfig,
     webdav_configured: bool,
     webdav_username: Option<String>,
-    kzwr_token_configured: bool,
+
     error: Option<String>,
 ) -> ConfigResponse {
     // 兼容视图：以「首个任务」为默认任务（多任务管理走 `/api/tasks`）
@@ -1550,8 +1526,6 @@ fn config_response(
         webdav_url: cfg.primary_target().and_then(|t| t.url.clone()),
         webdav_username,
         retention: RetentionView::from(retention),
-        kzwr_token_configured,
-        kzwr_quota_warn_percent: cfg.kzwr.quota_warn_percent,
         schedule_next,
         schedule_timezone: crate::domain::scheduler::timezone_label(),
         host_utc_offset_minutes: crate::domain::scheduler::utc_offset_minutes(),
@@ -1579,10 +1553,10 @@ fn webdav_ready(cfg: &crate::infra::config::AppConfig) -> bool {
 
 async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
     // 注意：config_echo 内部会锁 config，故须在下面加锁前先取，避免同一 Mutex 重入死锁
-    let (wuser, kzwr_on) = config_echo(&state);
+    let wuser = config_echo(&state);
     let cfg_guard = state.config.lock().unwrap();
     match cfg_guard.load() {
-        Ok(c) => Json(config_response(&c, webdav_ready(&c), wuser, kzwr_on, None)),
+        Ok(c) => Json(config_response(&c, webdav_ready(&c), wuser, None)),
         Err(e) => Json(ConfigResponse {
             backup_paths: Vec::new(),
             target_folder: state.target_folder.clone(),
@@ -1592,8 +1566,6 @@ async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
             webdav_url: None,
             webdav_username: None,
             retention: RetentionView::default(),
-            kzwr_token_configured: false,
-            kzwr_quota_warn_percent: 85,
             schedule_next: Vec::new(),
             schedule_timezone: crate::domain::scheduler::timezone_label(),
             host_utc_offset_minutes: crate::domain::scheduler::utc_offset_minutes(),
@@ -1619,7 +1591,7 @@ async fn config_save(
     Json(body): Json<ConfigSaveRequest>,
 ) -> Json<ConfigResponse> {
     // 同 config_get：先取回显字段再锁配置，避免 Mutex 重入死锁
-    let (wuser, kzwr_on) = config_echo(&state);
+    let wuser = config_echo(&state);
     let cfg_guard = state.config.lock().unwrap();
     let mut cfg = match cfg_guard.load() {
         Ok(c) => c,
@@ -1643,7 +1615,7 @@ async fn config_save(
             let cron = cron.trim().to_string();
             if let Err(e) = crate::domain::scheduler::validate_cron(&cron) {
                 let resp =
-                    config_response(&cfg, webdav_ready(&cfg), wuser, kzwr_on, Some(e.to_string()));
+                    config_response(&cfg, webdav_ready(&cfg), wuser, Some(e.to_string()));
                 return Json(resp);
             }
             Some(if cron.is_empty() { None } else { Some(cron) })
@@ -1683,10 +1655,6 @@ async fn config_save(
         if let Some(cron) = cron_update {
             task.schedule_cron = cron;
         }
-    }
-    if let Some(v) = body.kzwr_quota_warn_percent {
-        // 合法区间 0..=100（0 = 关闭预警）
-        cfg.kzwr.quota_warn_percent = v.min(100);
     }
     // 调试日志开关：保存并即时生效（日志过滤器热更新）
     if let Some(v) = body.debug {
@@ -1728,7 +1696,7 @@ async fn config_save(
             }
         }
         if let Some(e) = invalid {
-            let resp = config_response(&cfg, webdav_ready(&cfg), wuser, kzwr_on, Some(e));
+            let resp = config_response(&cfg, webdav_ready(&cfg), wuser, Some(e));
             return Json(resp);
         }
         cleaned.dedup();
@@ -1763,9 +1731,9 @@ async fn config_save(
             // 外置插件开关：**热生效**（装载/卸载外置插件，无需重启应用）
             apply_plugin_switch(&state, &cfg);
             state.reload_targets(&cfg);
-            Json(config_response(&cfg, webdav_ready(&cfg), wuser, kzwr_on, None))
+            Json(config_response(&cfg, webdav_ready(&cfg), wuser, None))
         }
-        Err(e) => Json(config_response(&cfg, false, wuser, kzwr_on, Some(format!("{:#}", e)))),
+        Err(e) => Json(config_response(&cfg, false, wuser, Some(format!("{:#}", e)))),
     }
 }
 
@@ -1800,12 +1768,10 @@ pub(crate) fn webdav_username(state: &AppState) -> Option<String> {
 
 /// 设置页回显所需的非敏感信息（内部会锁 config，**必须在加锁前调用**）
 ///
-/// 返回 (WebDAV 用户名, 是否已配置 kzwr access-token)；token 本身永不返回。
-fn config_echo(state: &AppState) -> (Option<String>, bool) {
+/// 返回 WebDAV 用户名（凭据本身永不返回）。
+fn config_echo(state: &AppState) -> Option<String> {
     let mgr = state.config.lock().unwrap();
-    let user = mgr.webdav_credentials().ok().and_then(|(u, _)| u);
-    let kzwr = mgr.kzwr_token().ok().flatten().is_some();
-    (user, kzwr)
+    mgr.webdav_credentials().ok().and_then(|(u, _)| u)
 }
 
 
@@ -2365,7 +2331,7 @@ pub async fn run_task_now(state: &AppState, task_id: &str) -> BackupResponse {
             let trash_emptied = if retention_cfg.empty_recycle_bin {
                 let mut n = 0u64;
                 for p in state.plugins.enhance_plugins() {
-                    if let Some(c) = p.after_backup(state).await {
+                    if let Some(c) = p.after_backup(state, &ctx.task.id).await {
                         n += c;
                     }
                 }
@@ -3948,11 +3914,10 @@ async fn config_export(
             error: Some("管理员口令错误".to_string()),
         });
     }
-    let (cfg, creds, kzwr_token, bundle_targets) = {
+    let (cfg, creds, bundle_targets) = {
         let mgr = state.config.lock().unwrap();
         let cfg = mgr.load().unwrap_or_default();
         let creds = mgr.webdav_credentials().unwrap_or((None, None));
-        let kzwr_token = mgr.kzwr_token().unwrap_or(None);
         // 全部目标的明文凭据（导出文件本身即敏感件，此函数入口已校验管理员口令）
         let bundle_targets: Vec<BundleTarget> = cfg
             .targets
@@ -3970,7 +3935,7 @@ async fn config_export(
                 }
             })
             .collect();
-        (cfg, creds, kzwr_token, bundle_targets)
+        (cfg, creds, bundle_targets)
     };
     let ks_path = crate::infra::keystore::keystore_path(&state.cfg_dir);
     let age_private_key = crate::infra::keystore::load_keystore(&state.passphrase, &ks_path)
@@ -3993,7 +3958,7 @@ async fn config_export(
         webdav_url: cfg.webdav.url.clone(),
         webdav_username: creds.0,
         webdav_password: creds.1,
-        kzwr_access_token: kzwr_token,
+
         age_private_key,
         key_backed_up: cfg.keys.backed_up,
         targets: bundle_targets,
@@ -4097,18 +4062,6 @@ async fn config_import(
             .filter(|s| !s.trim().is_empty())
         {
             cfg.webdav.url = Some(url.trim_end_matches('/').to_string());
-        }
-        // kzwr access-token（增强功能，可选）
-        if let Some(token) = bundle.kzwr_access_token.as_ref().filter(|s| !s.trim().is_empty()) {
-            match mgr.encrypt_field(token.trim()) {
-                Ok(e) => cfg.kzwr.access_token_enc = Some(e),
-                Err(_) => {
-                    return Json(ConfigImportResponse {
-                        success: false,
-                        error: Some("kzwr access-token 加密失败".to_string()),
-                    })
-                }
-            }
         }
         // 多目标（凭据用当前口令重新加密）
         if !bundle.targets.is_empty() {
@@ -4248,7 +4201,7 @@ async fn config_import(
 
     state.audit.record(
         "config.import",
-        "导入配置包（备份路径/目标/定时/通知/WebDAV 凭据/kzwr token）",
+        "导入配置包（备份路径/目标/定时/通知/WebDAV 凭据/插件自管数据）",
         true,
         None,
     );

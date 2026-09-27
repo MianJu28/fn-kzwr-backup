@@ -75,16 +75,6 @@ async fn main() -> anyhow::Result<()> {
         fnos_backup::domain::crypto::CryptoSession::full(&keys),
     ));
 
-    // kzwr REST 增强客户端（账号存储空间/回收站清理；与备份通道无关）
-    let kzwr = Arc::new(infra::kzwr_api::client::KzwrClient::default());
-    match config_mgr.lock().unwrap().kzwr_token() {
-        Ok(Some(t)) => {
-            kzwr.set_token(t);
-            info!("kzwr access-token 已加载（增强功能可用：存储空间/回收站）");
-        }
-        _ => info!("未配置 kzwr access-token（增强功能降级，不影响备份/恢复）"),
-    }
-
     // 插件注册表（唯一装配点）：内置 WebDAV 目标插件 + kzwr 增强插件（ADR-013）
     let mut registry_inner = fnos_backup::plugin::PluginRegistry::builtin();
 
@@ -156,7 +146,6 @@ async fn main() -> anyhow::Result<()> {
         primary_target_id: Arc::new(std::sync::RwLock::new(String::new())),
         target_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         plugins: registry,
-        kzwr,
         audit,
         backup_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         running_task_id: Arc::new(std::sync::RwLock::new(None)),

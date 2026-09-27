@@ -5,7 +5,7 @@
  * 前端不硬编码具体插件（新增插件不必改这里、也不必重新打包前端）。
  *
  * 渲染方式：**一律用通用 UI Schema**（`ui.blocks` → `components/PluginBlocks.svelte`）。
- * 内置插件（webdav / kzwr）也把自己的界面完整声明为 blocks，
+ * 每个插件（含外置的增强插件）把自己的界面完整声明为 blocks，
  * 因此前端不再有「内置组件 vs 通用渲染」的分支，也没有插件专用的手写组件。
  *
  * 本模块只负责：拉取、缓存、按分区过滤排序。
@@ -60,6 +60,9 @@ export function sectionsFor(plugins, section = 'settings') {
  * 仅用于展示位置与顺序；正常路径永远以接口返回为准。
  * `blocks` 为空 → 卡片会显示「暂未声明界面」提示，这是**接口失败**时的预期表现
  * （正常联网时后端会给出完整 blocks）。
+ *
+ * 只保留**核心内置**的 WebDAV 目标：增强类插件（如酷族账号 kzwr）一律外置，
+ * 由 `/api/plugins` 动态露出，这里写死等于把厂商专属逻辑又混回前端。
  */
 export const FALLBACK_SECTIONS = [
   {
@@ -70,14 +73,5 @@ export const FALLBACK_SECTIONS = [
     available: true,
     api_base: '',
     ui: { section: 'settings', title: '备份目标（WebDAV）', order: 10, blocks: [] },
-  },
-  {
-    id: 'kzwr',
-    name: '酷族账号增强',
-    kind: 'enhance',
-    builtin: true,
-    available: true,
-    api_base: '/api/p/kzwr',
-    ui: { section: 'settings', title: '增强功能（酷族账号）', order: 20, blocks: [] },
   },
 ];

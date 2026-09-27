@@ -25,14 +25,36 @@
     'config.export': '导出配置',
     'backup.run': '备份',
     'restore.run': '恢复',
-    'kzwr.token.save': '保存 token',
-    'kzwr.token.clear': '清除 token',
-    'kzwr.trash.empty': '清空回收站',
-    'kzwr.trash.auto': '自动清空回收站',
     'restore.prune': '清理缺失记录',
     'logs.clear': '清空日志',
     'audit.clear': '清空审计',
+    // 插件生命周期与插件回写自配置（由宿主记录）
+    'plugin.install': '安装插件',
+    'plugin.uninstall': '卸载插件',
+    'plugin.purge': '清除插件数据',
+    'plugin.reload': '重载插件',
+    'plugin.set_enabled': '启用/停用插件',
+    'plugin.parallel': '切换插件并发',
+    'plugin.data': '插件回写配置',
   };
+
+  /**
+   * 审计动作标签
+   *
+   * 动作名 `<来源域>.<对象>.<动作>` 的前两段由**发出方**决定：核心查上表；
+   * 外置插件自行声明（如 `kzwr.accounts.add`、`kzwr.trash.empty`），宿主只原样落库。
+   * 因此未收录的点号动作按命名规则显示成「插件·<域> <剩余部分>」，
+   * 前端不需要为任何插件维护映射表 —— 新增插件不改这里也能看懂审计。
+   */
+  function actionText(action) {
+    const a = String(action || '');
+    if (ACTION_TEXT[a]) return ACTION_TEXT[a];
+    const parts = a.split('.');
+    if (parts.length > 2 && parts[0] !== 'plugin' && parts[0] !== 'config') {
+      return `插件·${parts[0]} ${parts.slice(1).join('.')}`;
+    }
+    return a;
+  }
 
   $: list = entries || [];
   $: visible = list.slice(0, shown);
@@ -113,7 +135,7 @@
         {#each visible as e, i (e.ts + '-' + i)}
           <li class:fail={!e.ok}>
             <span class="ts mono">{fmtTime(e.ts)}</span>
-            <span class="tag">{ACTION_TEXT[e.action] || e.action}</span>
+            <span class="tag">{actionText(e.action)}</span>
             <span class="detail">{e.detail}</span>
             {#if !e.ok}
               <span class="badge badge-danger">失败</span>

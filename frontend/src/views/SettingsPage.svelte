@@ -9,7 +9,7 @@
    *   - 插件卡片 → 新的「插件」页（PluginsPage）
    *   - 外置插件（动态库）管理 → 新的「插件」页
    *   - WebDAV 凭据 → 「目标」页（多目标模型，ADR-014）
-   *   - kzwr 增强（token / 空间阈值 / 回收站）→ 「插件」页（由插件 schema 渲染）
+   *   - kzwr 增强（多账号 token / 空间阈值 / 回收站）→ 「插件」页（由插件 schema 的 accounts 区块渲染）
    *   - 保留策略 → 「任务」页（保留策略是任务级配置，全局那份不生效）
    */
   import KeySection from '../components/KeySection.svelte';
