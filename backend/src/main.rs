@@ -155,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
         kzwr,
         audit,
         backup_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        running_task_id: Arc::new(std::sync::RwLock::new(None)),
         crypto,
         passphrase: passphrase.clone(),
         cfg_dir,

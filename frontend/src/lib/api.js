@@ -101,6 +101,15 @@ export const api = {
   /** 设置某个目标插件的上传并发路数（并发回传，每插件独立） */
   pluginParallel: (id, parallel) => post(`/api/plugins/${id}/parallel`, { parallel }),
   /**
+   * 启用/禁用某个插件（运行时生效，无需重启）
+   *
+   * 禁用是**逻辑摘除**（不卸载 `.so`）。若该插件仍被任务引用，后端会**级联停用**
+   * 那些任务并在 `affected_tasks` 里回报；若正在执行备份的任务用它，则**拒绝**
+   * 本次操作（返回 `error` + `running_task`），避免打断备份。
+   */
+  pluginSetEnabled: (id, enabled) =>
+    post(`/api/plugins/${encodeURIComponent(id)}/enable`, { enabled }),
+  /**
    * 卸载清除该插件的宿主代管数据（ADR-013 决策 2）
    *
    * 仍被目标/任务引用时后端**拒绝**，返回 `referenced_by`（引用项名称列表）。

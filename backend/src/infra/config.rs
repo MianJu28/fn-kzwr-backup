@@ -92,6 +92,22 @@ pub struct PluginSettings {
     /// 并发会同时占用多条连接，对 NAS 上行与目标服务端压力更大，故内置插件默认不并发。
     #[serde(default)]
     pub target_parallel: std::collections::BTreeMap<String, u32>,
+    /// **按插件禁用**的插件 id 集合（运行时启停，无需重启）
+    ///
+    /// 与 [`PluginSettings::enabled`]（全局总开关）的分工：
+    /// - `enabled=false` → 根本不扫描/加载任何外置插件；
+    /// - 本字段 → 插件**已加载**（代码仍在内存中），但从活动集合里摘除：
+    ///   不再出现在 `/api/plugins`、不参与路由分发、不再被装配为备份目标。
+    ///
+    /// 为什么禁用 ≠ 卸载动态库：插件返回的 vtable 被宿主按 `&'static` 持有，
+    /// 飞行中的备份也可能仍持有由它派生的 `Arc<dyn TargetStorage>`，
+    /// 卸载会让这些引用悬空 → 进程崩溃。故「禁用」只做**逻辑摘除**，
+    /// 真正释放内存需重启应用（详见 `docs/PLUGIN_ABI.md`）。
+    ///
+    /// 内置插件（webdav/kzwr）同样可被禁用；禁用一个仍被任务引用的插件会
+    /// **级联禁用**那些任务（由接口负责，并如实回报受影响的任务）。
+    #[serde(default)]
+    pub disabled: Vec<String>,
 }
 
 impl Default for PluginSettings {
@@ -101,6 +117,7 @@ impl Default for PluginSettings {
             dir: None,
             pubkeys: Vec::new(),
             target_parallel: std::collections::BTreeMap::new(),
+            disabled: Vec::new(),
         }
     }
 }

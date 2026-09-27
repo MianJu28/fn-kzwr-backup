@@ -223,6 +223,12 @@ pub struct PluginEntry {
     /// `None` = 未配置（沿用插件声明）；`Some(0|1)` = 关闭并发；`Some(≥2)` = 启用并发。
     #[serde(default)]
     pub parallel: Option<u32>,
+    /// 该插件是否被**按插件禁用**（运行时启停；见 `PluginSettings::disabled`）
+    ///
+    /// 被禁用时：`available` 恒为 `false`、不参与路由分发与目标装配，
+    /// 但**仍会出现在清单里**，以便插件页把它列出来并允许重新启用。
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 /// 插件自检项（供「一键体检」汇总；由核心映射成 UI 的检查项）

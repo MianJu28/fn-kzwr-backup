@@ -210,6 +210,11 @@ pub struct TargetPool {
     inner: std::sync::RwLock<std::collections::HashMap<String, Arc<dyn TargetStorage>>>,
     /// 目标 id → 后端描述（日志与 UI 展示，如 `WebDAV（https://…）`）
     names: std::sync::RwLock<std::collections::HashMap<String, String>>,
+    /// **真正就绪**（凭据齐备且插件可用）的目标 id
+    ///
+    /// 不能靠 `inner` 的 key 判断：未配置的目标也会放进 `inner`（占位适配器），
+    /// 否则 `get()` 就取不到「明确的配置提示」。故就绪状态单独记录。
+    ready: std::sync::RwLock<std::collections::HashSet<String>>,
     fallback: Arc<dyn TargetStorage>,
 }
 
@@ -218,6 +223,7 @@ impl TargetPool {
         Self {
             inner: std::sync::RwLock::new(std::collections::HashMap::new()),
             names: std::sync::RwLock::new(std::collections::HashMap::new()),
+            ready: std::sync::RwLock::new(std::collections::HashSet::new()),
             fallback,
         }
     }
@@ -232,9 +238,9 @@ impl TargetPool {
             .unwrap_or_else(|| self.fallback.clone())
     }
 
-    /// 目标是否已装配（凭据齐备且插件可用）
+    /// 目标是否**真正就绪**（凭据齐备且插件可用；占位适配器 → false）
     pub fn is_ready(&self, id: &str) -> bool {
-        self.inner.read().unwrap().contains_key(id)
+        self.ready.read().unwrap().contains(id)
     }
 
     /// 后端描述（未装配返回 None）
@@ -247,16 +253,21 @@ impl TargetPool {
         self.inner.read().unwrap().keys().cloned().collect()
     }
 
-    /// 整体替换（配置保存/启动时重建；`items` = (目标id, 适配器, 描述)）
-    pub fn replace_all(&self, items: Vec<(String, Arc<dyn TargetStorage>, String)>) {
+    /// 整体替换（配置保存/启动时重建；`items` = (目标id, 适配器, 描述, 是否就绪)）
+    pub fn replace_all(&self, items: Vec<(String, Arc<dyn TargetStorage>, String, bool)>) {
         let mut map = std::collections::HashMap::new();
         let mut names = std::collections::HashMap::new();
-        for (id, t, name) in items {
+        let mut ready = std::collections::HashSet::new();
+        for (id, t, name, is_ready) in items {
+            if is_ready {
+                ready.insert(id.clone());
+            }
             map.insert(id.clone(), t);
             names.insert(id, name);
         }
         *self.inner.write().unwrap() = map;
         *self.names.write().unwrap() = names;
+        *self.ready.write().unwrap() = ready;
     }
 }
 

@@ -361,6 +361,27 @@ typedef struct KzwrTargetAbi {
 
 净减约 2000 行（19 文件，+441/−2461）。删除的组件均已在重构前确认无引用。
 
+### 7.2 运行时启停与插件设置弹窗（2026-09-27）
+
+插件改动很大后，前端仍要求「改开关/公钥 → 重启应用」才生效，且插件设置与其它配置
+混在一页。本次补齐运行时启停与独立设置弹窗。
+
+| 能力 | 实现 |
+|---|---|
+| **按插件禁用** | 新增 `plugins.disabled: Vec<String>`；`PluginRegistry` 用 `RwLock<HashSet>` 持有（注册表是 `Arc` 共享，启停接口只有 `&self`），所有查询接口过滤被禁用者 |
+| **运行时生效** | 路由从「启动时逐插件 `nest`」改为**请求时按 id 分发**：`/p/:plugin_id/*action` → 查注册表 → `tower::ServiceExt::oneshot` 执行该插件的 `routes()`。这样禁用立即 404、启用立即恢复，新加载插件也无需重启（`tower` 的 `util` feature 已在依赖里，零新增） |
+| **停用≠卸载** | 插件 vtable 被宿主按 `&'static` 持有，飞行中备份也可能持有其派生的 `Arc<dyn TargetStorage>`；卸载会让引用悬空 → 崩溃。故停用只做**逻辑摘除**，句柄保活到进程结束（UI 文案如实说明「真正释放需重启」） |
+| **级联保护** | 停用仍被任务引用的目标插件 → **级联停用**那些任务并在响应回报 `affected_tasks`；**正在执行备份的任务**（新增 `AppState.running_task_id` 追踪）使用该插件时 → **拒绝**本次停用，提示等备份结束 |
+| **设置弹窗** | 新增 `PluginSettingsModal.svelte`：点插件卡片「设置」打开，内容由插件自己的 `ui.blocks` 渲染（`PluginBlocks` 新增 `embedded` 形态，去掉卡片外壳）。卡片上只留只读概览（`metric`/`tips`） |
+
+**顺带修复的既有缺陷**：
+- `TargetPool::is_ready()` 原先只看 key 是否存在，但未配置的目标也会放进池中（占位适配器）
+  → 未配凭据的目标被错误显示为「已就绪」。现单独记录 `ready` 集合，语义正确。
+- 请求时分发需要清理外层路由写入的 `request extensions`：axum 的 `Path` 从
+  extensions 读 `UrlParams`，外层已写 `:plugin_id` + `*action` 两个参数，
+  不清理会让插件侧 `Path<String>` 看到 3 个参数并报
+  「Wrong number of path arguments for `Path`. Expected 1 but got 3」（实测踩到）。
+
 ---
 
 ## 8. 删除清单（决策 1 的清理面）

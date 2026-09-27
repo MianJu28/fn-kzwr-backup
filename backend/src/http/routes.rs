@@ -94,6 +94,8 @@ pub struct ConfigResponse {
     /// 只读项：仅回显**环境变量**状态，不提供前端开关（决策 3 要求默认强制验签，
     /// 否则一次误操作就可能让验签形同虚设）。
     pub plugins_allow_unsigned: bool,
+    /// 被**按插件禁用**的插件 id（运行时启停；见 `PluginSettings::disabled`）
+    pub plugins_disabled: Vec<String>,
     /// 告警 Webhook 地址（空 = 不外发）
     pub webhook_url: Option<String>,
     /// Webhook 自定义请求头
@@ -625,6 +627,10 @@ async fn plugins_list(State(state): State<AppState>) -> Json<serde_json::Value> 
         "plugins": state.plugins.describe(&cfg),
         // 有自管数据但插件未加载的 id（卸载残留；前端据此提示清理）
         "orphan_data": orphan_data,
+        // 被禁用的插件 id（前端置灰 + 允许重新启用）
+        "disabled": state.plugins.disabled_ids(),
+        // 正在执行备份的任务 id（禁用插件时的保护对象；无则为 null）
+        "running_task_id": state.running_task_id.read().unwrap().clone(),
         // 外置插件（ADR-013 方案 B：动态库）的开关/目录/加载诊断
         "external": {
             "configured": cfg.plugins.enabled,
@@ -743,6 +749,157 @@ async fn plugin_purge(
         "success": true,
         "removed": removed,
         "referenced_by": Vec::<String>::new(),
+    }))
+}
+
+// ── 插件启停（运行时，无需重启）──────────────────────────────────────
+
+/// `POST /api/plugins/:id/enable`：启用/禁用某个插件（按插件粒度）
+///
+/// body：`{"enabled": true|false}`（缺省 true）。
+///
+/// 语义与保护规则：
+/// - **禁用**只做**逻辑摘除**（不卸载 `.so`，见 `PluginSettings::disabled`）：
+///   立即从 `/api/plugins`、路由分发、目标装配与生命周期钩子中消失；
+/// - 若该插件是**目标插件**且仍被任务引用，则**级联禁用**那些任务
+///   （否则任务会立刻失败且用户不知道原因），并在响应里列出受影响的任务；
+/// - **正在执行备份的任务不会被级联禁用**：那会打断正在进行的备份。
+///   此时接口拒绝本次禁用，提示用户等备份结束后再操作；
+/// - 禁用前会热刷新目标池，使改动立即生效。
+async fn plugin_set_enabled(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    let enabled = body
+        .as_ref()
+        .and_then(|Json(v)| v.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    // 插件必须存在（含被禁用者，否则无法重新启用）
+    let known = state.plugins.plugin_ids().iter().any(|x| x == &id);
+    if !known {
+        return Json(err(format!("插件不存在：{id}")));
+    }
+
+    // 正在执行的任务：禁用目标插件会打断它，故一律保护
+    let running = state.running_task_id.read().unwrap().clone();
+
+    let mgr = state.config.lock().unwrap();
+    let mut cfg = mgr.load().unwrap_or_default();
+
+    // 受影响（将被级联禁用）的任务：仅当禁用的是它们所用的**目标插件**
+    let mut affected: Vec<String> = Vec::new();
+    if !enabled {
+        for task in &cfg.tasks {
+            if task.enabled {
+                if let Some(t) = cfg.target_by_id(&task.target_id) {
+                    if t.kind == id {
+                        let name = if task.name.is_empty() {
+                            task.id.clone()
+                        } else {
+                            task.name.clone()
+                        };
+                        affected.push(name);
+                    }
+                }
+            }
+        }
+        affected.sort();
+        affected.dedup();
+
+        // 正在跑的任务不能被级联禁用 —— 拒绝整次操作，让用户明确等待
+        if let Some(run_id) = &running {
+            let run_uses_this = cfg
+                .task_by_id(run_id)
+                .and_then(|t| cfg.target_by_id(&t.target_id))
+                .map(|t| t.kind == id)
+                .unwrap_or(false);
+            if run_uses_this {
+                let run_label = cfg
+                    .task_by_id(run_id)
+                    .map(|t| if t.name.is_empty() { t.id.clone() } else { t.name.clone() })
+                    .unwrap_or_else(|| run_id.clone());
+                return Json(serde_json::json!({
+                    "success": false,
+                    "error": format!(
+                        "任务「{run_label}」正在执行备份，它使用该插件；\
+                         现在禁用会打断备份。请等备份结束后再操作。"
+                    ),
+                    "running_task": run_label,
+                    "affected_tasks": affected,
+                }));
+            }
+        }
+
+        // 级联禁用受影响的任务
+        // 先算出「哪些任务引用了该插件」（不可变借用），再统一改（可变借用），
+        // 避免在 iter_mut 中又去读 cfg。
+        let task_ids: Vec<String> = cfg
+            .tasks
+            .iter()
+            .filter(|task| {
+                cfg.target_by_id(&task.target_id)
+                    .map(|t| t.kind == id)
+                    .unwrap_or(false)
+            })
+            .map(|task| task.id.clone())
+            .collect();
+        for task in cfg.tasks.iter_mut() {
+            if task_ids.contains(&task.id) {
+                task.enabled = false;
+            }
+        }
+    }
+
+    // 更新禁用集合
+    let mut disabled = cfg.plugins.disabled.clone();
+    disabled.retain(|x| x != &id);
+    if !enabled {
+        disabled.push(id.clone());
+    }
+    disabled.sort();
+    disabled.dedup();
+    cfg.plugins.disabled = disabled;
+
+    if let Err(e) = mgr.save(&cfg) {
+        return Json(err(format!("{:#}", e)));
+    }
+    drop(mgr);
+
+    // 立即生效：重建目标池（内部会先同步禁用集合）+ 刷新主目标
+    let ready = state.reload_targets(&cfg);
+
+    state.audit.record(
+        "plugin.set_enabled",
+        if enabled {
+            format!("启用插件 {id}")
+        } else if affected.is_empty() {
+            format!("禁用插件 {id}")
+        } else {
+            format!("禁用插件 {id}（同时停用任务：{}）", affected.join("、"))
+        },
+        true,
+        None,
+    );
+
+    Json(serde_json::json!({
+        "success": true,
+        "id": id,
+        "enabled": enabled,
+        // 级联停用的任务名（前端提示用户）
+        "affected_tasks": affected,
+        // 目标池里仍就绪的目标数（便于前端立刻反映状态变化）
+        "ready_targets": ready,
+        "note": if enabled {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(
+                "插件已停用；其代码仍保留在内存中（卸载动态库会让运行中的引用悬空），\
+                 重新启用无需重启应用。"
+            )
+        },
     }))
 }
 
@@ -1125,6 +1282,7 @@ fn config_response(
         plugins_dir: cfg.plugins.dir.clone().unwrap_or_default(),
         plugins_pubkeys: cfg.plugins.pubkeys.clone(),
         plugins_allow_unsigned: crate::plugin::loader::allow_unsigned_by_env(),
+        plugins_disabled: cfg.plugins.disabled.clone(),
         error,
     }
 }
@@ -1160,6 +1318,7 @@ async fn config_get(State(state): State<AppState>) -> Json<ConfigResponse> {
             plugins_dir: String::new(),
             plugins_pubkeys: Vec::new(),
             plugins_allow_unsigned: crate::plugin::loader::allow_unsigned_by_env(),
+            plugins_disabled: Vec::new(),
             webhook_url: None,
             webhook_headers: Vec::new(),
             webhook_body: None,
@@ -1743,11 +1902,18 @@ async fn task_run(
 }
 
 /// 备份运行标志的 RAII 守卫：离开作用域时复位（覆盖提前 return 与 panic 展开）
-struct BackupRunFlag<'a>(&'a std::sync::atomic::AtomicBool);
+///
+/// 同时维护 `running_task_id`：禁用插件时需要知道**具体哪个任务**在跑，
+/// 才能保证不打断正在进行的备份。两者必须一起设置/清除，故合并在同一守卫里。
+struct BackupRunFlag<'a> {
+    flag: &'a std::sync::atomic::AtomicBool,
+    task_id: &'a std::sync::RwLock<Option<String>>,
+}
 
 impl Drop for BackupRunFlag<'_> {
     fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        *self.task_id.write().unwrap() = None;
+        self.flag.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1797,7 +1963,13 @@ pub async fn run_task_now(state: &AppState, task_id: &str) -> BackupResponse {
             ..Default::default()
         };
     }
-    let _running = BackupRunFlag(&state.backup_running);
+    let _running = BackupRunFlag {
+        flag: &state.backup_running,
+        task_id: &state.running_task_id,
+    };
+    // 记录本任务 id（在 CAS 成功之后、真正开跑之前）：
+    // 插件启停接口据此保护「正在进行的任务」，不把它级联禁用。
+    *state.running_task_id.write().unwrap() = Some(task_id.to_string());
 
     // 1) 解析任务与它的目标（未就绪 → 明确提示，不静默失败）
     let ctx = match task_context(state, task_id) {
@@ -3786,6 +3958,8 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/plugins", get(plugins_list))
         .route("/plugins/:id/purge", post(plugin_purge))
+        // 按插件启用/禁用（运行时生效，无需重启）
+        .route("/plugins/:id/enable", post(plugin_set_enabled))
         .route("/plugins/:id/parallel", post(plugin_parallel))
         // 插件自管数据（宿主代存）：纯目标插件没有自己的路由，表单提交走这里
         .route("/plugins/:id/data", get(plugin_data_get).post(plugin_data_set))
@@ -3822,9 +3996,81 @@ pub fn router(state: AppState) -> Router {
         .route("/notify/webhook", post(webhook_save))
         .route("/notify/webhook/test", post(webhook_test));
 
-    // 插件路由：`/p/<插件id>/…`（如 /p/kzwr/user）；核心不感知具体插件的路径
-    for p in state.plugins.enhance_plugins() {
-        core = core.nest(&format!("/p/{}", p.meta().id), p.routes());
-    }
+    // 插件路由：`/p/<插件id>/<动作…>`（如 /p/kzwr/user、/p/kzwr/trash/empty）
+    //
+    // **不在启动时逐插件嵌套**，而是用一条兜底路由在**请求时**查注册表：
+    // 这样才能支持运行时启停插件（禁用后立即 404、重新启用立即恢复），
+    // 也让新加载的插件无需重启即可提供服务。核心仍不感知具体插件的路径。
+    core = core.route("/p/:plugin_id/*action", axum::routing::any(plugin_dispatch));
     core.with_state(state)
+}
+
+/// 把 `/api/p/<插件id>/<动作…>` 分发给该插件自己的 `routes()`
+///
+/// 分发方式：从注册表取插件 → 构造其子路由 → 用 `tower::ServiceExt::oneshot`
+/// 直接在当前请求上执行一次。这样插件侧仍是普通的 axum `Router`（写起来不变），
+/// 而宿主获得「按 id 动态查找」的能力。
+///
+/// 插件不存在 / 被禁用 → 404（不泄漏内部原因，但日志留痕）。
+async fn plugin_dispatch(
+    State(state): State<AppState>,
+    axum::extract::Path((plugin_id, action)): axum::extract::Path<(String, String)>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use tower::ServiceExt;
+
+    // 被禁用的插件按「不存在」处理：禁用应立即生效（前端会拿到 404）
+    let Some(plugin) = state.plugins.enhance_plugin_enabled(&plugin_id) else {
+        tracing::debug!(plugin = %plugin_id, "插件路由请求：插件不存在或已被禁用");
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": format!("插件 {plugin_id} 不存在或已被禁用")
+            })),
+        )
+            .into_response();
+    };
+
+    // 还原子路由内部的相对路径：把 `/p/<id>` 前缀剥掉，保留动作部分（含多段）与查询串
+    let sub_path = format!("/{}", action.trim_start_matches('/'));
+    let query = req.uri().query().map(|s| format!("?{s}")).unwrap_or_default();
+    let new_pq = match format!("{sub_path}{query}").parse::<axum::http::uri::PathAndQuery>() {
+        Ok(pq) => pq,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({ "error": "插件动作路径非法" })),
+            )
+                .into_response()
+        }
+    };
+    let (mut parts, body) = req.into_parts();
+    parts.uri = {
+        let mut u = parts.uri.into_parts();
+        u.path_and_query = Some(new_pq);
+        axum::http::Uri::from_parts(u).unwrap_or_else(|_| axum::http::Uri::from_static("/"))
+    };
+    // 关键：清掉外层路由写入的 request extensions。
+    //
+    // axum 的 `Path` 提取器从 **extensions** 里读 `UrlParams`，而外层路由已经写了
+    // `:plugin_id` + `*action` 两个参数。若不清理，插件侧的 `Path<String>` 会看到
+    // 3 个参数（2 外层 + 1 内层），直接报
+    // 「Wrong number of path arguments for `Path`. Expected 1 but got 3」。
+    // 分发相当于「重新进入一次路由」，故把上一层的参数痕迹（含 MatchedPath/OriginalUri）全部抹掉。
+    parts.extensions.clear();
+    let sub_req = axum::http::Request::from_parts(parts, body);
+
+    match plugin.routes().with_state(state).oneshot(sub_req).await {
+        Ok(resp) => resp.into_response(),
+        Err(e) => {
+            // `oneshot` 的 Infallible 错误在实践中不会出现；留个兜底避免 panic
+            tracing::warn!(plugin = %plugin_id, err = ?e, "插件路由分发失败");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({ "error": "插件路由分发失败" })),
+            )
+                .into_response()
+        }
+    }
 }

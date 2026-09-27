@@ -332,6 +332,8 @@
   async function handlePluginDone() {
     await loadAlerts();
     await loadConfig();
+    // 启停插件会级联影响任务（被停用）与目标（未就绪），故一并刷新
+    await Promise.all([loadTasks(), loadTargets()]);
   }
 
   /** 切换调试日志：立即生效并持久化 */

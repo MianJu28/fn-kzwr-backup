@@ -17,6 +17,12 @@
   export let plugin = null;
   /** 操作成功后的回调（让外层刷新账号信息/消息提醒等） */
   export let onDone = null;
+  /**
+   * 渲染形态：
+   * - `card`（默认）：完整卡片（标题 + 状态徽标 + 内容），用于插件页列表；
+   * - `embedded`：只渲染内容，不套卡片外壳 —— 用于弹窗内（弹窗已有自己的标题栏）。
+   */
+  export let variant = 'card';
 
   let busy = false;
   let values = {};
@@ -221,19 +227,21 @@
   }
 </script>
 
-<section class="card">
-  <div class="card-head">
-    <div class="icon-wrap"><Icon name="package" size={18} /></div>
-    <div class="grow">
-      <h2 class="card-title">{plugin?.ui?.title || plugin?.name || '插件'}</h2>
-      <p class="card-desc">
-        由插件 <code>{plugin?.id}</code> 提供{plugin?.description ? ` · ${plugin.description}` : ''}
-      </p>
+<section class="card" class:embedded={variant === 'embedded'}>
+  {#if variant === 'card'}
+    <div class="card-head">
+      <div class="icon-wrap"><Icon name="package" size={18} /></div>
+      <div class="grow">
+        <h2 class="card-title">{plugin?.ui?.title || plugin?.name || '插件'}</h2>
+        <p class="card-desc">
+          由插件 <code>{plugin?.id}</code> 提供{plugin?.description ? ` · ${plugin.description}` : ''}
+        </p>
+      </div>
+      <span class="badge {plugin?.disabled ? 'badge-warn' : plugin?.available ? 'badge-ok' : ''}">
+        {plugin?.disabled ? '已停用' : plugin?.available ? '已启用' : '未启用'}
+      </span>
     </div>
-    <span class="badge {plugin?.available ? 'badge-ok' : ''}">
-      {plugin?.available ? '已启用' : '未启用'}
-    </span>
-  </div>
+  {/if}
 
   <div class="card-body">
     {#if hostRedacted}
@@ -344,3 +352,16 @@
     {/if}
   </div>
 </section>
+
+<style>
+  /* 弹窗内嵌形态：去掉卡片外壳（弹窗自带标题栏与内边距），只保留内容 */
+  .card.embedded {
+    border: none;
+    background: none;
+    box-shadow: none;
+    border-radius: 0;
+  }
+  .card.embedded .card-body {
+    padding: 0;
+  }
+</style>

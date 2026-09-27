@@ -106,6 +106,9 @@ typedef struct KzwrPluginAbi {
 - 未知字段双方都应忽略（向前兼容）
 - **`component` 已弃用**：前端不再有「内置组件」分支，所有插件（含内置 webdav/kzwr）
   一律用 `blocks` 渲染。请把界面**完整**写进 `blocks`，不要依赖 `component`。
+- **渲染位置**：插件页卡片只显示只读概览（`metric` / `tips`）；可编辑项
+  （`text` / `number` / `toggle` / `button`）放在**插件设置弹窗**里（点卡片「设置」打开），
+  仍由同一份 `blocks` 驱动 —— 插件无需关心自己显示在卡片还是弹窗。
 - **动态 `metric`**：`metric` 块可带 `action`（如 `"/space"`），前端渲染时会 `GET`
   该路径，并用响应里的 `{"value": "...", "hint": "..."}` 覆盖静态文案 ——
   用于「空间用量」这类**实时数字**，避免为一个数字写专用前端组件。
@@ -231,6 +234,15 @@ bash Scripts/sign_plugin.sh sign dist/plugins           # 生成 <so>.sig（64 �
   不代表代码被审计；用户放置目录里的插件一样要自带有效签名才加载
 - 唯一逃生阀 `FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1` 仅用于本机调试（正式包的生命周期脚本
   用 `env -i` 白名单启动，不会透传该变量）
+- **运行时启停**（按插件粒度，无需重启）：`POST /api/plugins/<id>/enable`
+  `{"enabled":false}` → 写入 `plugins.disabled`，插件立即从 `/api/plugins`、路由分发、
+  目标装配与生命周期钩子中消失；`true` 立即恢复。
+  **停用 ≠ 卸载**：插件返回的 vtable 被宿主按 `&'static` 持有，飞行中的备份也可能
+  仍持有由它派生的 `Arc<dyn TargetStorage>`，卸载会让这些引用悬空 → 进程崩溃。
+  故停用只做**逻辑摘除**，动态库句柄仍保活到进程结束（真正释放需重启应用）。
+  配套保护：停用仍被任务引用的目标插件会**级联停用**那些任务（响应里回报
+  `affected_tasks`）；若正在执行备份的任务使用该插件，接口**拒绝**本次操作
+  （返回 `error` + `running_task`），避免打断备份。
 - 私钥 `Scripts/keys/sign.key` 被 `.gitignore` 排除，只应存在于发布机；仓库内只有公钥
 
 ---

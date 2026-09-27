@@ -77,6 +77,11 @@ pub struct AppState {
     pub target_ready: Arc<AtomicBool>,
     /// 备份运行标志（定时调度与手动触发共用：true = 有备份正在执行，并发触发直接跳过）
     pub backup_running: Arc<AtomicBool>,
+    /// **正在执行备份的任务 id**（无备份时为 `None`）
+    ///
+    /// `backup_running` 只回答「有没有在跑」，禁用一个插件时需要知道
+    /// **具体是哪个任务**在跑（该任务不能被级联禁用，否则会打断正在进行的备份）。
+    pub running_task_id: Arc<RwLock<Option<String>>>,
     /// 加密会话（备份加密/恢复解密；密钥变更后可热替换）
     pub crypto: Arc<CryptoSwap>,
     /// 应用口令（密钥库/配置敏感字段加密；更换密钥时需复用它重新加密落盘）
@@ -123,6 +128,10 @@ impl AppState {
     /// 同步更新：目标池、主目标适配器、主目标 id、`target_ready`。
     /// 返回已就绪（凭据齐备）的目标数量。
     pub fn reload_targets(&self, cfg: &AppConfig) -> usize {
+        // 插件启停先于目标装配生效：被禁用的目标插件会让对应目标落到「未配置」分支，
+        // 从而给出明确提示，而不是静默使用一个用户已禁用的插件。
+        self.plugins.set_disabled(&cfg.plugins.disabled);
+
         let built = {
             let mgr = self.config.lock().unwrap();
             self.plugins.build_targets(cfg, &mgr)
@@ -132,7 +141,7 @@ impl AppState {
             .map(|t| t.id.clone())
             .unwrap_or_default();
 
-        let mut items: Vec<(String, Arc<dyn TargetStorage>, String)> = Vec::new();
+        let mut items: Vec<(String, Arc<dyn TargetStorage>, String, bool)> = Vec::new();
         let mut ready_count = 0usize;
         let mut primary: Option<(Arc<dyn TargetStorage>, String, bool)> = None;
         for b in built {
@@ -142,7 +151,7 @@ impl AppState {
             if b.ready {
                 ready_count += 1;
             }
-            items.push((b.id, b.storage, b.name));
+            items.push((b.id, b.storage, b.name, b.ready));
         }
         self.targets.replace_all(items);
 
