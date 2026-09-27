@@ -39,7 +39,7 @@ use crate::infra::storage_trait::{ProgressCb, StorageError, StorageResult, Targe
 use crate::infra::target::webdav::{WebdavTarget, DEFAULT_URL};
 
 use super::super::abi::{AbiTargetCaps, C_ABI_VERSION, KzwrTargetAbi};
-use super::super::api::{PluginKind, PluginMeta, PluginUi, TargetPlugin};
+use super::super::api::{PluginKind, PluginMeta, PluginUi, TargetPlugin, UiBlock};
 use super::super::target_abi::CApiTarget;
 
 /// 密文在喂给 `WebdavTarget` 前的切块大小（其内部会叠加自己的 100MB 分片）
@@ -594,12 +594,19 @@ impl WebdavAbiPlugin {
             builtin: true,
             description: "kzwr 官方 WebDAV 备份目标（默认启用，ABI 推块桥）".to_string(),
         };
+        // UI 完全由通用 schema 描述（不再依赖前端手写组件）：
+        // - 凭据本身在「目标」页管理（多目标模型，ADR-014），这里只作说明与指引；
+        // - 上传并发由 `supports_plan` 驱动，前端 `PluginBlocks` 会自动渲染该设置项。
         let ui = Some(PluginUi {
             section: "settings".to_string(),
             title: "备份目标（WebDAV）".to_string(),
             order: 10,
-            component: Some("webdav".to_string()),
-            blocks: Vec::new(),
+            component: None,
+            blocks: vec![UiBlock::Tips {
+                text: "kzwr 官方 WebDAV 备份目标。账号与密码在「目标」页配置 \
+                       （支持多个目标，各自独立凭据与快照）。"
+                    .to_string(),
+            }],
         });
         // 内置 WebDAV **具备**并发回传能力（已实现 plan_* 三个回调），但**默认不启用**：
         // `max_parallel = 0` 表示顺序上传；用户在本插件卡片里配置 ≥2 才会开启。

@@ -16,12 +16,14 @@
     skip: 'info',
   };
   const PAGE_OF = {
-    webdav: 'settings',
+    // 凭据在「目标」页管理（多目标模型）；插件相关在「插件」页
+    webdav: 'targets',
     key: 'settings',
-    kzwr: 'settings',
-    quota: 'settings',
-    paths: 'backup',
-    schedule: 'backup',
+    kzwr: 'plugins',
+    quota: 'plugins',
+    // 源路径与定时都是**任务级**配置
+    paths: 'tasks',
+    schedule: 'tasks',
   };
 
   $: items = (result && result.items) || [];

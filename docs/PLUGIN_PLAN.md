@@ -340,8 +340,26 @@ typedef struct KzwrTargetAbi {
 | `components/PluginSection.svelte` | 机制徽标（`c-abi-v1` / `rust-direct`）→ **签名状态**徽标（`已签名/未签名/验签失败`）+ 公钥编辑框 + 卸载按钮 + 孤立数据提示 | ✅ |
 | `components/PluginBlocks.svelte` | 新增 `scope: "host"` 分支：该字段不投插件 `action`，改投 `POST /api/plugins/<id>/data`；打开时回显（值已脱敏 → 占位「已设置（留空则保持不变…）」） | ✅ |
 | `lib/api.js` | 新增 `pluginData` / `pluginDataSet` / `pluginPurge`；kzwr 三个方法 URL 不变（多段动作名兼容） | ✅ |
-| `views/SettingsPage.svelte` | 向 `PluginSection` 传 `pubkeys` / `allowUnsigned` | ✅ |
-| `lib/plugins.js` | 无语义改动（`ui` / `api_base` 驱动不变）；`BUILTIN_COMPONENTS` 保留 | — |
+
+### 7.1 前端页面重构（2026-09-27，插件化收尾）
+
+插件化改动很大，前端仍留着一整套**插件化前**的遗留形态，故做了一次结构性重构：
+
+| 变更 | 说明 |
+|---|---|
+| **新增「插件」页**（`views/PluginsPage.svelte`） | 插件卡片区（通用 UI Schema）+ 外置插件管理（开关/目录/公钥/诊断/卸载）。插件不再混在设置页 |
+| **设置页精简** | 只留核心项：age 密钥 / 通知 / 配置迁移（+ 日志页的调试开关） |
+| **删除「备份」页** | `BackupPage`/`BackupConfigSection`/`BackupSection`：编辑的全局 `backup_paths`/定时在后端**只写第一个任务**（`cfg.tasks.first_mut()`），多任务下语义误导；任务页已完整覆盖 |
+| **删除 `WebdavSection`** | 凭据改在「目标」页按**多目标**管理（ADR-014），设置页那份会绕过多目标模型 |
+| **删除 `KzwrSection`** | kzwr 改为**插件 schema 渲染**；为补回原组件独有的能力，后端新增 `/quota`（空间预警阈值）与 `/space`（动态指标）两条插件路由 |
+| **删除 `RetentionSection`** | 保留策略是**任务级**配置（备份流水线读 `ctx.task.retention`），设置页那份全局配置实际不生效 → 统一在任务页编辑 |
+| **删除 `RailAccount`** | 侧栏常驻账号卡（依赖可选 kzwr token）；账号信息在插件卡片内已有 |
+| **`OverviewSection` 并入 `DashboardPage`** | 概览改为**按任务/目标聚合统计**（任务数/就绪数/目标数/云端文件/下次触发），不再展示遗留全局字段 |
+| **顶栏「立即备份」移除** | `run_backup_now` 只跑 `default_task_id`，语义含糊；任务页已有**每任务**「立即备份」 |
+| **`component` 分支彻底移除** | 内置 webdav/kzwr 的 UI 也改为完整 `blocks` 描述（后端 `component: None`）→ 前端不再有插件专用手写组件，`BUILTIN_COMPONENTS` 删除 |
+| **动态 `metric`** | `metric` 块支持 `action`：前端渲染时 `GET` 该路径取实时值（用于云端空间用量），失败则保留静态文案 |
+
+净减约 2000 行（19 文件，+441/−2461）。删除的组件均已在重构前确认无引用。
 
 ---
 

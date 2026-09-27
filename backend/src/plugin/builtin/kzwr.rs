@@ -48,7 +48,9 @@ impl EnhancePlugin for KzwrPlugin {
     fn routes(&self) -> axum::Router<AppState> {
         axum::Router::new()
             .route("/user", axum::routing::get(kzwr_user))
+            .route("/space", axum::routing::get(kzwr_space))
             .route("/token", axum::routing::post(kzwr_token_save))
+            .route("/quota", axum::routing::post(kzwr_quota_save))
             .route("/trash/empty", axum::routing::post(kzwr_trash_empty))
     }
 
@@ -67,17 +69,30 @@ impl EnhancePlugin for KzwrPlugin {
         Some(empty_recycle_bin_if_configured(state).await as u64)
     }
 
-    /// 设置页：增强功能卡片。
+    /// 「插件」页：增强功能卡片（界面完全由 `blocks` 描述）。
     ///
-    /// 内置前端用 `component="kzwr"` 的完整组件；**不认识该组件的前端**（或外置插件）
-    /// 则由 `blocks` 通用渲染，因此这里同时给出可被 schema 描述的等价操作。
+    /// **完全由通用 UI Schema 描述**（`blocks` 覆盖全部可操作项），不再依赖前端的
+    /// 手写组件：token 保存、空间预警阈值、清空回收站都能被 `PluginBlocks` 渲染出来。
+    /// 因此这里**不设** `component`（设了会让前端优先走内置组件、绕开 schema）。
     fn ui(&self) -> Option<PluginUi> {
         Some(PluginUi {
             section: "settings".to_string(),
             title: "增强功能（酷族账号）".to_string(),
             order: 20,
-            component: Some("kzwr".to_string()),
+            component: None,
             blocks: vec![
+                UiBlock::Tips {
+                    text: "备份与恢复走 WebDAV，不需要 token。这里配置后可查看云端空间用量、\
+                           清理回收站与设置空间预警。"
+                        .to_string(),
+                },
+                // 动态指标：前端渲染时 GET /api/p/kzwr/space 取实时值
+                UiBlock::Metric {
+                    label: "云端空间".to_string(),
+                    value: "读取中…".to_string(),
+                    hint: None,
+                    action: Some("/space".to_string()),
+                },
                 UiBlock::Text {
                     field: "access_token".to_string(),
                     label: "access-token".to_string(),
@@ -89,15 +104,21 @@ impl EnhancePlugin for KzwrPlugin {
                     // kzwr 的 access-token 由插件自己的 `/token` 路由处理（非宿主代存）
                     scope: None,
                 },
+                UiBlock::Number {
+                    field: "percent".to_string(),
+                    label: "空间用量预警阈值".to_string(),
+                    value: Some(85),
+                    suffix: Some("%".to_string()),
+                    action: "/quota".to_string(),
+                    button: "保存".to_string(),
+                    // 由插件自己的 `/quota` 路由处理（写入 cfg.kzwr.quota_warn_percent）
+                    scope: None,
+                },
                 UiBlock::Button {
                     label: "清空云端回收站".to_string(),
                     action: "/trash/empty".to_string(),
                     danger: true,
                     confirm: Some("将物理删除回收站内所有文件，不可恢复".to_string()),
-                },
-                UiBlock::Tips {
-                    text: "空间用量可读取 GET /api/p/kzwr/user；内置前端组件提供完整界面。"
-                        .to_string(),
                 },
             ],
         })
@@ -121,7 +142,7 @@ impl EnhancePlugin for KzwrPlugin {
                 status: "warn".to_string(),
                 detail: "未配置 access-token（可选）：无存储空间信息与回收站清理".to_string(),
                 hint: Some(
-                    "如需存储空间预警/清空回收站：浏览器登录酷族 → F12 → Application → Cookies → www.kzwr.com → 复制 access-token 填入设置页"
+                    "如需存储空间预警/清空回收站：浏览器登录酷族 → F12 → Application → Cookies → www.kzwr.com → 复制 access-token 填入「插件」页"
                         .to_string(),
                 ),
             });
@@ -444,6 +465,33 @@ pub struct KzwrTokenResponse {
     pub configured: bool,
     /// 账号一致性提醒（如 API 账号与 WebDAV 账号不同）
     pub warning: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 空间预警阈值保存请求（`/api/p/kzwr/quota`）
+#[derive(Debug, Deserialize)]
+pub struct KzwrQuotaRequest {
+    /// 阈值百分比（0 = 关闭预警）；越界会被裁剪到 0..=100
+    pub percent: u64,
+}
+
+/// 空间预警阈值保存结果
+#[derive(Serialize, Default)]
+pub struct KzwrQuotaResponse {
+    pub success: bool,
+    /// 实际生效的阈值（已裁剪）
+    pub percent: u64,
+    pub error: Option<String>,
+}
+
+/// 空间用量（供 UI Schema 的动态 `metric` 块读取）
+#[derive(Serialize, Default)]
+pub struct KzwrSpaceResponse {
+    /// 展示值（如 "1.2 GB / 10 GB"）
+    pub value: String,
+    pub hint: Option<String>,
+    /// 已用百分比（0-100；无数据时 0）
+    pub percent: u64,
     pub error: Option<String>,
 }
 
@@ -889,6 +937,98 @@ async fn kzwr_token_save(
                 )),
             })
         }
+    }
+}
+
+/// kzwr 增强：保存云端空间占用预警阈值（0 = 关闭预警）
+///
+/// 与 `/token` 同属插件自带路由（挂在 `/api/p/kzwr/quota`）。
+/// 提供这条路由是为了让**通用 UI Schema 渲染**也能配置该阈值
+/// （原先只有内置前端的 `KzwrSection` 组件能改，删掉该组件后必须有替代路径）。
+async fn kzwr_quota_save(
+    State(state): State<AppState>,
+    Json(body): Json<KzwrQuotaRequest>,
+) -> Json<KzwrQuotaResponse> {
+    // 越界裁剪到 0..=100（0 = 关闭预警），避免无意义的值落盘
+    let percent = body.percent.min(100);
+    let saved = {
+        let mgr = state.config.lock().unwrap();
+        let mut cfg = mgr.load().unwrap_or_default();
+        cfg.kzwr.quota_warn_percent = percent;
+        mgr.save(&cfg)
+    };
+    match saved {
+        Ok(_) => {
+            state.audit.record(
+                "kzwr.quota",
+                if percent == 0 {
+                    "关闭云端空间预警".to_string()
+                } else {
+                    format!("云端空间预警阈值设为 {percent}%")
+                },
+                true,
+                None,
+            );
+            Json(KzwrQuotaResponse {
+                success: true,
+                percent,
+                error: None,
+            })
+        }
+        Err(e) => Json(KzwrQuotaResponse {
+            success: false,
+            percent,
+            error: Some(format!("保存失败: {:#}", e)),
+        }),
+    }
+}
+
+/// kzwr 增强：读取云端空间用量（供 UI Schema 的动态 `metric` 块用）
+///
+/// 前端渲染卡片时 GET 本路径，用返回值覆盖 `metric` 的静态文案 ——
+/// 这样「空间用量」这种**实时数字**不需要专用前端组件也能展示。
+async fn kzwr_space(State(state): State<AppState>) -> Json<KzwrSpaceResponse> {
+    let Some(token) = kzwr_token_of(&state) else {
+        return Json(KzwrSpaceResponse {
+            value: "未配置".to_string(),
+            hint: Some("填写 access-token 后可查看云端空间".to_string()),
+            percent: 0,
+            error: None,
+        });
+    };
+    state.kzwr.set_token(token);
+    match state.kzwr.get_member().await {
+        Ok(v) if member_is_login(&v) => {
+            let data = v.get("data").cloned().unwrap_or_default();
+            let num = |key: &str| data.get(key).and_then(|x| x.as_u64()).unwrap_or(0);
+            let total = num("total").max(num("capacity"));
+            let used = num("use");
+            let pct = if total > 0 { used * 100 / total } else { 0 };
+            Json(KzwrSpaceResponse {
+                value: format!("{} / {}", human_bytes(used), human_bytes(total)),
+                hint: Some(format!(
+                    "已用 {pct}%{}",
+                    data.get("plan")
+                        .and_then(|x| x.as_str())
+                        .map(|p| format!(" · {p}"))
+                        .unwrap_or_default()
+                )),
+                percent: pct,
+                error: None,
+            })
+        }
+        Ok(_) => Json(KzwrSpaceResponse {
+            value: "登录态失效".to_string(),
+            hint: Some("请重新从浏览器 Cookie 复制 access-token".to_string()),
+            percent: 0,
+            error: Some(KZWR_TOKEN_INVALID.to_string()),
+        }),
+        Err(e) => Json(KzwrSpaceResponse {
+            value: "读取失败".to_string(),
+            hint: None,
+            percent: 0,
+            error: Some(format!("获取空间用量失败：{e}")),
+        }),
     }
 }
 

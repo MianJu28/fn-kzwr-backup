@@ -36,13 +36,9 @@ export const api = {
   // 健康检查
   health: () => get('/api/health'),
 
-  // 配置（备份路径 / 目标文件夹 / 定时）
+  // 配置（核心项：调试日志开关；备份路径/定时/保留策略按任务管理，见 tasks()）
   config: () => get('/api/config'),
   saveConfig: (cfg) => post('/api/config', cfg),
-
-  // WebDAV 凭据（地址固定，后端保存前实测连通性）
-  saveWebdav: (username, password) => post('/api/webdav/config', { username, password }),
-  userInfo: () => get('/api/user/info'),
 
   // age 密钥
   keys: () => get('/api/keys'),
@@ -63,8 +59,7 @@ export const api = {
   exportConfig: (passphrase) => post('/api/config/export', { passphrase }),
   importConfig: (passphrase, config) => post('/api/config/import', { passphrase, config }),
 
-  // 备份 / 恢复
-  runBackup: () => post('/api/backup/run'),
+  // 恢复（备份按任务触发：runTask(id)，见下）
   /** 备份文件夹概况（文件数/文件夹数/总大小） */
   restoreFiles: () => get('/api/restore/files'),
   /** 按目录懒加载：只取一层子项（目录附递归统计）；task 指定任务（多任务下同一路径可能属于多个任务） */
@@ -117,13 +112,9 @@ export const api = {
   pluginDataSet: (id, fields, remove = []) =>
     post(`/api/plugins/${encodeURIComponent(id)}/data`, { fields, remove }),
 
-  // kzwr 增强插件（非备份通道，可选，需 access-token）
-  /** 账号信息（存储空间/套餐；未配置 token 时返回 configured:false + 指引） */
-  kzwrUser: () => get('/api/p/kzwr/user'),
-  /** 保存或清除 access-token（空串 = 清除） */
-  kzwrSaveToken: (access_token) => post('/api/p/kzwr/token', { access_token }),
-  /** 清空云端回收站（物理删除，不可恢复） */
-  kzwrTrashEmpty: () => post('/api/p/kzwr/trash/empty'),
+  // 注：kzwr 增强（token / 空间阈值 / 回收站）不再有专用方法 ——
+  // 它现在是普通插件，界面由后端 `ui.blocks` 驱动，统一走 pluginGet/pluginPost。
+  // 需要账号信息时用 `pluginGet('/api/p/kzwr', '/user')`。
 
   /** 定时任务预览：cron → 未来 5 次触发时间（服务器本地时区） */
   schedulePreview: (cron) => post('/api/schedule/preview', { cron }),

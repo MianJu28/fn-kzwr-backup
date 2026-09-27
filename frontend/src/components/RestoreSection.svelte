@@ -227,15 +227,15 @@
         <div class="icon-wrap"><Icon name="database" size={19} /></div>
         {#if backupPaths.length === 0}
           <strong>尚未配置备份路径</strong>
-          请先在「备份」页添加要备份的文件夹
-          <button class="btn btn-sm btn-soft cta" on:click={() => onGoto && onGoto('backup')}>
-            前往备份页<Icon name="arrow-right" size={13} />
+          请先在「任务」页新建一个备份任务并添加源文件夹
+          <button class="btn btn-sm btn-soft cta" on:click={() => onGoto && onGoto('tasks')}>
+            前往任务页<Icon name="arrow-right" size={13} />
           </button>
         {:else}
           <strong>暂无备份数据</strong>
-          请先在「备份」页执行一次备份
-          <button class="btn btn-sm btn-soft cta" on:click={() => onGoto && onGoto('backup')}>
-            前往备份页<Icon name="arrow-right" size={13} />
+          请先在「任务」页对某个任务执行一次备份
+          <button class="btn btn-sm btn-soft cta" on:click={() => onGoto && onGoto('tasks')}>
+            前往任务页<Icon name="arrow-right" size={13} />
           </button>
         {/if}
       </div>

@@ -103,6 +103,10 @@ pub struct EnhanceCaps {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginUi {
     /// 分区：`settings` | `dashboard`
+    ///
+    /// 注：`settings` 是**稳定 ABI 的既有取值**（外置插件已按此发送，不可改名）。
+    /// 前端插件化重构后，它渲染在独立的**「插件」页**而非设置页 ——
+    /// 该字段现在只表示「配置类卡片」，与具体页面解耦。
     pub section: String,
     /// 卡片标题
     pub title: String,
@@ -125,11 +129,19 @@ pub struct PluginUi {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UiBlock {
     /// 只读指标（如空间用量）
+    ///
+    /// `value` 是**静态**文案；若填了 `action`，前端会在卡片渲染时对该路径发起
+    /// **GET** 请求，并用响应里的 `value` / `hint` 覆盖显示 —— 用于「需要实时查询」
+    /// 的指标（如云端空间用量）。这样插件不必为了一个动态数字去写专用前端组件。
     Metric {
         label: String,
+        #[serde(default)]
         value: String,
         #[serde(default)]
         hint: Option<String>,
+        /// 可选：读取该路径（相对 `api_base`）取实时值，响应形如 `{"value":"...","hint":"..."}`
+        #[serde(default)]
+        action: Option<String>,
     },
     /// 文本/密码输入 + 提交按钮
     Text {

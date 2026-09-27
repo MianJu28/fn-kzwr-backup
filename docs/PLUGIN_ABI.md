@@ -104,6 +104,14 @@ typedef struct KzwrPluginAbi {
 - `ui` 可为 `null`（无界面插件）
 - `blocks[].action` 是**相对插件前缀**的路径，建议写成 `/xxx`（宿主也容忍漏写 `/`）；前端把它拼成 `POST /api/p/<插件id>/<action>`
 - 未知字段双方都应忽略（向前兼容）
+- **`component` 已弃用**：前端不再有「内置组件」分支，所有插件（含内置 webdav/kzwr）
+  一律用 `blocks` 渲染。请把界面**完整**写进 `blocks`，不要依赖 `component`。
+- **动态 `metric`**：`metric` 块可带 `action`（如 `"/space"`），前端渲染时会 `GET`
+  该路径，并用响应里的 `{"value": "...", "hint": "..."}` 覆盖静态文案 ——
+  用于「空间用量」这类**实时数字**，避免为一个数字写专用前端组件。
+  读取失败时保留静态 `value`（可当作兜底文案）。
+- `section` 取值 `settings`/`dashboard` 是**既有约定**（外置插件已按此发送，不要改名）；
+  重构后 `settings` 类卡片渲染在独立的**「插件」页**，与「设置」页无关。
 
 ### 4.2 `cfg_json`（宿主 → 插件：配置快照，**不含任何凭据**）
 
@@ -140,7 +148,7 @@ typedef struct KzwrPluginAbi {
 | 写入 | `POST /api/plugins/<id>/data`（body：`{"fields": {键: 值}, "remove": [键]}`），值经 `ConfigManager::encrypt_field` **加密**落盘到 `AppConfig.plugin_data[<id>]` |
 | 读取 | 打开实例时按命名空间解密，注入 `target_json.config`（插件侧读 `config.<键>`）；前端回显走 `GET /api/plugins/<id>/data`（值**脱敏**，只答 `redacted`/是否已设置） |
 | 卸载 | `POST /api/plugins/<id>/purge`：该插件仍被任一目标（`TargetConfig.kind`）或任务引用时**拒绝**，并列出引用项 |
-| 孤立检测 | 启动时比对「有 `plugin_data` 但没有已加载插件」的 id → `GET /api/plugins` 的 `orphan_data[]`，设置页提示清理 |
+| 孤立检测 | 启动时比对「有 `plugin_data` 但没有已加载插件」的 id → `GET /api/plugins` 的 `orphan_data[]`，「插件」页提示清理 |
 
 > 注意：`KzwrTargetAbi.config_get` / `config_set` 两个函数指针**目前是预留位**
 > （SDK 导出时为 `None`，宿主未实现回调）。插件请走上表的 `target_json.config` 通道。
@@ -190,9 +198,9 @@ bash Scripts/build_plugins.sh          # → dist/plugins/libmy_plugin.so
 #    自签流程：
 bash Scripts/sign_plugin.sh keygen                      # 生成 Scripts/keys/sign.key 并打印公钥
 bash Scripts/sign_plugin.sh sign dist/plugins           # 生成 <so>.sig（64 字节裸 Ed25519 签名）
-#    再把打印出的公钥填进 设置页 →「插件公钥」（plugins.pubkeys）
+#    再把打印出的公钥填进「插件」页 → 外置插件管理的「插件公钥」（plugins.pubkeys）
 
-# 6) 安装：放进 $TRIM_PKGETC/plugins/，设置页开启「外置插件加载」后重启应用
+# 6) 安装：放进 $TRIM_PKGETC/plugins/，在「插件」页开启「外置插件加载」后重启应用
 ```
 
 > 随包插件（`$TRIM_APPDEST/plugins/`）由发布流程用**官方私钥**签名，宿主内置对应公钥
@@ -204,7 +212,7 @@ bash Scripts/sign_plugin.sh sign dist/plugins           # 生成 <so>.sig（64 �
 - `GET /api/plugins` 的 `external` 字段：`enabled` / `dirs`（扫描到的目录与来源）/ `reports[]`
   （每个 `.so` 的 `loaded`、`mechanism`、`id`、`abi`、`error`、
   **`signature`**（`verified` / `unsigned` / `failed`）、**`sig_file`**（`.sig` 是否存在））
-- 设置页「外置插件（动态库）」卡片直接展示上述结果，并用徽标标出 **稳定 ABI v1**
+- 「插件」页的「外置插件（动态库）」卡片直接展示上述结果，并用徽标标出 **稳定 ABI v1**
   （~~Rust 直连~~ 已移除）与**签名三态**（已签名 / 未签名 / 验签失败）
 - `sig_file=false` + `signature=failed` 是「压根没签名」；`sig_file=true` + `signature=failed`
   是「签名对不上」（可能被篡改）——两者风险不同，前端文案必须区分

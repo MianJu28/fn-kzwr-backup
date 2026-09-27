@@ -33,6 +33,8 @@
   let placeholders = {};
   /** 插件未加载，宿主无法区分密钥字段 → 所有已存值均只提示「已设置」 */
   let hostRedacted = false;
+  /** 动态指标：`metric.action` → { value, hint }（渲染时 GET 该路径取实时值） */
+  let metrics = {};
 
   $: blocks = (plugin && plugin.ui && plugin.ui.blocks) || [];
 
@@ -52,7 +54,38 @@
     oks = {};
     placeholders = {};
     hostRedacted = false;
+    metrics = {};
     loadHostData();
+    loadMetrics();
+  }
+
+  /**
+   * 载入**动态指标**（`metric.action`）
+   *
+   * 静态 `value` 只是占位文案；插件可通过 `action` 暴露一个 GET 接口返回实时值
+   * （如云端空间用量），避免为了一个数字去写专用前端组件。
+   * 读取失败**不覆盖**静态文案（保留插件给的兜底说明），也不弹错打断渲染。
+   */
+  async function loadMetrics() {
+    const dyn = blocks.filter((b) => b.type === 'metric' && b.action);
+    if (dyn.length === 0) return;
+    const next = {};
+    await Promise.all(
+      dyn.map(async (b) => {
+        const path = b.action.startsWith('/') ? b.action : `/${b.action}`;
+        try {
+          const r = await api.pluginGet(plugin.api_base, path);
+          if (r && !r.error && r.value) {
+            next[b.action] = { value: String(r.value), hint: r.hint ? String(r.hint) : '' };
+          } else if (r && r.error) {
+            next[b.action] = { value: String(r.value || '读取失败'), hint: String(r.error) };
+          }
+        } catch (e) {
+          /* 保留静态文案 */
+        }
+      })
+    );
+    metrics = { ...metrics, ...next };
   }
 
   /**
@@ -222,8 +255,10 @@
       {:else if b.type === 'metric'}
         <div class="stat">
           <div class="stat-label">{b.label}</div>
-          <div class="stat-value">{b.value}</div>
-          {#if b.hint}<div class="stat-sub">{b.hint}</div>{/if}
+          <div class="stat-value">{metrics[b.action]?.value ?? b.value}</div>
+          {#if metrics[b.action]?.hint ?? b.hint}
+            <div class="stat-sub">{metrics[b.action]?.hint ?? b.hint}</div>
+          {/if}
         </div>
       {:else if b.type === 'text' || b.type === 'number'}
         <div class="field">

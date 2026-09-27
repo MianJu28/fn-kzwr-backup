@@ -1,10 +1,12 @@
 /**
  * 前端插件注册表
  *
- * 页面上「有哪些插件卡片、什么顺序、用哪个组件渲染」**全部来自后端 `/api/plugins`**，
- * 前端不硬编码具体插件（新增插件不必改这里、也不必重新打包前端）：
- * - 后端返回 `ui.component`（如 `webdav` / `kzwr`）→ 用内置组件渲染（体验最好）
- * - 不认识该组件 → 回退到 `ui.blocks` 的通用渲染（components/PluginBlocks.svelte）
+ * 页面上「有哪些插件卡片、什么顺序、长什么样」**全部来自后端 `/api/plugins`**，
+ * 前端不硬编码具体插件（新增插件不必改这里、也不必重新打包前端）。
+ *
+ * 渲染方式：**一律用通用 UI Schema**（`ui.blocks` → `components/PluginBlocks.svelte`）。
+ * 内置插件（webdav / kzwr）也把自己的界面完整声明为 blocks，
+ * 因此前端不再有「内置组件 vs 通用渲染」的分支，也没有插件专用的手写组件。
  *
  * 本模块只负责：拉取、缓存、按分区过滤排序。
  */
@@ -52,13 +54,12 @@ export function sectionsFor(plugins, section = 'settings') {
     .sort((a, b) => (a.ui.order || 0) - (b.ui.order || 0));
 }
 
-/** 前端**已内置**的组件名（其余插件走通用 UI Schema 渲染） */
-export const BUILTIN_COMPONENTS = ['webdav', 'kzwr'];
-
 /**
  * `/api/plugins` 不可用时的兜底区块（保持页面可用，不依赖网络）
  *
  * 仅用于展示位置与顺序；正常路径永远以接口返回为准。
+ * `blocks` 为空 → 卡片会显示「暂未声明界面」提示，这是**接口失败**时的预期表现
+ * （正常联网时后端会给出完整 blocks）。
  */
 export const FALLBACK_SECTIONS = [
   {
@@ -68,7 +69,7 @@ export const FALLBACK_SECTIONS = [
     builtin: true,
     available: true,
     api_base: '',
-    ui: { section: 'settings', title: '备份目标（WebDAV）', order: 10, component: 'webdav', blocks: [] },
+    ui: { section: 'settings', title: '备份目标（WebDAV）', order: 10, blocks: [] },
   },
   {
     id: 'kzwr',
@@ -77,6 +78,6 @@ export const FALLBACK_SECTIONS = [
     builtin: true,
     available: true,
     api_base: '/api/p/kzwr',
-    ui: { section: 'settings', title: '增强功能（酷族账号）', order: 20, component: 'kzwr', blocks: [] },
+    ui: { section: 'settings', title: '增强功能（酷族账号）', order: 20, blocks: [] },
   },
 ];

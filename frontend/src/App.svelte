@@ -1,9 +1,9 @@
 <script>
   import DashboardPage from './views/DashboardPage.svelte';
-  import BackupPage from './views/BackupPage.svelte';
   import RestorePage from './views/RestorePage.svelte';
   import TasksPage from './views/TasksPage.svelte';
   import TargetsPage from './views/TargetsPage.svelte';
+  import PluginsPage from './views/PluginsPage.svelte';
   import SettingsPage from './views/SettingsPage.svelte';
   import AuditPage from './views/AuditPage.svelte';
   import LogsPage from './views/LogsPage.svelte';
@@ -13,7 +13,6 @@
   import ConfirmDialog from './components/ConfirmDialog.svelte';
   import Icon from './components/Icon.svelte';
   import Logo from './components/Logo.svelte';
-  import RailAccount from './components/RailAccount.svelte';
 
   import { api } from './lib/api.js';
   import { APP_BASE } from './lib/appBase.js';
@@ -31,18 +30,12 @@
   let currentPage = 'dashboard';
   let loading = true;
 
-  // WebDAV 目标
-  let webdavConfigured = false;
-  let webdavUrl = '';
-
-  // 备份配置
+  // 备份路径（**只用于恢复页**：判断「还没配过任何源」以给出引导文案；
+  // 真正的路径配置在「任务」页，按任务管理）
   let backupPaths = [];
-  let targetFolder = 'fn-backup';
-  let scheduleCron = '';
-  let scheduleCronValid = true;
   // 宿主时区说明（如「CST (UTC+08:00)」，用于页面标注时间口径）
   let scheduleTimezone = '';
-  // 插件清单（/api/plugins）：设置页区块由它驱动
+  // 插件清单（/api/plugins）：「插件」页的卡片区由它驱动
   let plugins = [];
   // 多任务 / 多目标（ADR-014）
   let tasks = [];
@@ -65,10 +58,6 @@
   let liveStatus = null;
   let wsConnected = false;
 
-  // 账号
-  let userInfo = null;
-  let userInfoError = null;
-
   // 密钥
   let keyInfo = null;
   let revealKey = '';
@@ -76,21 +65,8 @@
 
   // 告警与通知
   let alerts = [];
-  // 非敏感配置回显：WebDAV 用户名（密码永不返回）与保留策略
-  let webdavUsername = '';
   let debugOn = false;
-  let retention = {
-    enabled: false,
-    cleanup_unmanaged: false,
-    min_age_days: 0,
-    empty_recycle_bin: false,
-  };
-  // kzwr REST 增强功能（可选）
-  let kzwrConfigured = false;
-  let kzwrUser = null;
-  let kzwrQuotaWarnPercent = 85;
-  // 账号一致性提醒 / 一键体检
-  let webdavWarning = '';
+  // 一键体检
   let setupResult = null;
   let webhookUrl = '';
   let webhookHeaders = [];
@@ -100,7 +76,7 @@
     { id: 'dashboard', label: '概览', icon: 'grid' },
     { id: 'tasks', label: '任务', icon: 'package' },
     { id: 'targets', label: '目标', icon: 'cloud' },
-    { id: 'backup', label: '备份', icon: 'upload' },
+    { id: 'plugins', label: '插件', icon: 'package' },
     { id: 'restore', label: '恢复', icon: 'download' },
     { id: 'settings', label: '设置', icon: 'sliders' },
     { id: 'audit', label: '审计', icon: 'file' },
@@ -108,19 +84,18 @@
   ];
 
   const PAGE_META = {
-    dashboard: { title: '概览', desc: '备份状态、配置一览与实时任务进度' },
+    dashboard: { title: '概览', desc: '备份状态、任务与目标一览、实时任务进度' },
     tasks: { title: '备份任务', desc: '每个任务 = 源文件夹 + 目标 + 定时 + 保留策略，各自独立增量与快照' },
     targets: { title: '备份目标', desc: '远程存储目的地与账号凭据，一个目标可被多个任务共用' },
-    backup: { title: '备份', desc: '配置备份路径与定时任务，或立即执行一次增量备份' },
+    plugins: { title: '插件', desc: '插件能力卡片与外置插件（动态库）管理：开关、目录、签名公钥与诊断' },
     restore: { title: '恢复', desc: '浏览云端备份内容，按文件或目录恢复到原位置' },
-    settings: { title: '设置', desc: 'WebDAV 凭据、加密密钥、通知与配置迁移' },
+    settings: { title: '设置', desc: '加密密钥、通知与配置迁移' },
     audit: { title: '操作审计', desc: '敏感与破坏性操作的本地留痕（audit.log）' },
     logs: { title: '运行日志', desc: '服务端运行日志查看、清空与下载' },
   };
 
   $: page = PAGE_META[currentPage] || PAGE_META.dashboard;
   $: alertsCount = alerts.length;
-  $: readyToRun = webdavConfigured && backupPaths.length > 0;
 
   /* ── 数据加载 ─────────────────────────────────────────────── */
 
@@ -139,7 +114,7 @@
   async function loadConfig() {
     try {
       const d = await api.config();
-      // 插件清单：决定设置页/概览页显示哪些插件卡片、什么顺序
+      // 插件清单：决定「插件」页显示哪些插件卡片、什么顺序
       plugins = await loadPlugins(true);
       // 时间展示统一按宿主（NAS）时区，而不是浏览器时区
       setHostTimezone(d.host_utc_offset_minutes);
@@ -148,21 +123,8 @@
       pluginsDirCfg = d.plugins_dir || '';
       pluginsPubkeysCfg = d.plugins_pubkeys || [];
       pluginsAllowUnsigned = !!d.plugins_allow_unsigned;
+      // 仅用于恢复页的空状态引导；路径本身按任务管理（见「任务」页）
       backupPaths = d.backup_paths || [];
-      targetFolder = d.target_folder || 'fn-backup';
-      scheduleCron = d.schedule_cron || '';
-      scheduleCronValid = d.schedule_cron_valid !== false;
-      webdavConfigured = !!d.webdav_configured;
-      webdavUrl = d.webdav_url || '';
-      webdavUsername = d.webdav_username || '';
-      retention = d.retention || {
-        enabled: false,
-        cleanup_unmanaged: false,
-        min_age_days: 0,
-        empty_recycle_bin: false,
-      };
-      kzwrConfigured = !!d.kzwr_token_configured;
-      kzwrQuotaWarnPercent = d.kzwr_quota_warn_percent ?? 85;
       webhookUrl = d.webhook_url || '';
       webhookHeaders = d.webhook_headers || [];
       webhookBody = d.webhook_body || '';
@@ -170,42 +132,6 @@
       debugOn = !!d.debug;
     } catch (e) {
       error = e.message;
-    }
-  }
-
-  /** 加载 kzwr 增强信息（未配置 token 时不请求，避免无谓提示） */
-  async function loadKzwrUser() {
-    if (!kzwrConfigured) {
-      kzwrUser = null;
-      return;
-    }
-    try {
-      kzwrUser = await api.kzwrUser();
-    } catch (e) {
-      kzwrUser = { error: e.message };
-    }
-  }
-
-  /** 侧栏账号卡手动刷新 */
-  let refreshingKzwr = false;
-  async function handleRailRefresh() {
-    if (refreshingKzwr) return;
-    refreshingKzwr = true;
-    try {
-      await loadUserInfo();
-      await loadKzwrUser();
-    } finally {
-      refreshingKzwr = false;
-    }
-  }
-
-  async function loadUserInfo() {
-    try {
-      const d = await api.userInfo();
-      userInfo = d;
-      userInfoError = d.error || null;
-    } catch (e) {
-      userInfoError = e.message;
     }
   }
 
@@ -287,15 +213,12 @@
     await Promise.all([
       loadHealth(),
       loadConfig(),
-      loadUserInfo(),
       loadKeys(),
       loadAlerts(),
       loadRestoreFiles(),
       loadTasks(),
       loadTargets(),
     ]);
-    // 依赖 loadConfig 得到的 kzwrConfigured，故串行放在其后
-    await loadKzwrUser();
     loading = false;
   }
 
@@ -358,56 +281,6 @@
     }
   }
 
-  /* ── 操作：备份 ───────────────────────────────────────────── */
-
-  async function handleSaveConfig() {
-    busy = true;
-    error = null;
-    try {
-      const d = await api.saveConfig({
-        backup_paths: backupPaths,
-        target_folder: targetFolder,
-        schedule_cron: scheduleCron.trim(),
-      });
-      scheduleCronValid = d.schedule_cron_valid !== false;
-      if (d.error) {
-        error = d.error;
-        toast.error(d.error, '保存失败');
-      } else if (!scheduleCronValid) {
-        error = 'cron 表达式无效，已拒绝保存';
-        toast.error('cron 表达式无效，已拒绝保存');
-      } else {
-        toast.success('配置已保存并即时生效');
-      }
-    } catch (e) {
-      error = e.message;
-      toast.error(e.message);
-    } finally {
-      busy = false;
-    }
-  }
-
-  /** kzwr 增强：保存或清除 access-token（保存成功后刷新账号信息） */
-  async function handleSaveKzwrToken(token) {
-    busy = true;
-    error = null;
-    try {
-      const d = await api.kzwrSaveToken(token);
-      kzwrConfigured = !!d.configured;
-      if (d.success) {
-        await loadKzwrUser();
-        // 插件可用性变了（token 已配置/清除）：刷新插件清单
-        plugins = await loadPlugins(true);
-      }
-      else if (!kzwrConfigured) kzwrUser = null;
-      return d;
-    } catch (e) {
-      return { success: false, configured: kzwrConfigured, error: e.message };
-    } finally {
-      busy = false;
-    }
-  }
-
   /** 保存外置插件开关、目录与签名公钥（重启应用后生效） */
   async function handleSavePlugins(enabled, dir, pubkeys) {
     busy = true;
@@ -435,61 +308,6 @@
     }
   }
 
-  /** 设置某个目标插件的上传并发路数（并发回传，每插件独立） */
-  async function handleSavePluginParallel(id, n) {
-    busy = true;
-    error = null;
-    try {
-      const d = await api.pluginParallel(id, n);
-      if (d.error) {
-        error = d.error;
-        return { error: d.error };
-      }
-      // 刷新插件清单以回显新的并发度
-      const ps = await api.plugins();
-      plugins = ps.plugins || [];
-      return {};
-    } catch (e) {
-      error = e.message;
-      return { error: e.message };
-    } finally {
-      busy = false;
-    }
-  }
-
-  /** kzwr 增强：保存空间预警阈值（复用 /api/config） */
-  async function handleSaveKzwrQuota(percent) {
-    busy = true;
-    error = null;
-    try {
-      const d = await api.saveConfig({
-        backup_paths: backupPaths,
-        target_folder: targetFolder,
-        kzwr_quota_warn_percent: Math.max(0, Math.min(100, Math.floor(Number(percent) || 0))),
-      });
-      if (d.error) {
-        error = d.error;
-        return { error: d.error };
-      }
-      kzwrQuotaWarnPercent = d.kzwr_quota_warn_percent ?? percent;
-      return {};
-    } catch (e) {
-      error = e.message;
-      return { error: e.message };
-    } finally {
-      busy = false;
-    }
-  }
-
-  /** 定时任务预览：cron → 未来 5 次触发时间 */
-  async function handlePreviewCron(cron) {
-    try {
-      return await api.schedulePreview(cron || '');
-    } catch (e) {
-      return { valid: false, next: [], error: e.message };
-    }
-  }
-
   /** 一键体检 */
   async function handleSetupCheck() {
     busy = true;
@@ -497,7 +315,6 @@
     try {
       setupResult = await api.setupCheck();
       await loadAlerts();
-      if (kzwrConfigured) await loadKzwrUser();
       return setupResult;
     } catch (e) {
       error = e.message;
@@ -510,64 +327,18 @@
 
   /**
    * 插件通用区块（UI Schema）完成一次操作后的回调：
-   * 刷新消息提醒、配置与插件清单（可用性可能已变化）
+   * 刷新消息提醒与配置（插件可用性可能已变化，如 token 已配置/清除）
    */
   async function handlePluginDone() {
     await loadAlerts();
     await loadConfig();
-    if (kzwrConfigured) await loadKzwrUser();
-  }
-
-  /** kzwr 增强：清空回收站 */
-  async function handleEmptyTrash() {
-    busy = true;
-    error = null;
-    try {
-      return await api.kzwrTrashEmpty();
-    } catch (e) {
-      return { emptied: 0, error: e.message };
-    } finally {
-      busy = false;
-    }
-  }
-
-  /** 保存保留策略：只提交保留策略（不提交 cron，避免被无效表达式阻塞） */
-  async function handleSaveRetention(next) {
-    busy = true;
-    error = null;
-    try {
-      const d = await api.saveConfig({
-        backup_paths: backupPaths,
-        target_folder: targetFolder,
-        retention_enabled: next.enabled,
-        retention_cleanup_unmanaged: next.cleanup_unmanaged,
-        retention_min_age_days: next.min_age_days,
-        retention_empty_recycle_bin: next.empty_recycle_bin,
-      });
-      if (d.error) {
-        error = d.error;
-        return { error: d.error };
-      }
-      // 用后端返回值回写，保证页面与磁盘一致
-      retention = d.retention || next;
-      return {};
-    } catch (e) {
-      error = e.message;
-      return { error: e.message };
-    } finally {
-      busy = false;
-    }
   }
 
   /** 切换调试日志：立即生效并持久化 */
   async function handleSaveDebug(enabled) {
     busy = true;
     try {
-      const d = await api.saveConfig({
-        backup_paths: backupPaths,
-        target_folder: targetFolder,
-        debug: enabled,
-      });
+      const d = await api.saveConfig({ debug: enabled });
       if (d.error) {
         error = d.error;
         return { error: d.error };
@@ -577,32 +348,6 @@
     } catch (e) {
       error = e.message;
       return { error: e.message };
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function handleRunBackup() {
-    busy = true;
-    error = null;
-    backupResult = null;
-    try {
-      const d = await api.runBackup();
-      backupResult = d;
-      if (d.error) {
-        error = d.error;
-        if (d.skipped) toast.warn(d.error, '已跳过');
-        else toast.error(d.error, '备份失败');
-      } else {
-        await loadRestoreFiles();
-        toast.success(
-          `上传 ${d.uploaded} 个文件（${d.uploaded_bytes} 字节），未变化 ${d.unchanged}`,
-          '备份完成',
-        );
-      }
-    } catch (e) {
-      error = e.message;
-      toast.error(e.message, '备份失败');
     } finally {
       busy = false;
     }
@@ -627,30 +372,7 @@
     return r;
   }
 
-  /* ── 操作：WebDAV / 密钥 / 通知 / 配置迁移 ───────────────── */
-
-  async function handleSaveWebdav(username, password) {
-    busy = true;
-    try {
-      const d = await api.saveWebdav(username, password);
-      if (d.success) {
-        webdavConfigured = true;
-        webdavUrl = d.url || webdavUrl;
-        webdavWarning = d.warning || '';
-        await loadUserInfo();
-        if (webdavWarning) toast.warn('凭据已保存，但检测到账号不一致', '请检查账号');
-        else toast.success('WebDAV 凭据已保存并验证通过');
-        return '';
-      }
-      toast.error(d.error || '凭据验证未通过');
-      return d.error || '配置失败';
-    } catch (e) {
-      toast.error(e.message);
-      return e.message;
-    } finally {
-      busy = false;
-    }
-  }
+  /* ── 操作：密钥 / 通知 / 配置迁移 ─────────────────────────── */
 
   async function handleSetKey(privateKey) {
     const d = await api.setKey(privateKey);
@@ -706,8 +428,8 @@
   async function handleImportConfig(passphrase, configText) {
     const d = await api.importConfig(passphrase, configText);
     if (d.success) {
-      await Promise.all([loadConfig(), loadKeys(), loadUserInfo(), loadRestoreFiles()]);
-      await loadKzwrUser();
+      // 导入会替换任务/目标/插件配置：全部相关视图一起刷新
+      await Promise.all([loadConfig(), loadKeys(), loadRestoreFiles(), loadTasks(), loadTargets()]);
       toast.success('配置已导入并即时生效');
     }
     return d;
@@ -789,36 +511,9 @@
         <h1>{page.title}</h1>
         <p>{page.desc}</p>
       </div>
-      <div class="actions">
-        <button
-          class="btn btn-primary"
-          on:click={handleRunBackup}
-          disabled={busy || !webdavConfigured}
-          title={webdavConfigured ? '立即执行一次增量备份' : '请先在设置中配置 WebDAV 凭据'}
-        >
-          {#if busy}
-            <span class="spin"></span>执行中
-          {:else}
-            <Icon name="zap" size={15} />立即备份
-          {/if}
-        </button>
-      </div>
     </header>
 
     <div class="scroll">
-      {#if !webdavConfigured}
-        <div class="alert alert-warn" role="status">
-          <Icon name="alert" size={17} />
-          <div class="alert-body">
-            <div class="alert-title">尚未配置 WebDAV 凭据</div>
-            填写账号与应用密码后才能执行备份与恢复。
-            <button class="btn btn-sm btn-soft inline" on:click={() => go('settings')}>
-              前往设置<Icon name="arrow-right" size={13} />
-            </button>
-          </div>
-        </div>
-      {/if}
-
       {#if error}
         <div class="alert alert-danger" role="alert">
           <Icon name="alert" size={17} />
@@ -843,13 +538,9 @@
             </div>
           {:else if currentPage === 'dashboard'}
             <DashboardPage
-              {backupPaths}
-              {targetFolder}
-              {webdavConfigured}
-              {webdavUrl}
+              {tasks}
+              {targets}
               {restoreFolders}
-              {scheduleCron}
-              {scheduleCronValid}
               {keyBackedUp}
               {setupResult}
               {busy}
@@ -865,19 +556,16 @@
             />
           {:else if currentPage === 'targets'}
             <TargetsPage {targets} {busy} onChanged={handleTasksChanged} />
-          {:else if currentPage === 'backup'}
-            <BackupPage
-              bind:backupPaths
-              bind:targetFolder
-              bind:scheduleCron
-              bind:scheduleCronValid
+          {:else if currentPage === 'plugins'}
+            <PluginsPage
+              {plugins}
+              onPluginDone={handlePluginDone}
+              pluginsEnabled={pluginsEnabledCfg}
+              pluginsDir={pluginsDirCfg}
+              pluginsPubkeys={pluginsPubkeysCfg}
+              pluginsAllowUnsigned={pluginsAllowUnsigned}
+              onSavePlugins={handleSavePlugins}
               {busy}
-              {backupResult}
-              {webdavConfigured}
-              onSave={handleSaveConfig}
-              onRunBackup={handleRunBackup}
-              onPreviewCron={handlePreviewCron}
-              onGoto={go}
             />
           {:else if currentPage === 'restore'}
             <RestorePage
@@ -895,22 +583,6 @@
             <LogsPage debug={debugOn} onSaveDebug={handleSaveDebug} />
           {:else if currentPage === 'settings'}
             <SettingsPage
-              {plugins}
-              onPluginDone={handlePluginDone}
-              pluginsEnabled={pluginsEnabledCfg}
-              pluginsDir={pluginsDirCfg}
-              pluginsPubkeys={pluginsPubkeysCfg}
-              pluginsAllowUnsigned={pluginsAllowUnsigned}
-              onSavePlugins={handleSavePlugins}
-              onSavePluginParallel={handleSavePluginParallel}
-              {webdavConfigured}
-              {webdavUrl}
-              {webdavUsername}
-              {webdavWarning}
-              {retention}
-              {kzwrConfigured}
-              {kzwrUser}
-              {kzwrQuotaWarnPercent}
               {busy}
               {keyInfo}
               {revealKey}
@@ -918,15 +590,10 @@
               {webhookUrl}
               {webhookHeaders}
               {webhookBody}
-              onSaveWebdav={handleSaveWebdav}
               onSetKey={handleSetKey}
               onGenerateKey={handleGenerateKey}
               onExportKey={handleExportKey}
               onBackupAck={handleBackupAck}
-              onSaveRetention={handleSaveRetention}
-              onSaveKzwrToken={handleSaveKzwrToken}
-              onSaveKzwrQuota={handleSaveKzwrQuota}
-              onEmptyTrash={handleEmptyTrash}
               onSaveWebhook={handleSaveWebhook}
               onTestWebhook={handleTestWebhook}
               onExportConfig={handleExportConfig}
@@ -936,14 +603,6 @@
         </div>
 
         <aside class="rail">
-          <RailAccount
-            username={webdavUsername || (userInfo && userInfo.username) || ''}
-            configured={webdavConfigured}
-            kzwr={kzwrUser}
-            onGoto={go}
-            onRefresh={handleRailRefresh}
-            refreshing={refreshingKzwr}
-          />
           <LiveStatus {liveStatus} {wsConnected} />
         </aside>
       </div>
@@ -1121,11 +780,6 @@
     color: var(--text-3);
     font-size: 12.5px;
   }
-  .actions {
-    display: flex;
-    gap: var(--s2);
-  }
-
   .scroll {
     padding: var(--s5) var(--s6) var(--s8);
     display: flex;
@@ -1153,9 +807,6 @@
     display: flex;
     flex-direction: column;
     gap: var(--s4);
-  }
-  .inline {
-    margin-left: 6px;
   }
   .loading-card {
     display: flex;
