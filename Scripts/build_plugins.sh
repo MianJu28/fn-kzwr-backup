@@ -21,6 +21,9 @@
 #
 # 环境变量：
 #   CARGO_TARGET_DIR  可指定共享构建目录
+#   PLUGIN_TARGET     交叉编译目标三元组（如 aarch64-unknown-linux-musl）。
+#                     必须与宿主后端架构一致，否则 .so 架构不符、dlopen 失败。
+#                     留空 = 本机架构。
 #   SIGN_KEY          签名私钥路径（**默认** Scripts/keys/sign.key，存在即启用）
 #   SKIP_SIGN=1       显式跳过签名（产出未签名插件，仅供本机调试）
 #   ALLOW_KEY_MISMATCH=1  允许「私钥与宿主内置官方公钥不配对」（第三方自建分发用）
@@ -80,13 +83,13 @@ for d in "$PLUGINS_DIR"/*/; do
         skipped=$((skipped + 1))
         continue
     fi
-    echo "==> 构建插件 $name"
+    echo "==> 构建插件 $name${PLUGIN_TARGET:+（目标 $PLUGIN_TARGET）}"
     # --offline 优先（NAS 上依赖已缓存）；失败再回退联网。
     # 错误信息要留住：否则构建失败只会看到「未产出 *.so」，排查时无从下手。
     log="$(mktemp)"
-    if ! ( cd "$d" && cargo build --release --offline ) >"$log" 2>&1; then
+    if ! ( cd "$d" && cargo build --release --offline ${PLUGIN_TARGET:+--target "$PLUGIN_TARGET"} ) >"$log" 2>&1; then
         echo "    离线构建失败，回退联网重试…" >&2
-        if ! ( cd "$d" && cargo build --release ) >"$log" 2>&1; then
+        if ! ( cd "$d" && cargo build --release ${PLUGIN_TARGET:+--target "$PLUGIN_TARGET"} ) >"$log" 2>&1; then
             echo "ERROR: 插件 $name 构建失败：" >&2
             tail -30 "$log" >&2
             rm -f "$log"
@@ -101,21 +104,24 @@ for d in "$PLUGINS_DIR"/*/; do
         /*) ;;
         *) target_dir="$d$target_dir" ;;
     esac
+    # 指定 PLUGIN_TARGET 时产物在 <target>/<triple>/release/ 下
+    out_sub="release"
+    [ -n "$PLUGIN_TARGET" ] && out_sub="$PLUGIN_TARGET/release"
     # 精确算出本插件应产出的文件名，而不是 `find -quit` 撞运气：
     # 共用 CARGO_TARGET_DIR 时同级目录里躺着**所有**插件的 .so，取第一个会把
     # 别的插件拷成本插件（静默发错二进制）。
     libname="$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "${d}Cargo.toml" | tail -1)"
-    so="$target_dir/release/lib${libname}.so"
+    so="$target_dir/$out_sub/lib${libname}.so"
     if [ ! -f "$so" ]; then
         # lib.name 未显式声明时 cargo 会用包名（连字符转下划线）；两种都试过再报错
         pkgname="$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "${d}Cargo.toml" | head -1)"
-        alt="$target_dir/release/lib$(printf '%s' "$pkgname" | tr '-' '_').so"
+        alt="$target_dir/$out_sub/lib$(printf '%s' "$pkgname" | tr '-' '_').so"
         if [ -f "$alt" ]; then
             so="$alt"
         else
             echo "ERROR: 插件 $name 未产出 *.so（确认 crate-type = [\"cdylib\"]）" >&2
             echo "       期望文件：$so" >&2
-            echo "       目录内容：$(ls -1 "$target_dir/release" 2>/dev/null | grep '\.so$' | tr '\n' ' ')" >&2
+            echo "       目录内容：$(ls -1 "$target_dir/$out_sub" 2>/dev/null | grep '\.so$' | tr '\n' ' ')" >&2
             exit 1
         fi
     fi

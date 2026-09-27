@@ -220,9 +220,40 @@ typedef struct KzwrTargetAbi {
 
 - **`plugin_data` 不随配置导入导出**：`ConfigBundle` 未加该字段 → 换机/恢复配置会丢插件自管配置（§6）。
 - **插件启用状态与公钥改动需重启应用**：`load_external` 只在启动时调用一次（无热重载）。
-- **CI 不构建插件**：`.github/workflows/build-fnos-app.yml` 手工组装包、**不含 `plugins/`**，
-  也没有签名步骤 → 官方 `.fpk` 目前**不带插件**。要在发布包里带签名插件，
-  需在 CI 中注入私钥（`secrets`）并调用 `build_plugins.sh`。
+- **ARM 交叉编译未经真机验证**：CI 的 `aarch64-unknown-linux-gnu` 腿已按标准交叉编译配置写好
+  （`gcc-aarch64-linux-gnu` + `CARGO_TARGET_*_LINKER`/`CC_*`），但手头没有 ARM 设备可验证。
+- ~~**CI 不构建插件**~~：**已修复（2026-09-27）**。CI 改为统一调用 `Scripts/build_fnos_app.sh`
+  （单一事实来源，修掉了手工组装时写错的 `cd bin/fn-kzwr-backup-app` 路径），
+  并从 `secrets.PLUGIN_SIGN_KEY_B64` 注入私钥、构建并签名插件、打包后自检
+  「平台字段 / 动态链接 / 插件与 `.sig` 数量一致」。未配置私钥时：手动触发 → 告警且不含插件；
+  tag 发布 → 直接失败（避免发出版本里随包插件凭空消失）。
+
+### 3.4.3 关键约束：与 musl 静态链接互斥（2026-09-27 实测）
+
+外置插件（ADR-013）要求宿主**必须**是 glibc 动态链接，两条原因：
+
+1. **musl 目标不支持 `cdylib`**（本机实测）：对 `plugins/example-hello` 执行
+   `cargo build --target x86_64-unknown-linux-musl` 直接报
+   `the target ... does not support these crate types` —— 插件根本编译不出来。
+2. **静态链接的二进制没有动态装载器**：`dlopen` 不可用，`libloading` 必然失败，
+   即便插件用 gnu 目标编出来也加载不了。
+   （注：本条为已知机制，**未在本机实测**——`static.rust-lang.org` 在此网络不可达、装不上 musl std；
+   第 1 条已足以否掉该组合。）
+
+因此 2026-09-27 把发布链接方式从 musl 静态改为 **glibc 动态**：
+
+| 项 | 原 | 现 |
+|---|---|---|
+| 后端目标 | `x86_64-unknown-linux-musl` | `x86_64-unknown-linux-gnu` |
+| 插件目标 | 不可能（cdylib 不支持） | 与后端同一 `TARGET_TRIPLE` |
+| `build_fnos_app.sh` 默认 | `MUSL_TARGET=1` | glibc（`MUSL_TARGET=0`） |
+
+- 兼容性佐证：线上已安装的 v0.3.9 本就是动态链接 glibc（`U dlopen@GLIBC_2.34`），
+  该路径已在真机长期运行。
+- 代价与缓解：需目标机 glibc ≥ 构建机。在较旧的构建镜像里编译即可
+  （当前线上二进制只要求 GLIBC ≤ 2.34，NAS 是 2.36）。
+- 脚本会阻止危险组合：`MUSL_TARGET=1` 且未设 `SKIP_PLUGINS=1` → **直接报错**，
+  避免打出「宿主静态、插件全废」的包。要纯静态包就得显式放弃插件。
 
 ---
 

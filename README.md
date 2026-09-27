@@ -146,4 +146,15 @@ url = "https://dav.kzwr.com/dav"
 
 - ✅ Phase 1-3：MVP、增量加密、恢复能力
 - ✅ Phase 4：保留策略 / 断点续传 / WebSocket 监控 / 定时备份 / WebDAV 目标 / 监控告警 / 飞牛 `.fpk` 打包与 x86 设备实测 / **多目标 · 多任务**（v0.4.0）
-- 🔶 Phase 5：插件化（内置插件 + 外置动态库加载 + **目标能力表（自定义备份目标）** + **并发回传**均已落地；待做：插件签名校验、插件自管数据、kzwr 增强插件 ABI 化）、aarch64 设备实测、密钥轮换、异地恢复
+- 🔶 Phase 5：插件化（内置插件 + 外置动态库加载 + **目标能力表（自定义备份目标）** + **并发回传** +
+  **签名强制校验（内置官方公钥信任锚，随包插件开箱即用）** + **插件自管数据** 均已落地；
+  待做：kzwr 增强插件 ABI 化）、aarch64 设备实测、密钥轮换、异地恢复
+
+> **插件签名（发布相关）**：宿主**默认强制验签**，随包插件由官方私钥签名、公钥编译进宿主
+> （`backend/src/plugin/loader.rs` 的 `OFFICIAL_PUBKEYS`），用户零配置即可加载。
+> 仓库内**只有公钥**：私钥为 `Scripts/keys/sign.key`（被 `.gitignore` 排除），
+> CI 发布需在 Secrets 配置 `PLUGIN_SIGN_KEY_B64`（`base64 -w0 Scripts/keys/sign.key`）。
+> 详见 `docs/PLUGIN_PLAN.md` §3.4。
+>
+> **链接方式**：发布包为 **glibc 动态链接**（非 musl 静态）——musl 不支持 `cdylib`、
+> 静态 musl 也无法 `dlopen`，与外置插件互斥，见 `docs/PLUGIN_PLAN.md` §3.4.3。

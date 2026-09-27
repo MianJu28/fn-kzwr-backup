@@ -660,7 +660,7 @@ fn-kzwr-backup/
 |--------|------|-------|------|
 | 酷族网软对接 | 官方 WebDAV（Basic 凭据，加密存储，保存时 ping 验证并热切换） | 1-2 | ✅ WebDAV 适配器已实现并端到端实测；REST 适配器与登录二进制已移除（ADR-009） |
 | 飞牛源访问 | 仅本地 FS（tokio::fs），不考虑 SMB/NFS | 1 | ✅ 已实现 |
-| 双架构编译 | musl 静态链接 + cross 工具，全纯 Rust 依赖，GitHub Actions matrix | 1 | ✅ 已实现（本地 musl 构建验证） |
+| 双架构编译 | **glibc 动态链接** + cross 工具，GitHub Actions matrix（2026-09-27 由 musl 静态改） | 1 | ✅ 已实现（x86_64 本机实测；ARM 交叉编译待真机验证）。改因见「链接方式」 |
 | 源目录授权 | config/resource 声明（`data-share`）+ 运行时引导，弃 root 模式 | 1 | ✅ `config/resource` 声明 + `disable_authorization_path=false`；x86 实测授权目录可读（`run-as=package`） |
 | UI 暴露认证 | 端口服务 + **敏感操作口令校验**（未采用 JWT/全站登录） | 1 | ✅ 端口服务与 iframe 内 WebSocket 已在 x86 实测；导私钥/配置导入导出等敏感操作校验管理员口令；**不做全站登录** |
 | 密钥管理 | age 公私钥（X25519）；备份用公钥加密、恢复用私钥解密；私钥可被管理员口令（age scrypt）加密存储 | 2 | ✅ 已实现（`keystore.age` 加密持久化，口令热切换） |
@@ -897,8 +897,25 @@ packaging/fn-kzwr-backup-app/
 - **卸载**：默认保留数据；`wizard/uninstall` 勾选清除时删除
 
 **构建与 CI**：
-- 本地脚本 `Scripts/build_fnos_app.sh`：`cargo build --release` + `npm run build` + 组装包 + `fnpack build`（产物输出至 `dist/`）
-- GitHub Actions `.github/workflows/build-fnos-app.yml`：`x86_64-unknown-linux-musl` + `aarch64-unknown-linux-musl` 双架构交叉编译、前端构建、fnpack 打包、artifact 上传
+- 本地脚本 `Scripts/build_fnos_app.sh`：`cargo build --release` + `npm run build` + 组装包（含外置插件签名）+ `fnpack build`（产物输出至 `dist/`）
+  - 关键环境变量：`TARGET_TRIPLE`（交叉编译目标，留空=本机）、`PLATFORM`（manifest 的 platform，留空按三元组推断）、
+    `PREBUILT_BIN`（复用已构建后端）、`SKIP_PLUGINS=1`、`SKIP_SIGN=1`、`MUSL_TARGET=1`（须配 `SKIP_PLUGINS=1`）
+- GitHub Actions `.github/workflows/build-fnos-app.yml`：`x86_64-unknown-linux-gnu` + `aarch64-unknown-linux-gnu`
+  双架构交叉编译（**glibc 动态链接**，见下）、前端构建、**插件签名**（`secrets.PLUGIN_SIGN_KEY_B64`）、
+  fnpack 打包、**产物自检**（platform/动态链接/插件与 `.sig` 数量一致）、artifact 上传
+  - 每个架构一个 `.fpk`（`platform=x86` / `arm`）；`install_init` **不做**架构选择，由飞牛按 `platform` 判定
+  - tag 发布若未配置签名私钥 → 直接失败；手动触发 → 告警并产出**不含插件**的包
+
+**链接方式（2026-09-27 由 musl 静态改为 glibc 动态）**：
+- 原方案为 musl 静态（无运行时依赖）。但**外置插件（ADR-013）与 musl 静态不可能共存**：
+  1. musl 目标**不支持 `cdylib`** —— rustc 直接报
+     `the target 'x86_64-unknown-linux-musl' does not support these crate types`，插件根本编译不出来（本机实测）；
+  2. **静态链接的二进制没有动态装载器**，`dlopen` 不可用（`libloading` 必然失败，故 musl 静态包无法加载任何插件）。
+- 插件是一等功能，故发布包统一 glibc 动态链接；线上已安装的 v0.3.9 同样是动态链接 glibc
+  （`U dlopen@GLIBC_2.34`），说明该路径已在真机长期运行。
+- 代价：需要目标机 glibc 版本 ≥ 构建机。缓解：在较旧的构建镜像里编译
+  （当前线上二进制仅要求 GLIBC ≤ 2.34，而 NAS 为 2.36）。
+- 仍需纯静态包时：`MUSL_TARGET=1 SKIP_PLUGINS=1 ./Scripts/build_fnos_app.sh`（**不含插件**）。
 
 **早期 WSL 构建测试（2026-08-22，构建环境已废弃，仅存档）**：
 - 后端 `cargo build --release` 编译成功（2m02s，4 个 warning）

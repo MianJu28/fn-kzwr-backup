@@ -1,10 +1,23 @@
 name: 构建飞牛应用 (.fpk)
 
-# 在发布 tag（v*）或手动触发时构建双架构飞牛应用包。
-# 架构说明：
-#   - Rust 后端编译为 x86_64 与 aarch64（musl 静态链接，避免运行时依赖）
-#   - 前端 Svelte 一次构建，产物与架构无关
-# 打包产物为单包（.fpk），安装时由 install_init 按 uname -m 选择对应二进制。
+# 在发布 tag（v*）或手动触发时构建飞牛应用包。
+#
+# 架构与链接方式（2026-09-27 修订）：
+#   - 每个架构产出**一个** .fpk（x86_64 → platform=x86，aarch64 → platform=arm），
+#     由 Scripts/build_fnos_app.sh 按 TARGET_TRIPLE/PLATFORM 生成，
+#     安装时飞牛按 manifest 的 platform 拒绝架构不符的包。
+#   - 后端与插件统一 **glibc 动态链接**（不再是 musl 静态）。
+#     原因：musl 目标不支持 cdylib、静态 musl 也不支持 dlopen ⇒ 与「外置插件」互斥
+#     （随包插件必须能 dlopen；详见 docs/PLUGIN_PLAN.md §3.4.3）。
+#   - 打包逻辑一律走 Scripts/build_fnos_app.sh（单一事实来源），
+#     CI 不再手工拼装（手工拼装曾漏掉换行符/权限归一化，且路径写错导致产物缺失）。
+#
+# 插件签名：
+#   - 仓库只存**公钥**（backend/src/plugin/loader.rs 的 OFFICIAL_PUBKEYS）。
+#     私钥必须在仓库 Secrets 里配置为 PLUGIN_SIGN_KEY_B64
+#     （`base64 -w0 Scripts/keys/sign.key` 的结果）。
+#   - 未配置时：手动触发 → 告警并产出**不含插件**的包；tag 发布 → 直接失败，
+#     避免发出版本里随包插件凭空消失。
 
 on:
   workflow_dispatch:
@@ -15,10 +28,17 @@ on:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
+        include:
+          - target: x86_64-unknown-linux-gnu
+            platform: x86
+            arch: x86_64
+            cross: ''
+          - target: aarch64-unknown-linux-gnu
+            platform: arm
+            arch: aarch64
+            cross: gcc-aarch64-linux-gnu
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,51 +48,109 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: 交叉编译后端
-        uses: houseabsolute/actions-rust-cross@v0
+      - name: 缓存 cargo
+        uses: actions/cache@v4
         with:
-          command: build
-          args: --release --target ${{ matrix.target }}
-          working-directory: backend
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ matrix.arch }}-${{ hashFiles('backend/Cargo.lock', 'plugins/*/Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.arch }}-
 
-      - name: 构建前端
+      # ARM 交叉编译：rusqlite(bundled) 与 ring 含 C 代码，必须给出交叉 C 工具链，
+      # 否则 cc 会用宿主 gcc，链接阶段报架构不匹配。
+      - name: 安装 ARM 交叉工具链
+        if: matrix.cross != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.cross }}
+
+      - name: 配置交叉编译环境
+        if: matrix.arch == 'aarch64'
+        run: |
+          {
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
+            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+            echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"
+          } >> "$GITHUB_ENV"
+
+      - name: 安装前端依赖
         uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      - run: cd frontend && npm ci && npm run build
+      - run: cd frontend && npm ci
 
-      - name: 组装飞牛应用包
+      - name: 安装 fnpack
         run: |
-          # 从可提交的打包源码目录复制骨架
-          PACK=dist/fn-kzwr-backup-app
-          rm -rf $PACK
-          mkdir -p $PACK
-          cp -r packaging/fn-kzwr-backup-app/. $PACK/
-          ARCH="${{ matrix.target }}"
-          # 拷贝对应架构后端二进制
-          mkdir -p $PACK/app/bin
-          cp backend/target/$ARCH/release/fn-kzwr-backup $PACK/app/bin/fn-kzwr-backup
-          # 拷贝前端产物
-          rm -rf $PACK/app/www
-          cp -r frontend/dist $PACK/app/www
-          chmod +x $PACK/app/bin/fn-kzwr-backup
-
-      - name: 打包 .fpk
-        run: |
-          # 下载 Linux x86 版 fnpack
+          # 注意：static2.fnnas.com 上只有 1.2.3 可用（1.2.4 等路径返回 404），不要随手改版本
           curl -sSL -o /usr/local/bin/fnpack \
             https://static2.fnnas.com/fnpack/fnpack-1.2.3-linux-amd64
           chmod +x /usr/local/bin/fnpack
-          cd bin/fn-kzwr-backup-app
-          fnpack build
-          cp ./*.fpk "$GITHUB_WORKSPACE/"
+          fnpack --version || true
+
+      - name: 注入插件签名私钥
+        id: signkey
+        env:
+          PLUGIN_SIGN_KEY_B64: ${{ secrets.PLUGIN_SIGN_KEY_B64 }}
+        run: |
+          if [ -n "$PLUGIN_SIGN_KEY_B64" ]; then
+            mkdir -p Scripts/keys
+            printf '%s' "$PLUGIN_SIGN_KEY_B64" | base64 -d > Scripts/keys/sign.key
+            chmod 600 Scripts/keys/sign.key
+            # 立刻校验私钥可用且与宿主内置官方公钥配对，避免打包阶段才发现
+            pub="$(bash Scripts/sign_plugin.sh pubkey Scripts/keys/sign.key | tr -d '[:space:]')"
+            if [ -z "$pub" ]; then
+              echo "::error::PLUGIN_SIGN_KEY_B64 不是有效的 Ed25519 私钥"
+              exit 1
+            fi
+            echo "签名公钥：$pub"
+            echo "have_key=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_key=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::未配置 Secrets.PLUGIN_SIGN_KEY_B64 —— 本次产出的 .fpk 将**不含**外置插件"
+            if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+              echo "::error::tag 发布必须配置 PLUGIN_SIGN_KEY_B64（否则随包插件缺失，安装后插件列表为空）"
+              exit 1
+            fi
+          fi
+
+      - name: 构建并打包
+        env:
+          TARGET_TRIPLE: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          SKIP_PLUGINS: ${{ steps.signkey.outputs.have_key == '1' && '0' || '1' }}
+        run: bash Scripts/build_fnos_app.sh
+
+      - name: 校验产物
+        run: |
+          set -e
+          FPK="$(ls -t dist/fn-kzwr-backup-app/*.fpk | head -1)"
+          echo "产物：$FPK"
+          test -n "$FPK"
+          # 解包自检：确认核心文件与（有私钥时的）已签名插件都在包内
+          TMP="$(mktemp -d)"
+          tar xzf "$FPK" -C "$TMP"
+          test -f "$TMP/manifest" || { echo "::error::包内缺 manifest"; exit 1; }
+          grep -q "^platform[[:space:]]*=[[:space:]]*${{ matrix.platform }}$" "$TMP/manifest" \
+            || { echo "::error::manifest platform 与矩阵不符"; exit 1; }
+          tar xzf "$TMP/app.tgz" -C "$TMP"
+          test -f "$TMP/bin/fn-kzwr-backup" || { echo "::error::包内缺后端二进制"; exit 1; }
+          # 后端必须是动态链接（静态 musl 无法 dlopen，插件会全废）
+          file "$TMP/bin/fn-kzwr-backup" | grep -q "dynamically linked" \
+            || { echo "::error::后端二进制不是动态链接，外置插件无法加载"; exit 1; }
+          if [ "${{ steps.signkey.outputs.have_key }}" = "1" ]; then
+            n=$(find "$TMP/plugins" -name '*.so' 2>/dev/null | wc -l)
+            s=$(find "$TMP/plugins" -name '*.so.sig' 2>/dev/null | wc -l)
+            echo "随包插件：$n 个，签名文件：$s 个"
+            test "$n" -gt 0 || { echo "::error::已配置签名私钥但包内没有插件"; exit 1; }
+            test "$n" -eq "$s" || { echo "::error::存在未签名的随包插件（会被宿主拒绝加载）"; exit 1; }
+          fi
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: fn-kzwr-backup-${{ matrix.target }}
-          path: |
-            *.fpk
-            dist/fn-kzwr-backup-app/app/bin/fn-kzwr-backup
+          name: fn-kzwr-backup-fpk-${{ matrix.arch }}
+          path: dist/fn-kzwr-backup-app/*.fpk
+          if-no-files-found: error
