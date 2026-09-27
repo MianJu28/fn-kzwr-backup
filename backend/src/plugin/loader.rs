@@ -81,6 +81,10 @@ pub struct ExternalPluginReport {
 /// 插件目录列表（去重、仅保留存在的目录），并附带来源说明
 ///
 /// `configured` 为配置项 `plugins.dir`（`:` 分隔多个，可空）。
+/// 扫描的插件目录（**实际扫描用**）
+///
+/// 物理上有两个来源（用户放置 + 随应用分发），但前端只展示「插件目录」一项
+/// （见 [`plugin_dir_label`]），避免用户看到两个目录产生困惑。
 pub fn plugin_dirs(configured: Option<&str>) -> Vec<(PathBuf, String)> {
     let mut out: Vec<(PathBuf, String)> = Vec::new();
     let mut push = |p: PathBuf, src: &str| {
@@ -93,6 +97,7 @@ pub fn plugin_dirs(configured: Option<&str>) -> Vec<(PathBuf, String)> {
         out.push((p, src.to_string()));
     };
 
+    // 调试用：环境变量指定的额外目录（正式安装不会设置）
     if let Ok(v) = std::env::var("FN_KZWR_PLUGIN_DIR") {
         for part in v.split(':').filter(|s| !s.trim().is_empty()) {
             push(PathBuf::from(part.trim()), "环境变量 FN_KZWR_PLUGIN_DIR");
@@ -103,13 +108,27 @@ pub fn plugin_dirs(configured: Option<&str>) -> Vec<(PathBuf, String)> {
             push(PathBuf::from(part.trim()), "设置页「插件目录」");
         }
     }
+    // 用户放置目录：**安装/卸载发生在这里**（持久且应用用户可写）
     if let Ok(etc) = std::env::var("TRIM_PKGETC") {
-        push(Path::new(&etc).join("plugins"), "配置目录 $TRIM_PKGETC/plugins");
+        push(Path::new(&etc).join("plugins"), "插件目录（用户安装）");
     }
+    // 随应用分发目录（只读，存放随包插件）—— 不单独展示，见 plugin_dir_label
     if let Ok(dest) = std::env::var("TRIM_APPDEST") {
-        push(Path::new(&dest).join("plugins"), "应用目录 $TRIM_APPDEST/plugins");
+        push(Path::new(&dest).join("plugins"), "随应用分发");
     }
     out
+}
+
+/// **展示用**的插件目录（前端只显示这一个）
+///
+/// 物理扫描目录其实有两个（用户安装目录 + 随应用分发目录），
+/// 但用户只需要知道「插件装在哪个目录」，故界面只呈现用户安装目录。
+pub fn plugin_dir_label() -> String {
+    std::env::var("TRIM_PKGETC")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|etc| Path::new(&etc).join("plugins").to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// 是否启用外置插件加载

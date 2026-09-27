@@ -13,6 +13,7 @@
    * - 未启用时下方设置**折叠**，避免默认关闭状态下展示一堆无关项。
    */
   import Icon from './Icon.svelte';
+  import PluginInstallModal from './PluginInstallModal.svelte';
   import { api } from '../lib/api.js';
   import { toast } from '../lib/toast.js';
   import { confirmDialog } from '../lib/confirm.js';
@@ -30,19 +31,14 @@
   let loading = false;
   let formEnabled = enabled;
   let saved = false;
+  /** 正在切换启用状态（按钮 loading） */
+  let saving = false;
   let purgeBusy = '';
   /** 正在卸载的插件文件名 */
   let uninstallBusy = '';
 
-  // ── 安装表单 ──────────────────────────────────────────────────
+  // 安装弹窗（文件名不要求输入：直接用所选 .so 的原名）
   let showInstall = false;
-  let installing = false;
-  let instName = ''; // 目标文件名（默认取所选 .so 的文件名）
-  let instPubkey = '';
-  let instSo = null; // 选中的 .so File
-  let instSig = null; // 选中的 .sig File（可留空 = 由浏览器按同名推导？不：签名必须显式提供）
-  let instMsg = '';
-  let instOk = false;
 
   // 启用状态变化时同步表单（同值不覆盖，避免打断输入）
   $: if (enabled !== formEnabled && !saved) formEnabled = enabled;
@@ -85,6 +81,27 @@
     };
   }
 
+  /** 启用/停用按钮：立即保存并热生效 */
+  async function toggleEnabled() {
+    saving = true;
+    try {
+      const r = onSave ? await onSave(!formEnabled) : null;
+      if (r && r.error) {
+        toast.error(r.error, '操作失败');
+        return;
+      }
+      formEnabled = !formEnabled;
+      toast.success(
+        formEnabled ? '外置插件已启用（已加载，无需重启）' : '外置插件已停用（已卸载，无需重启）'
+      );
+      await loadInfo();
+    } catch (e) {
+      toast.error(e.message);
+    } finally {
+      saving = false;
+    }
+  }
+
   async function save() {
     if (!onSave) return;
     saved = true;
@@ -118,79 +135,24 @@
     });
   }
 
-  function pickSo(e) {
-    const f = e.target.files && e.target.files[0];
-    if (!f) return;
-    instSo = f;
-    // 默认文件名取所选 .so 的名字（用户可改，但一般不用）
-    if (!instName) instName = f.name;
-    instMsg = '';
-  }
-
-  function pickSig(e) {
-    const f = e.target.files && e.target.files[0];
-    if (!f) return;
-    instSig = f;
-    instMsg = '';
-  }
-
-  async function install() {
-    instMsg = '';
-    instOk = false;
-    if (!instSo) {
-      instMsg = '请先选择插件文件（.so）';
-      return;
-    }
-    if (!instSig) {
-      instMsg = '请同时选择签名文件（<插件名>.so.sig）—— 宿主强制验签，缺签名无法安装';
-      return;
-    }
-    const name = (instName || instSo.name).trim();
-    if (!name.toLowerCase().endsWith('.so')) {
-      instMsg = '文件名必须以 .so 结尾';
-      return;
-    }
-    if (!instPubkey.trim()) {
-      instMsg = '请填写用于校验该插件的公钥（用签名私钥对应的公钥）';
-      return;
-    }
-    installing = true;
+  /** 弹窗提交：文件名直接用所选 .so 的原名（不要求用户输入） */
+  async function submitInstall(so, sig, pubkey) {
     try {
-      const [data_b64, sig_b64] = await Promise.all([
-        fileToB64(instSo),
-        fileToB64(instSig),
-      ]);
+      const [data_b64, sig_b64] = await Promise.all([fileToB64(so), fileToB64(sig)]);
       const r = await api.pluginInstall({
-        file_name: name,
+        file_name: so.name,
         data_b64,
         sig_b64,
-        pubkey: instPubkey.trim(),
+        pubkey,
       });
-      if (r && r.error) {
-        instMsg = r.error;
-        toast.error(r.error, '安装失败');
-      } else {
-        instOk = true;
-        instMsg = `已安装 ${name}；重启应用后加载。`;
-        toast.success(`${name} 已安装并通过签名校验`, '安装成功');
-        // 复位表单
-        instSo = null;
-        instSig = null;
-        instPubkeysReset();
-        showInstall = false;
-        await loadInfo();
-      }
+      if (r && r.error) return { error: r.error };
+      toast.success(`${so.name} 已安装${r && r.loaded ? '并立即加载' : ''}`, '安装成功');
+      if (r && r.note) toast.info(r.note);
+      await loadInfo();
+      return {};
     } catch (e) {
-      instMsg = e.message;
-      toast.error(e.message);
-    } finally {
-      installing = false;
+      return { error: e.message };
     }
-  }
-
-  function instPubkeysReset() {
-    instName = '';
-    instPubkey = '';
   }
 
   /** 卸载**外置**插件：删除 .so/.sig 并解绑其公钥（内置/随包插件删不掉） */
@@ -271,33 +233,39 @@
   </div>
 
   <div class="card-body">
-    <!-- 总开关：关闭时折叠下方全部设置 -->
-    <label class="switch-row">
-      <input
-        type="checkbox"
-        checked={formEnabled}
-        on:change={(e) => (formEnabled = e.target.checked)}
-        disabled={busy}
-      />
-      <span>启用外置插件加载<em class="opt">（重启应用后生效）</em></span>
-    </label>
-
-    {#if formEnabled !== enabled}
-      <div class="alert alert-info">
-        <Icon name="info" size={15} />
-        <div class="alert-body">
-          开关已改动但<strong>尚未保存</strong>。
-          <button class="btn btn-sm btn-primary inline" on:click={save} disabled={busy}>保存并生效</button>
+    <!-- 总开关：用**按钮**而非复选框，语义是「启用/停用」而非勾选一项设置 -->
+    <div class="switch-bar">
+      <div class="grow">
+        <div class="switch-title">
+          外置插件加载
+          <span class="badge {formEnabled ? 'badge-ok' : ''}">
+            {formEnabled ? '已启用' : '已停用'}
+          </span>
         </div>
+        <p class="field-hint">
+          启用后会加载插件目录中的 <code>.so</code> 插件。
+          <strong>已改为热生效，无需重启应用。</strong>
+        </p>
       </div>
-    {/if}
+      <button
+        class="btn {formEnabled ? 'btn-ghost danger' : 'btn-primary'}"
+        on:click={toggleEnabled}
+        disabled={busy || saving}
+      >
+        {#if saving}
+          <span class="spin"></span>处理中
+        {:else}
+          <Icon name={formEnabled ? 'x' : 'zap'} size={14} />{formEnabled ? '停用' : '启用'}
+        {/if}
+      </button>
+    </div>
 
     {#if !formEnabled}
       <p class="field-hint">
         未启用：不会加载任何外置插件。下面的安装与管理在启用后才可用。
       </p>
     {:else}
-      <!-- 安装插件：上传 .so + .so.sig，并填写该插件的公钥（一插件一公钥） -->
+      <!-- 安装插件：弹窗内完成（文件名不要求输入） -->
       <div class="install-block">
         <div class="install-head">
           <div class="grow">
@@ -307,52 +275,12 @@
               并填写<strong>该插件的公钥</strong>。安装时会先验签，不通过不会写入磁盘。
             </p>
           </div>
-          <button class="btn btn-sm btn-primary" on:click={() => (showInstall = !showInstall)} disabled={busy || installing}>
-            <Icon name={showInstall ? 'minus' : 'plus'} size={14} />{showInstall ? '收起' : '安装插件'}
+          <button class="btn btn-sm btn-primary" on:click={() => (showInstall = true)} disabled={busy || saving}>
+            <Icon name="plus" size={14} />安装插件
           </button>
         </div>
-
-        {#if showInstall}
-          <div class="install-form">
-            <div class="field">
-              <label for="pl-so">插件文件（.so）</label>
-              <input id="pl-so" type="file" accept=".so" on:change={pickSo} disabled={installing} />
-            </div>
-            <div class="field">
-              <label for="pl-sig">签名文件（.so.sig）</label>
-              <input id="pl-sig" type="file" accept=".sig" on:change={pickSig} disabled={installing} />
-              <p class="field-hint">
-                用 <code>Scripts/sign_plugin.sh sign &lt;插件.so&gt;</code> 生成（与所选私钥同源）。
-              </p>
-            </div>
-            <div class="field">
-              <label for="pl-name">安装文件名</label>
-              <input id="pl-name" placeholder="默认取所选文件名" value={instName}
-                on:input={(e) => (instName = e.target.value)} disabled={installing} />
-            </div>
-            <div class="field">
-              <label for="pl-pub">该插件的公钥（base64 的 32 字节 Ed25519 公钥）</label>
-              <input id="pl-pub" class="mono" placeholder="例如：YCzDjlN5uEHPulgwyGWnZYpYV3P7O1xPNpTT0zAkv+A="
-                value={instPubkey} on:input={(e) => (instPubkey = e.target.value)} disabled={installing} />
-              <p class="field-hint">
-                用 <code>Scripts/sign_plugin.sh pubkey</code> 打印。
-                <strong>一个插件只认它自己的公钥</strong>——其它插件的公钥无法通过校验。
-              </p>
-            </div>
-            {#if instMsg}
-              <p class={instOk ? 'field-hint ok' : 'field-error'}>{instMsg}</p>
-            {/if}
-            <div class="row-actions">
-              <button class="btn btn-primary" on:click={install} disabled={installing}>
-                {installing ? '校验并安装中…' : '校验并安装'}
-              </button>
-              <button class="btn btn-ghost" on:click={() => (showInstall = false)} disabled={installing}>取消</button>
-            </div>
-          </div>
-        {/if}
       </div>
     {/if}
-
     {#if allowUnsigned}
       <div class="alert alert-warn">
         <Icon name="shield_alert" size={15} />
@@ -386,7 +314,7 @@
 
     {#if info}
       <div class="row-sub">
-        <span class="meta"><b>扫描目录</b>{(info.dirs || []).length} 个（固定，无需配置）</span>
+        <span class="meta"><b>插件目录</b>{(info.dir || (info.dirs || [])[0]?.path) || '—'}</span>
         <span class="meta"><b>加载结果</b>{(info.reports || []).filter((r) => r.loaded).length} 成功 /
           {(info.reports || []).filter((r) => !r.loaded).length} 失败</span>
         {#if info.env_override !== null && info.env_override !== undefined}
@@ -394,17 +322,12 @@
         {/if}
       </div>
 
-      {#if (info.dirs || []).length}
-        {#each info.dirs as d}
-          <div class="row-sub"><code>{d.path}</code><span class="meta">{d.source}</span></div>
-        {/each}
-      {/if}
 
       {#if (info.reports || []).length}
         <div>
           {#each info.reports as r}
             {@const sig = sigBadge(r)}
-            <div class="row-item">
+            <div class="row-item kind-{r.kind === 'target' ? 'target' : r.kind === 'enhance' ? 'enhance' : 'both'}">
               <div class="grow">
                 <div class="row-title">
                   <code>{r.file}</code>
@@ -413,7 +336,12 @@
                   </span>
                   <span class="badge {sig.cls}" title={sig.title}>{sig.text}</span>
                   {#if r.id}<span class="badge badge-info">{r.id}</span>{/if}
-                  {#if r.kind}<span class="meta">{r.kind}</span>{/if}
+                  {#if r.kind}
+                    <span class="badge {r.kind === 'target' ? 'badge-ok' : 'badge-info'}"
+                      title={r.kind === 'target' ? '提供备份目标（备份到哪）' : '提供增强能力（UI 卡片 / 动作 / 体检）'}>
+                      {r.kind === 'target' ? '备份目标' : '增强能力'}
+                    </span>
+                  {/if}
                   {#if r.mechanism === 'c-abi-v1'}
                     <span class="badge badge-ok" title="只依赖冻结的 C ABI 契约：升级本应用无需重编此插件">
                       稳定 ABI v{r.abi || 1}
@@ -478,6 +406,12 @@
       <p class="field-hint">当前未启用：不会加载任何外置插件，已加载列表为空属正常现象</p>
     {/if}
   </div>
+  <!-- 安装弹窗 -->
+  <PluginInstallModal
+    open={showInstall}
+    onClose={() => (showInstall = false)}
+    onSubmit={submitInstall}
+  />
 </section>
 
 <style>
@@ -495,6 +429,53 @@
   }
   .field-hint.ok {
     color: var(--success);
+  }
+
+  /* 插件行：统一边框/背景（.row-item 自带），并按类型给左侧色条，
+   * 让「备份目标 / 增强能力」一眼可辨、风格与其它列表行一致。 */
+  .row-item {
+    position: relative;
+    border-left: 3px solid var(--border-strong);
+  }
+  .row-item.kind-target {
+    border-left-color: var(--primary);
+  }
+  .row-item.kind-enhance {
+    border-left-color: var(--info, #0369a1);
+  }
+  .switch-bar {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--s3);
+    padding: var(--s3) var(--s4);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+  }
+  .switch-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13.5px;
+    font-weight: 620;
+    color: var(--text);
+  }
+  .switch-bar .field-hint {
+    margin-top: 3px;
+  }
+  .spin {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    animation: spin 0.7s linear infinite;
+    display: inline-block;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 
   /* 安装区：浅色面板，与插件列表区分 */
@@ -516,34 +497,6 @@
   }
   .install-head .field-hint {
     margin-top: 2px;
-  }
-  .install-form {
-    margin-top: var(--s3);
-    padding-top: var(--s3);
-    border-top: 1px dashed var(--border);
-  }
-  /* 文件选择框：原生 file input 很突兀，统一外观 */
-  .install-form input[type='file'] {
-    padding: 7px 10px;
-    font-size: 12.5px;
-    color: var(--text-2);
-    background: var(--surface);
-    cursor: pointer;
-  }
-  .install-form input[type='file']::file-selector-button {
-    margin-right: 10px;
-    padding: 5px 12px;
-    border: 1px solid var(--border-strong);
-    border-radius: var(--r-sm);
-    background: var(--surface-3);
-    color: var(--text);
-    font-family: inherit;
-    font-size: 12.5px;
-    cursor: pointer;
-    transition: background var(--t-fast);
-  }
-  .install-form input[type='file']::file-selector-button:hover {
-    background: var(--surface-hover);
   }
   .row-actions {
     display: flex;

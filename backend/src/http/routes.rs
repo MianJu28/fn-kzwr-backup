@@ -638,7 +638,8 @@ async fn plugins_list(State(state): State<AppState>) -> Json<serde_json::Value> 
             "configured": cfg.plugins.enabled,
             "env_override": env_override,
             "enabled": env_override.unwrap_or(cfg.plugins.enabled),
-            "dir": cfg.plugins.dir.clone().unwrap_or_default(),
+            // 展示用：只有一个「插件目录」（物理上还有个随应用分发目录，不展示给用户）
+            "dir": crate::plugin::loader::plugin_dir_label(),
             "dirs": state.plugins.plugin_dirs()
                 .iter()
                 .map(|(p, s)| serde_json::json!({ "path": p, "source": s }))
@@ -905,6 +906,55 @@ async fn plugin_set_enabled(
     }))
 }
 
+/// `POST /api/plugins/reload`：**热重加载**外置插件（无需重启应用）
+///
+/// 语义：按当前配置（`plugins.enabled`、目录、公钥映射）重新扫描并装载外置插件：
+/// - `enabled=false` → 卸载全部外置插件（丢弃其动态库句柄）；
+/// - `enabled=true`  → 重新扫描目录并装载（已有同名插件会被替换）。
+///
+/// 之后**重建目标池**，使新插件立刻可作为备份目标使用。
+///
+/// 安全边界（与「禁用」同样的理由）：**不主动 drop 仍被引用的旧插件**。
+/// 旧的一组由 `Arc` 引用计数托管 —— 若此刻正在执行备份，它持有的 `Arc<dyn TargetStorage>`
+/// 会让旧的动态库继续存活到该次备份结束，因此不会出现悬空指针。
+async fn plugin_reload(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let mgr = state.config.lock().unwrap();
+    let cfg = mgr.load().unwrap_or_default();
+    drop(mgr);
+
+    let enabled = crate::plugin::loader::enabled_by_env().unwrap_or(cfg.plugins.enabled);
+    if !enabled {
+        state.plugins.unload_external();
+    } else {
+        let dirs = crate::plugin::loader::plugin_dirs(cfg.plugins.dir.as_deref());
+        state
+            .plugins
+            .load_external(&dirs, &cfg.plugins.plugin_pubkeys, &cfg.plugins.pubkeys);
+    }
+    let ready = state.reload_targets(&cfg);
+    let reports = state.plugins.external_reports();
+    let loaded = reports.iter().filter(|r| r.loaded).count();
+
+    state.audit.record(
+        "plugin.reload",
+        if enabled {
+            format!("热重加载外置插件：{loaded} 个已加载")
+        } else {
+            "热卸载全部外置插件".to_string()
+        },
+        true,
+        None,
+    );
+    Json(serde_json::json!({
+        "success": true,
+        "enabled": enabled,
+        "loaded": loaded,
+        "total": reports.len(),
+        "ready_targets": ready,
+        "reports": reports,
+    }))
+}
+
 // ── 插件安装（上传 .so + .sig，绑定该文件的公钥）──────────────────────
 
 /// `POST /api/plugins/install`：安装一个外置插件
@@ -1018,9 +1068,26 @@ async fn plugin_install(
     }
     drop(mgr);
 
+    // 安装后**立即热加载**：把刚装的插件装进注册表并重建目标池（无需等重启）
+    let (loaded_now, note) = {
+        let cfg2 = { state.config.lock().unwrap().load().unwrap_or_default() };
+        apply_plugin_switch(&state, &cfg2);
+        let ready = state.reload_targets(&cfg2);
+        let reports = state.plugins.external_reports();
+        let ok = reports.iter().any(|r| r.file == file_name && r.loaded);
+        (
+            ok,
+            if ok {
+                format!("已安装并**立即加载**；目标池已重建（就绪目标 {ready} 个）。")
+            } else {
+                "已安装到插件目录，但本次加载失败（详见下方报告）；可点「重新加载」重试。".to_string()
+            },
+        )
+    };
+
     state.audit.record(
         "plugin.install",
-        format!("安装外置插件 {file_name}（签名校验通过，已绑定公钥）"),
+        format!("安装外置插件 {file_name}（签名校验通过，已绑定公钥；热加载结果：{loaded_now}）"),
         true,
         None,
     );
@@ -1029,7 +1096,8 @@ async fn plugin_install(
         "file": file_name,
         "dir": dir.to_string_lossy(),
         "path": so_path.to_string_lossy(),
-        "note": "插件已安装并通过签名校验；应用**重启后**才会加载（插件在启动时装配）。",
+        "note": note,
+        "loaded": loaded_now,
     }))
 }
 
@@ -1078,6 +1146,13 @@ async fn plugin_uninstall(
     }
     drop(mgr);
 
+    // 卸载后**立即热重加载**：让列表与目标池反映删除后的状态（无需重启）
+    {
+        let cfg2 = { state.config.lock().unwrap().load().unwrap_or_default() };
+        apply_plugin_switch(&state, &cfg2);
+        state.reload_targets(&cfg2);
+    }
+
     state.audit.record(
         "plugin.uninstall",
         format!("卸载外置插件 {file}（解绑公钥：{untied}）"),
@@ -1089,7 +1164,7 @@ async fn plugin_uninstall(
         "file": file,
         "removed": removed,
         "unbound_pubkey": untied,
-        "note": "已删除插件文件；已加载的代码要等重启应用才真正释放。",
+        "note": "已删除插件文件并重新加载插件列表。",
     }))
 }
 
@@ -1617,7 +1692,7 @@ async fn config_save(
     if let Some(v) = body.debug {
         cfg.debug = v;
     }
-    // 外置插件开关/目录：只落盘（插件在启动时装配，重启后生效）
+    // 外置插件开关：落盘**并热生效**（不再要求重启 —— 见 `apply_plugin_switch`）
     if let Some(v) = body.plugins_enabled {
         cfg.plugins.enabled = v;
     }
@@ -1685,10 +1760,35 @@ async fn config_save(
             // 调试日志开关热更新（保存成功后立即切换日志级别）
             crate::apply_log_debug(cfg.debug);
             drop(cfg_guard);
+            // 外置插件开关：**热生效**（装载/卸载外置插件，无需重启应用）
+            apply_plugin_switch(&state, &cfg);
             state.reload_targets(&cfg);
             Json(config_response(&cfg, webdav_ready(&cfg), wuser, kzwr_on, None))
         }
         Err(e) => Json(config_response(&cfg, false, wuser, kzwr_on, Some(format!("{:#}", e)))),
+    }
+}
+
+/// 让「外置插件加载」开关**立即生效**（无需重启）
+///
+/// 以前这个开关只落盘、要求重启 —— 因为插件在启动时装配。现在注册表支持热替换：
+/// - 打开 → 扫描目录并装载外置插件；
+/// - 关闭 → 卸载全部外置插件（丢弃动态库句柄）。
+///
+/// 注意：**卸载不等于立即释放内存**。若此刻有备份正在使用某插件，
+/// 那个 `Arc<dyn TargetStorage>` 会让对应的动态库继续存活到本次备份结束
+/// （引用计数保证内存安全，不会出现悬空指针 / 崩溃）。
+fn apply_plugin_switch(state: &AppState, cfg: &crate::infra::config::AppConfig) {
+    let enabled = crate::plugin::loader::enabled_by_env().unwrap_or(cfg.plugins.enabled);
+    if enabled {
+        let dirs = crate::plugin::loader::plugin_dirs(cfg.plugins.dir.as_deref());
+        state
+            .plugins
+            .load_external(&dirs, &cfg.plugins.plugin_pubkeys, &cfg.plugins.pubkeys);
+        tracing::info!(enabled, "外置插件开关已热生效：已重新装载");
+    } else {
+        state.plugins.unload_external();
+        tracing::info!("外置插件开关已热生效：已卸载全部外置插件");
     }
 }
 
@@ -4166,6 +4266,7 @@ pub fn router(state: AppState) -> Router {
     let mut core = Router::new()
         .route("/health", get(health))
         .route("/plugins", get(plugins_list))
+        .route("/plugins/reload", post(plugin_reload))
         .route("/plugins/install", post(plugin_install))
         .route("/plugins/:file/uninstall", post(plugin_uninstall))
         .route("/plugins/:id/purge", post(plugin_purge))

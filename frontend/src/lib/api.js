@@ -122,6 +122,8 @@ export const api = {
    * 安装时提供的公钥会与该文件名绑定（「一插件一公钥」，A 的公钥无法验过 B）。
    */
   pluginInstall: (body) => post('/api/plugins/install', body),
+  /** 热重加载外置插件（按当前配置重新扫描装载；无需重启应用） */
+  pluginReload: () => post('/api/plugins/reload', {}),
   /** 卸载**外置**插件（删 .so/.sig + 解绑公钥；内置/随包插件不可卸载） */
   pluginUninstall: (file) =>
     post(`/api/plugins/${encodeURIComponent(file)}/uninstall`, {}),

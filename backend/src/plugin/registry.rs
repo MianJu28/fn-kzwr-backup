@@ -14,17 +14,33 @@ use super::api::{EnhancePlugin, PluginEntry, TargetPlugin};
 use super::builtin;
 use super::loader::ExternalPluginReport;
 
-pub struct PluginRegistry {
+/// **外置插件快照**：可整体热替换的一组已加载插件
+///
+/// 之所以要整组替换（而不是逐个增删）：动态库句柄 `lib` 必须与其插件对象**同生共死** ——
+/// 句柄 drop 后，插件 vtable 指向的内存会失效。整组替换能保证
+/// 「旧的一组先全部托管、再由新的一组接替」，不会出现半新半旧的中间态。
+struct ExternalSet {
     targets: Vec<Arc<dyn TargetPlugin>>,
     enhances: Vec<Arc<dyn EnhancePlugin>>,
-    /// 外置动态库句柄：**必须保活到进程结束**（Drop 会让已注册的 vtable 悬空）
-    external_libs: Vec<libloading::Library>,
-    /// 外置插件加载报告（供 `/api/plugins` 诊断）
-    external_reports: Vec<ExternalPluginReport>,
+    /// 动态库句柄：与上面两组插件**配套**保活（Drop 会让 vtable 悬空）
+    libs: Vec<libloading::Library>,
+    /// 加载报告（供 `/api/plugins` 诊断）
+    reports: Vec<ExternalPluginReport>,
     /// 外置插件 id → 动态库路径（标注来源）
-    external_paths: HashMap<String, String>,
+    paths: HashMap<String, String>,
     /// 扫描过的插件目录（(路径, 来源说明)）
-    plugin_dirs: Vec<(String, String)>,
+    dirs: Vec<(String, String)>,
+}
+
+pub struct PluginRegistry {
+    /// 内置插件（编译期固定，不可增删）
+    builtin_targets: Vec<Arc<dyn TargetPlugin>>,
+    builtin_enhances: Vec<Arc<dyn EnhancePlugin>>,
+    /// **外置插件**（可热替换：`RwLock<Option<ExternalSet>>`）
+    ///
+    /// 用 `Option` 表达「尚未加载/已关闭」；用 `RwLock` 是因为注册表被
+    /// `Arc<PluginRegistry>` 共享，而热加载接口只有 `&self`。
+    external: std::sync::RwLock<Option<ExternalSet>>,
     /// **被禁用的插件 id**（运行时启停）
     ///
     /// 禁用只做**逻辑摘除**：插件对象仍在此结构中（动态库也仍映射在内存），
@@ -39,12 +55,9 @@ impl PluginRegistry {
     /// 载入内置插件（编译期固定）
     pub fn builtin() -> Self {
         Self {
-            targets: vec![Arc::new(builtin::webdav_abi::WebdavAbiPlugin::new())],
-            enhances: vec![Arc::new(builtin::kzwr::KzwrPlugin)],
-            external_libs: Vec::new(),
-            external_reports: Vec::new(),
-            external_paths: HashMap::new(),
-            plugin_dirs: Vec::new(),
+            builtin_targets: vec![Arc::new(builtin::webdav_abi::WebdavAbiPlugin::new())],
+            builtin_enhances: vec![Arc::new(builtin::kzwr::KzwrPlugin)],
+            external: std::sync::RwLock::new(None),
             disabled: std::sync::RwLock::new(std::collections::HashSet::new()),
         }
     }
@@ -82,51 +95,94 @@ impl PluginRegistry {
     /// `legacy_pubkeys` 是旧的扁平列表，仅对未登记文件回退使用。
     /// 失败只记录诊断，不影响内置能力与其它插件。
     pub fn load_external(
-        &mut self,
+        &self,
         dirs: &[(PathBuf, String)],
         plugin_pubkeys: &std::collections::BTreeMap<String, String>,
         legacy_pubkeys: &[String],
     ) {
-        self.plugin_dirs = dirs
-            .iter()
-            .map(|(p, s)| (p.to_string_lossy().into_owned(), s.clone()))
-            .collect();
         let dirs_only: Vec<PathBuf> = dirs.iter().map(|(p, _)| p.clone()).collect();
         let outcome = super::loader::load_external(&dirs_only, plugin_pubkeys, legacy_pubkeys);
-        self.targets.extend(outcome.targets);
-        self.enhances.extend(outcome.enhances);
-        self.external_libs.extend(outcome.libs);
+        let mut paths = HashMap::new();
         for r in &outcome.reports {
             if let (Some(id), true) = (r.id.clone(), r.loaded) {
-                self.external_paths.insert(id, r.path.clone());
+                paths.insert(id, r.path.clone());
             }
         }
-        self.external_reports = outcome.reports;
+        let set = ExternalSet {
+            targets: outcome.targets,
+            enhances: outcome.enhances,
+            libs: outcome.libs,
+            reports: outcome.reports,
+            paths,
+            dirs: dirs
+                .iter()
+                .map(|(p, s)| (p.to_string_lossy().into_owned(), s.clone()))
+                .collect(),
+        };
+        // 整组替换：旧的 ExternalSet（含其动态库句柄）在离开作用域时才 drop，
+        // 此时已没有任何活动引用指向它 —— 见结构体注释。
+        *self.external.write().unwrap() = Some(set);
     }
 
-    /// 外置插件加载报告（诊断）
-    pub fn external_reports(&self) -> &[ExternalPluginReport] {
-        &self.external_reports
+    /// **关闭**外置插件（丢弃整组外置插件与其动态库句柄）
+    ///
+    /// 等价于 `plugins.enabled=false` 的热生效版本。注意：已派发出去的
+    /// `Arc` 仍会存活到其使用者结束（Rust 的引用计数保证内存安全）。
+    pub fn unload_external(&self) {
+        *self.external.write().unwrap() = None;
     }
 
-    /// 扫描过的插件目录（(路径, 来源说明)）
-    pub fn plugin_dirs(&self) -> &[(String, String)] {
-        &self.plugin_dirs
+    /// 外置插件是否已加载（对应「外置插件加载」开关的运行时状态）
+    pub fn external_loaded(&self) -> bool {
+        self.external.read().unwrap().is_some()
+    }
+
+    /// 外置插件加载报告（诊断；未加载则为空）
+    pub fn external_reports(&self) -> Vec<ExternalPluginReport> {
+        self.external
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.reports.clone())
+            .unwrap_or_default()
+    }
+
+    /// 扫描过的插件目录（(路径, 来源说明)；未加载则为空）
+    pub fn plugin_dirs(&self) -> Vec<(String, String)> {
+        self.external
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.dirs.clone())
+            .unwrap_or_default()
     }
 
     /// 按插件 id（目标配置里的 `kind`）取目标插件
-    pub fn target_plugin(&self, kind: &str) -> Option<&Arc<dyn TargetPlugin>> {
+    pub fn target_plugin(&self, kind: &str) -> Option<Arc<dyn TargetPlugin>> {
         if self.is_disabled(kind) {
             return None;
         }
-        self.targets.iter().find(|p| p.meta().id == kind)
+        self.builtin_targets
+            .iter()
+            .find(|p| p.meta().id == kind)
+            .cloned()
+            .or_else(|| {
+                self.external
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|s| s.targets.iter().find(|p| p.meta().id == kind).cloned())
+            })
     }
 
     /// 全部**启用中**的目标插件（被禁用者已过滤）
-    pub fn target_plugins(&self) -> Vec<&Arc<dyn TargetPlugin>> {
-        self.targets
+    pub fn target_plugins(&self) -> Vec<Arc<dyn TargetPlugin>> {
+        let ext = self.external.read().unwrap();
+        self.builtin_targets
             .iter()
+            .chain(ext.iter().flat_map(|s| s.targets.iter()))
             .filter(|p| !self.is_disabled(&p.meta().id))
+            .cloned()
             .collect()
     }
 
@@ -134,29 +190,62 @@ impl PluginRegistry {
     ///
     /// 生命周期钩子（`on_startup`/`patrol`/`after_backup`）与路由挂载都走这里，
     /// 因此禁用后插件立即不再被调用。
-    pub fn enhance_plugins(&self) -> Vec<&Arc<dyn EnhancePlugin>> {
-        self.enhances
+    pub fn enhance_plugins(&self) -> Vec<Arc<dyn EnhancePlugin>> {
+        let ext = self.external.read().unwrap();
+        self.builtin_enhances
             .iter()
+            .chain(ext.iter().flat_map(|s| s.enhances.iter()))
             .filter(|p| !self.is_disabled(&p.meta().id))
+            .cloned()
             .collect()
     }
 
     /// 按 id 取**启用中**的增强插件（路由分发用；被禁用 → `None`）
-    pub fn enhance_plugin_enabled(&self, id: &str) -> Option<&Arc<dyn EnhancePlugin>> {
+    pub fn enhance_plugin_enabled(&self, id: &str) -> Option<Arc<dyn EnhancePlugin>> {
         if self.is_disabled(id) {
             return None;
         }
-        self.enhances.iter().find(|p| p.meta().id == id)
+        self.builtin_enhances
+            .iter()
+            .find(|p| p.meta().id == id)
+            .cloned()
+            .or_else(|| {
+                self.external
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|s| s.enhances.iter().find(|p| p.meta().id == id).cloned())
+            })
     }
 
     /// 按 id 取增强插件（**含被禁用者**；诊断/卸载等管理操作用）
-    pub fn enhance_plugin_any(&self, id: &str) -> Option<&Arc<dyn EnhancePlugin>> {
-        self.enhances.iter().find(|p| p.meta().id == id)
+    pub fn enhance_plugin_any(&self, id: &str) -> Option<Arc<dyn EnhancePlugin>> {
+        self.builtin_enhances
+            .iter()
+            .find(|p| p.meta().id == id)
+            .cloned()
+            .or_else(|| {
+                self.external
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|s| s.enhances.iter().find(|p| p.meta().id == id).cloned())
+            })
     }
 
     /// 按 id 取目标插件（**含被禁用者**；诊断与管理操作用）
-    pub fn target_plugin_any(&self, id: &str) -> Option<&Arc<dyn TargetPlugin>> {
-        self.targets.iter().find(|p| p.meta().id == id)
+    pub fn target_plugin_any(&self, id: &str) -> Option<Arc<dyn TargetPlugin>> {
+        self.builtin_targets
+            .iter()
+            .find(|p| p.meta().id == id)
+            .cloned()
+            .or_else(|| {
+                self.external
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|s| s.targets.iter().find(|p| p.meta().id == id).cloned())
+            })
     }
 
     /// 全部已加载插件 id（目标 + 增强；含内置与外部）
@@ -164,11 +253,18 @@ impl PluginRegistry {
     /// **不过滤** disabled：被禁用的插件其 `plugin_data` 仍应被视为「有归属」，
     /// 不该被孤立数据检测提示成遗留配置。
     pub fn plugin_ids(&self) -> Vec<String> {
+        let ext = self.external.read().unwrap();
         let mut ids: Vec<String> = self
-            .targets
+            .builtin_targets
             .iter()
+            .chain(ext.iter().flat_map(|s| s.targets.iter()))
             .map(|p| p.meta().id.clone())
-            .chain(self.enhances.iter().map(|p| p.meta().id.clone()))
+            .chain(
+                self.builtin_enhances
+                    .iter()
+                    .chain(ext.iter().flat_map(|s| s.enhances.iter()))
+                    .map(|p| p.meta().id.clone()),
+            )
             .collect();
         ids.sort();
         ids.dedup();
@@ -177,7 +273,7 @@ impl PluginRegistry {
 
     /// 调某插件的 `destroy` 钩子（卸载清除时用；找不到则无操作）
     pub fn call_destroy(&self, id: &str) {
-        if let Some(p) = self.enhances.iter().find(|p| p.meta().id == id) {
+        if let Some(p) = self.enhance_plugin_any(id) {
             p.destroy();
         }
     }
@@ -187,10 +283,16 @@ impl PluginRegistry {
     /// **包含被禁用的插件**（`disabled: true`）：插件页需要列出它们以便重新启用。
     /// 其它消费方（目标装配、路由分发、生命周期钩子）走的是过滤后的接口。
     pub fn describe(&self, cfg: &AppConfig) -> Vec<PluginEntry> {
+        let ext = self.external.read().unwrap();
+        let ext_paths = ext.as_ref().map(|s| &s.paths);
         let mut out = Vec::new();
-        for p in &self.targets {
+        for p in self
+            .builtin_targets
+            .iter()
+            .chain(ext.iter().flat_map(|s| s.targets.iter()))
+        {
             let meta = p.meta();
-            let path = self.external_paths.get(&meta.id).cloned();
+            let path = ext_paths.and_then(|m| m.get(&meta.id)).cloned();
             // 并发回传：能力由插件声明，并发度由用户**按插件**配置（缺省沿用声明）
             let supports_plan = p.supports_plan();
             let parallel = cfg.plugins.target_parallel.get(&meta.id).copied();
@@ -208,9 +310,13 @@ impl PluginRegistry {
                 parallel,
             });
         }
-        for p in &self.enhances {
+        for p in self
+            .builtin_enhances
+            .iter()
+            .chain(ext.iter().flat_map(|s| s.enhances.iter()))
+        {
             let meta = p.meta();
-            let path = self.external_paths.get(&meta.id).cloned();
+            let path = ext_paths.and_then(|m| m.get(&meta.id)).cloned();
             let disabled = self.is_disabled(&meta.id);
             out.push(PluginEntry {
                 api_base: format!("/api/p/{}", meta.id),

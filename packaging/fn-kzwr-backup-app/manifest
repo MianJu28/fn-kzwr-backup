@@ -1,5 +1,5 @@
 appname               = fn-kzwr-backup
-version               = 0.4.3
+version               = 0.4.4
 display_name          = 酷族备份
 desc                  = <b>酷族备份</b> —— 飞牛 NAS 增量加密备份<br>把指定文件夹增量、age 加密备份到<a href='https://www.kzwr.com' target='_blank'>酷族网软</a>官方 WebDAV。<br>支持断点续传、大文件自动分片、cron 定时、实时进度与速度、保留策略，按文件或目录选择性恢复。<br><br><b>酷族网软</b>：官网 <a href='https://www.kzwr.com' target='_blank'>www.kzwr.com</a>。<br>免费用户提供 10G 空间、不限速，但下载站在大陆境外，实际速度看网络情况。<br><br>意见建议反馈：<a href='https://github.com/MianJu28/fn-kzwr-backup/issues' target='_blank'>github.com/MianJu28/fn-kzwr-backup/issues</a><br>邮箱：mianju@agent.qq.com
 platform              = x86
@@ -15,4 +15,4 @@ ctl_stop              = true
 checkport             = false
 disable_authorization_path = false
 micro_app             = true
-changelog             = 外置插件改为界面安装：选择 .so 与签名文件、填写该插件公钥即可安装（安装前强制验签，不通过不写盘），并可一键卸载；插件目录固定为默认位置，无需配置；未启用插件加载时相关设置自动折叠。安全增强：插件公钥改为「一插件一公钥」，单个插件密钥泄露不再波及其它插件（原先任一公钥可验任一插件，存在越权信任）。插件可单独启用/停用（立即生效，无需重启），点卡片「设置」在弹窗内配置，设置项支持回显（改完再打开可见真实值，密钥只显示「已设置」）；上传并发在「目标」页按目标配置。修复：未配置凭据的目标误显示为「已就绪」；插件页与目标页样式统一。
+changelog             = 外置插件改为**热加载**：启用/停用、安装、卸载均立即生效，无需重启应用（安装后自动加载、卸载后自动刷新）。安装插件改用弹窗（只需选择 .so 与签名、填写该插件公钥，无需输入文件名）；插件目录只显示一个（用户安装目录）；启用开关改为按钮。插件列表按「备份目标 / 增强能力」着色区分，与卡片风格统一。安全增强：插件公钥为「一插件一公钥」，单个插件密钥泄露不再波及其它插件。插件可单独启用/停用，点卡片「设置」在弹窗内配置且支持回显；上传并发在「目标」页按目标配置。修复：未配置凭据的目标误显示为「已就绪」；多处表单与卡片样式统一。

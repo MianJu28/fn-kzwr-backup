@@ -271,6 +271,10 @@ bash Scripts/sign_plugin.sh sign dist/plugins           # 生成 <so>.sig（64 �
   把绑定关系写入 `plugin_pubkeys`。验签失败**绝不落盘**。配套
   `POST /api/plugins/:file/uninstall` 删除 `.so`/`.sig` 并解绑公钥（内置/随包插件不可删）。
   - 上传用 base64 而非 multipart：未引入 `multer`，不想为一个上传新增依赖。
+- **热加载**（2026-09-27）：`POST /api/plugins/reload` 按当前配置重新扫描装载；
+  保存开关、安装、卸载后都会**自动**触发，无需重启应用。
+  注意「卸载不等于立即释放内存」：若正在执行的备份持有某插件派生的
+  `Arc<dyn TargetStorage>`，对应动态库会存活到该次备份结束（引用计数保证安全）。
 - **运行时启停**（按插件粒度，无需重启）：`POST /api/plugins/<id>/enable`
   `{"enabled":false}` → 写入 `plugins.disabled`，插件立即从 `/api/plugins`、路由分发、
   目标装配与生命周期钩子中消失；`true` 立即恢复。

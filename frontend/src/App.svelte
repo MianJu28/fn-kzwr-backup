@@ -299,8 +299,8 @@
         return { error: d.error };
       }
       pluginsEnabledCfg = !!d.plugins_enabled;
-      pluginsDirCfg = d.plugins_dir || '';
-      pluginsPubkeysCfg = d.plugins_pubkeys || [];
+      // 后端已让开关热生效；这里再拉一次清单，让插件列表立刻反映装载/卸载结果
+      await handlePluginDone();
       return {};
     } catch (e) {
       error = e.message;
