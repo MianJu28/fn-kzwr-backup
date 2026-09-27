@@ -510,6 +510,48 @@ trait TargetStorage {
 
 ---
 
+### ADR-015：增强类插件一律外置，核心不掺厂商专属逻辑（2026-09-28，v0.4.5）
+
+**背景**：ADR-013 把 kzwr 从「核心里的散落代码」收拢成 `plugin/builtin/kzwr.rs`，但它仍是
+**编译进主程序的内置插件**：能 `use` 宿主内部库、配置仍存在宿主的 `[kzwr]` 段、告警来源
+`AlertSource::Kzwr` 与体检项 `enhance.kzwr_token_configured` 都写死在核心里。结果是
+「升级主程序必须连带重编 kzwr」「换个云盘厂商要改核心」，并且导出配置包会持续携带一个
+核心其实已经不需要读的敏感段。
+
+**决策**：kzwr 的功能与配置**全部移出核心**，成为 `plugins/kzwr/` 下的**外置 cdylib**，
+随 `.fpk` 一起分发并默认签名（内置官方公钥可验签，用户零配置即可加载）。规则上升为：
+**增强类（enhance）插件一律外置；内置只保留 `webdav` 目标插件。**
+
+- **不做向后兼容的旧配置搬运**（用户确认）：`[kzwr]` 段随核心代码一起删除，升级后用户
+  在「插件」页重新填写 access-token。一次性的重填成本，换核心彻底解耦与配置面缩小。
+- **载入容错保留**：老 `config.toml` 里的 `[kzwr]` 段必须能被**忽略并成功载入**
+  （`infra/config.rs::legacy_kzwr_section_is_ignored`），否则升级即服务起不来；下次保存自然消失。
+- **插件不得回调宿主**（ADR-013 的不变式在本条被再次逼实）：原来 kzwr 用到的
+  `state.config` / `state.audit` / `raise_alert_once` / `state.alerts` 全部改成
+  **返回值里的声明**（`config` / `audit` / `alerts` / `resolve`），由宿主
+  `cabi::apply_side_effects` 落地。主表 `KzwrPluginAbi` 因此**保持冻结**，不需要 v2。
+- **多凭据界面进契约而不是进前端**：新增 `UiBlock::Accounts` + 通用渲染器
+  `PluginAccounts.svelte`。判断标准被明确为「**新增插件不该要求改前端**」。
+- **去掉账号一致性检查**：备份目标与酷族账号可以不是同一账号，跨账号交叉比对是错的。
+- 阈值改为**按账号**存储（`percent-<id>`，默认 90%），不再全局一个值。
+
+**代价与边界**：
+
+- 增强插件不再能借用宿主的 reqwest/工具函数，必须自带依赖 → 单个 .so 体积涨到 ~4.4 MB。
+  可接受：插件只在需要时加载，且换来了「主程序升级不重编插件」。
+- 插件**可以** `block_on`（宿主把每个增强回调放进 `spawn_blocking`），但**目标插件不可以**
+  （`test_json` / `target_open` 仍在 async 线程上直调）。两类插件规则不同是历史事实，
+  已写进 `PLUGIN_ABI.md` §3 并在 `target_abi.rs` 注释钉住。
+- 凭据明文**永不回传前端**：`/accounts` 只回 `configured` + `meta`；宿主代管数据导出对
+  未声明 UI 的插件 **fail-closed** 一律只回布尔。
+
+**验证**（本机端到端，v0.4.5）：签名插件加载 → 添加账号（无效 token 被真实 API 拒绝、
+不落盘）→ 阈值读写（含 0=关闭、越界报错）→ 体检项 `kzwr.<账号id>` → 告警来源
+`{"plugin":"kzwr"}` → 审计标签通用回退 → 停用后路由 404 → 重新启用恢复 → 八个只读端点
+全量扫描无明文 token。
+
+---
+
 ## 7. 项目目录结构
 
 项目遵循飞牛应用规范，Rust 源码与前端源码在开发期独立，打包时合入飞牛目录结构。
@@ -694,10 +736,10 @@ fn-kzwr-backup/
 | | 保留策略（孤儿清理） | ✅ | `domain/retention.rs`，备份后自动清理目标端孤儿文件 |
 | | 定时备份（cron） | ✅ | `domain/scheduler.rs`（`croner` 解析），cron 表达式到点触发、配置热更新；**全局运行互斥**（`AppState.backup_running` CAS），已有备份在跑时跳过本次触发 |
 | | 定时任务可视化 | ✅ | `POST /api/schedule/preview`：cron → 未来 5 次触发时间；**按服务器本地时区解释**（调度器已从 UTC 修正，`0 0 * * *` 即本地零点） |
-| **增强功能** | access-token（可选，ADR-011） | ✅ | `infra/kzwr_api`：REST 客户端；token 加密存储、保存前实测、热更新；未配置时降级，不影响备份/恢复 |
-| | 账号信息与空间 | ✅ | `GET /api/kzwr/user`：存储空间/套餐/UID/单文件上限/地区/IP 等；占用达阈值（默认 85%，0=关闭）生成空间预警 |
-| | 回收站清理 | ✅ | 设置页手动清空（无门槛）；可跟随保留策略自动清理：占用 ≥N GB 才清 + 仅清理 N 天前条目（解析不出时间的保守保留）；`BackupResponse.trash_emptied` |
-| | 账号一致性校验 | ✅ | WebDAV 凭据 / access-token 保存时交叉比对账号（email/name 包含匹配），不一致 → 页面提醒 + 告警 |
+| **增强功能**（v0.4.5 起为**外置插件**） | access-token（可选，ADR-011） | ✅ | `plugins/kzwr/`（外置 .so，随包分发并默认签名）：插件自带 REST 客户端与字节格式化；token 经**声明式回写**存进 `plugin_data["kzwr"]`（age 加密），保存前实测；未配置时降级，不影响备份/恢复。**核心已无一行 kzwr 代码** |
+| | 账号信息与空间 | ✅ | `GET /api/p/kzwr/user`、`/api/p/kzwr/space`：存储空间/套餐/UID/单文件上限等；**支持多账号**，占用达该账号阈值（默认 90%，0=关闭）生成空间预警 |
+| | 回收站清理 | ✅ | 插件页手动清空（无门槛）；可跟随保留策略自动清理：占用 ≥N GB 才清 + 仅清理 N 天前条目（解析不出时间的保守保留）；由 `after_backup` 事件驱动，门槛取自 `cfg.tasks[]` |
+| | ~~账号一致性校验~~ | ❌ 已去除 | （2026-09-28 决策）备份目标与酷族账号**可以不是同一账号**，跨账号交叉比对是错的 |
 | | token 失效告警 | ✅ | 启动与使用时校验登录态（官方 API 对无效 token 仍返回 200，须查 `isLogin`），失效生成 kzwr 告警 |
 | **可观测** | 一键体检 | ✅ | `GET /api/setup/check`：服务/WebDAV 实连/路径+快照数/私钥确认/定时/增强 token 实连/空间阈值，逐项带修复建议 |
 | | 操作审计 | ✅ | `$TRIM_PKGVAR/audit.log`（JSON Lines，512KB 自动裁剪保留 1000 行）：凭据/密钥/配置/备份/恢复/回收站操作留痕；`GET /api/audit`；独立「审计」页查看（侧边导航入口） |
@@ -781,8 +823,7 @@ backend/src/
 │   ├── loader.rs        # 加载：目录扫描 + libloading + 稳定入口校验 + 失败隔离（已无 Rust 直连回退）
 │   ├── registry.rs      # 唯一装配点：builtin()/load_external()/build_targets()/describe()
 │   └── builtin/
-│       ├── webdav.rs    # 目标插件（默认启用；每个目标一份实例）
-│       └── kzwr.rs      # 增强插件（账号/空间/回收站/告警/巡检）
+│       └── webdav.rs    # 目标插件（默认启用；每个目标一份实例）——**内置增强插件已清零**
 ├── infra/
 │   ├── mod.rs
 │   ├── storage_trait.rs # TargetStorage/SourceStorage trait + **TargetPool(多目标池，ADR-014)** + SwapTarget(主目标)/UnconfiguredTarget

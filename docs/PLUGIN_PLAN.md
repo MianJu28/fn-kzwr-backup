@@ -9,7 +9,9 @@
 >   **Step 4**（插件自管数据：`plugin_data` + `/api/plugins/:id/data` + `/purge` + 孤立检测）、
 >   **Step 6**（前端签名徽标 / 卸载按钮 / SDK `export_target_v1!` / `example-localfs` 示范插件）
 >   均已完成（2026-09-27）。
-> - ⏳ **Step 5-kzwr**（增强插件 ABI 化，见 §5.2）待做——这是唯一剩余的改造项。
+> - ✅ **Step 5-kzwr**（增强插件 ABI 化，见 §5.2）**已完成**（2026-09-28，v0.4.5）：
+>   kzwr 的功能与配置**全部移出核心**，宿主不再内置任何增强插件；`plugins/kzwr/` 外置 .so
+>   随包分发并默认签名。剩余项均非改造（见 §9）。
 >
 > 前置事实：产品未发布、无历史插件 → **直接修改 v1 契约本身**，不做 v1/v2 并存。
 >
@@ -23,6 +25,11 @@
 |---|---|
 | 1 | **不保留 Rust 直连路径**；内置插件（webdav / kzwr）**也用 ABI 重写** |
 | 2 | 插件自管配置由**宿主代加密存储**；**卸载插件时清除其配置** |
+| 8 | （2026-09-28）kzwr 迁移**不搬运旧配置**：用户重新填写 access-token，换取核心彻底解耦 |
+| 9 | （2026-09-28）**完全删除**宿主 kzwr（含 `enhance.kzwr_token_configured`），不留「还在但没人读」的东西 |
+| 10 | （2026-09-28）**去掉账号一致性检查**（备份目标与酷族账号可以不是同一账号） |
+| 11 | （2026-09-28）告警走**方案 A**：返回值 `alerts[]` → 宿主 `raise_alert_once`，**通用能力**，非 kzwr 特例 |
+| 12 | （2026-09-28）多账号用**通用 `UiBlock::Accounts` + 通用前端渲染器**；阈值**按账号**存储，默认 90% |
 | 4 | 并发为**可选项**；开启并发后**由插件回传**决定传哪些（pull 调度） |
 | 6 | 加**心跳**（卡死检测） |
 | 7 | 插件**上报实写字节**，宿主复查 |
@@ -93,7 +100,7 @@ typedef struct KzwrPluginAbi {
   "id": "kzwr", "kind": "enhance", "version": "1.0.0",
   "runtime": { "target": "fn_kzwr_plugin_target_v1" },
   "target": { "write": "push", "supports_plan": true, "max_parallel": 4, "preferred_chunk_kib": 1024 },
-  "ui": { "section": "settings", "title": "…", "order": 20, "component": "kzwr", "blocks": [ /* … */ ] }
+  "ui": { "section": "settings", "title": "…", "order": 20, "blocks": [ /* … */ ] }
 }
 ```
 
@@ -101,8 +108,13 @@ typedef struct KzwrPluginAbi {
 因此既有 `/api/p/kzwr/trash/empty` **无需改名、前端零改动**。
 
 **告警声明式回传**（避免插件回调宿主）：`event_json` / `health_json` 返回值扩展为
-`{"count":N, "alerts":[{"level":"warn","message":"…","dedup_key":"kzwr.quota"}]}`，
+`{"count":N, "alerts":[{"level":"warn","message":"…"}]}`，
 宿主负责去重与落告警（等价于现有 `raise_alert_once` 语义）。
+
+> 实现修正：原计划里的 `dedup_key` 字段**没有做**——去重直接按「告警来源 + 消息全文」
+> 精确匹配（`AlertSource::Plugin(id)`），比另起一个键更简单且无第二事实来源。
+> 代价：消息里若要区分账号，就得把账号名写进消息（kzwr 的配额告警即如此），
+> 恢复时按 `resolve:[前缀]` 前缀匹配消解。**最终形态以 `PLUGIN_ABI.md` §4.4 为准。**
 
 ### 3.2 目标能力表（独立入口符号 → 独立演进）
 
@@ -293,20 +305,55 @@ typedef struct KzwrTargetAbi {
 | `build(TargetConfig, ConfigManager)` 内部 `resolve()` 读配置 + `TRIM_DAV_*` 环境变量 | 凭据从 `target_json` 取（宿主传入）；`TRIM_DAV_*` 仅对 `default` 目标生效（保留调试能力） |
 | 直接返回 `Arc<dyn TargetStorage>`（`WebdavTarget`） | 内部仍复用 `WebdavTarget`，但对外只暴露推块接口（`write_inner` 的流改为"宿主喂块"驱动） |
 
-### 5.2 kzwr（增强插件）—— 依赖宿主能力的替代方案
+### 5.2 kzwr（增强插件）—— **已完成**（v0.4.5，2026-09-28）
 
-| 现在依赖 | 行号 | ABI 化替代 |
-|---|---|---|
-| `state.kzwr`（`KzwrClient`） | `kzwr.rs:107-108,128-129,210-211,239-240,345-346,370-371,675-676,734-735,800,824-825,904,907,930` | 插件**自建** client（token 从 `config_get` 读）；因是内置插件，仍可 `use` 宿主内部库 |
-| `state.config` 读写 token / 阈值 / 保留策略 | `kzwr.rs:233,271-277,669,801,831` | `config_get/config_set`（命名空间 `kzwr`）；保留策略相关改由宿主传入 `cfg_json.tasks[]` |
-| `state.audit.record(...)` | `kzwr.rs:700,705,806,834,932,952` | 宿主统一记审计（`plugin.<id>.<action>`），插件不感知 |
-| `raise_alert_once` / `state.alerts` | `kzwr.rs:132,216,283,349,374,711,739,866,910` | 改为**声明式回传**（§3.1 `alerts[]`，带 `dedup_key`），宿主落告警 |
-| `human_bytes` | `kzwr.rs:172-173,291-292,937` | 插件内部自带（或 SDK 提供） |
-| `webdav_username(state)` | `kzwr.rs:208,829` | 待定：`cfg_json.targets[].username`（见 §10 第 1 条） |
-| `routes()`（axum Router，`core.nest`） | `kzwr.rs:48-53`；挂载 `routes.rs:3486` | 改为 3 个动作：`user` / `token` / `trash/empty`（多段动作名，见 §3.1） |
-| `health_check` 返回 `Vec<CheckOutcome>` | `kzwr.rs:113-197` | 改为 `health_json` 返回同形 JSON（宿主已有转换层 `cabi.rs:198-238`） |
+目标（用户原话）：「将之前 kzwr 遗留的功能和配置完全迁移到插件当中，不和宿主混在一起」。
+**宿主侧 `builtin/kzwr.rs` 与 `infra/kzwr_api/` 已整体删除**，核心不再引用任何酷族专属
+概念（`registry.rs` 有一条不变式测试钉住这一点）。迁移后全部代码在 `plugins/kzwr/`。
 
-> 迁移后 `kzwr.rs` 内的类型（`KzwrUserResponse` 等）保留，只把入口换成 `extern "C"` 回调 + JSON 收发。
+原表里的「依赖宿主能力」逐条落地结果：
+
+| 原依赖 | 最终替代（已实现） |
+|---|---|
+| `state.kzwr`（`KzwrClient`） | 插件自带 `src/api.rs`（reqwest + `access-token` 头），`src/rt.rs` 里的 `OnceLock` runtime 承载异步；宿主把每个增强回调放进 `spawn_blocking`，故插件可安全 `block_on`（详见 `PLUGIN_ABI.md` §3） |
+| `state.config` 读写 token / 阈值 | 读：`cfg.self_config`（宿主只注入**本插件**命名空间）；写：返回值里的 `config:{set,remove}` 声明式回写 → `plugin_data["kzwr"]`（age 加密） |
+| `state.audit.record(...)` | 返回值 `audit:[{action,detail,ok}]` → 宿主落 `state.audit`；`plugin.data`（回写键名，不含值）由宿主自动补记 |
+| `raise_alert_once` / `state.alerts` | 返回值 `alerts:[{level,message}]` → 宿主 `raise_alert_once`（按 来源+消息 精确去重）；`resolve:[前缀]` → 条件恢复后消解该插件的旧告警 |
+| `human_bytes` | 插件内部自带 |
+| `webdav_username(state)`（账号一致性检查） | **已去掉**（用户决策）：备份目标与酷族账号不必是同一账号，跨账号检查是错的 |
+| `routes()`（axum Router） | 动作名沿用原路径 → `/api/p/kzwr/*` 前端 URL **零改动**；`accounts`、`accounts/{add,update,remove,percent}`、`user`、`space`、`quota`、`trash`、`trash/empty` |
+| `health_check` → `Vec<CheckOutcome>` | `health_json` 返回 `{checks:[{key,title,status,detail,hint}],alerts:[…],resolve:[…]}`（裸数组也兼容）；体检键 `kzwr.<账号id>` 让前端「前往处理」自动路由到插件页 |
+
+**四项关键决策（均为用户确认）**：
+
+1. **旧配置不迁移** —— 宿主 `enhance.kzwr_token_configured` 等一并删除，用户升级后需在
+   「插件」页**重新填写** access-token（一次性成本，换核心彻底解耦）。
+2. **完全删除**核心 kzwr 代码，不留「还在但没人读」的配置段（否则导出包会持续携带敏感明文）。
+3. **去掉账号一致性检查**（见上表）。
+4. **告警走通用声明式通道**（`alerts`/`resolve`），任何插件都能用，不为 kzwr 开特例。
+
+**新增的通用能力（不属于 kzwr，属于框架）**：
+
+- `UiBlock::Accounts` —— 多凭据账号列表的**声明式**界面区块；前端通用渲染器
+  `PluginAccounts.svelte` **零插件专属逻辑**。契约见 `PLUGIN_ABI.md` §4.5。
+  这样「一个插件需要多账号」不再要求改前端。
+- 声明式副作用通道 `alerts` / `resolve` / `config` / `audit`（§4.4），主表保持**冻结**。
+- 契约回归测试 `backend/src/plugin/contract_tests.rs`：**直接读各插件的 `describe.json`
+  用真实宿主类型反序列化**，并遍历 `plugins/*/describe.json` —— 新增插件自动纳入校验，
+  漂移即编译期失败。
+
+**迁移中踩到并已修正的实现细节**（都有测试钉住）：
+
+- 配置键名不允许点号 → 按账号阈值用 `percent-<id>`；且宿主对一批键是
+  **整批生效或整批拒绝**，一个坏键会让「阈值改了不生效」且插件自认为成功。
+- `0 = 关闭预警` 必须**显式写 0**，不能表达成「删键」（删键 = 未单独设置 = 回落到全局值，
+  表现为设 0 后立刻弹回、且下轮巡检继续报警）。
+- 越界阈值（>100）**报错**而不是夹到 100（夹住会让提示文案与实际存储矛盾）。
+- `/accounts` 回显的 `default_percent` 用**生效值**而不是编译期常量。
+
+> 遗留：`[kzwr]` 段在旧 `config.toml` 里仍可能存在，由 `infra/config.rs` 的
+> `legacy_kzwr_section_is_ignored` 钉住「必须能载入且其余各段不丢」——这是升级即服务
+> 启动的前提。
 
 ---
 
@@ -360,6 +407,22 @@ typedef struct KzwrTargetAbi {
 | **动态 `metric`** | `metric` 块支持 `action`：前端渲染时 `GET` 该路径取实时值（用于云端空间用量），失败则保留静态文案 |
 
 净减约 2000 行（19 文件，+441/−2461）。删除的组件均已在重构前确认无引用。
+
+### 7.7 kzwr 完全外置：功能与配置都不再混在宿主里（2026-09-28，v0.4.5）
+
+| 反馈 / 目标 | 处理 |
+|---|---|
+| 「将之前 kzwr 遗留的功能和配置完全迁移到插件当中，不和宿主混在一起」 | 删除 `plugin/builtin/kzwr.rs`、`infra/kzwr_api/`（整个模块）、`AlertSource::Kzwr`、`AppState.kzwr`、`enhance.kzwr_token_configured`；能力全部落在 `plugins/kzwr/`（外置 .so，随包分发并默认签名） |
+| 一个插件需要管多个凭据，却要改前端 | 新增 `UiBlock::Accounts` + 通用渲染器 `PluginAccounts.svelte`（**零插件专属逻辑**）：列表 / 新增 / 编辑 / 删除 / 每项一个数值调参，全部由插件 `describe.json` 声明路径与字段 |
+| 插件想发告警、想持久化自己的配置、想留审计，却没有宿主回调 | 新增**声明式副作用通道**（主表保持冻结）：返回值 `alerts[]` / `resolve[]` / `config{set,remove}` / `audit[]`，由 `cabi::apply_side_effects` 按固定顺序落地。任何插件可用 |
+| 契约漂移（文档写的类型和代码不一致、新增插件前端不认） | 新增 `backend/src/plugin/contract_tests.rs`：用**真实宿主类型**反序列化各插件 `describe.json`，并遍历 `plugins/*/describe.json` 自动纳入；写回解析/键名规则/健康两种形状都抽成可测函数并覆盖 |
+| 体检「前往处理」只认几个写死的 key | `SetupCheckSection.pageOf()` 改为通用规则：带点的 key 一律路由到插件页；`AuditSection.actionText()` 对 `kzwr.*` 这类插件动作给通用中文标签；`MessagesPanel` 认 `{"plugin":"<id>"}` 形态的告警来源 |
+| 旧单 token 配置 | **不迁移**（用户决策）：升级后需在「插件」页重新填写。旧 `[kzwr]` 段仍能被载入（`legacy_kzwr_section_is_ignored` 钉住「载入成功且其余各段不丢失」），下次保存自然消失 |
+| 多账号实时用量在卡片上看不到（迁移后一度只剩静态文案） | 插件卡片按声明的 `metric.action` 通用拉取实时值（与设置弹窗同一契约），任何插件声明即可用；`accounts` 块计入「N 项设置」 |
+
+**迁移过程中修掉的真实缺陷**（均由测试钉住，见 §5.2 末尾）：阈值 `0`（关闭预警）
+被表达成删键 → 设 0 后弹回全局值并继续报警；越界阈值被静默夹到 100 却回显原值；
+`/accounts` 的 `default_percent` 回显编译期常量而非生效值。
 
 ### 7.6 外置插件热加载 + 交互收敛（2026-09-27，v0.4.4）
 
@@ -460,6 +523,19 @@ GET（读，供回显）与 POST（写，保存），并在 `ui.blocks` 里声�
 - 文档：`docs/ARCHITECTURE.md:476-477,505,508`、`docs/PLUGIN_ABI.md:15,154`
 - 保留：`plugins/sdk/`、`plugins/example-hello/`（稳定 ABI 示例）
 
+### 8.1 Step 5-kzwr 的删除面（v0.4.5）
+
+- `backend/src/plugin/builtin/kzwr.rs`（整个模块，约 1000 行）+ `builtin/mod.rs` 的注册
+- `backend/src/infra/kzwr_api/`（整个模块：client / constants / models）
+- `AppState.kzwr`（`KzwrClient` 实例）与 `AlertSource::Kzwr`
+- `AppConfig.kzwr`（`KzwrConfig{access_token_enc, quota_warn_percent}`）与其默认值函数
+- `enhance.kzwr_token_configured`（体检项）与前端 `KzwrSection`（Step 5 前已删，本次删净其后端）
+- 前端硬编码的 `'kzwr'` 来源标签、`PAGE_OF.kzwr/quota`、`AuditSection` 里 4 条 `kzwr.*` 标签、
+  `lib/plugins.js` 的 kzwr 兜底卡片项
+- 不变式测试：`registry.rs` 断言**核心不内置任何增强插件**（`builtin` 只剩 webdav 目标）
+- 保留：`plugins/kzwr/`（迁移后的全部实现）、`[kzwr]` 旧段的**载入容错**（不是保留功能，
+  是不让老配置炸掉服务）
+
 ---
 
 ## 9. 实施顺序与估时
@@ -471,10 +547,14 @@ GET（读，供回显）与 POST（写，保存），并在 `ui.blocks` 里声�
 | 3 | 签名校验（`ring` + `.sig` 约定 + 公钥配置 + 内置官方公钥 + `Scripts/sign_plugin.sh`） | 0.5 天 | ✅ 已完成（算法按实现修正：对 .so 原始字节签名、base64 公钥，见 §3.4） |
 | 4 | 插件自管数据（`plugin_data` + `plugin_data_json` + 卸载清除 + 孤立检测 + 导入导出） | 0.4 天 | ✅ 已完成（`/api/plugins/:id/data`、`/purge`，前端设置页可编辑） |
 | 5 | 内置插件 ABI 化：webdav（目标表） | 0.4 天 | ✅ 已完成（方案 C：静态表 + `WebdavAbiPlugin` 组合 `CApiTarget`） |
-| 5b | 内置插件 ABI 化：kzwr（动作/体检/事件/自管配置/告警） | 0.6 天 | ⏳ 待做（最大改造面，见 §5.2） |
+| 5b | kzwr **完全外置**（动作/体检/事件/自管配置/告警） | 0.6 天 | ✅ 已完成（2026-09-28，v0.4.5；比原计划更进一步——不是「内置的 ABI 版」而是**移出核心成为外置 .so**，见 §5.2 / §7.7 / §8.1） |
 | 6 | 前端（签名徽标、卸载按钮）+ SDK `export_target_v1!` + 示范插件（本地目录） | 0.5 天 | ✅ 已完成（签名徽标含「已签名/未签名/验签失败」三态；`plugins/example-localfs` 示范目标插件） |
 | 7 | 文档合并（`PLUGIN_ABI.md`）+ ADR 补充 | 0.3 天 | ✅ 已完成（§9 目标能力表 + §10 诊断） |
-| | **合计** | **~4.5 天**（含真机端到端） | 完成约 90%（仅余 5b kzwr ABI 化 + 真机回归） |
+| | **合计** | **~4.5 天**（含真机端到端） | 改造项 1–7 **全部完成**；剩余为真机回归与 §11 的运维项 |
+
+> 5b 的落地形态与原计划不同：原写「内置插件 ABI 化」，实际按用户要求做成**外置插件**
+> （核心不含 kzwr 一行代码）。原表 §5.2 里「因是内置插件，仍可 `use` 宿主内部库」这一
+> 前提已不成立，也不再需要——插件自带 HTTP 客户端与字节格式化。
 
 ### 已完成部分的实测结论（2026-09-26，NAS）
 

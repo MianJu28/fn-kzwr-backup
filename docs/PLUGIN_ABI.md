@@ -3,12 +3,18 @@
 > 目标：**主程序升级不需要重新编译插件**。做法是把跨边界的数据从「Rust 类型」换成
 > 「版本化的 C ABI + UTF-8 JSON」——宿主内部随便改，只要本文档的契约不变，插件就一直能用。
 >
-> **内置插件与外置插件走同一份契约**：内置插件（`webdav` 目标、`kzwr` 增强）同样是
+> **内置插件与外置插件走同一份契约**：内置插件（当前只剩 `webdav` **目标**）同样是
 > 「编译进主程序的 ABI 插件」，区别在于表是**编译期静态表**而非 `dlopen` 取到的。
 > 因此本文档对内置插件同样有约束力。
 >
+> **增强类插件一律外置**：核心不掺任何厂商专属逻辑（v0.4.5 起 `kzwr` 也已从核心删除，
+> 外置为 `plugins/kzwr/`）。它是本文档各条约定的**参考实现**，多凭据界面见 §4.5，
+> 声明式副作用见 §4.4。
+>
 > 代码位置：宿主 `backend/src/plugin/{abi.rs,cabi.rs,loader.rs,target_abi.rs,builtin/}`；
-> 插件 SDK `plugins/sdk/`；示例 `plugins/example-hello/`。
+> 插件 SDK `plugins/sdk/`；示例 `plugins/example-hello/`；kzwr `plugins/kzwr/`。
+> 契约回归测试：`backend/src/plugin/contract_tests.rs`（**直接读各插件的 `describe.json`
+> 用真实宿主类型反序列化**，新增插件自动纳入校验）。
 >
 > - 增强类能力（UI / 动作 / 体检 / 事件）：见 §2 主表
 > - **自定义备份目标**（推块传输 / 并发回传）：见 **§9 目标能力表**
@@ -62,14 +68,34 @@ typedef struct KzwrPluginAbi {
 - **空指针**（`NULL` / `nullptr`）表示"无内容"，宿主按空处理，不会崩
 - **不要 panic 跨 FFI**：Rust 插件请自行 `catch_unwind`（示例已演示）；宿主另有一层 `catch_unwind` 兜底
 - **线程安全**：宿主可能从不同线程调用回调
-- 回调应当**快速返回**（动作接口在请求线程里执行；长任务请自行异步化并尽快返回）
-- ⚠️ **禁止在回调里 `runtime().block_on()` 启动/驱动新的 async runtime**
-  （2026-09-26 血泪坑）：宿主常在 **tokio runtime 线程**上调用同步回调（如 axum handler
-  里的 `test_json`）。此时 `block_on` 会 panic
-  `Cannot start a runtime from within a runtime`，而 `extern "C"` 帧**不允许 unwind** →
-  **整个进程 abort**（表现为"接口返回空 + 进程消失"）。
-  正确做法：把阻塞工作派发到**专用线程**（`std::thread::spawn`）再 `block_on`，
-  该线程没有 runtime 上下文，可安全阻塞。
+- 回调应当**快速返回**；耗时的工作请自行控制超时（宿主动作路由是**一请求一次调用**，
+  插件不返回则前端一直转）。
+
+#### 线程与 async（`block_on` 的正确姿势）
+
+`extern "C"` 帧**不允许 unwind**：panic 跨过它 = 整个进程 abort（症状是「接口返回空 +
+进程消失」）。而在 **tokio runtime 线程**上 `block_on` 会 panic
+`Cannot start a runtime from within a runtime` —— 这正是最容易踩的组合。
+
+- **增强插件（`KzwrPluginAbi`）：宿主已把每个回调放进 `tokio::task::spawn_blocking`**
+  （`cabi.rs` 的 `call1`/`call2`：`available` / `action` / `health` / `event` / `reload` /
+  `on_startup` / `patrol` / `after_backup` 全部覆盖）。`spawn_blocking` 线程**不是** async
+  上下文，因此插件**可以**在自己的 runtime 上 `block_on` 发 HTTP 请求 —— 这是增强插件
+  唯一的等待方式（没有宿主回调可以借用）。要点：
+  1. runtime 用 `OnceLock` 之类的**全局单例**，别每次调用新建（线程数会爆）；
+  2. 仍然自己 `catch_unwind`（见 §8），宿主另有一层兜底，但**别依赖它**：跨 ABI 的
+     `extern "C"` unwind 在 release 优化下不保证还能被兜住；
+  3. 不要在 `block_on` 里跑无上限的循环，宿主的 blocking 池是有容量上限的。
+- **目标插件（`KzwrTargetAbi`）：仍然可能在 runtime 线程上被调用** —— 只有分块收发
+  （`write_stream`/`read_stream`）与 `list`/`delete`/`ensure_dir`/`ping` 走了
+  `spawn_blocking`；**`test_json`（目标页「测试连接」）与 `target_open`（装配目标时）是
+  直接在 async 线程上调的** —— 2026-09-26 那次 abort 就是 `test_json` 里 `block_on` 引发的。
+  所以目标插件**禁止**在回调里 `block_on`；要阻塞就派发到自己的**专用线程**
+  （`std::thread::spawn` 后再 `block_on`，该线程没有 runtime 上下文）。
+
+> 两类插件规则不同是**历史事实**：增强插件可以 `block_on`，是因为宿主把增强表的每个回调
+> 都放进了 `spawn_blocking`（目标表没有这层改造）。新增**目标**插件时不要照抄 kzwr 的
+> `block_on` 写法。
 
 ## 4. JSON 契约
 
@@ -94,7 +120,12 @@ typedef struct KzwrPluginAbi {
       { "type": "button", "label": "按钮", "action": "/hello", "danger": false, "confirm": null },
       { "type": "text", "field": "token", "label": "输入项", "value": null, "placeholder": "提示", "secret": true, "action": "/save", "button": "保存" },
       { "type": "number", "field": "days", "label": "天数", "value": 7, "suffix": "天", "action": "/save", "button": "保存" },
-      { "type": "toggle", "field": "enabled", "label": "开关", "value": false, "action": "/toggle" }
+      { "type": "toggle", "field": "enabled", "label": "开关", "value": false, "action": "/toggle" },
+      { "type": "accounts", "label": "账号", "list": "/accounts", "add": "/accounts/add",
+        "update": "/accounts/update", "remove": "/accounts/remove",
+        "credential_field": "token", "credential_label": "访问令牌", "multiple": true,
+        "edit_action": "/accounts/percent", "edit_field": "percent", "edit_label": "预警阈值",
+        "edit_suffix": "%", "edit_min": 0, "edit_max": 100 }
     ]
   }
 }
@@ -104,11 +135,13 @@ typedef struct KzwrPluginAbi {
 - `ui` 可为 `null`（无界面插件）
 - `blocks[].action` 是**相对插件前缀**的路径，建议写成 `/xxx`（宿主也容忍漏写 `/`）；前端把它拼成 `POST /api/p/<插件id>/<action>`
 - 未知字段双方都应忽略（向前兼容）
-- **`component` 已弃用**：前端不再有「内置组件」分支，所有插件（含内置 webdav/kzwr）
-  一律用 `blocks` 渲染。请把界面**完整**写进 `blocks`，不要依赖 `component`。
+- **`component` 已弃用**：前端不再有「内置组件」分支，所有插件一律用 `blocks` 渲染，
+  **包括需要多账号界面的插件**（用 `accounts` 块，见 §4.5）。请把界面**完整**写进
+  `blocks`，不要依赖 `component`：新增插件不该要求改前端。
 - **渲染位置**：插件页卡片只显示只读概览（`metric` / `tips`）；可编辑项
   （`text` / `number` / `toggle` / `button`）放在**插件设置弹窗**里（点卡片「设置」打开），
-  仍由同一份 `blocks` 驱动 —— 插件无需关心自己显示在卡片还是弹窗。
+  仍由同一份 `blocks` 驱动 —— 插件无需关心自己显示在卡片还是弹窗
+  （`accounts` 同属可编辑项，出现在弹窗里；卡片只显示 `metric`/`tips` 概览）。
 - **表单回显（`echo`，强烈建议实现）**：`value` 只是描述里的**静态默认值** ——
   插件并不知道自己持久化过什么，所以只靠 `value` 会让表单**永远显示默认值**
   （典型症状：用户把阈值改成 42，重新打开又显示 85，像是没保存）。
@@ -156,14 +189,31 @@ typedef struct KzwrPluginAbi {
   ],
   "tasks": [
     { "id": "default", "name": "默认任务", "enabled": true, "paths": ["/vol1/…"],
-      "target_id": "default", "target_folder": "fn-backup", "schedule_cron": "0 2 * * *" }
+      "target_id": "default", "target_folder": "fn-backup", "schedule_cron": "0 2 * * *",
+      "empty_recycle_bin": true, "recycle_max_gb": 20, "recycle_min_age_days": 7 }
   ],
-  "enhance": { "kzwr_token_configured": true }
+  "self_config": { "accounts": "[{\"id\":\"a1\",\"name\":\"主账号\",\"token\":\"…\"}]", "percent-a1": "90" },
+  "after_backup_task": "default"
 }
 ```
 
-口令、access-token **永不外传**（`ready` 表示凭据是否齐备）。
-`username` **会**传给插件（目标管理页本来就回显它）——这是决策 10-1 的定案。
+- 口令、age 私钥等**宿主自己的**凭据永不外传（`ready` 只表示凭据是否齐备）。
+- `username` **会**传给插件（目标管理页本来就回显它）——这是决策 10-1 的定案。
+- `tasks[].empty_recycle_bin` / `recycle_max_gb` / `recycle_min_age_days` 是**任务级**保留策略：
+  宿主只提供数值，具体清理动作由具备该能力的插件实现（插件不该自己拍脑袋定门槛）。
+- `after_backup_task` **只有 `after_backup` 事件**非 `null`：告诉插件「刚完成的是哪个任务」，
+  它才能套用**该任务自己**的门槛。其它事件为 `null`（JSON 里字段恒在，用 `Option`）。
+
+#### `self_config`：插件读自己设置的唯一路径
+
+| 规则 | 说明 |
+|---|---|
+| 内容 | `cfg.plugin_data[<本插件 id>]` 解密后的**明文**键值对 |
+| 隔离 | 由宿主按 `plugin_id` 过滤：插件**读不到其它插件**的键，也读不到宿主凭据 |
+| 键名 | 非空、≤64 字符、只允许 `[A-Za-z0-9_-]` —— **点号不允许**（见 §4.4） |
+| 保密 | 值可能含插件自有凭据：**宿主与插件都不得把它写入日志或回传前端** |
+
+增强插件的写入路径不是回调，而是返回值里的 `config` 字段（见 §4.4）。
 
 ### 4.2.1 `target_json.config`：插件自管配置（决策 2）
 
@@ -186,17 +236,104 @@ typedef struct KzwrPluginAbi {
 | 回调 | 返回 |
 |------|------|
 | `available_json` | `{"available": true, "reason": null}` |
-| `health_json` | `[{"key":"…","title":"…","status":"ok\|warn\|fail","detail":"…","hint":null}]` |
+| `health_json` | 体检项数组，或 `{"checks":[…], "alerts":[…], "resolve":[…]}`（见下） |
 | `action_json` | 任意 JSON（推荐 `{"success":true,"message":"…"}` 或 `{"success":false,"error":"…"}`）；宿主原样回给前端 |
 | `event_json` | 任意 JSON；`after_backup` 可用 `{"count": N}` 表示"处理了 N 项" |
 
 `action_json` 的入参 `request_json`：
 
 ```json
-{ "body": { "…前端提交的 JSON…" }, "cfg": { "…配置快照…" } }
+{ "body": { "…前端提交的 JSON…" }, "cfg": { "…配置快照…" }, "method": "POST" }
 ```
 
+- **`method`**：`"GET"` / `"POST"`。同一条 action 路径既被前端**回显**（GET）又被**保存**（POST）
+  时调用，插件必须按 `method` 分流，否则 GET 会被当成写入。
+- **GET 的查询串进 `body`**：`GET /api/p/kzwr/accounts?fresh=1` 时，宿主把 query 序列化后
+  放入 `body`，即 `{"fresh": "1"}`。⚠️ **值一律是字符串**（HTTP query 没有类型），
+  判断布尔请用「真值」写法（`"1"/"true"/"yes"/"on"`），不要 `body["fresh"] == true`。
+- 布尔判断请写成 `is_truthy(body.get("fresh"))` 之类：前端也可能传 `?fresh`（值为空串）。
+
 事件名：`startup`（启动）、`patrol`（周期巡检，约 30 分钟）、`after_backup`（备份成功后）、`reload`（配置变更后）。
+
+`health_json` 的两种形状宿主**都接受**（宿主 `cabi::parse_health`）：
+
+```json
+[ { "key": "kzwr.a1", "title": "酷族账号「主账号」", "status": "warn",
+    "detail": "云端空间 92%（1.8 TB / 2 TB）", "hint": "阈值 90%，建议清理" } ]
+```
+
+```json
+{ "checks": [ …同上… ],
+  "alerts":  [ { "level": "warn", "message": "…" } ],
+  "resolve": [ "云端存储空间已用「主账号」" ] }
+```
+
+- 体检项 `key` 的命名约定：`<插件id>` 或 `<插件id>.<子项/账号>`。**带点号即插件产物**，
+  前端据此把「前往处理」按钮指向插件页（不需要为任何插件写专属映射）。
+- `status` 省略时按 `ok` 处理；返回值**不是合法 JSON** 时退化成空表（体检不会因某个
+  插件走形而 500）。
+
+### 4.4 声明式副作用：插件唯一的「让宿主做事」通道
+
+**ABI 里没有宿主回调**（没有 `host_vtable`，插件不能调宿主的任何函数）。插件想告警、
+想清告警、想持久化配置、想留审计，就把意图**随返回值一起带回来**，由宿主执行。
+`health_json` / `event_json` / `action_json` 的返回值里都识别这 4 个可选字段
+（宿主入口：`cabi::apply_side_effects`；顺序固定 **alerts → resolve → config → audit**，
+这样「同一轮里既报新障又消旧障」的结果是确定的）：
+
+```json
+{
+  "success": true,
+  "alerts":  [ { "level": "warn", "message": "云端存储空间已用「主账号」 92%，达到阈值 90%" } ],
+  "resolve": [ "云端存储空间已用「主账号」" ],
+  "config":  { "set": { "accounts": "[…]" }, "remove": ["token"] },
+  "audit":   [ { "action": "kzwr.accounts.add", "detail": "新增账号「主账号」", "ok": true } ]
+}
+```
+
+| 字段 | 宿主行为 | 要点 |
+|---|---|---|
+| `alerts[]` | 以来源 `Plugin(插件id)` 落库，**同来源+同文案去重**（不重复外发 Webhook） | `level` 只认 `"error"`，其它一律 `warn`；**消解靠文案**，所以要把变化量（账号名）写进文案，且别写时间戳——否则每次都不重复、越积越多 |
+| `resolve[]` | 删除**本插件**中消息以这些**前缀**开头的告警 | 用于「条件恢复后自动消解」（空间回落）。前缀必须是 `alerts` 文案的开头若干字符；空串被忽略 |
+| `config` | 写入 `plugin_data[<本插件 id>]`（age 加密落盘），下次调用起出现在 `cfg.self_config` | 见下方键名规则；审计只记**键名**不记值 |
+| `audit[]` | `AuditLog.record(action, detail, ok, None)` | 让用户**看不见**的后台动作可追溯（如备份后自动清理）。`action` 自带插件命名空间，核心不猜语义 |
+
+#### `config` 键名规则（踩过的坑，必读）
+
+- 非空、`≤ 64` 字符、只允许 **`[A-Za-z0-9_-]`** —— **点号 `.` 不允许**。
+- 校验是 **整批生效或整批拒绝**：任一非法键名 → 本次 `config` 全部不写（宿主只留一条 warn 日志）。
+  曾经 kzwr 用 `percent.<id>`，被整批拒绝且插件以为保存成功，症状是「阈值改了不生效」。
+  现在按账号存阈值一律用 **`percent-<id>`**。
+- 值：非字符串会被 `to_string()` 后存入；**空串 = 删除该键**（`remove` 也走同一路径）。
+- 想在一个键里存结构化数据（如账号列表）就存 JSON 字符串——整个命名空间一起加密，
+  比拆成 `account.1.token` 之类更安全也更简单（且拆出来的键名还得不含点号）。
+
+> 副作用字段是**新增的可选字段**：不认识它们的旧插件照常工作（§5 的「只增不改」）。
+
+### 4.5 `accounts` 区块：多凭据插件的通用界面（前端零改动）
+
+一个插件管多份凭据（多账号、多站点）时，**不要**写前端专属组件，声明 `accounts` 块即可，
+前端 `PluginAccounts.svelte` 按声明渲染。数据契约（路径都相对 `api_base`，即 `/api/p/<id>`）：
+
+| 操作 | 请求 | 响应 |
+|---|---|---|
+| 列表 | `GET {list}` | `{"accounts":[{"id","name","configured","meta":{…}}]}` |
+| 加 `fresh=1` | `GET {list}?fresh=1` | 同上；插件此时**才可以**访问外部接口取实时状态 |
+| 新增 | `POST {add}` `{"name","<credential_field>"}` | `{"success":true,"message":"…","config":{…}}` |
+| 修改 | `POST {update}` `{"id","name","<credential_field>"}` | 同上；**凭据字段留空 = 保持原值** |
+| 删除 | `POST {remove}` `{"id"}` | 同上 |
+| 每项数值设置 | `POST {edit_action}` `{"id","<edit_field>": number}` | 同上（可选：不声明 `edit_action` 就没有这个按钮） |
+
+字段语义：
+
+- `credential_field` / `credential_label` / `credential_placeholder`：凭据字段名与输入框文案。
+- `multiple`：`false` 时前端隐藏「添加」按钮（仍显示列表与编辑）。
+- `edit_action` / `edit_field` / `edit_label` / `edit_suffix` / `edit_hint` / `edit_min` / `edit_max`：
+  每项数值设置（如预警阈值）的动作、字段名与取值范围；前端在提交前按 `edit_min`/`edit_max` 校验。
+- `meta`：**只放可显示的状态**（用量、是否已设置、提示文案…），供前端渲染成一行小字。
+  ⚠️ **`list` 响应永不返回凭据明文**，也不要用 `configured: false` 之外的方式表达「没设置」：
+  凭据明文从插件出前端即算泄漏（本项目硬约束）。
+- 新增/修改后前端会自动刷新列表并回调页面刷新指标（`metric` 块重新 GET）。
 
 ## 5. 版本演进规则
 
