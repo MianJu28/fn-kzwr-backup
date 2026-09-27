@@ -1,5 +1,5 @@
 appname               = fn-kzwr-backup
-version               = 0.4.0
+version               = 0.4.1
 display_name          = 酷族备份
 desc                  = <b>酷族备份</b> —— 飞牛 NAS 增量加密备份<br>把指定文件夹增量、age 加密备份到<a href='https://www.kzwr.com' target='_blank'>酷族网软</a>官方 WebDAV。<br>支持断点续传、大文件自动分片、cron 定时、实时进度与速度、保留策略，按文件或目录选择性恢复。<br><br><b>酷族网软</b>：官网 <a href='https://www.kzwr.com' target='_blank'>www.kzwr.com</a>。<br>免费用户提供 10G 空间、不限速，但下载站在大陆境外，实际速度看网络情况。<br><br>意见建议反馈：<a href='https://github.com/MianJu28/fn-kzwr-backup/issues' target='_blank'>github.com/MianJu28/fn-kzwr-backup/issues</a><br>邮箱：mianju@agent.qq.com
 platform              = x86
@@ -15,4 +15,4 @@ ctl_stop              = true
 checkport             = false
 disable_authorization_path = false
 micro_app             = true
-changelog             = 新增多目标 · 多任务管理：可配置多个 WebDAV 目标（各自独立账号凭据，互不影响），并把「源文件夹 + 目标 + 定时 + 保留策略」组合成多个备份任务，每个任务各自独立增量与快照；新增「任务」「目标」两个管理页（含保存前连通性实测、测试连接、删除保护）。升级后原配置自动迁移为默认任务/目标，既有备份记录继续增量、不会重传。另支持外置插件（动态库，默认关闭）：把 .so 放进插件目录并在设置页开启，即可扩展新功能卡片/接口/备份目标，无需重新打包应用与前端；插件经 ABI 与版本双重校验，加载失败不影响核心。
+changelog             = 新增独立「插件」页：插件能力卡片与外置插件（动态库）管理集中于此，界面由插件自身声明（通用 UI Schema）驱动，新增插件无需重新打包应用与前端；内置 webdav / kzwr 也已改为同一套声明式界面。插件签名默认强制校验：随包插件由官方私钥签名、公钥内置，开箱即用；自签插件在插件页填入公钥即可。插件支持宿主代管配置（加密存储，可随配置导入导出）与卸载保护（仍被任务/目标引用时拒绝卸载）。前端同步重构：概览改为按任务/目标聚合，删去与「任务」页重复的旧「备份」页、重复的 WebDAV 凭据卡与不生效的全局保留策略卡（保留策略本就按任务配置，请在任务页设置）。升级后原配置与既有备份记录保持不变、继续增量。
