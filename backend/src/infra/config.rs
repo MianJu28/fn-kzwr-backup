@@ -160,6 +160,16 @@ pub struct TargetConfig {
     /// 是否启用（禁用后引用它的任务不可运行）
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// **本目标**的上传并发路数（`None` = 沿用 `plugins.target_parallel[插件id]`，
+    /// 再缺省则沿用插件声明；`0`/`1` = 顺序上传，`≥2` = 并发回传）
+    ///
+    /// 为什么必须**按目标**而不是按插件：一个插件（如 webdav）会被多个目标同时实例化
+    /// （多账号各自一套凭据），它们的网络条件与服务端限制各不相同
+    /// —— 曾经只有 `plugins.target_parallel[插件id]` 一份，改一个目标所有同类型目标全跟着变。
+    /// `None` 而非 `0` 表示「未设置」，是为了让「显式设为顺序（0）」与「跟随插件默认」可区分
+    /// （这与阈值 `percent-<id>` 踩过的坑同理）。
+    #[serde(default)]
+    pub parallel: Option<u32>,
 }
 
 fn default_target_kind() -> String {
@@ -244,8 +254,22 @@ impl AppConfig {
                 username_enc: self.webdav.username_enc.clone(),
                 password_enc: self.webdav.password_enc.clone(),
                 enabled: true,
+                parallel: None,
             });
             changed = true;
+        }
+        // 并发度曾**只有插件级**一份（`plugins.target_parallel[插件id]`），导致同类型
+        // 的多个目标改一个全变。改为按目标存储后，把旧值**继承**到当时存在的目标上
+        // —— 否则用户升级后并发设置会静默失效（症状：明明配了并发，却退回顺序上传）。
+        if !self.plugins.target_parallel.is_empty() {
+            for t in self.targets.iter_mut() {
+                if t.parallel.is_none() {
+                    if let Some(v) = self.plugins.target_parallel.get(&t.kind).copied() {
+                        t.parallel = Some(v);
+                        changed = true;
+                    }
+                }
+            }
         }
         if self.tasks.is_empty() && !self.backup.paths.is_empty() {
             self.tasks.push(TaskConfig {
@@ -280,6 +304,11 @@ impl AppConfig {
 
     pub fn target_by_id(&self, id: &str) -> Option<&TargetConfig> {
         self.targets.iter().find(|t| t.id == id)
+    }
+
+    /// 按 id 取**可变**目标（用于就地修改某个目标的自有字段，如按目标的并发度）
+    pub fn target_by_id_mut(&mut self, id: &str) -> Option<&mut TargetConfig> {
+        self.targets.iter_mut().find(|t| t.id == id)
     }
 
     pub fn task_by_id(&self, id: &str) -> Option<&TaskConfig> {
@@ -530,6 +559,7 @@ impl ConfigManager {
                 username_enc: Some(enc_user),
                 password_enc: Some(enc_pass),
                 enabled: true,
+                parallel: None,
             });
         } else {
             // 主目标（首个启用者）就地更新
@@ -881,4 +911,96 @@ greeting = "enc:CCCC"
         assert!(m.plugin_data_remove(&mut cfg, "p"), "首次删除应返回 true");
         assert!(!m.plugin_data_remove(&mut cfg, "p"), "再次删除应返回 false");
     }
+
+    // ── 并发度按目标隔离（2026-09-28）─────────────────────────────────
+    //
+    // 曾经并发度只有 `plugins.target_parallel[插件id]` 一份，而同一个插件会被
+    // **多个目标同时实例化**（多账号各一套凭据）—— 于是改一个目标，同类型目标全跟着变。
+
+    /// 旧配置（只有插件级并发度）迁移后应被**继承**到各目标上，而不是静默失效
+    #[test]
+    fn migrate_inherits_legacy_plugin_parallel_into_targets() {
+        let mut cfg = AppConfig::default();
+        cfg.plugins.target_parallel.insert("webdav".to_string(), 4);
+        cfg.targets.push(TargetConfig {
+            id: "t1".to_string(),
+            kind: "webdav".to_string(),
+            parallel: None,
+            ..Default::default()
+        });
+        cfg.targets.push(TargetConfig {
+            id: "t2".to_string(),
+            kind: "webdav".to_string(),
+            parallel: None,
+            ..Default::default()
+        });
+        assert!(cfg.migrate(), "应发生了迁移");
+        assert_eq!(cfg.targets[0].parallel, Some(4), "旧值应继承到 t1");
+        assert_eq!(cfg.targets[1].parallel, Some(4), "旧值应继承到 t2");
+    }
+
+    /// 迁移**不得覆盖**目标已显式设置的值（显式设置优先于插件级回退）
+    #[test]
+    fn migrate_does_not_overwrite_explicit_target_parallel() {
+        let mut cfg = AppConfig::default();
+        cfg.plugins.target_parallel.insert("webdav".to_string(), 4);
+        cfg.targets.push(TargetConfig {
+            id: "t1".to_string(),
+            kind: "webdav".to_string(),
+            // 显式设为顺序上传（0），与插件级的 4 不同
+            parallel: Some(0),
+            ..Default::default()
+        });
+        cfg.migrate();
+        assert_eq!(
+            cfg.targets[0].parallel,
+            Some(0),
+            "目标已显式设置时，迁移不能覆盖（否则用户的『顺序上传』会被改回并发）"
+        );
+    }
+
+    /// 按目标取并发度：两个同类目标各自独立（曾是一个插件共一份）
+    #[test]
+    fn per_target_parallel_is_independent() {
+        let mut cfg = AppConfig::default();
+        cfg.targets.push(TargetConfig {
+            id: "a".to_string(),
+            kind: "webdav".to_string(),
+            parallel: Some(2),
+            ..Default::default()
+        });
+        cfg.targets.push(TargetConfig {
+            id: "b".to_string(),
+            kind: "webdav".to_string(),
+            parallel: Some(6),
+            ..Default::default()
+        });
+        assert_eq!(cfg.target_by_id("a").unwrap().parallel, Some(2));
+        assert_eq!(cfg.target_by_id("b").unwrap().parallel, Some(6));
+        // 就地修改一个，另一个不受影响（这正是按目标存储的意义）
+        cfg.target_by_id_mut("a").unwrap().parallel = Some(0);
+        assert_eq!(cfg.target_by_id("a").unwrap().parallel, Some(0));
+        assert_eq!(
+            cfg.target_by_id("b").unwrap().parallel,
+            Some(6),
+            "改 a 不应影响 b"
+        );
+    }
+
+    /// `None` 表示「未设置」而非「顺序上传」—— 二者必须可区分
+    #[test]
+    fn unset_parallel_is_distinguishable_from_sequential() {
+        let t_unset = TargetConfig {
+            parallel: None,
+            ..Default::default()
+        };
+        let t_sequential = TargetConfig {
+            parallel: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(t_unset.parallel, None, "未设置");
+        assert_eq!(t_sequential.parallel, Some(0), "显式顺序上传");
+        assert_ne!(t_unset.parallel, t_sequential.parallel);
+    }
+
 }

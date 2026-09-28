@@ -37,24 +37,37 @@
     return (plugins || []).find((p) => p.id === kind) || null;
   }
 
-  /** 该目标类型是否支持并发回传（插件自身能力声明，非用户开关） */
-  function supportsPlan(kind) {
-    const p = pluginOf(kind);
+  /**
+   * 该目标是否支持并发回传
+   *
+   * 优先用**目标自己**带回来的 `supports_plan`（后端按目标所用插件现算），
+   * 没有则回退到按插件类型查询 —— 兼容后端尚未下发该字段的旧版本。
+   */
+  function supportsPlan(t) {
+    if (t && typeof t.supports_plan === 'boolean') return t.supports_plan;
+    const p = pluginOf(t?.kind);
     return !!(p && p.supports_plan);
   }
 
-  /** 该目标类型当前的并发度（0/1 = 顺序；≥2 = 并发） */
-  function parallelOf(kind) {
-    const p = pluginOf(kind);
+  /**
+   * 该目标当前的并发度（0/1 = 顺序；≥2 = 并发）
+   *
+   * **按目标取值**：同一个插件（如 webdav）会被多个目标实例化（多账号各一套凭据），
+   * 并发度属于「这个目标用几条连接」，故读目标自己的 `parallel`；
+   * 未设置时回退到插件级旧值（兼容升级前的配置）。
+   */
+  function parallelOf(t) {
+    if (t && t.parallel != null) return t.parallel;
+    const p = pluginOf(t?.kind);
     return (p && p.parallel) || 0;
   }
 
-  /** 保存某目标类型的上传并发路数（并发度按**插件**配置，同类型目标共用） */
-  async function saveParallel(kind, n) {
-    parSaving = kind;
+  /** 保存**该目标**的上传并发路数（并发度按目标配置，互不影响） */
+  async function saveParallel(id, n) {
+    parSaving = id;
     try {
       const v = Math.max(0, Math.min(8, Math.floor(Number(n) || 0)));
-      const r = await api.pluginParallel(kind, v);
+      const r = await api.targetParallel(id, v);
       if (r && r.error) {
         toast.error(r.error);
         return;
@@ -225,13 +238,13 @@
         </div>
       </div>
 
-      <!-- 该目标类型的上传并发（能力由插件声明；值按插件配置，同类型目标共用） -->
-      {#if supportsPlan(t.kind)}
+      <!-- 本目标的上传并发（能力由插件声明；**值按目标**，各目标互不影响） -->
+      {#if supportsPlan(t)}
         <div class="parallel-row">
           <div class="grow">
             <div class="parallel-label">上传并发路数</div>
             <p class="field-hint">
-              0 或 1 = 顺序上传；≥2 = 并发回传（最多 8）。同一类型的目标共用该设置；
+              0 或 1 = 顺序上传；≥2 = 并发回传（最多 8）。**仅作用于本目标**；
               保存后下次备份生效，无需重启。并发会同时占用多条连接。
             </p>
           </div>
@@ -240,9 +253,9 @@
             type="number"
             min="0"
             max="8"
-            value={parallelOf(t.kind)}
-            disabled={parSaving === t.kind}
-            on:change={(e) => saveParallel(t.kind, e.target.value)}
+            value={parallelOf(t)}
+            disabled={parSaving === t.id}
+            on:change={(e) => saveParallel(t.id, e.target.value)}
           />
         </div>
       {/if}

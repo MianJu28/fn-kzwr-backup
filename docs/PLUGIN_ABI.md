@@ -591,9 +591,15 @@ typedef struct KzwrTargetAbi {
 
 - `plan_next` 返回的是**目标端路径数组**，必须与 `job_json.upload[].rel_path` 同口径
 - 宿主会校验返回的路径**确实属于本次待传清单**（防越权写入）；不在清单内的会被忽略
-- **是否启用由用户按插件配置**：设置项 `plugins.target_parallel[插件 id]`
+- **是否启用由用户按「目标」配置**：设置项 `TargetConfig.parallel`
   （缺省沿用插件声明；`0`/`1` = 关闭；`≥2` = 启用，上限 8），接口
-  `POST /api/plugins/:id/parallel`，保存后热重建、无需重启
+  `POST /api/targets/:id/parallel`，保存后热重建、无需重启
+  - **必须按目标而非按插件**：同一个插件（如 webdav）会被多个目标同时实例化
+    （多账号各一套凭据、各自网络条件），按插件存一份会让「改一个目标、同类型目标全变」。
+  - 优先级：`TargetConfig.parallel` → `plugins.target_parallel[插件 id]`（**旧配置的兼容回退**）
+    → 插件自身声明。老配置的插件级值会在启动迁移时**继承**到当时存在的各目标上，
+    因此升级不会让已配置的并发静默失效。
+  - `POST /api/plugins/:id/parallel` 仍保留（写插件级回退值），但新代码请用按目标的接口。
 - 插件本身不支持时（未声明 `supports_plan`），即便用户配了并发度也不会启用
 
 ### 9.5 写一个目标插件（SDK）

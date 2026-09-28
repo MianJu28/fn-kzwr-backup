@@ -497,6 +497,9 @@ pub struct BundleTarget {
     pub password: Option<String>,
     #[serde(default = "default_test_true")]
     pub enabled: bool,
+    /// 该目标的上传并发度（`null` = 未设置）；随包导出/导入，避免换机后退回默认值
+    #[serde(default)]
+    pub parallel: Option<u32>,
 }
 
 /// 配置导出请求（需管理员口令）
@@ -647,8 +650,12 @@ pub struct PluginParallelRequest {
 
 /// `POST /api/plugins/:id/parallel`：设置**该插件**的上传并发路数
 ///
-/// 并发回传按插件分别配置（`plugins.target_parallel[插件 id]`），只有声明支持
-/// `supports_plan` 的目标插件可设置。保存后目标池热重建，下次备份即生效。
+/// ⚠️ 这是**旧的插件级**接口，仅作兼容保留：一个插件会被多个目标同时实例化
+/// （多账号各一套凭据），按插件存一份会让「改一个目标、同类型目标全变」。
+/// 新代码请用 **`POST /api/targets/:id/parallel`**（按目标配置）。
+///
+/// 插件级值仍会作为**回退**被使用：某目标自身未设置（`TargetConfig.parallel == None`）时
+/// 沿用插件级值，因此老配置的并发设置不会突然失效。
 async fn plugin_parallel(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -1410,6 +1417,14 @@ fn target_view(
         "enabled": t.enabled,
         "ready": state.targets.is_ready(&t.id),
         "backend": state.targets.describe(&t.id),
+        // **本目标**的上传并发度（0/1 = 顺序；≥2 = 并发路数；null = 未设置，沿用插件级/插件声明）
+        "parallel": t.parallel,
+        // 该目标所用插件是否支持并发回传（能力由插件声明，决定是否显示并发输入框）
+        "supports_plan": state
+            .plugins
+            .target_plugin(&t.kind)
+            .map(|p| p.supports_plan())
+            .unwrap_or(false),
         "tasks": 0, // 由调用方填充（引用该目标的任务数）
     })
 }
@@ -1971,6 +1986,9 @@ async fn target_save(
         username_enc: enc_user,
         password_enc: enc_pass,
         enabled: body.enabled.unwrap_or(true),
+        // 编辑目标时**保留**该目标自己的并发度（并发度在目标页单独编辑，
+        // 不该因为改了地址/凭据而被重置）
+        parallel: existing.as_ref().and_then(|t| t.parallel),
     };
     match cfg.targets.iter_mut().find(|t| t.id == id) {
         Some(slot) => *slot = target,
@@ -2051,6 +2069,59 @@ async fn target_test(
         Ok(url) => Json(serde_json::json!({ "success": true, "url": url, "error": null })),
         Err(e) => Json(err(e)),
     }
+}
+
+/// `POST /api/targets/:id/parallel`：设置**该目标**的上传并发路数
+///
+/// 并发度**按目标**存储（`TargetConfig.parallel`）—— 同一个插件（如 webdav）会被多个目标
+/// 同时实例化（多账号各一套凭据、各自的网络条件），此前只有插件级一份，
+/// 改一个目标会让所有同类型目标跟着变。
+///
+/// 只有该目标所用插件声明了 `supports_plan` 才可设置；保存后目标池热重建，下次备份即生效。
+async fn target_parallel(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Option<axum::extract::Json<PluginParallelRequest>>,
+) -> Json<serde_json::Value> {
+    let kind = {
+        let mgr = state.config.lock().unwrap();
+        let cfg = mgr.load().unwrap_or_default();
+        let Some(t) = cfg.target_by_id(&id) else {
+            return Json(err(format!("目标不存在：{id}")));
+        };
+        t.kind.clone()
+    };
+    // 并发回传能力由插件声明（与插件级接口同一判据）
+    let Some(plugin) = state.plugins.target_plugin(&kind) else {
+        return Json(err(format!("未注册类型为 {kind} 的目标插件")));
+    };
+    if !plugin.supports_plan() {
+        return Json(err(format!("目标 {id} 所用插件 {kind} 不支持并发回传")));
+    }
+    let v = body
+        .and_then(|b| b.0.parallel)
+        .unwrap_or(0)
+        .min(crate::plugin::target_abi::MAX_PARALLEL);
+    let cfg = {
+        let mgr = state.config.lock().unwrap();
+        let mut cfg = mgr.load().unwrap_or_default();
+        let Some(t) = cfg.target_by_id_mut(&id) else {
+            return Json(err(format!("目标不存在：{id}")));
+        };
+        t.parallel = Some(v);
+        if let Err(e) = mgr.save(&cfg) {
+            return Json(err(format!("{:#}", e)));
+        }
+        cfg
+    };
+    state.reload_targets(&cfg);
+    state.audit.record(
+        "target.parallel",
+        format!("设置目标 {id} 上传并发路数 {v}"),
+        true,
+        None,
+    );
+    Json(serde_json::json!({ "success": true, "parallel": v, "error": null }))
 }
 
 // ── 任务管理 API（多任务，ADR-014）────────────────────────────────────
@@ -3971,6 +4042,7 @@ async fn config_export(
                     username: u,
                     password: p,
                     enabled: t.enabled,
+                    parallel: t.parallel,
                 }
             })
             .collect();
@@ -4135,6 +4207,7 @@ async fn config_import(
                     username_enc,
                     password_enc,
                     enabled: t.enabled,
+                    parallel: t.parallel,
                 });
             }
             cfg.targets = targets;
@@ -4277,6 +4350,8 @@ pub fn router(state: AppState) -> Router {
         .route("/targets", get(targets_list).post(target_save))
         .route("/targets/:id/delete", post(target_delete))
         .route("/targets/:id/test", post(target_test))
+        // 并发度**按目标**配置（同一个插件可被多个目标实例化，不能共用一份）
+        .route("/targets/:id/parallel", post(target_parallel))
         .route("/tasks", get(tasks_list).post(task_save))
         .route("/tasks/:id/delete", post(task_delete))
         .route("/tasks/:id/run", post(task_run))

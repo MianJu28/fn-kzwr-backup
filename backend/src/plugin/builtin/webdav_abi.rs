@@ -644,7 +644,8 @@ impl TargetPlugin for WebdavAbiPlugin {
         if !target.enabled || target.kind != "webdav" {
             return None;
         }
-        // 并发度由宿主按「插件 id → 并发度」配置在 inner.build 内处理（每插件独立）
+        // 并发度由宿主在 inner.build 内按「目标 → 插件」的优先级解析（见 CApiTarget::caps_for）：
+        // 先取本目标的 `TargetConfig.parallel`，没有才回退到插件级设置。
         self.inner.build(target, mgr)
     }
 

@@ -36,6 +36,7 @@
     'plugin.set_enabled': '启用/停用插件',
     'plugin.parallel': '切换插件并发',
     'plugin.data': '插件回写配置',
+    'target.parallel': '切换目标上传并发',
   };
 
   /**

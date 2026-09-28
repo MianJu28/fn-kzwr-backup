@@ -98,7 +98,19 @@ export const api = {
   /** 通用插件调用：base 为插件 api_base（如 /api/p/kzwr），path 为插件内路径 */
   pluginGet: (base, path) => get(`${base}${path}`),
   pluginPost: (base, path, body) => post(`${base}${path}`, body || {}),
-  /** 设置某个目标插件的上传并发路数（并发回传，每插件独立） */
+  /**
+   * 设置**某个目标**的上传并发路数（并发回传，**按目标**配置）
+   *
+   * 同一个插件（如 webdav）会被多个目标实例化（多账号各一套凭据），
+   * 并发度属于「这个目标用几条连接」，故按目标 id 配置 —— 互不影响。
+   */
+  targetParallel: (id, parallel) => post(`/api/targets/${id}/parallel`, { parallel }),
+  /**
+   * 设置某个**目标插件**的上传并发路数（并发回传）
+   *
+   * ⚠️ 旧接口，仅作兼容保留：插件级一份会让同类型目标改一个全变。
+   * 新代码请用 `targetParallel`（按目标）。
+   */
   pluginParallel: (id, parallel) => post(`/api/plugins/${id}/parallel`, { parallel }),
   /**
    * 启用/禁用某个插件（运行时生效，无需重启）

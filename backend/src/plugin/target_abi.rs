@@ -95,21 +95,28 @@ impl CApiTarget {
             && self.abi.plan_next.is_some()
     }
 
-    /// 按**本插件**的用户配置覆盖并发回传能力
+    /// 按**本目标**的用户配置覆盖并发回传能力（回退到插件级，再回退到插件声明）
     ///
-    /// 并发回传是每插件各自的能力与开关（`plugins.target_parallel[插件id]`）：
-    /// - 缺省（未配置）= 沿用插件自身声明；
-    /// - `0` / `1` = 关闭并发回传（顺序上传）；
-    /// - `≥2` = 启用，该值即并发路数（宿主上限 8）。
+    /// 优先级：`TargetConfig.parallel`（按目标）→ `plugins.target_parallel[插件id]`
+    /// （旧配置的兼容回退）→ 插件自身声明的 `caps`。
+    ///
+    /// 必须**按目标**取值：一个插件会被多个目标同时实例化（多账号各一套凭据），
+    /// 它们网络条件不同 —— 曾经只读插件级那份，改一个目标导致同类型目标全变。
+    ///
+    /// 取值语义：`None` = 未设置（继续回退）；`0`/`1` = 顺序上传；`≥2` = 并发路数（上限 8）。
+    /// 用 `Option` 而非 `0` 表示未设置，才能区分「显式设为顺序」与「跟随插件默认」。
     ///
     /// 在 `build()` 而非构造时读取：插件实例在启动时装配，那时配置尚未加载。
-    fn caps_for(&self, mgr: &ConfigManager) -> AbiTargetCaps {
+    fn caps_for(&self, target: &TargetConfig, mgr: &ConfigManager) -> AbiTargetCaps {
         let mut caps = self.caps.clone();
-        if let Some(v) = mgr
-            .load()
-            .ok()
-            .and_then(|c| c.plugins.target_parallel.get(&self.meta.id).copied())
-        {
+        // 第一优先：本目标自己的设置
+        let v = target.parallel.or_else(|| {
+            // 回退：旧的插件级设置（配置迁移会把旧值继承到目标上，这里是给未迁移/新目标兜底）
+            mgr.load()
+                .ok()
+                .and_then(|c| c.plugins.target_parallel.get(&self.meta.id).copied())
+        });
+        if let Some(v) = v {
             caps.max_parallel = v.min(MAX_PARALLEL);
             // 插件本身不支持时，即便用户配置了并发度也不启用
             caps.supports_plan = caps.supports_plan && v >= 2;
@@ -231,7 +238,7 @@ impl TargetPlugin for CApiTarget {
         }
         let storage = AbiTargetStorage {
             abi: self.abi,
-            caps: self.caps_for(mgr),
+            caps: self.caps_for(target, mgr),
             th: th as usize,
             name: self.meta.name.clone(),
             chunk_size: self.chunk_size(),
@@ -698,5 +705,225 @@ impl AbiEntry {
             is_dir: self.is_dir,
             digest: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! 并发度解析的单元测试（这里正是「改一个目标、同类型目标全变」的 bug 所在处）
+    use super::*;
+    use crate::infra::config::{AppConfig, ConfigManager, TargetConfig};
+    use crate::plugin::abi::{KzwrTargetAbi, C_ABI_VERSION};
+
+    // ── 最小桩：只为让 CApiTarget 能构造（不真的调用任何回调）─────────────
+    extern "C" fn stub_open(_: *const std::os::raw::c_char) -> *mut std::os::raw::c_void {
+        std::ptr::null_mut()
+    }
+    extern "C" fn stub_write_begin(
+        _: *mut std::os::raw::c_void,
+        _: *const std::os::raw::c_char,
+        _: u64,
+    ) -> *mut std::os::raw::c_void {
+        std::ptr::null_mut()
+    }
+    extern "C" fn stub_write_chunk(
+        _: *mut std::os::raw::c_void,
+        _: *mut std::os::raw::c_void,
+        _: *const u8,
+        _: u32,
+    ) -> i32 {
+        0
+    }
+    extern "C" fn stub_write_end(_: *mut std::os::raw::c_void, _: *mut std::os::raw::c_void) -> i64 {
+        0
+    }
+    extern "C" fn stub_read_begin(
+        _: *mut std::os::raw::c_void,
+        _: *const std::os::raw::c_char,
+    ) -> *mut std::os::raw::c_void {
+        std::ptr::null_mut()
+    }
+    extern "C" fn stub_read_chunk(
+        _: *mut std::os::raw::c_void,
+        _: *mut std::os::raw::c_void,
+        _: *mut u8,
+        _: u32,
+    ) -> i32 {
+        0
+    }
+    extern "C" fn stub_list(_: *mut std::os::raw::c_void, _: *const std::os::raw::c_char) -> *mut std::os::raw::c_char {
+        std::ptr::null_mut()
+    }
+    extern "C" fn stub_delete(_: *mut std::os::raw::c_void, _: *const std::os::raw::c_char) -> i32 {
+        0
+    }
+    extern "C" fn stub_plan_begin(
+        _: *mut std::os::raw::c_void,
+        _: *const std::os::raw::c_char,
+    ) -> *mut std::os::raw::c_void {
+        std::ptr::null_mut()
+    }
+    extern "C" fn stub_plan_next(_: *mut std::os::raw::c_void, _: *mut std::os::raw::c_void) -> *mut std::os::raw::c_char {
+        std::ptr::null_mut()
+    }
+    /// 释放桩返回的字符串（本测试不真的返回字符串，故只做空指针防护）
+    extern "C" fn stub_free_str(p: *mut std::os::raw::c_char) {
+        if !p.is_null() {
+            unsafe { drop(std::ffi::CString::from_raw(p)) };
+        }
+    }
+
+    fn stub_table() -> &'static KzwrTargetAbi {
+        static T: std::sync::OnceLock<KzwrTargetAbi> = std::sync::OnceLock::new();
+        T.get_or_init(|| KzwrTargetAbi {
+            abi: C_ABI_VERSION,
+            size: KzwrTargetAbi::REQUIRED_SIZE,
+            target_open: stub_open,
+            target_close: None,
+            write_begin: stub_write_begin,
+            write_chunk: stub_write_chunk,
+            write_end: stub_write_end,
+            write_abort: None,
+            read_begin: stub_read_begin,
+            read_chunk: stub_read_chunk,
+            read_end: None,
+            list_json: stub_list,
+            delete: stub_delete,
+            ensure_dir: None,
+            ping: None,
+            test_json: None,
+            config_get: None,
+            config_set: None,
+            last_error_json: None,
+            plan_begin: Some(stub_plan_begin),
+            plan_next: Some(stub_plan_next),
+            plan_end: None,
+            free_str: stub_free_str,
+        })
+    }
+
+    fn target(id: &str, parallel: Option<u32>) -> TargetConfig {
+        TargetConfig {
+            id: id.to_string(),
+            kind: "webdav".to_string(),
+            parallel,
+            ..Default::default()
+        }
+    }
+
+    fn cfg_with(plugin_parallel: Option<u32>) -> (tempfile::TempDir, ConfigManager, AppConfig) {
+        let d = tempfile::tempdir().expect("tempdir");
+        let m = ConfigManager::new(d.path(), crate::infra::keystore::secret("test-pass"));
+        let mut cfg = AppConfig::default();
+        if let Some(v) = plugin_parallel {
+            cfg.plugins.target_parallel.insert("webdav".to_string(), v);
+        }
+        m.save(&cfg).expect("save");
+        (d, m, cfg)
+    }
+
+    /// **核心回归**：同一个插件的两个目标，并发度必须各自独立
+    #[test]
+    fn two_targets_of_same_plugin_get_independent_parallel() {
+        let (_d, m, _cfg) = cfg_with(Some(4));
+        let t = CApiTarget::from_static(
+            stub_table(),
+            crate::plugin::api::PluginMeta {
+                id: "webdav".to_string(),
+                name: "WebDAV".to_string(),
+                version: "1".to_string(),
+                kind: crate::plugin::api::PluginKind::Target,
+                builtin: true,
+                description: String::new(),
+            },
+            AbiTargetCaps {
+                supports_plan: true,
+                max_parallel: 0,
+                preferred_chunk_kib: 1024,
+            },
+            None,
+        );
+        let a = t.caps_for(&target("a", Some(2)), &m);
+        let b = t.caps_for(&target("b", Some(6)), &m);
+        assert_eq!(a.max_parallel, 2, "目标 a 应用自己的 2");
+        assert_eq!(b.max_parallel, 6, "目标 b 应用自己的 6");
+        assert_ne!(a.max_parallel, b.max_parallel, "两个目标必须互不影响");
+        assert!(a.supports_plan && b.supports_plan, "≥2 都应启用并发回传");
+    }
+
+    /// 目标未设置 → 回退到插件级旧值（保证老配置的并发设置不失效）
+    #[test]
+    fn unset_target_falls_back_to_plugin_level() {
+        let (_d, m, _cfg) = cfg_with(Some(3));
+        let t = CApiTarget::from_static(
+            stub_table(),
+            crate::plugin::api::PluginMeta {
+                id: "webdav".to_string(),
+                name: "WebDAV".to_string(),
+                version: "1".to_string(),
+                kind: crate::plugin::api::PluginKind::Target,
+                builtin: true,
+                description: String::new(),
+            },
+            AbiTargetCaps {
+                supports_plan: true,
+                max_parallel: 0,
+                preferred_chunk_kib: 1024,
+            },
+            None,
+        );
+        let c = t.caps_for(&target("x", None), &m);
+        assert_eq!(c.max_parallel, 3, "未设置时应回退到插件级");
+    }
+
+    /// 目标显式设为 0（顺序上传）时，不能因为插件级是 4 就被改成并发
+    #[test]
+    fn explicit_zero_beats_plugin_level_fallback() {
+        let (_d, m, _cfg) = cfg_with(Some(4));
+        let t = CApiTarget::from_static(
+            stub_table(),
+            crate::plugin::api::PluginMeta {
+                id: "webdav".to_string(),
+                name: "WebDAV".to_string(),
+                version: "1".to_string(),
+                kind: crate::plugin::api::PluginKind::Target,
+                builtin: true,
+                description: String::new(),
+            },
+            AbiTargetCaps {
+                supports_plan: true,
+                max_parallel: 0,
+                preferred_chunk_kib: 1024,
+            },
+            None,
+        );
+        let c = t.caps_for(&target("x", Some(0)), &m);
+        assert_eq!(c.max_parallel, 0, "显式 0 应生效（顺序上传）");
+        assert!(!c.supports_plan, "0/1 应关闭并发回传");
+    }
+
+    /// 并发度不得超过宿主上限（防插件被配置成几百路把连接打满）
+    #[test]
+    fn parallel_is_capped_at_max() {
+        let (_d, m, _cfg) = cfg_with(None);
+        let t = CApiTarget::from_static(
+            stub_table(),
+            crate::plugin::api::PluginMeta {
+                id: "webdav".to_string(),
+                name: "WebDAV".to_string(),
+                version: "1".to_string(),
+                kind: crate::plugin::api::PluginKind::Target,
+                builtin: true,
+                description: String::new(),
+            },
+            AbiTargetCaps {
+                supports_plan: true,
+                max_parallel: 0,
+                preferred_chunk_kib: 1024,
+            },
+            None,
+        );
+        let c = t.caps_for(&target("x", Some(999)), &m);
+        assert_eq!(c.max_parallel, MAX_PARALLEL, "应被夹到上限 8");
     }
 }
