@@ -244,6 +244,13 @@
         try {
           const data = JSON.parse(evt.data);
           if (data.type !== 'event') return;
+          // 插件自报进度（kind === 'plugin'）**不得**占用顶部任务卡：
+          // 它既不是备份也不是恢复，若照单全收会把正在进行备份的实时状态顶掉。
+          // 这类事件只在浏览器控制台留痕，任务卡继续由宿主的 backup/restore 事件驱动。
+          if (data.kind === 'plugin') {
+            console.debug('[plugin]', data.job_id, data.message, `${data.done}/${data.total}`);
+            return;
+          }
           liveStatus = {
             kind: data.kind,
             status: data.status,

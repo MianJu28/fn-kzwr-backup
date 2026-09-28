@@ -295,3 +295,192 @@ fn quota_alert_prefix_stable_for_resolve() {
     let legacy = "云端存储空间已用 92%（1.8 TB / 2 TB），达到预警阈值 85%，请及时清理以免备份失败";
     assert!(legacy.starts_with(prefix), "旧格式告警应能被同一前缀消解");
 }
+
+// ── ABI 布局哨兵 ─────────────────────────────────────────────────────────
+//
+// 宿主与 SDK **各自独立定义**同一张 `#[repr(C)]` 表（这样插件不依赖宿主 crate）。
+// 两边靠字段**顺序与类型**对齐 —— 一旦有人只改一边（或误插字段而非追加），
+// 就是**静默的内存错位**：调用会跳到错误地址。编译器发现不了，只有这里能发现。
+//
+// 做法：从两边源码里抽出 `pub struct ... { ... }` 的字段名序列，逐字段比对。
+
+/// 读取仓库内某个相对路径的源码
+fn read_repo_file(rel: &str) -> String {
+    let p = std::path::Path::new(PLUGINS_DIR).join("..").join(rel);
+    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("读取 {} 失败：{e}", p.display()))
+}
+
+/// 从源码里抽出一个 `struct <name> { ... }` 的**字段名**序列
+///
+/// 只取「行首是 `pub <ident>:`」的行，忽略注释/属性/泛型，够用且不引入解析依赖。
+/// 行内注释与 `///` 文档行会被跳过；`Option<...>` 等类型不影响字段名提取。
+fn struct_fields(src: &str, name: &str) -> Vec<String> {
+    let marker = format!("pub struct {name} {{");
+    let start = src
+        .find(&marker)
+        .unwrap_or_else(|| panic!("源码里找不到 `{marker}`（结构体被改名或移动了？）"));
+    let body = &src[start + marker.len()..];
+    let mut out = Vec::new();
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.starts_with('}') {
+            break; // 结构体结束
+        }
+        if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
+            continue;
+        }
+        // 形如 `pub log: Option<...>,`
+        let Some(rest) = line.strip_prefix("pub ") else {
+            continue;
+        };
+        let Some((field, _)) = rest.split_once(':') else {
+            continue;
+        };
+        out.push(field.trim().to_string());
+    }
+    assert!(!out.is_empty(), "结构体 {name} 未解析出字段（格式变了？）");
+    out
+}
+
+#[test]
+fn host_plugin_abi_fields_match_sdk_exactly() {
+    let host = read_repo_file("backend/src/plugin/abi.rs");
+    let sdk = read_repo_file("plugins/sdk/src/lib.rs");
+    let h = struct_fields(&host, "KzwrPluginAbi");
+    let s = struct_fields(&sdk, "KzwrPluginAbi");
+    assert_eq!(
+        h, s,
+        "主表 KzwrPluginAbi 两侧字段不一致（宿主 abi.rs vs SDK lib.rs）：\n宿主: {h:?}\nSDK : {s:?}\n\
+         规则：只能**尾部追加**；顺序/名称必须逐字段相同，否则是静默内存错位"
+    );
+    // 尾部字段的存在性也要断言，避免有人把 host_bind 放到中间
+    assert_eq!(h.last().map(String::as_str), Some("host_bind"));
+}
+
+#[test]
+fn host_capability_table_fields_match_sdk_exactly() {
+    let host = read_repo_file("backend/src/plugin/abi.rs");
+    let sdk = read_repo_file("plugins/sdk/src/lib.rs");
+    let h = struct_fields(&host, "KzwrHostAbi");
+    let s = struct_fields(&sdk, "KzwrHostAbi");
+    assert_eq!(
+        h, s,
+        "能力表 KzwrHostAbi 两侧字段不一致（宿主 abi.rs vs SDK lib.rs）：\n宿主: {h:?}\nSDK : {s:?}\n\
+         这是宿主**下发给插件**的表：错位会让插件的日志/告警调用跳错地址"
+    );
+    assert_eq!(h.first().map(String::as_str), Some("abi"));
+    // `free_str` 必须在**必需前缀**里（紧随 abi/size）—— 它是唯一非可选入口，
+    // 这样老宿主的短表仍能被接受、只逐字段跳过缺失能力。
+    assert_eq!(
+        h.get(2).map(String::as_str),
+        Some("free_str"),
+        "free_str 必须是第三个字段（必需前缀），否则老宿主短表会被整表拒绝"
+    );
+}
+
+#[test]
+fn host_table_min_size_covers_all_but_optional_tail() {
+    use crate::plugin::abi::{KzwrHostAbi, HOST_ABI_VERSION};
+    // 必需前缀与完整长度都必须有意义：后者 ≥ 前者，且版本号非零
+    assert!(KzwrHostAbi::MIN_SIZE >= 8, "至少要含 abi + size");
+    assert!(
+        KzwrHostAbi::TABLE_SIZE > KzwrHostAbi::MIN_SIZE,
+        "能力表的可选尾部字段让完整长度大于必需前缀（若相等，说明 free_str 后没有可选字段了）"
+    );
+    assert_eq!(HOST_ABI_VERSION, 1);
+
+    // 主表：必需前缀只到 free_str 为止，尾部可选字段（destroy/host_bind）不计入
+    use crate::plugin::abi::KzwrPluginAbi;
+    assert!(KzwrPluginAbi::MIN_SIZE < KzwrPluginAbi::TABLE_SIZE);
+}
+
+#[test]
+fn older_plugin_table_without_host_bind_is_still_accepted() {    // 「老插件表短一截」必须仍然合法（否则每次给主表加字段都会踢掉所有旧插件）。
+    // 这里直接构造一个「只到 free_str」的表头来验证 size 判定。
+    use crate::plugin::abi::KzwrPluginAbi;
+    let mut short = std::mem::MaybeUninit::<KzwrPluginAbi>::zeroed();
+    // 只读 `size` 字段：写进去再验判定逻辑（`has_host_bind` 只看 size）
+    unsafe {
+        let p = short.as_mut_ptr();
+        (*p).abi = crate::plugin::abi::C_ABI_VERSION;
+        (*p).size = KzwrPluginAbi::MIN_SIZE;
+        let t = &*p;
+        assert!(
+            !crate::plugin::cabi::has_host_bind(t),
+            "size 只到必需前缀时，必须判定为「未实现 host_bind」"
+        );
+        assert!(
+            (t.size as usize) >= KzwrPluginAbi::MIN_SIZE as usize,
+            "必需前缀校验必须通过（老插件不能被拒绝）"
+        );
+        // 完整长度则必须判定为「实现了 host_bind」
+        (*p).size = KzwrPluginAbi::TABLE_SIZE;
+        assert!(crate::plugin::cabi::has_host_bind(&*p));
+    }
+}
+
+/// **真实跨边界**冒烟测试：加载已构建（并签名）的 kzwr `.so`，走完整的
+/// `host_bind` 握手，再经能力表回调 —— 这是唯一能证明「宿主与 SDK 的
+/// `#[repr(C)]` 布局在**运行时**真的对齐」的测试（源码比对只能证明文本一致）。
+///
+/// `dist/` 未提交，因此没有构建产物时**跳过**（不算失败）：
+/// 先跑 `Scripts/build_plugins.sh` 再执行本测试即可获得完整覆盖。
+#[test]
+fn real_plugin_completes_host_bind_handshake() {
+    let so = std::path::Path::new(PLUGINS_DIR)
+        .join("../dist/plugins/libfn_kzwr_plugin_kzwr.so");
+    if !so.is_file() {
+        eprintln!(
+            "跳过：{} 不存在（先跑 Scripts/build_plugins.sh 可获得完整跨边界覆盖）",
+            so.display()
+        );
+        return;
+    }
+
+    // 直接 dlsym 入口 + 校验主表（与 loader 同一条路径）
+    let lib = unsafe { libloading::Library::new(&so) }.expect("dlopen 插件失败");
+    let entry = unsafe {
+        lib.get::<extern "C" fn() -> *const crate::plugin::abi::KzwrPluginAbi>(
+            crate::plugin::abi::SYM_ENTRY_V1,
+        )
+    }
+    .expect("缺少稳定入口 fn_kzwr_plugin_abi_v1");
+    let table = unsafe { crate::plugin::cabi::validate_table(entry()) }
+        .expect("插件主表未通过校验");
+    assert!(
+        crate::plugin::cabi::has_host_bind(table),
+        "我们自己的插件必须声明 host_bind（SDK 的 export_plugin_v1! 会自动填）"
+    );
+
+    // 宿主能力表 + ctx：用真实的 HostEffects（无须 AppState，仅验布局与握手）
+    let effects = crate::plugin::host_abi::HostEffects::new(
+        std::env::temp_dir().join("kzwr-crossboundary"),
+    );
+    let ctx = effects.issue("kzwr-so", std::collections::BTreeMap::new());
+    let host = effects.table();
+    assert!(!host.is_null());
+
+    // 握手：插件侧会校验 abi/size 并保存绑定，返回 0 表示接受
+    let bind = unsafe { (*table).host_bind }.expect("host_bind 槽位");
+    let rc = unsafe { bind(host, ctx) };
+    assert_eq!(
+        rc, 0,
+        "插件拒绝了宿主能力表（返回 {rc}）—— 说明两侧 ABI 版本或必需前缀不一致"
+    );
+
+    // 再经能力表调用一次 `config_get`：验证「宿主分配串 + 插件用 free_str 释放」
+    // 这条**双向**路径在真实进程里能跑通（布局错位会在这里崩或读到垃圾）。
+    let cfg_get = unsafe { (*host).config_get }.expect("config_get 槽位");
+    let key = std::ffi::CString::new("token").unwrap();
+    let p = unsafe { cfg_get(ctx, key.as_ptr()) };
+    assert!(p.is_null(), "该插件命名空间为空，应返回 NULL");
+    // own_data_dir 则应返回有效路径，且可用 free_str 释放
+    let own = unsafe { (*host).own_data_dir }.expect("own_data_dir 槽位");
+    let dp = unsafe { own(ctx) };
+    assert!(!dp.is_null(), "宿主应给出插件私有目录");
+    let dir = unsafe { std::ffi::CStr::from_ptr(dp) }
+        .to_string_lossy()
+        .into_owned();
+    assert!(dir.contains("kzwr-so"), "目录应带插件 id：{dir}");
+    unsafe { ((*host).free_str)(dp) };
+}

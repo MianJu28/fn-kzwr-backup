@@ -203,6 +203,30 @@ impl PluginRegistry {
             .collect()
     }
 
+    /// 全部**已加载**的增强插件（**含被禁用者**）
+    ///
+    /// 用于 `host_bind` 下发：能力表与"是否被调用"无关 —— 禁用只做逻辑摘除，
+    /// 插件对象仍存活；绑定让插件在重新启用后立刻可用，且禁用时用 `revoke` 收口。
+    pub fn all_enhance_plugins(&self) -> Vec<Arc<dyn EnhancePlugin>> {
+        let ext = self.external.read().unwrap();
+        self.builtin_enhances
+            .iter()
+            .chain(ext.iter().flat_map(|s| s.enhances.iter()))
+            .cloned()
+            .collect()
+    }
+
+    /// 向所有已加载的增强插件下发宿主能力表，返回接受者数量
+    ///
+    /// **必须在 `AppState` 建好之后调用**（能力表实现依赖 `AppState`）。
+    /// 跨 FFI 前不持任何锁：`bind_host` 内部自行取/放配置锁。
+    pub fn bind_all_host(&self, state: &crate::AppState) -> usize {
+        self.all_enhance_plugins()
+            .iter()
+            .filter(|p| p.bind_host(state))
+            .count()
+    }
+
     /// 按 id 取**启用中**的增强插件（路由分发用；被禁用 → `None`）
     pub fn enhance_plugin_enabled(&self, id: &str) -> Option<Arc<dyn EnhancePlugin>> {
         if self.is_disabled(id) {

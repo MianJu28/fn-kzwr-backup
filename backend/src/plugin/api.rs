@@ -372,6 +372,19 @@ pub trait EnhancePlugin: Send + Sync {
     /// 配置变更后重载插件自身状态（如配置导入/保存后刷新 token）；默认无操作
     async fn reload(&self, _state: &crate::AppState) {}
 
+    /// 插件自注册的定时任务到点回调（`kind` 为插件在能力表 `schedule` 里给的标识）
+    ///
+    /// 只有实现 `host_bind` 并调用 `schedule` 的插件才会收到；默认无操作。
+    async fn timer(&self, _state: &crate::AppState, _kind: &str) {}
+
+    /// 下发宿主能力表（仅外置 C ABI 插件需要；内置插件走 Rust 直连，默认无操作）
+    ///
+    /// **必须在 `AppState` 建好之后**调用：能力表的实现依赖 `AppState`。
+    /// 返回 `true` = 插件接受了能力表。
+    fn bind_host(&self, _state: &crate::AppState) -> bool {
+        false
+    }
+
     /// 设置页/概览页的 UI 描述（默认不出现）
     fn ui(&self) -> Option<PluginUi> {
         None

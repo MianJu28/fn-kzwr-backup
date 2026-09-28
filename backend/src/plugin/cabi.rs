@@ -40,10 +40,21 @@ pub struct CApiEnhance {
     pub path: String,
 }
 
+/// 插件表是否覆盖到 `host_bind` 字段（尾部追加 ⇒ 老插件的表可能短到这里之前）
+///
+/// 用 `offset_of` + 字段大小比较，而不是拿 `TABLE_SIZE` 硬比：后者会把
+/// 「只差尾部一两个可选字段」的老插件误判成没实现。
+pub fn has_host_bind(t: &KzwrPluginAbi) -> bool {
+    let need = std::mem::offset_of!(KzwrPluginAbi, host_bind)
+        + std::mem::size_of::<Option<super::abi::HostBindFn>>();
+    (t.size as usize) >= need
+}
+
 /// 校验插件主表（空指针 / `abi` 版本 / `size` 必需前缀）
 ///
-/// 主表**冻结**（能力用独立表承载），故 `size` 只需 ≥ [`KzwrPluginAbi::REQUIRED_SIZE`]；
-/// 新增能力不要求插件重编。
+/// 主表**尾部追加演进**（不再冻结）：`size` 只需覆盖到 `free_str` 为止的必需前缀
+/// （[`KzwrPluginAbi::MIN_SIZE`]）。老插件表短一截是**合法**的 —— 宿主按「未实现」
+/// 处理后面的可选字段（`destroy` / `host_bind`），插件继续走声明式回传通道。
 pub unsafe fn validate_table(
     table: *const KzwrPluginAbi,
 ) -> Result<&'static KzwrPluginAbi, String> {
@@ -57,11 +68,11 @@ pub unsafe fn validate_table(
             t.abi
         ));
     }
-    let need = KzwrPluginAbi::REQUIRED_SIZE as usize;
+    let need = KzwrPluginAbi::MIN_SIZE as usize;
     if (t.size as usize) < need {
         return Err(format!(
-            "插件表长度 {} 小于宿主要求的必需前缀 {}（主表冻结：新增能力走独立能力表）",
-            t.size, need
+            "插件表长度 {} 小于必需的公开前缀 {need}（describe_json/事件/动作/free_str 必须齐全）",
+            t.size
         ));
     }
     Ok(t)
@@ -121,6 +132,49 @@ impl CApiEnhance {
             .await
             .ok()
             .flatten()
+    }
+
+    /// 下发宿主能力表：签发 ctx 并调用插件的 `host_bind`（未实现则是无操作）
+    ///
+    /// **必须在 `AppState` 建好之后**才能调用（能力表的实现依赖 `AppState`：
+    /// 审计/告警/事件总线都在里面）。因此加载期只接管主表，绑定单独一步。
+    ///
+    /// 返回 `true` = 插件接受了能力表；`false` = 未实现 / 拒绝 / 调用异常。
+    /// 三种情况都不影响插件继续用声明式回传通道。
+    pub fn bind_host(&self, state: &AppState) -> bool {
+        if !has_host_bind(self.table.0) {
+            return false;
+        }
+        let Some(f) = self.table.0.host_bind else {
+            return false;
+        };
+        let id = self.describe.id.clone();
+
+        // 自管配置的明文镜像（隔离：只取自己那一份命名空间）。
+        // **锁必须在进插件之前释放** —— 宿主不变式：绝不跨 FFI 持锁。
+        let kv = {
+            let mgr = state.config.lock().unwrap();
+            match mgr.load() {
+                Ok(cfg) => mgr.plugin_data_export(&cfg, &id).unwrap_or_default(),
+                Err(_) => std::collections::BTreeMap::new(),
+            }
+        };
+        let ctx = state.host_effects.issue(&id, kv);
+        let table = state.host_effects.table();
+
+        // `host_bind` 里插件可能做不少初始化（建 runtime、读盘），故兜异常：
+        // 绑定失败绝不能影响加载与其它插件。
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(table, ctx)))
+            .unwrap_or(-1);
+        if ok == 0 {
+            tracing::info!(plugin = %id, "插件已接受宿主能力表（日志/审计/告警/自配置/进度/定时）");
+            true
+        } else {
+            // 拒绝 ⇒ 立刻失效 ctx，避免"半绑定"状态下产生效果
+            state.host_effects.revoke(&id);
+            tracing::warn!(plugin = %id, code = ok, "插件拒绝了宿主能力表，继续使用声明式回传");
+            false
+        }
     }
 }
 
@@ -441,6 +495,29 @@ impl EnhancePlugin for CApiEnhance {
         }
     }
 
+    /// 插件自注册的定时任务到点回调
+    ///
+    /// 契约：事件名恒为 `"timer"`，`kind` 通过快照顶层的 `timer_kind` 字段给出 ——    /// 这样插件只需一个分支处理「定时器」，不必按 kind 去拼事件名。
+    async fn timer(&self, state: &AppState, kind: &str) {
+        let base = cfg_json_for(state, &self.describe.id, None);
+        // 把 kind 注入快照（解析失败则退化为原样字符串：插件仍能收到 timer 事件）
+        let cfg_json = match serde_json::from_str::<Value>(&base) {
+            Ok(Value::Object(mut m)) => {
+                m.insert("timer_kind".to_string(), Value::String(kind.to_string()));
+                Value::Object(m).to_string()
+            }
+            _ => base,
+        };
+        if let Some(raw) = self.call_event("timer", &cfg_json).await {
+            apply_side_effects(state, &self.describe.id, &raw);
+        }
+    }
+
+    /// 下发宿主能力表（外置 C ABI 插件的真实实现；见固有方法 [`CApiEnhance::bind_host`]）
+    fn bind_host(&self, state: &AppState) -> bool {
+        CApiEnhance::bind_host(self, state)
+    }
+
     async fn health_check(
         &self,
         state: &AppState,
@@ -573,6 +650,12 @@ async fn action_call(
             // 动作返回值同样支持声明式告警（A 方案）：token 失效之类的故障，
             // 用户点「检查」时就能进告警流，不必等下一次巡检。
             apply_side_effects(&state, &plugin_id, &text);
+            // 排空屏障：插件在本次动作里经能力表上报的告警/审计也应立刻可见
+            // （否则用户点完「检查」，告警要等一下才出现在消息提醒里）。
+            state
+                .host_effects
+                .flush(std::time::Duration::from_millis(500))
+                .await;
             serde_json::from_str::<Value>(&text).unwrap_or_else(|e| {
                 serde_json::json!({
                     "success": false,

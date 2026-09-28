@@ -10,11 +10,16 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 
 /// 任务类型
+///
+/// `Plugin` 是**唯一**不参与宿主任务卡的事件类型：插件经能力表 `progress` 上报的进度
+/// 用它发布，前端据此**忽略**它对顶部「任务卡」的覆盖（否则插件进度会顶掉备份状态）。
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskKind {
     Backup,
     Restore,
+    /// 插件自报进度（非宿主任务）
+    Plugin,
 }
 
 /// 任务状态

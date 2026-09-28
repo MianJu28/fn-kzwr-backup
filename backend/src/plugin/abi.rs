@@ -28,6 +28,7 @@
 //! | `event_json` | `event`, `cfg_json` | `{"count":u64?, "alerts":[{"level","message"}]?}` |
 //! | `free_str` | — | 释放插件返回的字符串（宿主必须调用） |
 //! | `destroy` | — | 卸载插件自身状态（可选） |
+//! | `host_bind` | `host`, `ctx` | 可选；宿主下发能力表（见 [`KzwrHostAbi`]），返回 0 = 接受 |
 //!
 //! `request_json`（动作入参）固定为：
 //!
@@ -36,8 +37,18 @@
 //!   "method": "GET" | "POST" }
 //! ```
 //!
-//! **告警是「声明式回传」**：插件不回调宿主，而是在 `health_json` / `event_json` /
-//! `action_json` 的返回值里带上 `alerts` 数组，由宿主负责去重与落库（见 `cabi::apply_side_effects`）。
+//! ## 插件如何影响宿主：两条通道并存
+//!
+//! 1. **声明式回传**（始终可用，无需 `host_bind`）：在 `health_json` / `event_json` /
+//!    `action_json` 的返回值里带上 `alerts` / `resolve` / `audit` / `config`，由宿主统一
+//!    落库（见 `cabi::apply_side_effects`）。**老插件零改动继续工作。**
+//! 2. **宿主能力表回调**（可选，需实现 `host_bind`）：日志实时入 `app.log`、长任务里
+//!    逐条审计/告警、同步读写自己的配置、上报进度、注册定时器。
+//!
+//! 两条通道写同一个落库点、同一套去重规则，所以**混用不会重复**（如同一条告警
+//! 既 `return alerts` 又 `host.alert(...)` 也只会出现一次）。第 2 条通道的纪律是：
+//! 写操作一律**入队**（由宿主唯一的消费任务落库）、能力按 ctx **限定到本插件**、
+//! 插件被禁用/卸载后 ctx 立即**失效**。详见 [`KzwrHostAbi`] 与 `plugin/host_abi.rs`。
 //!
 //! `cfg.self_config` 是**本插件自己的**明文配置（隔离：只含本插件命名空间，不含其它
 //! 插件的键，也不含宿主凭据）；`cfg.after_backup_task` 只在 `after_backup` 事件里有值，
@@ -48,14 +59,20 @@
 //! - 字符串一律 **UTF-8 + NUL 结尾**；返回空指针（NULL）表示"无内容"
 //! - **所有权**：插件返回的字符串归宿主，宿主必须调用该表的 `free_str` 释放
 //! - **不要 panic 跨 FFI**（Rust 插件请自行 `catch_unwind`）；宿主也会兜一层 `catch_unwind`
-//! - **`size` 语义**：主表**冻结**（`KzwrPluginAbi` 不再增长），新增能力一律走**独立能力表**
-//!   （如 [`KzwrTargetAbi`]），因此 `size` 只需 ≥ [`KzwrPluginAbi::REQUIRED_SIZE`]
-//! - **`abi`**：破坏性改动才 +1（如改回调签名、改必需字段语义）
+//! - **`size` 语义 = 前缀探测**：主表 [`KzwrPluginAbi`] 采用**尾部追加 + 可选字段**演进
+//!   （新字段一律 `Option`，老插件的表比宿主短 ⇒ 读不到该字段 ⇒ 按未实现处理，见
+//!   [`KzwrPluginAbi::MIN_SIZE`]）。必需前缀仍只有 `describe_json` + `free_str`
+//! - **`abi`**：破坏性改动才 +1（如改回调签名、改必需字段语义、删除字段）
 //!
-//! 同样的契约在插件侧由 `plugins/sdk` 提供（`KzwrPluginAbi` + `export_plugin_v1!` / `export_target_v1!` 宏）。
+//! 同样的契约在插件侧由 `plugins/sdk` 提供（`KzwrPluginAbi` / `KzwrHostAbi` +
+//! `export_plugin_v1!` / `export_target_v1!` 宏）。
+//!
+//! ⚠️ `plugins/sdk/src/lib.rs` 里的镜像结构体必须与本页**逐字段同序同类型**：
+//! 两边是独立定义、靠 `#[repr(C)]` 对齐，漂移 = 内存踩踏。
+//! `plugin::contract_tests` 会逐字段比对两侧源码，改这里请同步改 SDK。
 
 use std::ffi::c_void;
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_int};
 
 use serde::Deserialize;
 
@@ -76,14 +93,22 @@ pub type JsonFn0 = extern "C" fn() -> *mut c_char;
 pub type JsonFn1 = extern "C" fn(*const c_char) -> *mut c_char;
 pub type JsonFn2 = extern "C" fn(*const c_char, *const c_char) -> *mut c_char;
 
-/// 插件提供的静态函数表（`#[repr(C)]`：布局固定，**冻结不再增长**）
+/// 宿主能力表的下发回调（插件实现，可选）
+///
+/// 宿主在采纳插件主表后调用一次：`host` 指向宿主提供的**静态**能力表（进程生命周期内
+/// 有效、永不释放，插件可长期持有该指针），`ctx` 是宿主签发的**不透明句柄**，把之后
+/// 每一次回调**限定到本插件**（插件无法指定别人的插件 id）。
+/// 返回 0 = 插件接受能力表；非 0 = 插件拒绝（宿主按未绑定继续，不影响加载）。
+pub type HostBindFn = extern "C" fn(*const KzwrHostAbi, *mut c_void) -> c_int;
+
+/// 插件提供的静态函数表（`#[repr(C)]`：布局固定，**尾部追加演进**）
 ///
 /// 只提供目标能力的插件只需实现 `describe_json` + `free_str`（其余回调留 NULL）。
 #[repr(C)]
 pub struct KzwrPluginAbi {
     /// 必须 == [`C_ABI_VERSION`]
     pub abi: u32,
-    /// 本结构体字节大小（宿主据此校验前缀是否齐全）
+    /// 本结构体字节大小（宿主据此探测尾部可选字段是否存在）
     pub size: u32,
     /// 插件元信息、UI 描述、能力声明（**必需**）
     pub describe_json: JsonFn0,
@@ -93,17 +118,134 @@ pub struct KzwrPluginAbi {
     pub action_json: Option<JsonFn2>,
     /// 「一键体检」自检项
     pub health_json: Option<JsonFn1>,
-    /// 生命周期事件（`startup`/`patrol`/`after_backup`/`reload`）
+    /// 生命周期事件（`startup`/`patrol`/`after_backup`/`reload`/`timer`）
     pub event_json: Option<JsonFn2>,
     /// 释放插件返回的字符串（**必需**）
     pub free_str: extern "C" fn(*mut c_char),
     /// 卸载/清理（可选；宿主删除插件前调用）
     pub destroy: Option<extern "C" fn()>,
+    /// 宿主能力表下发（可选；见 [`HostBindFn`]）
+    ///
+    /// **尾部追加字段**：老插件的表短到这里之前 ⇒ 宿主按未实现处理，
+    /// 插件继续用声明式回传通道。
+    pub host_bind: Option<HostBindFn>,
 }
 
 impl KzwrPluginAbi {
-    /// 宿主期望的主表长度（主表冻结 ⇒ 等于必需前缀长度）
-    pub const REQUIRED_SIZE: u32 = std::mem::size_of::<Self>() as u32;
+    /// 当前宿主定义的完整表长（= SDK 镜像表长度；哨兵测试据此发现漂移）
+    pub const TABLE_SIZE: u32 = std::mem::size_of::<Self>() as u32;
+
+    /// **必需**前缀长度：到 `free_str` 为止（`destroy`/`host_bind` 可选）
+    ///
+    /// 用 `offset_of` 精确算出，是为了让「老插件表短一截」这种合法情况
+    /// 仍被接受 —— 否则每次给主表加字段都会踢掉所有旧插件。
+    pub const MIN_SIZE: u32 = std::mem::offset_of!(Self, free_str) as u32
+        + std::mem::size_of::<extern "C" fn(*mut c_char)>() as u32;
+}
+
+// ── 宿主能力表（宿主 → 插件下发；见 [`HostBindFn`]）────────────────────────
+
+/// 宿主能力表 ABI 版本（独立于主表 `C_ABI_VERSION` 计数）
+pub const HOST_ABI_VERSION: u32 = 1;
+
+/// 宿主能力表的回调类型别名（首个参数一律是宿主签发的 `ctx`）
+/// 日志：`level` = 0 trace / 1 debug / 2 info / 3 warn / 4 error
+pub type HostLogFn = extern "C" fn(*mut c_void, i32, *const c_char);
+/// 审计：`action` 短标识，`detail` 描述，`ok` 非 0 = 成功
+pub type HostAuditFn = extern "C" fn(*mut c_void, *const c_char, *const c_char, i32);
+/// 告警：`level` = 0 error / 1 warn（与宿主 `AlertLevel` 一致）
+pub type HostAlertFn = extern "C" fn(*mut c_void, i32, *const c_char);
+/// 消解告警：按前缀批量消解本插件此前上报的告警
+pub type HostResolveFn = extern "C" fn(*mut c_void, *const c_char);
+/// 读自己的配置（返回 NULL = 不存在；非空归**插件**释放，用 `free_str`）
+pub type HostCfgGetFn = extern "C" fn(*mut c_void, *const c_char) -> *mut c_char;
+/// 写/删自己的配置：0 = 已受理（异部落盘），非 0 = 拒绝（非法键名/队列满/已失效）
+pub type HostCfgSetFn = extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int;
+/// 进度上报：`done/total`（total=0 表示未知），`label` 可为 NULL
+pub type HostProgressFn = extern "C" fn(*mut c_void, *const c_char, u64, u64, *const c_char);
+/// 注册定时器：`kind` 非空，`cron` 本地时区；0 = 已受理
+pub type HostScheduleFn = extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int;
+/// 释放宿主分配的字符串（只用于 `config_get`/`own_data_dir` 的返回值）
+pub type HostFreeStrFn = extern "C" fn(*mut c_char);
+
+/// **宿主能力表**：宿主提供给插件回调使用（方向与 [`KzwrPluginAbi`] 相反）
+///
+/// ## 为什么每个能力字段都是 `Option`
+/// 本表同样按**尾部追加**演进：宿主可能比插件旧（字段还没出现）或比插件新。
+/// 取到 `None` 就必须退回到「声明式回传」或本地默认行为，**不能崩**。
+///
+/// ## 为什么 `free_str` 紧跟在 `size` 之后（必需前缀）
+/// 它是唯一**非可选**的入口（插件要用它释放 `config_get` / `own_data_dir` 返回的串）。
+/// 放进必需前缀，[`KzwrHostAbi::MIN_SIZE`] 才能只覆盖 `abi + size + free_str`——
+/// 于是**新插件遇到老宿主**（表更短、缺若干能力字段）时仍然接受整表，
+/// 只是逐字段探测后跳过缺失的能力；否则就得整表拒绝，白白丢掉所有可用能力。
+///
+/// ## 三条硬纪律（宿主实现据此设计，插件必须知道）
+///
+/// 1. **写操作入队，不同步落库**。插件回调常跑在 `spawn_blocking` 线程（甚至插件
+///    自己的 tokio runtime 里），而宿主的告警链路含 `tokio::spawn` → 直接调用会
+///    panic「`must be called from the context of a Tokio runtime`」。故 `log`/`audit`/
+///    `alert`/`resolve`/`progress`/`config_set`/`schedule` 只做一次 `try_send`，由宿主
+///    唯一的消费任务落库。队列满 ⇒ 丢弃并计数（绝不打回插件线程）。
+/// 2. **`config_get` 是唯一同步读**（无锁、无副作用），因此必须满足宿主不变式：
+///    **宿主不得跨 FFI 持任何锁**。写完立刻读能拿到自己的值（待落盘覆盖层）。
+/// 3. **能力被 ctx 限定到本插件**：所有命名空间（配置键、告警、定时器、数据目录）
+///    都由 ctx 决定，参数里**没有**插件 id 可填 → 改不了、也读不到别的插件。
+///    ctx 在插件被禁用/卸载时失效，之后的调用被静默丢弃。
+///
+/// ## 线程与安全边界
+/// 每个入口都 `catch_unwind` + 校验入参（NULL / 非法 UTF-8 / 超长 → 截断或拒绝），
+/// 并受每插件令牌桶限流。宿主**不**回调进插件，也不在持锁时调用本表的实现。
+#[repr(C)]
+pub struct KzwrHostAbi {
+    /// 必须 == [`HOST_ABI_VERSION`]
+    pub abi: u32,
+    /// 本表字节大小（插件据此探测尾部字段；用 `offset_of` 校验，勿硬编码）
+    pub size: u32,
+    /// 释放宿主分配的字符串（**必需**；只用于本表返回的串）
+    pub free_str: HostFreeStrFn,
+
+    // ── 观测（入队） ────────────────────────────────────────────────
+    /// 写宿主运行日志（进 `$TRIM_PKGVAR/logs/app.log`，带时间戳/级别/插件前缀）
+    pub log: Option<HostLogFn>,
+    /// 写审计日志（与宿主敏感操作同一份 `audit.log`，来源标记为本插件）
+    pub audit: Option<HostAuditFn>,
+    /// 上报一条告警（与声明式 `alerts` 同一去重规则）
+    pub alert: Option<HostAlertFn>,
+    /// 消解本插件此前上报的告警（按消息前缀）
+    pub resolve_alerts: Option<HostResolveFn>,
+
+    // ── 本插件自管配置 ─────────────────────────────────────────────
+    /// 同步读一个键（明文；NULL = 不存在）
+    pub config_get: Option<HostCfgGetFn>,
+    /// 写一个键（值空串 = 删除该键）；0 = 已受理
+    pub config_set: Option<HostCfgSetFn>,
+
+    // ── 环境（纯读，无副作用） ─────────────────────────────────────
+    /// 宿主版本串（**静态内存，插件不得释放**）
+    pub host_version: Option<extern "C" fn() -> *const c_char>,
+    /// 当前毫秒时间戳（与宿主同一时基；负数 = 不可用）
+    pub now_ms: Option<extern "C" fn() -> i64>,
+    /// 本插件私有数据目录（宿主已 `mkdir`；返回串**必须**用 `free_str` 释放）
+    pub own_data_dir: Option<extern "C" fn(*mut c_void) -> *mut c_char>,
+
+    // ── 长任务与调度（入队） ───────────────────────────────────────
+    /// 上报进度（转发到 WebSocket 事件流，`kind="plugin"`）
+    pub progress: Option<HostProgressFn>,
+    /// 注册周期任务：到点宿主回调 `event_json("timer", cfg)`，其中 `cfg.timer_kind` = 注册时的 `kind`
+    pub schedule: Option<HostScheduleFn>,
+}
+
+impl KzwrHostAbi {
+    /// 本表完整长度（哨兵测试据此发现 SDK 镜像漂移）
+    pub const TABLE_SIZE: u32 = std::mem::size_of::<Self>() as u32;
+
+    /// **必需**前缀长度：`abi` + `size` + `free_str`（其余能力字段可选）
+    ///
+    /// 只覆盖前三个字段是刻意的：老宿主的表更短时，插件仍应接受整表、
+    /// 逐字段探测后跳过缺失的能力（见本结构体的布局说明）。
+    pub const MIN_SIZE: u32 = std::mem::offset_of!(Self, free_str) as u32
+        + std::mem::size_of::<HostFreeStrFn>() as u32;
 }
 
 // ── 目标能力表（独立符号 → 独立演进）──────────────────────────────────────

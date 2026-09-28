@@ -53,13 +53,17 @@ typedef struct KzwrPluginAbi {
     char *(*available_json)(const char *cfg_json);
     char *(*action_json)(const char *action, const char *request_json);
     char *(*health_json)(const char *cfg_json);
-    char *(*event_json)(const char *event, const char *cfg_json);   // 可选（可为 NULL）
+    char *(*event_json)(const char *event, const char *cfg_json);   // 槽位必需，值可为 NULL
     void  (*free_str)(char *p);
     void  (*destroy)(void);                                        // 可选（可为 NULL）
+    int   (*host_bind)(const KzwrHostAbi *host, void *ctx);         // 可选（可为 NULL）；见 §4.6
 } KzwrPluginAbi;
 ```
 
-结构体**只能尾部追加字段**；宿主按 `size` 判断可选字段是否存在（v1 所有回调均必需，`event_json`/`destroy` 用 `NULL` 表示未实现）。
+结构体**只能尾部追加字段**；宿主按 `size` 判断尾部字段是否存在。
+**必需前缀**只到 `free_str` 为止（`KzwrPluginAbi::MIN_SIZE`）；`destroy` 与 `host_bind` 在它之后，
+是纯尾部可选字段 —— 因此**老插件表短一截仍能加载**，只是拿不到新能力。
+`event_json` 的**槽位**在必需前缀内（一直都有），但它的**值**可以是 `NULL` 表示未实现。
 
 ## 3. 约定（违反会导致拒绝加载或崩溃）
 
@@ -85,7 +89,9 @@ typedef struct KzwrPluginAbi {
   1. runtime 用 `OnceLock` 之类的**全局单例**，别每次调用新建（线程数会爆）；
   2. 仍然自己 `catch_unwind`（见 §8），宿主另有一层兜底，但**别依赖它**：跨 ABI 的
      `extern "C"` unwind 在 release 优化下不保证还能被兜住；
-  3. 不要在 `block_on` 里跑无上限的循环，宿主的 blocking 池是有容量上限的。
+  3. 不要在 `block_on` 里跑无上限的循环，宿主的 blocking 池是有容量上限的；
+  4. 想写日志/报进度/留审计不必"先返回"——用 §4.6 的能力表即可（`host_bind` 之后随时可调，
+     且那些入口都是**入队**，不会阻塞插件的 runtime）。
 - **目标插件（`KzwrTargetAbi`）：仍然可能在 runtime 线程上被调用** —— 只有分块收发
   （`write_stream`/`read_stream`）与 `list`/`delete`/`ensure_dir`/`ping` 走了
   `spawn_blocking`；**`test_json`（目标页「测试连接」）与 `target_open`（装配目标时）是
@@ -273,9 +279,9 @@ typedef struct KzwrPluginAbi {
 - `status` 省略时按 `ok` 处理；返回值**不是合法 JSON** 时退化成空表（体检不会因某个
   插件走形而 500）。
 
-### 4.4 声明式副作用：插件唯一的「让宿主做事」通道
+### 4.4 声明式副作用：插件「让宿主做事」的默认通道
 
-**ABI 里没有宿主回调**（没有 `host_vtable`，插件不能调宿主的任何函数）。插件想告警、
+**老插件不能调宿主**（它们的主表里没有宿主函数表）。插件想告警、
 想清告警、想持久化配置、想留审计，就把意图**随返回值一起带回来**，由宿主执行。
 `health_json` / `event_json` / `action_json` 的返回值里都识别这 4 个可选字段
 （宿主入口：`cabi::apply_side_effects`；顺序固定 **alerts → resolve → config → audit**，
@@ -334,6 +340,71 @@ typedef struct KzwrPluginAbi {
   ⚠️ **`list` 响应永不返回凭据明文**，也不要用 `configured: false` 之外的方式表达「没设置」：
   凭据明文从插件出前端即算泄漏（本项目硬约束）。
 - 新增/修改后前端会自动刷新列表并回调页面刷新指标（`metric` 块重新 GET）。
+
+### 4.6 宿主能力表：插件**回调**宿主（`host_bind`，可选）
+
+上面的声明式通道有个固有限制：**插件必须"先返回"才能上报**。于是——
+动作跑到一半想写日志、多账号循环想报进度、后台想自己定个周期任务——都做不到。
+主表尾部新增的可选回调 `host_bind` 解决了这件事：
+
+```rust
+// 插件主表尾部（SDK 的 export_plugin_v1! 已自动填好，插件无需自己实现）
+pub host_bind: Option<extern "C" fn(*const KzwrHostAbi, *mut c_void) -> c_int>,
+```
+
+加载后宿主调用它一次，把**静态能力表** `KzwrHostAbi` 和一个**不透明句柄 `ctx`** 交给插件：
+
+```rust
+// 插件侧（用 SDK 的安全 API，不要自己解引用能力表）
+if sdk::host::available() {
+    sdk::host::log(sdk::LOG_INFO, "开始清理");          // → 宿主 app.log
+    sdk::host::progress("清空回收站", 1, 3, "账号 A");   // → WebSocket 事件流
+    sdk::host::audit("kzwr.trash.auto", "删除 12 项", true);
+    sdk::host::alert(sdk::ALERT_WARN, "空间已用 92%");
+    sdk::host::resolve_alerts("云端存储空间已用");
+    if let Some(t) = sdk::host::config_get("token") { /* 明文 */ }
+    sdk::host::config_set("percent-a1f3", "90");
+    sdk::host::schedule("nightly", "0 3 * * *");        // 到点回调 event_json("timer", cfg)
+}
+```
+
+| 能力 | 语义 | 关键约束 |
+|---|---|---|
+| `log` | 进宿主的 `app.log`（带时间戳/级别/`plugin=<id>`） | **入队**；队列满则丢弃并计数，绝不打回插件线程 |
+| `audit` | 与宿主敏感操作**同一份** `audit.log` | 同上；`action` 自带插件命名空间 |
+| `alert` | 来源 `Plugin(id)`，与声明式 `alerts` **同一去重规则** | 两条通道混用**不会**产生重复告警 |
+| `resolve_alerts` | 按消息前缀消解**本插件**的告警 | 与声明式 `resolve` 同一实现 |
+| `config_get` | 同步读自己的配置（明文） | **唯一同步入口**；不取宿主锁 ⇒ 不会与宿主的 FFI 调用自死锁 |
+| `config_set` | 写/删自己的配置（空串 = 删除） | 键名规则同 §4.4（**不允许点号**）；写完立刻读能读回自己的值 |
+| `host_version` / `now_ms` / `own_data_dir` | 宿主版本串、毫秒时间戳、插件私有目录 | 前两者是纯读；目录在 `$TRIM_PKGVAR/plugins/<id>`（宿主已 `mkdir`） |
+| `progress` | 转发到 WebSocket，`kind="plugin"` | 前端**忽略**它对顶部任务卡的覆盖，不会顶掉备份状态 |
+| `schedule` | 注册周期任务（cron，宿主本地时区） | 到点回调 `event_json("timer", cfg)`，`cfg.timer_kind` = 注册的 `kind` |
+
+#### 三条硬纪律（插件必须知道）
+
+1. **写操作是"入队"而非同步落库**：`log`/`audit`/`alert`/`resolve`/`progress`/`config_set`/
+   `schedule` 只做一次 `try_send`，由宿主唯一的消费任务落库。队列满 ⇒ **丢弃**并计数
+   （宿主宁可丢观测，也不让插件线程被阻塞）。因此这些调用**不保证**在同一毫秒内出现在日志里；
+   但一次动作用 `action_json` 返回后，宿主会做一次**排空屏障**，告警与审计在同一个响应里就可见。
+2. **`config_get` 是唯一同步读**，因此宿主保证「**不跨 FFI 持锁**」。
+   反过来：插件**不要**在 `host_bind` 之外缓存 `config_get` 的返回值当配置真相——
+   用户可能刚在设置页改过，每次动作前重读。
+3. **能力被 `ctx` 限定到本插件**：所有命名空间（配置键、告警、定时器、数据目录）都由 `ctx`
+   决定，参数里**没有**插件 id 可填 ⇒ 改不了、也读不到别的插件。插件被**禁用/卸载后 `ctx`
+   立即失效**，之后的调用被静默丢弃（不会崩，也**不会**再产生任何效果）。
+
+#### 兼容性（两侧都能优雅降级）
+
+- **老插件 + 新宿主**：主表短一截 ⇒ 宿主判定「未实现 `host_bind`」，不调用；插件继续用声明式通道。
+- **新插件 + 老宿主**：没收到 `host_bind` ⇒ `sdk::host::available()` 为 `false`，
+  SDK 的每个 API 都退化成**安全空操作**，插件行为与以前一致（不崩）。
+- 能力表**逐字段**探测 `size`：老宿主的表短一截时，插件仍接受整表、只跳过缺失的能力
+  （`free_str` 因此在必需前缀里，见 `KzwrHostAbi::MIN_SIZE`）。
+
+> **安全取舍**：`ctx` 是不透明指针而非密码学凭证——理论上知道了别人的 `ctx` 地址就能冒用。
+> 这是个**有意的**取舍：宿主从不 `dlclose` 插件、进程内插件互不信任程度有限；
+> 真要强隔离得上进程级方案（文档另述）。宿主侧不变式（不跨 FFI 持锁、每入口 `catch_unwind`、
+> 入参校验 + 4 KiB 截断 + 令牌桶限流）已由 `plugin/host_abi.rs` 落实，并有单元测试钉住。
 
 ## 5. 版本演进规则
 

@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 use crate::api::{self, Client};
 use crate::state::{Account, Snapshot, Writeback};
+use fn_kzwr_plugin_sdk as sdk;
 
 /// 动作执行结果：返回给前端的 JSON + 声明式副作用
 pub struct ActResult {
@@ -725,7 +726,17 @@ pub async fn trash_empty(cfg: &Value, body: &Value) -> ActResult {
     let mut total = 0usize;
     let mut details = Vec::new();
     let mut errors: Vec<String> = Vec::new();
-    for a in &targets {
+    // 多账号逐个清空可能耗时较久（每账号要翻页删条目），上报进度让用户看到进展。
+    // 无能力表时 `progress` 是安全空操作，不影响老宿主上的行为。
+    let n = targets.len();
+    sdk::host::progress("清空回收站", 0, n as u64, "开始");
+    for (i, a) in targets.iter().enumerate() {
+        sdk::host::progress(
+            "清空回收站",
+            i as u64,
+            n as u64,
+            &format!("正在处理账号「{}」", a.name),
+        );
         match empty_trash_gated(&client, &a.token, 0, 0).await {
             Ok(o) => {
                 total += o.emptied;
@@ -740,6 +751,7 @@ pub async fn trash_empty(cfg: &Value, body: &Value) -> ActResult {
             Err(e) => errors.push(format!("{}：{e}", a.name)),
         }
     }
+    sdk::host::progress("清空回收站", n as u64, n as u64, "完成");
     let mut r = if errors.is_empty() {
         ActResult::ok(json!({
             "success": true,

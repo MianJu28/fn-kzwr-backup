@@ -114,6 +114,10 @@ pub struct AppState {
     pub log_file: PathBuf,
     /// 插件注册表（远程目标与增强插件的唯一装配点；详见 `plugin` 模块）
     pub plugins: Arc<crate::plugin::registry::PluginRegistry>,
+    /// 插件能力表（宿主 → 插件回调：日志/审计/告警/自配置/进度/定时；详见 `plugin::host_abi`）
+    ///
+    /// 由插件在 `host_bind` 回调中接收；所有效果经**唯一消费任务**落地。
+    pub host_effects: Arc<crate::plugin::host_abi::HostEffects>,
     /// 操作审计日志（敏感/破坏性操作留痕，存 $TRIM_PKGVAR/audit.log）
     pub audit: Arc<crate::domain::audit::AuditLog>,
 }

@@ -75,8 +75,8 @@ async fn main() -> anyhow::Result<()> {
         fnos_backup::domain::crypto::CryptoSession::full(&keys),
     ));
 
-    // 插件注册表（唯一装配点）：内置 WebDAV 目标插件 + kzwr 增强插件（ADR-013）
-    let mut registry_inner = fnos_backup::plugin::PluginRegistry::builtin();
+    // 插件注册表（唯一装配点）：内置 WebDAV 目标插件（增强类插件一律外置，ADR-015）
+    let registry_inner = fnos_backup::plugin::PluginRegistry::builtin();
 
     // 配置载入 + 旧版单任务配置迁移（多任务/多目标模型，ADR-014）
     let initial_cfg = {
@@ -129,6 +129,10 @@ async fn main() -> anyhow::Result<()> {
 
     let audit = Arc::new(fnos_backup::domain::audit::AuditLog::new(&var_dir));
 
+    // 插件能力表（宿主 → 插件回调）：插件私有数据目录落在 `$TRIM_PKGVAR/plugins/<id>`
+    let host_effects =
+        fnos_backup::plugin::host_abi::HostEffects::new(var_dir.join("plugins"));
+
     // 占位适配器：目标未装配时调用即返回配置提示（服务照常启动，供 UI 完成配置）
     let unconfigured = |msg: &str| -> Arc<dyn infra::storage_trait::TargetStorage> {
         Arc::new(infra::storage_trait::UnconfiguredTarget {
@@ -146,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
         primary_target_id: Arc::new(std::sync::RwLock::new(String::new())),
         target_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         plugins: registry,
+        host_effects,
         audit,
         backup_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         running_task_id: Arc::new(std::sync::RwLock::new(None)),
@@ -176,6 +181,20 @@ async fn main() -> anyhow::Result<()> {
             "多任务/多目标已就绪"
         );
     }
+
+    // 插件能力表：**必须在 `AppState` 建好之后**启动消费任务并下发，
+    // 因为能力表的实现（日志/审计/告警/进度/定时）全部依赖 `AppState`。
+    //
+    // 顺序很重要：先起消费任务（否则插件绑定时上报的效果无人落地），
+    // 再下发 `host_bind`，最后起定时器轮询。
+    state.host_effects.spawn_consumer(state.clone());
+    {
+        let bound = state.plugins.bind_all_host(&state);
+        if bound > 0 {
+            info!(bound, "已向插件下发宿主能力表（host_bind）");
+        }
+    }
+    state.host_effects.spawn_timer_loop(state.clone());
 
     // 定时备份调度器（后台任务，按任务各自的 cron 触发）
     let scheduler_state = state.clone();

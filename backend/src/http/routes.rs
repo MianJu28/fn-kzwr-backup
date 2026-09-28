@@ -725,11 +725,18 @@ async fn plugin_purge(
     // 2) 调插件 `destroy`（自身状态清理；动态库句柄仍由宿主保活）
     state.plugins.call_destroy(&id);
 
+    // 2.5) 插件能力表 ctx 立即失效：数据都要清了，在途效果不能再落库
+    state.host_effects.revoke(&id);
+
     // 3) 删除该 id 的 `plugin_data` 命名空间
     let removed = mgr.plugin_data_remove(&mut cfg, &id);
     if let Err(e) = mgr.save(&cfg) {
         return Json(err(format!("{:#}", e)));
     }
+    // 镜像同步清空（插件若被重新启用，读不到旧值）
+    state
+        .host_effects
+        .refresh_kv(&id, std::collections::BTreeMap::new());
     state.audit.record(
         "plugin.purge",
         format!("卸载清除插件 {id}（{}自管数据）", if removed { "删除了" } else { "无可删" }),
@@ -862,6 +869,17 @@ async fn plugin_set_enabled(
     // 立即生效：重建目标池（内部会先同步禁用集合）+ 刷新主目标
     let ready = state.reload_targets(&cfg);
 
+    // 插件能力表随启停收口：
+    // - 禁用 → `revoke` 让 ctx 立即失效（在途效果一律不采纳）
+    // - 启用 → 重新下发（`issue` 会先失效旧 ctx，再签发新的）
+    if enabled {
+        if let Some(p) = state.plugins.enhance_plugin_any(&id) {
+            p.bind_host(&state);
+        }
+    } else {
+        state.host_effects.revoke(&id);
+    }
+
     state.audit.record(
         "plugin.set_enabled",
         if enabled {
@@ -910,16 +928,10 @@ async fn plugin_reload(State(state): State<AppState>) -> Json<serde_json::Value>
     let cfg = mgr.load().unwrap_or_default();
     drop(mgr);
 
-    let enabled = crate::plugin::loader::enabled_by_env().unwrap_or(cfg.plugins.enabled);
-    if !enabled {
-        state.plugins.unload_external();
-    } else {
-        let dirs = crate::plugin::loader::plugin_dirs(cfg.plugins.dir.as_deref());
-        state
-            .plugins
-            .load_external(&dirs, &cfg.plugins.plugin_pubkeys, &cfg.plugins.pubkeys);
-    }
+    // 走统一入口：内部会把旧 ctx 全部失效、对新插件重新下发能力表
+    apply_plugin_switch(&state, &cfg);
     let ready = state.reload_targets(&cfg);
+    let enabled = crate::plugin::loader::enabled_by_env().unwrap_or(cfg.plugins.enabled);
     let reports = state.plugins.external_reports();
     let loaded = reports.iter().filter(|r| r.loaded).count();
 
@@ -1280,6 +1292,14 @@ async fn plugin_data_set(
     };
     // 目标实例按新配置重建（下一次备份生效；无需重启）
     state.reload_targets(&cfg);
+    // 插件能力表的配置镜像同步刷新：让插件经 `config_get` 读到刚保存的值
+    // （否则镜像还停留在启动时的快照，插件会看到过期配置）
+    {
+        let mgr = state.config.lock().unwrap();
+        if let Ok(kv) = mgr.plugin_data_export(&cfg, &id) {
+            state.host_effects.refresh_kv(&id, kv);
+        }
+    }
     // 审计只记**键名与数量**，绝不记值（可能含插件凭据）
     let keys: Vec<&str> = req.fields.keys().map(|s| s.as_str()).collect();
     state.audit.record(
@@ -1758,6 +1778,25 @@ fn apply_plugin_switch(state: &AppState, cfg: &crate::infra::config::AppConfig) 
         state.plugins.unload_external();
         tracing::info!("外置插件开关已热生效：已卸载全部外置插件");
     }
+
+    // 插件对象整组换新 ⇒ 旧 ctx 的持有者已经不在服务了，新的一组需要重新绑定。
+    // 先对所有当前 id 失效（覆盖「已被删除的插件」的残留 ctx），再下发新表。
+    // `host_bind` 幂等：内部 `issue` 会先失效旧 ctx 再签发。
+    let ids: Vec<String> = state
+        .plugins
+        .plugin_ids()
+        .into_iter()
+        .chain(
+            // 卸载后插件可能已从列表消失，但它的 ctx 还在登记表里 —— `revoke` 全部
+            // 已登记插件 id，确保旧 ctx 不会被误用。
+            state.host_effects.known_plugin_ids(),
+        )
+        .collect();
+    for id in ids {
+        state.host_effects.revoke(&id);
+    }
+    let bound = state.plugins.bind_all_host(state);
+    tracing::debug!(bound, "插件热重载后已重新下发宿主能力表");
 }
 
 /// 当前 WebDAV 账号：取**主目标**的解密用户名

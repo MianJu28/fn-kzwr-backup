@@ -19,6 +19,7 @@ pub mod abi;
 pub mod api;
 pub mod builtin;
 pub mod cabi;
+pub mod host_abi;
 pub mod loader;
 pub mod registry;
 pub mod target_abi;
