@@ -428,7 +428,7 @@ trait TargetStorage {
   - `tasks: Vec<TaskConfig>`：一个任务 = 源路径集 + `target_id` + 目标目录前缀 + `schedule_cron` + `retention`
   - **旧字段 `backup` / `webdav` 保留为兼容镜像**：载入时若 `targets`/`tasks` 为空 → `migrate()` 由旧字段生成 `default` 目标与 `default` 任务（幂等，落盘一次）；保存时 `sync_legacy_mirror()` 把首个任务/目标回写旧字段（降级到 0.3.x 仍可读）。**默认任务 id 刻意取 `default`**，与旧 `AppState.job_id`（`TRIM_JOB_ID`）一致 → 快照 key 仍是 `default-0`，**升级后不会全量重传**。
 - **目标池**（`infra/storage_trait.rs::TargetPool`）：`目标 id → 适配器`；`PluginRegistry::build_targets(cfg, mgr)` 装配全部目标（未就绪也入池，取用时回退占位适配器并给出明确提示）。`AppState.targets` 是池，`AppState.target`（`SwapTarget`）仍是**主目标**（首个启用目标），供 kzwr 增强等全局能力与兼容接口使用。
-- **任务执行**（`http/routes.rs::run_task_now`）：`job_id = "{task.id}-{源序号}"`、`account = 该目标任务凭据的用户名`、target 取自目标池 → **每个任务在每个目标上都各自独立快照/增量/保留策略**。互斥仍是全局 `backup_running`（同一时刻只跑一个备份任务，避免 NAS 带宽争抢）。
+- **任务执行**（`http/routes/tasks.rs::run_task_now`）：`job_id = "{task.id}-{源序号}"`、`account = 该目标任务凭据的用户名`、target 取自目标池 → **每个任务在每个目标上都各自独立快照/增量/保留策略**。互斥仍是全局 `backup_running`（同一时刻只跑一个备份任务，避免 NAS 带宽争抢）。
 - **调度**（`domain/scheduler.rs`）：由「单 cron」改为**每任务独立 cron**：维护 `任务 id → (cron, 下次触发)`，每轮 tick 重建/清理待触发表，到点调用 `run_task_now`；新增/删除/停用/改 cron 均热生效。
 - **API**：新增 `GET/POST /api/targets`、`POST /api/targets/:id/{delete,test}`、`GET/POST /api/tasks`、`POST /api/tasks/:id/{delete,run}`；恢复侧 `restore/files|tree|run|prune` 增加 `task` 维度（缺省按源路径自动定位）；`/api/config`、`/api/webdav/config`、`/api/backup/run` 保留并作用于「首个任务/主目标」（兼容旧前端与旧客户端）。配置导出/导入加入 `targets`（含明文凭据）/`tasks`。
 - **前端**：新增 `views/TasksPage.svelte`（任务列表 + 内联编辑：源路径/目标下拉/cron 预设与预览/保留策略；立即备份/停用/编辑/删除）、`views/TargetsPage.svelte`（目标列表 + 内联编辑，保存前实测连通性、测试连接、删除保护提示）；恢复页按「任务」分组展示并在调用中带上 `task`；`app.css` 增加通用列表行/编辑器类。
@@ -438,7 +438,7 @@ trait TargetStorage {
 - (+) 同一源可同时/分别备份到多个账号；每个目标独立增量、独立保留策略，某目标失败不影响其它目标
 - (+) 升级无感：旧配置自动迁移、快照 key 不变、旧接口继续可用
 - (+) 新增目标类型只需再写一个 `TargetPlugin`（ADR-013），配置与 UI 自动支持「再建一个」
-- (-) 配置模型变复杂（两套字段并存期）；`routes.rs` 的兼容分支（首个任务/主目标）在旧前端下线后可移除
+- (-) 配置模型变复杂（两套字段并存期）；`routes/tasks.rs` 的兼容分支（首个任务/主目标）在旧前端下线后可移除
 - ⚠️ 后端**不能持有 config 锁跨 await**（`target_save` 的连通性实测因此必须「先实测、后加密」，否则自锁）
 - ⚠️ 恢复页的多任务键：同一路径可能属于多个任务，UI 状态键用「任务 id + 路径」，并把 `task` 透传给树/恢复/清理接口
 
@@ -496,7 +496,7 @@ trait TargetStorage {
 - (+) WebDAV 作为**内置默认插件**，基本备份能力不依赖插件机制本身
 - (+) 装配过程可观测（`fnos_backup::plugin::registry` 日志 + `/api/plugins`）
 - (+) **外置插件不改前端**：插件声明的 `ui.blocks` 由前端通用渲染器渲染，新增功能区块无需重新打包前端
-- (-) 多一层 trait/注册表间接；`routes.rs` 里的增强功能路由需逐步迁入插件（P3 已完成）
+- (-) 多一层 trait/注册表间接；`routes/` 里的增强功能路由需逐步迁入插件（P3 已完成）
 - ⚠️ 装配日志必须打在**库 crate**（`fnos_backup::*`）内：`main.rs` 属二进制 crate，其 `info!` 会被默认过滤器挡掉
 - ~~⚠️ 外置插件与宿主共享 Rust trait 对象（**非稳定 ABI**）：插件必须与宿主同源码/同 toolchain 编译，宿主以「编译期宿主版本 == 运行版本」强制这一约束~~ → **该约束随 Rust 直连机制一并移除（2026-09-26）**。现行唯一机制为稳定 C ABI v1，跨边界只有 `repr(C)` 函数表 + JSON，**不存在 trait 对象共享**
 
@@ -606,6 +606,52 @@ NULL/非法入参、超长截断不切多字节字符、cron 校验、能力表�
 
 > **对 ADR-015 的修订**：ADR-015 结尾的「插件不得回调宿主」在本条被**放松**为
 > 「**默认用声明式；仅当需要中途日志/进度/定时/同步读配置时，用 `host_bind` 能力表**」。
+
+---
+
+### ADR-022：拆分 `http/routes.rs`（4464 行 → 11 个模块）（2026-09-28，v0.5.1）
+
+**背景**：`backend/src/http/routes.rs` 长到 **4464 行**，是整个仓库最大的单文件，
+包含 70 个顶层函数与 40+ 个 DTO —— 备份/恢复/目标/任务/插件/配置/密钥/日志/审计
+全部挤在一起。改任何一处都要在一屏里定位，且容易误改到无关逻辑。
+
+**决策**：按**职责**拆成目录模块（保持 `http::routes` 这一模块名不变，外部调用点零改动）：
+
+| 模块 | 内容 | 行数 |
+|---|---|---|
+| `mod.rs` | `router` 装配 + 插件动作分发（唯一通配路由） | 189 |
+| `types.rs` | 请求/响应 DTO（**集中放置**：请求与响应成对使用，散落时改字段要来回跳） | 686 |
+| `common.rs` | 跨模块共享辅助：`err` / `new_id` / `raise_alert(_once)` / `human_bytes` / 日志清洗 | 164 |
+| `plugins.rs` | 插件管理（列表/启停/热重载/安装卸载/清除数据） | 647 |
+| `targets.rs` | 目标管理（多目标；`target_view` 是回显唯一出口，**凭据永不回传明文**） | 421 |
+| `tasks.rs` | 任务管理 + `run_backup_now` / `run_task_now`（也被调度器调用，故 `pub`） | 499 |
+| `restore.rs` | 恢复（列表/目录树/执行/清理缺失）+ 快照聚合辅助 | 652 |
+| `config.rs` | 配置读写 + 导出导入（**含明文凭据**，入口一律要管理员口令） | 654 |
+| `logs.rs` | 运行日志（查看/清空/下载） | 96 |
+| `audit.rs` | 审计 + 一键体检 + 定时预览 | 326 |
+| `keys.rs` | 密钥 + 告警 + Webhook（Webhook 是告警的外发通道） | 278 |
+
+**拆分方法（可复现的关键）**：写了一个**括号/字符串/注释感知**的解析器按顶层 item
+切分，再按职责分配。直接用行号切会把 `impl`、多行字符串、`#[derive]` 属性、
+以及**紧贴 item 的 `///` 文档注释**切碎 —— 会产生无法编译或丢失文档的半截代码。
+解析器保证 **0 行遗漏、0 行重复**（130 个 item 恰好覆盖全文），
+并对 `config_response` 这种**参数列表里含空行**的函数做了圆括号深度跟踪。
+
+**等价性验证**（这是纯重构，行为必须完全一致）：
+- **路由表**：拆分前后各提取一次 `.route("…")`，41 条**完全一致**
+- **handler 映射**：46 个 handler（含 `delete`/`any`/`ws::`）**完全一致**
+- 宿主 65 项测试全绿；所有 bins/tests 构建通过；**无新增编译告警**
+- 隔离实例冒烟：`/api/health` `/plugins` `/targets` `/tasks` `/audit` `/alerts`
+  `/keys` `/config` `/setup/check` 均 200；插件动作路由 `/api/p/kzwr/quota` 正常
+
+**代价与边界**：
+
+- 拆分后出现**跨模块调用**（如 `restore.rs` 用 `config.rs` 的 `webdav_ready`），
+  因此子模块内 item 统一 `pub(super)`、**不对外暴露**；外部仍只看到
+  `routes::{router, run_task_now, raise_alert_once}`。
+- `types.rs` 686 行仍偏大（都是 DTO 声明，没有逻辑），可接受；若继续增长可按
+  「目标/任务/恢复/配置」再分子模块。
+- 拆分脚本为一次性工具，**未入库**（保留在 `/tmp`），避免污染 `Scripts/`。
 
 ---
 
@@ -893,7 +939,7 @@ fn-kzwr-backup/
 │       ├── main.rs             # 入口: axum HTTP 服务启动
 │       ├── lib.rs              # 库入口 (AppState 等)
 │       ├── http/               # 接口层 (REST + WebSocket)
-│       │   ├── routes.rs       # 路由 + 各 handler (backup/restore/config/health)
+│       │   ├── routes/         # 路由（**按职责拆分**，见下）
 │       │   └── ws.rs           # 状态推送 WebSocket
 │       ├── domain/             # 领域核心层 (纯逻辑, 无 IO)
 │       │   ├── backup.rs       # 备份调度 (BackupJob 聚合)
@@ -1074,7 +1120,7 @@ fn-kzwr-backup/
 | **应用元数据** | HTML 应用介绍 | ✅ | `manifest.desc` 使用 HTML（`<b>`/`<br>`/`<a>`/`<img>`）：一句一行、含官网与反馈渠道、图床宣传图自适应宽度 |
 | **Web UI** | Svelte 前端 | ✅ | 导航栏多页面（概览/备份/恢复/设置）；views+components 分层 |
 | | 用户信息 | ✅ | WebDAV 账号卡片（UserCard 组件；WebDAV 无套餐/容量接口，不展示容量条） |
-| **HTTP API** | 备份/恢复/配置 | ✅ | `http/routes.rs`，axum 路由 |
+| **HTTP API** | 备份/恢复/配置 | ✅ | `http/routes/`（按职责拆分：mod/types/common/plugins/targets/tasks/restore/config/logs/audit/keys），axum 路由 |
 | | 用户信息 | ✅ | `/api/user/info` 返回本地配置的 WebDAV 账号（WebDAV 无配额/套餐属性） |
 | | 密钥管理 | ✅ | `GET/POST /api/keys`（查公钥 / 自定义私钥）、`POST /api/keys/generate`（自动生成并一次性回传私钥；密钥热切换无需重启） |
 | **配置** | 加密 TOML 配置 | ✅ | WebDAV 用户名/密码以 `enc:<age密文>` 形式加密存储（age scrypt 口令派生；REST 时代的密码/token 字段已不存在） |
@@ -1105,7 +1151,18 @@ backend/src/
 ├── lib.rs               # 库入口 (AppState 等)
 ├── http/
 │   ├── mod.rs
-│   ├── routes.rs        # 路由 + 各 handler (backup/restore/config/health/user_info/keys)
+│   ├── routes/          # 路由（原单文件 4464 行，已按职责拆分）
+│   │   ├── mod.rs       # router 装配 + 插件动作分发（唯一通配路由）
+│   │   ├── types.rs     # 请求/响应 DTO（集中放置，成对字段不用来回跳）
+│   │   ├── common.rs    # 跨模块共享辅助：错误响应 / new_id / 告警 / 日志清洗
+│   │   ├── plugins.rs   # 插件管理（列表/启停/热重载/安装卸载/清除数据）
+│   │   ├── targets.rs   # 目标管理（多目标；凭据永不回传明文）
+│   │   ├── tasks.rs     # 任务管理 + run_backup_now / run_task_now
+│   │   ├── restore.rs   # 恢复（列表/目录树/执行/清理缺失）
+│   │   ├── config.rs    # 配置读写 + 导出导入（含明文凭据，入口要口令）
+│   │   ├── logs.rs      # 运行日志（查看/清空/下载）
+│   │   ├── audit.rs     # 审计 + 一键体检 + 定时预览
+│   │   └── keys.rs      # 密钥 + 告警 + Webhook
 │   └── ws.rs            # WebSocket 状态推送
 ├── domain/
 │   ├── mod.rs
