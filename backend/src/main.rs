@@ -135,6 +135,8 @@ async fn main() -> anyhow::Result<()> {
     // 插件改用 `own_data_dir` + 能力表的 `seal`/`unseal`（密钥留在宿主手里），
     // 因此这两个原语必须在插件绑定之前就绪。
     fnos_backup::plugin::crypto::init(infra::keystore::secret(&passphrase_str));
+    // 插件专属线程的沙箱需要知道「插件私有目录」在哪（用于构建 Landlock 白名单）
+    fnos_backup::plugin::worker::init(var_dir.join("plugins"));
     let host_effects =
         fnos_backup::plugin::host_abi::HostEffects::new(var_dir.join("plugins"));
 

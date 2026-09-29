@@ -23,7 +23,9 @@ pub mod crypto;
 pub mod host_abi;
 pub mod loader;
 pub mod registry;
+pub mod sandbox;
 pub mod target_abi;
+pub mod worker;
 
 #[cfg(test)]
 mod contract_tests;

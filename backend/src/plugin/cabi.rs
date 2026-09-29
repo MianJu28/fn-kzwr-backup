@@ -128,10 +128,28 @@ impl CApiEnhance {
         let table = self.table;
         let event = event.to_string();
         let cfg_json = cfg_json.to_string();
-        tokio::task::spawn_blocking(move || call2(table, f, &event, &cfg_json))
+        // 投递到**该插件的专属线程**（其上已施加 Landlock 沙箱，见 `plugin/worker.rs`）。
+        // 用专属线程而非 `spawn_blocking`：Landlock 不可逆，池线程会被永久污染。
+        self.call_on_worker(move || call2(table, f, &event, &cfg_json))
             .await
-            .ok()
             .flatten()
+    }
+
+    /// 把同步 FFI 调用投递到**本插件的专属线程**并在其上执行
+    ///
+    /// 为什么不直接用 `spawn_blocking`：Landlock 沙箱是 **per-thread 且不可逆**的，
+    /// 施加到 tokio 共享池线程会把它**永久污染**，导致宿主其它阻塞任务
+    /// （配置读写、快照落盘）莫名失败。专属线程只跑本插件的回调。
+    ///
+    /// 返回 `None` = 沙箱线程不可用或回调 panic（**内层** `Option` 是 FFI 自身的
+    /// 「未实现/NULL」，故调用点通常 `.flatten()`）。
+    async fn call_on_worker<F, T>(&self, f: F) -> Option<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let id = self.describe.id.clone();
+        super::worker::run_on_plugin_thread(&id, super::worker::policy_for(&id, &[]), f).await
     }
 
     /// 下发宿主能力表：签发 ctx 并调用插件的 `host_bind`（未实现则是无操作）
@@ -407,9 +425,9 @@ impl EnhancePlugin for CApiEnhance {
         // 快照不含插件配置（ADR-021）⇒ 无需解密，也就不必取配置锁
         let cfg_json = CfgSnapshot::from_config(cfg).to_json();
         let table = self.table;
-        let raw = match tokio::task::spawn_blocking(move || call1(table, f, &cfg_json))
+        let raw = match self
+            .call_on_worker(move || call1(table, f, &cfg_json))
             .await
-            .ok()
             .flatten()
         {
             Some(s) => s,
@@ -513,10 +531,14 @@ async fn action_call(
         });
     };
     let action_for_err = action.clone();
-    let text = tokio::task::spawn_blocking(move || call2(table, f, &action, &request))
-        .await
-        .ok()
-        .flatten();
+    // 同样走该插件的专属线程（沙箱载体）
+    let text = super::worker::run_on_plugin_thread(
+        &plugin_id,
+        super::worker::policy_for(&plugin_id, &[]),
+        move || call2(table, f, &action, &request),
+    )
+    .await
+    .flatten();
     match text {
         Some(text) => {
             // 动作返回值同样支持声明式告警（A 方案）：token 失效之类的故障，
