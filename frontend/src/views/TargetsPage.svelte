@@ -10,6 +10,7 @@
    * 故与凭据放在同一处编辑，而不是散落在插件页。
    */
   import Icon from '../components/Icon.svelte';
+  import TargetEditModal from '../components/TargetEditModal.svelte';
   import { api } from '../lib/api.js';
   import { toast } from '../lib/toast.js';
   import { confirmDialog } from '../lib/confirm.js';
@@ -141,6 +142,7 @@
       username: '',
       password: '',
       enabled: true,
+      fields: {},
     };
     formMsg = '';
   }
@@ -155,6 +157,8 @@
       url: defaultUrl(kind),
       username: '',
       password: '',
+      // 自定义字段属于旧类型，一并清掉（弹窗会按新插件的 form 重新初始化）
+      fields: {},
     };
     formMsg = '';
   }
@@ -169,6 +173,8 @@
       password: '',
       enabled: t.enabled !== false,
       password_set: t.password_set,
+      // 插件自定义字段的**回显值**（敏感字段为布尔，非明文）
+      fields: t.fields || {},
     };
     formMsg = '';
   }
@@ -176,59 +182,6 @@
   function cancelEdit() {
     editing = null;
     formMsg = '';
-  }
-
-  async function save() {
-    if (!editing) return;
-    const creds = needsCreds(editing.kind);
-    if (!editing.url.trim()) {
-      formMsg = `请填写${urlLabel(editing.kind)}`;
-      formOk = false;
-      return;
-    }
-    // 只有「需要凭据」的目标才校验账号密码；本地目录这类目标留空是正常的
-    if (creds) {
-      if (!editing.username.trim()) {
-        formMsg = '请填写账号';
-        formOk = false;
-        return;
-      }
-      if (!editing.id && !editing.password) {
-        formMsg = '新建目标需要填写应用密码';
-        formOk = false;
-        return;
-      }
-    }
-    saving = true;
-    formMsg =
-      creds && editing.password ? '正在实测连通性…' : '正在保存…';
-    formOk = true;
-    try {
-      const body = {
-        name: editing.name.trim() || undefined,
-        kind: editing.kind || 'webdav',
-        url: editing.url.trim(),
-        enabled: !!editing.enabled,
-        // 不用凭据的目标不提交账号密码（后端也不会因缺凭据而拒绝）
-        username: creds ? editing.username.trim() : undefined,
-      };
-      if (editing.id) body.id = editing.id;
-      if (creds && editing.password) body.password = editing.password;
-      const r = await api.saveTarget(body);
-      if (r.error) {
-        formMsg = r.error;
-        formOk = false;
-        return;
-      }
-      toast.success(editing.id ? '目标已更新' : '目标已创建');
-      editing = null;
-      if (onChanged) await onChanged();
-    } catch (e) {
-      formMsg = e.message;
-      formOk = false;
-    } finally {
-      saving = false;
-    }
   }
 
   async function test(t) {
@@ -340,89 +293,27 @@
       {/if}
     {/each}
 
-    {#if editing}
-      <div class="editor">
-        <div class="field">
-          <label for="tg-name">名称</label>
-          <input id="tg-name" placeholder="如：酷族主账号" value={editing.name}
-            on:input={(e) => (editing = { ...editing, name: e.target.value })} disabled={saving} />
-        </div>
-
-        <!-- 目标类型：来自**目标插件**清单（enhance 类插件不会出现在这里）。
-             编辑既有目标时不允许改类型（改了等于换一种存储，凭据/语义都不同）。 -->
-        <div class="field">
-          <label for="tg-kind">类型</label>
-          {#if editing.id}
-            <input id="tg-kind" value={pluginName(editing.kind)} disabled />
-            <p class="field-hint">类型创建后不可更改（如需换类型请新建目标）</p>
-          {:else}
-            <select id="tg-kind" value={editing.kind}
-              on:change={(e) => changeKind(e.target.value)} disabled={saving}>
-              {#each targetPlugins as p (p.id)}
-                <option value={p.id}>{p.name}{p.builtin ? '' : '（外置插件）'}</option>
-              {/each}
-            </select>
-            <p class="field-hint">每种类型对应一个目标插件；选错类型会导致备份无法写入</p>
-          {/if}
-        </div>
-
-        <div class="field">
-          <label for="tg-url">{urlLabel(editing.kind)}</label>
-          <input id="tg-url" placeholder={urlPlaceholder(editing.kind)} value={editing.url}
-            on:input={(e) => (editing = { ...editing, url: e.target.value })} disabled={saving} />
-          <p class="field-hint">{urlHint(editing.kind)}</p>
-        </div>
-
-        <!-- 账号/密码：只有声明「需要凭据」的插件才显示。
-             本地目录这类目标不用凭据，强制要求会让用户根本建不出目标。 -->
-        {#if needsCreds(editing.kind)}
-          <div class="field">
-            <label for="tg-user">账号</label>
-            <input id="tg-user" placeholder="酷族用户名 / 邮箱" value={editing.username}
-              on:input={(e) => (editing = { ...editing, username: e.target.value })} disabled={saving} />
-          </div>
-          <div class="field">
-            <label for="tg-pass">应用密码</label>
-            <input id="tg-pass" type="password"
-              placeholder={editing.password_set ? '留空 = 不修改已保存的密码' : '在 kzwr 官网「应用密码」创建'}
-              value={editing.password}
-              on:input={(e) => (editing = { ...editing, password: e.target.value })} disabled={saving} />
-            <p class="field-hint">保存前会实测一次连通性；建议选择「永不过期」与读写权限</p>
-          </div>
-        {:else}
-          <p class="field-hint">
-            该目标类型**不需要账号密码**，只需填写上面的{urlLabel(editing.kind)}。
-          </p>
-        {/if}
-        <label class="switch-row">
-          <input type="checkbox" checked={editing.enabled}
-            on:change={(e) => (editing = { ...editing, enabled: e.target.checked })} disabled={saving} />
-          <span>启用该目标</span>
-        </label>
-
-        {#if formMsg}
-          <div class="alert {formOk ? 'alert-ok' : 'alert-warn'}">
-            <Icon name={formOk ? 'check' : 'alert'} size={15} />
-            <div class="alert-body">{formMsg}</div>
-          </div>
-        {/if}
-
-        <div class="row-actions">
-          <button class="btn btn-primary" on:click={save} disabled={saving}>
-            {saving ? '保存中…' : editing.id ? '保存修改' : '创建目标'}
-          </button>
-          <button class="btn btn-ghost" on:click={cancelEdit} disabled={saving}>取消</button>
-        </div>
-      </div>
-    {:else}
-      <div class="row-actions">
-        <button class="btn btn-primary" on:click={startCreate} disabled={busy}>
-          <Icon name="plus" size={14} /> 新建目标
-        </button>
-      </div>
-    {/if}
+    <!-- 新建/编辑走**弹窗**：表单由目标插件的 `describe_json.target.form` 声明，
+         宿主只渲染与存取（与插件设置弹窗同一思路） -->
+    <div class="row-actions">
+      <button class="btn btn-primary" on:click={startCreate} disabled={busy}>
+        <Icon name="plus" size={14} /> 新建目标
+      </button>
+    </div>
   </div>
 </section>
+
+<!-- 目标编辑弹窗：字段完全由目标插件声明（`describe_json.target.form`） -->
+<TargetEditModal
+  {editing}
+  {targetPlugins}
+  onSaved={onChanged}
+  onClose={(e) => {
+    // 弹窗内切换「类型」时：更新编辑态（表单会按新插件的 form 重新初始化）
+    if (e && e.switchKind) changeKind(e.switchKind);
+    else cancelEdit();
+  }}
+/>
 
 <style>
   /* 上传并发：紧贴所属目标的卡片下方，视觉上归入该目标 */

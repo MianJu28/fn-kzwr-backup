@@ -635,6 +635,63 @@ typedef struct KzwrTargetAbi {
 - 插件自己的设置（如本地目录的 `root`）走 §4.4 的自管配置通道
   （`ui.blocks` 里 `scope: "host"` 的 `text` 块，值存 `plugin_data` 并注入 `target_json.config`）。
 
+### 9.4.1 「新建/编辑目标」弹窗的表单由插件声明（`describe_json.target`）
+
+「目标」页的新建/编辑走**弹窗**，表单形态**完全由目标插件声明** —— 宿主只负责渲染与存取，
+不预设任何字段语义。这与插件设置弹窗（§4.4 的 `ui.blocks`）是同一套思路：
+**新增目标类型不需要改前端**。
+
+```json
+"target": {
+  "needs_credentials": false,
+  "url_label": "目录路径",
+  "url_placeholder": "/vol1/backup/kzwr-localfs",
+  "url_hint": "本机目录的绝对路径；插件只写入 age 密文",
+  "form": [
+    { "key": "url", "label": "目录路径", "kind": "text", "required": true,
+      "placeholder": "/vol1/backup", "hint": "绝对路径" },
+    { "key": "subdir", "label": "子目录（可选）", "kind": "text", "default": "" },
+    { "key": "token", "label": "访问令牌", "kind": "password" },
+    { "key": "keep_local", "label": "保留本机副本", "kind": "toggle" },
+    { "key": "mode", "label": "模式", "kind": "select",
+      "options": [{ "value": "fast" }, { "value": "safe", "label": "安全模式" }] }
+  ]
+}
+```
+
+| 字段 | 缺省 | 含义 |
+|---|---|---|
+| `key` | — | 字段键（提交体与 `target_json.config` 里的键名） |
+| `label` | — | 展示标签 |
+| `kind` | `"text"` | `text` \| `password` \| `number` \| `toggle` \| `select` |
+| `required` | `false` | 前端校验必填 |
+| `secret` | 按 `kind == "password"` 推断 | **是否敏感**：加密落盘，回显只给布尔 |
+| `placeholder` / `hint` / `default` | 空 | 占位、说明、新建时的预填值 |
+| `options` | 空 | `select` 的选项（`label` 省略则用 `value`） |
+
+#### 键名与存储位置
+
+| 键 | 存储 | 注入 `target_json` |
+|---|---|---|
+| **`url`** | `TargetConfig.url` | `url` |
+| **`username`** / **`password`** | `username_enc` / `password_enc`（加密） | `username` / `password` |
+| **其余任意键** | `TargetConfig.fields`（**按目标**、按 `secret` 加密） | 合并进 `config`（同名时**目标级优先**），同时单列在 `fields` |
+
+要点：
+
+- **三个 well-known 键**（`url`/`username`/`password`）映射到既有存储，
+  是为了不破坏已发布插件的读取位置（它们一直读 `target_json.url` 等）。
+- **其余键按目标存储**，不放进 `plugin_data[插件id]` —— 后者是**插件级**的，
+  同一插件的多个目标会互相覆盖（与 §9.4 并发度踩过的坑同类）。
+- **敏感字段永不回传明文**：`GET /api/targets` 里该键是 `true`/`false`（是否已设置）。
+  留空提交 = **不修改**（与 `password` 既有语义一致）。
+- 空串提交 = **清除**该字段。
+- 键名规则同 §4.4（非空、≤64、`[A-Za-z0-9_-]`，**不允许点号**），非法键整次保存被拒。
+- 插件**不声明** `form` 时，前端回退到内置的 WebDAV 默认表单（`url` + `username` + `password`）
+  —— 老插件零改动，行为与之前一致。
+- `url_label` / `url_placeholder` / `url_hint` 仍然有效：它们是**回退表单**的文案
+  （未声明 `form` 时用）；声明了 `form` 就在字段里自己写 `label`/`hint`。
+
 ### 9.5 写一个目标插件（SDK）
 
 SDK 提供了目标表与导出宏，用法与增强插件一致：

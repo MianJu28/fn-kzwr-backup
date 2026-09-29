@@ -199,6 +199,7 @@ impl CApiTarget {
         user: &str,
         pass: &str,
         config: serde_json::Value,
+        fields: serde_json::Value,
     ) -> String {
         serde_json::json!({
             "id": target.id,
@@ -209,6 +210,12 @@ impl CApiTarget {
             "password": pass,
             // 插件自管配置（命名空间 = 插件 id；宿主代加密存储，此处解密注入）
             "config": config,
+            // **本目标**的插件自定义字段（按目标存储、已解密）
+            //
+            // 与 `config` 分开给出，是为了让插件能区分「这个目标自己的值」与
+            // 「该插件的全局值」；但为了让既有插件（读 `config.xxx`）无需改动，
+            // 调用方已把本目标的键**合并进 `config`**（同名时目标级优先）。
+            "fields": fields,
         })
         .to_string()
     }
@@ -255,6 +262,10 @@ impl TargetPlugin for CApiTarget {
     fn url_hint(&self) -> Option<String> {
         CApiTarget::url_hint(self)
     }
+    /// 由插件在 `describe_json.target.form` 声明（缺省空 ⇒ 前端按 WebDAV 渲染）
+    fn form_fields(&self) -> Vec<crate::plugin::abi::AbiTargetField> {
+        self.caps.form.clone()
+    }
     fn build(&self, target: &TargetConfig, mgr: &ConfigManager) -> Option<(Arc<dyn TargetStorage>, String)> {
         // 解密在调用方/mgr 内完成（与内置目标一致）
         let creds = mgr.target_credentials(target).ok().unwrap_or((None, None));
@@ -262,8 +273,23 @@ impl TargetPlugin for CApiTarget {
         // 插件自管配置（命名空间 = 插件 id）解密后注入 `target_json.config`。
         // 注意：此处在 config 锁内（`reload_targets` 持锁调用），只能读、不能写。
         let cfg = mgr.load().unwrap_or_default();
-        let config = mgr.plugin_data_json(&cfg, &self.meta.id);
-        let json = self.target_json(target, user, pass, config);
+        let mut config = mgr.plugin_data_json(&cfg, &self.meta.id);
+        // **本目标**的自定义字段（按目标存储、已解密）：
+        // - 合并进 `config`（同名时**目标级优先**），让既有插件读 `config.xxx` 无需改动；
+        // - 同时单独放在 `fields` 里，便于插件区分「本目标」与「插件全局」。
+        let target_fields = target.custom_fields_plain(mgr);
+        let fields_json = serde_json::Value::Object(
+            target_fields
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect(),
+        );
+        if let (Some(cfg_obj), Some(f_obj)) = (config.as_object_mut(), fields_json.as_object()) {
+            for (k, v) in f_obj {
+                cfg_obj.insert(k.clone(), v.clone());
+            }
+        }
+        let json = self.target_json(target, user, pass, config, fields_json);
         let c = CString::new(json).ok()?;
         let th = unsafe { (self.abi.target_open)(c.as_ptr()) };
         if th.is_null() {
@@ -877,6 +903,7 @@ mod tests {
                 url_label: None,
                 url_placeholder: None,
                 url_hint: None,
+                form: Vec::new(),
             },
             None,
         );
@@ -910,6 +937,7 @@ mod tests {
                 url_label: None,
                 url_placeholder: None,
                 url_hint: None,
+                form: Vec::new(),
             },
             None,
         );
@@ -939,6 +967,7 @@ mod tests {
                 url_label: None,
                 url_placeholder: None,
                 url_hint: None,
+                form: Vec::new(),
             },
             None,
         );
@@ -969,6 +998,7 @@ mod tests {
                 url_label: None,
                 url_placeholder: None,
                 url_hint: None,
+                form: Vec::new(),
             },
             None,
         );

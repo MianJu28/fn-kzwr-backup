@@ -110,6 +110,18 @@ pub trait TargetPlugin: Send + Sync {
     fn url_hint(&self) -> Option<String> {
         None
     }
+
+    /// **「新建/编辑目标」弹窗的字段声明**（缺省 = 宿主给 WebDAV 默认表单）
+    ///
+    /// 宿主**只负责渲染与存取**，不预设字段语义 —— 与插件设置弹窗（`ui.blocks`）
+    /// 同一套思路：新增目标类型不需要改前端。
+    ///
+    /// 三个 well-known 键（`url` / `username` / `password`）映射到既有存储，
+    /// 其余任意键存入该目标自己的 `TargetConfig.fields`（加密）并注入
+    /// `target_json.config`，插件从自己的命名空间读。
+    fn form_fields(&self) -> Vec<crate::plugin::abi::AbiTargetField> {
+        Vec::new()
+    }
 }
 
 /// 增强插件提供的能力（前端据此决定是否渲染对应区块）
@@ -369,6 +381,12 @@ pub struct PluginEntry {
     /// 目标地址字段的说明文字
     #[serde(default)]
     pub url_hint: Option<String>,
+    /// **「新建/编辑目标」弹窗的字段声明**（`kind=target` 时有意义）
+    ///
+    /// 非空时前端按它渲染表单；为空则回退到宿主内置的 WebDAV 默认表单
+    /// —— 保证老插件（未声明 `form`）行为不变。
+    #[serde(default)]
+    pub form: Vec<crate::plugin::abi::AbiTargetField>,
 }
 
 /// `needs_credentials` 的 serde 缺省：`true`（老前端/未知插件按需要凭据处理）

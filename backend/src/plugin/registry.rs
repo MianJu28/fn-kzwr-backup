@@ -329,6 +329,8 @@ impl PluginRegistry {
             let needs_credentials = p.needs_credentials();
             let (url_label, url_placeholder, url_hint) =
                 (p.url_label(), p.url_placeholder(), p.url_hint());
+            // 「新建/编辑目标」弹窗的字段：插件声明，宿主只渲染
+            let form = p.form_fields();
             out.push(PluginEntry {
                 api_base: format!("/api/p/{}", meta.id),
                 source: if path.is_some() { "external" } else { "builtin" }.to_string(),
@@ -344,6 +346,7 @@ impl PluginRegistry {
                 url_label,
                 url_placeholder,
                 url_hint,
+                form,
             });
         }
         for p in self
@@ -369,6 +372,7 @@ impl PluginRegistry {
                 url_label: None,
                 url_placeholder: None,
                 url_hint: None,
+                form: Vec::new(),
             });
         }
         out

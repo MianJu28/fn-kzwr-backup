@@ -737,6 +737,63 @@ example-localfs 必须声明 / `PluginEntry` 暴露 kind 与凭据标志）。�
 
 ---
 
+### ADR-020：目标编辑改为弹窗，表单**完全由插件声明**（2026-09-28，v0.4.9）
+
+**背景**：用户要求「**创建目标使用弹窗，弹窗也想插件设置一样，让插件自定义，不由宿主来定义**」。
+
+ADR-019 把目标创建打通了，但表单仍是**宿主写死**的：`TargetsPage.svelte` 内联渲染
+「地址 / 账号 / 密码」三个固定输入框，只靠 `needs_credentials` 决定是否显示后两个。
+插件想加一个自己的字段（如本地目录的子目录、S3 的 region）**没有任何办法** ——
+只能去改宿主前端，违背了「新增插件不该要求改前端」这条既定判据（ADR-015）。
+
+**决策**：把「目标表单长什么样」整体交给插件，宿主退化为**渲染器 + 存取器**。
+
+1. **`describe_json.target.form`**：插件声明字段列表（`key`/`label`/`kind`/`required`/
+   `secret`/`placeholder`/`hint`/`default`/`options`），`kind` 支持
+   `text`/`password`/`number`/`toggle`/`select`。
+2. **新增 `TargetEditModal.svelte`**：按声明渲染弹窗；替换掉 `TargetsPage` 的内联编辑器。
+   宿主只额外渲染两个**所有目标都有**的字段：`name` 与 `enabled`。
+3. **`TargetConfig.fields`**（新增）：插件自定义字段**按目标**存储（`secret` 的加密落盘），
+   注入 `target_json` 时**合并进 `config`**（同名时目标级优先）并单列 `fields`
+   —— 既有插件读 `config.xxx` 无需改动。
+4. **三个 well-known 键**（`url`/`username`/`password`）仍映射到既有存储，
+   不破坏已发布插件的读取位置。
+5. **不声明 `form` 时回退内置 WebDAV 表单** —— 老插件零改动，行为与之前完全一致。
+
+**为什么自定义字段不复用 `plugin_data[插件id]`**：那是**插件级**的，
+一个插件的多个目标会共用同一份配置 —— 与 ADR-018 并发度踩过的坑**完全同类**
+（「本地目录 A 的路径」与「本地目录 B 的路径」必须是两回事）。故新增按目标的 `fields`。
+
+**为什么 `secret` 缺省按 `kind == "password"` 推断**：安全默认值要**保守**。
+插件写 `kind: "password"` 却忘了写 `secret: true` 时，若缺省按「不敏感」处理，
+明文就会直接落盘且回传前端 —— 这是不可接受的。反向可用 `secret: false` 显式关闭。
+
+**代价与边界**：
+
+- 宿主对自定义字段**只校验键名规则**（非空/≤64/`[A-Za-z0-9_-]`/不含点号），
+  不解释语义、不校验取值 —— 语义与合法性由插件在 `target_open` 里判断（返回 NULL 即配置无效）。
+- `kind` 是**开放字符串**而非枚举：前端认不出的一律按 `text` 渲染（前向兼容），
+  这样宿主加新控件类型不会让老前端崩、插件用新类型也不会让老宿主崩。
+- 编辑时**未提交的键保持原值**（敏感字段留空 = 不修改），因此前端可以只提交改动的字段。
+
+**验证**：新增 5 项测试（`form` 可选 / 字段与 `options` 解析 / **敏感判定保守性** /
+example-localfs 必须声明 form / **自定义字段按目标隔离** / 加解密往返）。宿主 **67 项全绿**。
+隔离实例 E2E：插件清单带出 4 个声明字段 → 建**两个同类目标**（`subdir` 分别为
+`alpha`/`beta`）→ 各自备份**落到各自的子目录**（`backup/alpha/...` vs `backup/beta/...`，
+互不干扰）→ 敏感字段回显为布尔、**明文不泄漏** → 只改名称时 `subdir` 与敏感值**保留**。
+
+> **修掉一个连带 bug**：`url` 原先只从请求**顶层**读，而声明式表单把 `url` 当普通字段
+> 提交在 `fields` 里 ⇒ 保存后 `url` 为空、目标 `ready:false`。现两处都收
+> （顶层优先，都没有才沿用原值），`username`/`password` 同理。
+隔离实例 E2E 全链路：插件清单带出 `needs_credentials=false` 与「目录路径」标签 →
+**不带凭据创建** `example-localfs` 目标成功（`ready:true`）→ 建任务指向它 →
+**备份 2 文件 / 200043 字节**（落盘为 `age-encryption.org/v1` 密文）→
+**恢复 2 文件 / 200043 字节**，`a.txt` 内容与 200000 字节二进制均**逐字节一致** →
+该目标也能按目标设并发（`parallel=4`）→ 回归：WebDAV 目标**仍**强制要求凭据、
+未知类型与增强插件仍被拒绝。
+
+---
+
 ## 7. 项目目录结构
 
 项目遵循飞牛应用规范，Rust 源码与前端源码在开发期独立，打包时合入飞牛目录结构。
@@ -977,7 +1034,7 @@ fn-kzwr-backup/
 | | 稳定 C ABI（免重编） | ✅ | 唯一入口 `fn_kzwr_plugin_abi_v1` + `repr(C)` 函数表 + JSON 数据交换（`plugin/abi.rs` ↔ `plugins/sdk`，插件零第三方依赖）；`abi`+`size` 双校验；**宿主升级不需要重编插件**；契约见 `docs/PLUGIN_ABI.md`；示例 `plugins/example-hello/` |
 | | ~~Rust 直连（进阶）~~ | ❌ | **已移除（2026-09-26，ADR-013 决策 1）**：Rust 无稳定 ABI、升级必重编，维护两条路径收益为负。删除面：`plugin/sdk.rs`、`plugins/example-rdirect/`、`export_plugin!`、`FN_KZWR_PLUGINS_ALLOW_MISMATCH`。原「只有它能写自定义目标」的限制已由下方**目标能力表**解除 |
 | | 目标能力表（自定义备份目标） | ✅ | `KzwrTargetAbi`（独立符号 `fn_kzwr_plugin_target_v1`）+ `AbiTargetStorage` 适配器；**推块模式**（宿主加密后喂密文，插件不碰明文与密钥）；字节复查 + 看门狗；契约见 `docs/PLUGIN_ABI.md` §9 |
-| | 外置插件提供备份目标 | ✅ | SDK `export_target_v1!` 宏 + 静态表，外置 `.so` 也能作为备份目标；示范插件 `plugins/example-localfs/`（本地目录目标，含路径越权防护与并发回传）；NAS 实测：加载 → 建目标 → 备份 30 文件 1600016 字节写入插件管理的目录，并发回传生效。**v0.4.8（ADR-019）打通「目标」页创建**：类型下拉只列 `kind=target` 的插件，表单字段（是否需要凭据、地址标签/占位/说明）由插件 `describe_json.target` 声明 —— 此前前端把 `kind` 硬编码为 webdav 且后端一律强制凭据，导致插件目标**建不出来** |
+| | 外置插件提供备份目标 | ✅ | SDK `export_target_v1!` 宏 + 静态表，外置 `.so` 也能作为备份目标；示范插件 `plugins/example-localfs/`（本地目录目标，含路径越权防护与并发回传）；NAS 实测：加载 → 建目标 → 备份 30 文件 1600016 字节写入插件管理的目录，并发回传生效。**v0.4.9（ADR-020）目标编辑改弹窗、表单完全由插件 `target.form` 声明**；**v0.4.8（ADR-019）打通「目标」页创建**：类型下拉只列 `kind=target` 的插件，表单字段（是否需要凭据、地址标签/占位/说明）由插件 `describe_json.target` 声明 —— 此前前端把 `kind` 硬编码为 webdav 且后端一律强制凭据，导致插件目标**建不出来** |
 | | 内置 webdav 目标 ABI 化 | ✅ | **方案 C（2026-09-26）**：内置插件同样提供静态 `KzwrTargetAbi` 表（`builtin/webdav_abi.rs`），由 `WebdavAbiPlugin`（组合 `CApiTarget`）注册；与外部 `.so` 走同一份契约。传输 = 临时文件累积密文 → `write_end` 一次性喂 `WebdavTarget`；NAS 端到端实测备份/恢复均逐字节一致 |
 | | 并发回传（计划式） | ✅ | `plan_begin`/`plan_next`/`plan_end`：目标**自己决定**分批与节奏，宿主按批并发推送。能力由插件 `supports_plan()` 声明；**开关/并发度按「目标」存** `TargetConfig.parallel`（缺省沿用声明，0/1 关闭，≥2 启用，上限 8）—— 同一个插件会被多个目标实例化，按插件存一份会导致「改一个目标、同类型目标全变」；`POST /api/targets/:id/parallel`，保存后热重建无需重启；前端控件在「目标」页每个目标自己的行内（插件级 `plugins.target_parallel` 仅作旧配置回退） |
 

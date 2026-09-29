@@ -170,6 +170,18 @@ pub struct TargetConfig {
     /// （这与阈值 `percent-<id>` 踩过的坑同理）。
     #[serde(default)]
     pub parallel: Option<u32>,
+    /// **插件自定义的目标字段**（键 → 值，`enc:` 前缀表示加密存储）
+    ///
+    /// 由目标插件的 `describe_json.target.form` 声明字段，宿主**只负责存取、不解释语义**；
+    /// 这些键与 `plugin_data` 合并后注入 `target_json.config`，插件从自己的命名空间读。
+    ///
+    /// 为什么按**目标**存而不是复用 `plugin_data[插件id]`：后者是**插件级**的，
+    /// 一个插件的多个目标会共用同一份配置 —— 正是并发度踩过的那个坑
+    /// （「本地目录 A 的路径」与「本地目录 B 的路径」必须是两回事）。
+    ///
+    /// 键名规则与 `plugin_data` 一致（非空、≤64、`[A-Za-z0-9_-]`，**不允许点号**）。
+    #[serde(default)]
+    pub fields: std::collections::BTreeMap<String, String>,
 }
 
 fn default_target_kind() -> String {
@@ -184,6 +196,30 @@ impl TargetConfig {
     /// 凭据是否已配置（用户名 + 密码齐备）
     pub fn configured(&self) -> bool {
         self.username_enc.is_some() && self.password_enc.is_some()
+    }
+
+    /// 读取本目标的插件自定义字段（**已解密**的明文键值对）
+    ///
+    /// `enc:` 前缀的值解密；解密失败只记键名（不记值）并跳过该键，
+    /// 避免一个坏字段让整个目标装配失败。
+    pub fn custom_fields_plain(
+        &self,
+        mgr: &ConfigManager,
+    ) -> std::collections::BTreeMap<String, String> {
+        let mut out = std::collections::BTreeMap::new();
+        for (k, v) in &self.fields {
+            match mgr.decrypt_field(&Some(v.clone())) {
+                Ok(Some(plain)) => {
+                    out.insert(k.clone(), plain);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    // 只记键名与错误，**绝不记值**（可能含凭据）
+                    tracing::warn!(target = %self.id, key = %k, err = %e, "目标自定义字段解密失败，已跳过");
+                }
+            }
+        }
+        out
     }
 }
 
@@ -255,6 +291,7 @@ impl AppConfig {
                 password_enc: self.webdav.password_enc.clone(),
                 enabled: true,
                 parallel: None,
+                fields: std::collections::BTreeMap::new(),
             });
             changed = true;
         }
@@ -560,6 +597,7 @@ impl ConfigManager {
                 password_enc: Some(enc_pass),
                 enabled: true,
                 parallel: None,
+                fields: std::collections::BTreeMap::new(),
             });
         } else {
             // 主目标（首个启用者）就地更新
@@ -985,6 +1023,70 @@ greeting = "enc:CCCC"
             Some(6),
             "改 a 不应影响 b"
         );
+    }
+
+    /// **本目标自定义字段按目标隔离**（同一插件的两个目标互不共用）
+    ///
+    /// 这是与并发度同一类的坑：`plugin_data` 是**插件级**的，若把「本地目录路径」
+    /// 存在那里，两个本地目录目标就会互相覆盖。
+    #[test]
+    fn custom_fields_are_isolated_per_target() {
+        let mut cfg = AppConfig::default();
+        let mut a = TargetConfig {
+            id: "a".to_string(),
+            kind: "example-localfs".to_string(),
+            ..Default::default()
+        };
+        a.fields.insert("subdir".to_string(), "alpha".to_string());
+        let mut b = TargetConfig {
+            id: "b".to_string(),
+            kind: "example-localfs".to_string(),
+            ..Default::default()
+        };
+        b.fields.insert("subdir".to_string(), "beta".to_string());
+        cfg.targets.push(a);
+        cfg.targets.push(b);
+
+        assert_eq!(
+            cfg.target_by_id("a").unwrap().fields.get("subdir").map(String::as_str),
+            Some("alpha")
+        );
+        assert_eq!(
+            cfg.target_by_id("b").unwrap().fields.get("subdir").map(String::as_str),
+            Some("beta")
+        );
+        // 改一个不影响另一个
+        cfg.target_by_id_mut("a")
+            .unwrap()
+            .fields
+            .insert("subdir".to_string(), "changed".to_string());
+        assert_eq!(
+            cfg.target_by_id("b").unwrap().fields.get("subdir").map(String::as_str),
+            Some("beta"),
+            "改目标 a 的字段不应影响目标 b"
+        );
+    }
+
+    /// 自定义字段的加解密往返（敏感字段按 `enc:` 落盘，读出为明文）
+    #[test]
+    fn custom_fields_round_trip_with_encryption() {
+        let (_d, m) = mgr();
+        let mut t = TargetConfig {
+            id: "t".to_string(),
+            kind: "example-localfs".to_string(),
+            ..Default::default()
+        };
+        // 明文键
+        t.fields.insert("subdir".to_string(), "my-backups".to_string());
+        // 敏感键：加密存储
+        let enc = m.encrypt_field("s3cr3t").expect("加密");
+        assert!(enc.starts_with("enc:"), "敏感字段应带 enc: 前缀");
+        assert_ne!(enc, "s3cr3t", "不得明文落盘");
+        t.fields.insert("token".to_string(), enc);
+
+        let plain = t.custom_fields_plain(&m);
+        assert_eq!(plain.get("subdir").map(String::as_str), Some("my-backups"));
+        assert_eq!(plain.get("token").map(String::as_str), Some("s3cr3t"), "读出应为明文");
     }
 
     /// `None` 表示「未设置」而非「顺序上传」—— 二者必须可区分

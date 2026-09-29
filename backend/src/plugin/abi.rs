@@ -74,7 +74,7 @@
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// C ABI 版本：**仅破坏性改动 +1**；不变则插件无需随宿主升级重编译
 pub const C_ABI_VERSION: u32 = 1;
@@ -404,6 +404,82 @@ pub struct AbiTargetCaps {
     /// 地址字段的说明文字（缺省按 WebDAV 的语义）
     #[serde(default)]
     pub url_hint: Option<String>,
+
+    /// **「新建/编辑目标」表单的字段声明**（缺省 = 宿主按 WebDAV 语义给默认表单）
+    ///
+    /// 这是「弹窗由插件自定义」的落点：插件声明要哪些字段、什么类型、是否必填、
+    /// 是否敏感，宿主**只负责渲染与存取**，不预设任何字段语义
+    /// —— 与插件设置弹窗（`ui.blocks`）同一套思路。
+    #[serde(default)]
+    pub form: Vec<AbiTargetField>,
+}
+
+/// 目标表单里的一个字段（插件声明，宿主渲染）
+///
+/// ## 键名约定
+/// 三个**well-known 键**由宿主映射到既有存储（`target_json` 的固定字段）：
+///
+/// | 键 | 宿主存储 | 注入 `target_json` |
+/// |---|---|---|
+/// | `url` | `TargetConfig.url` | `url` |
+/// | `username` | `username_enc`（加密） | `username` |
+/// | `password` | `password_enc`（加密） | `password` |
+///
+/// **其余任意键**存入 `TargetConfig.fields`（**按目标**、加密存储），
+/// 并注入 `target_json.config` —— 插件从自己的命名空间读，宿主不解释其含义。
+///
+/// 用 well-known 键映射而不是「所有字段都进 fields」，是为了不破坏既有契约：
+/// `target_json.url` / `username` / `password` 是已发布插件的读取位置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbiTargetField {
+    /// 字段键（提交体与 `target_json.config` 里的键名）
+    pub key: String,
+    /// 展示标签
+    pub label: String,
+    /// 控件类型：`text`（缺省）| `password` | `number` | `toggle` | `select`
+    #[serde(default = "default_field_kind")]
+    pub kind: String,
+    /// 是否必填（前端校验；后端只校验 `url` 这类宿主必需的键）
+    #[serde(default)]
+    pub required: bool,
+    /// 是否敏感：**加密存储**，回显时只给 `configured` 布尔、绝不回传明文
+    ///
+    /// 缺省时按 `kind == "password"` 推断（密码框默认敏感）。
+    #[serde(default)]
+    pub secret: Option<bool>,
+    /// 占位提示
+    #[serde(default)]
+    pub placeholder: Option<String>,
+    /// 字段下方的说明文字
+    #[serde(default)]
+    pub hint: Option<String>,
+    /// 缺省值（新建时预填）
+    #[serde(default)]
+    pub default: Option<String>,
+    /// `kind == "select"` 时的选项
+    #[serde(default)]
+    pub options: Vec<AbiTargetFieldOption>,
+}
+
+impl AbiTargetField {
+    /// 是否敏感（显式声明优先；缺省按 password 类型推断）
+    pub fn is_secret(&self) -> bool {
+        self.secret.unwrap_or(self.kind == "password")
+    }
+}
+
+/// `select` 字段的一个选项
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbiTargetFieldOption {
+    /// 提交值
+    pub value: String,
+    /// 展示文案（缺省用 `value`）
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+fn default_field_kind() -> String {
+    "text".to_string()
 }
 
 /// `#[serde(default)]` 的 bool 缺省值：`true`
@@ -424,6 +500,7 @@ impl Default for AbiTargetCaps {
             url_label: None,
             url_placeholder: None,
             url_hint: None,
+            form: Vec::new(),
         }
     }
 }

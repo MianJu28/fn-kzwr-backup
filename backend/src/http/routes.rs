@@ -168,6 +168,15 @@ pub struct TargetSaveRequest {
     /// 保存前是否实测连通性（默认 true）
     #[serde(default = "default_test_true")]
     pub test: bool,
+    /// **插件自定义字段**（键 → 值）
+    ///
+    /// 键名由目标插件的 `describe_json.target.form` 声明；`url`/`username`/`password`
+    /// 三个 well-known 键也可以从这里传（会被归位到既有存储），其余键存入
+    /// 该目标自己的 `TargetConfig.fields`。
+    ///
+    /// 未出现在本次请求里的键**保持原值**（与 `password` 缺省不改语义一致）。
+    #[serde(default)]
+    pub fields: std::collections::BTreeMap<String, String>,
 }
 
 fn default_test_true() -> bool {
@@ -1407,6 +1416,50 @@ fn target_view(
             Err(_) => (None, false),
         }
     };
+    // 插件自定义字段回显：**敏感字段只回布尔**（明文绝不回传前端，本项目硬约束）
+    let field_values: serde_json::Map<String, serde_json::Value> = {
+        let plugin = state.plugins.target_plugin(&t.kind);
+        let declared = plugin.map(|p| p.form_fields()).unwrap_or_default();
+        let mgr = state.config.lock().unwrap();
+        let plain = t.custom_fields_plain(&mgr);
+        let mut m = serde_json::Map::new();
+        for f in &declared {
+            if matches!(f.key.as_str(), "url" | "username" | "password") {
+                continue; // 这三个走上面既有字段
+            }
+            let has = t.fields.contains_key(&f.key);
+            if f.is_secret() {
+                // 只给「是否已设置」，绝不回传明文
+                m.insert(f.key.clone(), serde_json::Value::Bool(has));
+            } else {
+                m.insert(
+                    f.key.clone(),
+                    match plain.get(&f.key) {
+                        Some(v) => serde_json::Value::String(v.clone()),
+                        None => serde_json::Value::Null,
+                    },
+                );
+            }
+        }
+        // 未被当前插件声明的历史字段也带上（避免插件改声明后前端看不到）
+        for k in t.fields.keys() {
+            if !m.contains_key(k) && !matches!(k.as_str(), "url" | "username" | "password") {
+                let secret = declared.iter().find(|f| &f.key == k).map(|f| f.is_secret());
+                if secret == Some(true) {
+                    m.insert(k.clone(), serde_json::Value::Bool(true));
+                } else {
+                    m.insert(
+                        k.clone(),
+                        match plain.get(k) {
+                            Some(v) => serde_json::Value::String(v.clone()),
+                            None => serde_json::Value::Null,
+                        },
+                    );
+                }
+            }
+        }
+        m
+    };
     serde_json::json!({
         "id": t.id,
         "name": t.name,
@@ -1425,6 +1478,8 @@ fn target_view(
             .target_plugin(&t.kind)
             .map(|p| p.supports_plan())
             .unwrap_or(false),
+        // 插件自定义字段的值（敏感字段为 `true`/`false` 表示「是否已设置」）
+        "fields": field_values,
         "tasks": 0, // 由调用方填充（引用该目标的任务数）
     })
 }
@@ -1916,9 +1971,14 @@ async fn target_save(
         .as_ref()
         .map(|t| t.id.clone())
         .unwrap_or_else(|| new_id("t"));
+    // well-known 键（url/username/password）**两处都收**：
+    // - 顶层字段是既有契约（老前端 / 直接调 API 的脚本用）；
+    // - `fields` 里同名键是插件声明式表单的提交路径（`target.form` 把 url 声明成普通字段）。
+    // 两者取「本次请求真正提供了值的那个」，都没有才沿用原值。
     let url = body
         .url
         .clone()
+        .or_else(|| body.fields.get("url").cloned())
         .unwrap_or_else(|| existing.as_ref().and_then(|t| t.url.clone()).unwrap_or_default());
     let name = body
         .name
@@ -1934,14 +1994,20 @@ async fn target_save(
     // 该插件是否用凭据：不用凭据的目标（如本地目录）允许留空，且不做连通性实测
     // —— 否则用户在「目标」页根本建不出这类目标（旧行为正是一律强制要求账号密码）。
     let needs_creds = plugin.needs_credentials();
+    // 与 url 同理：顶层字段与 `fields` 同名键都收（插件声明式表单走后者）
     let provided_user = body
         .username
-        .as_deref()
+        .clone()
+        .or_else(|| body.fields.get("username").cloned())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let provided_pass = body
+        .password
+        .clone()
+        .or_else(|| body.fields.get("password").cloned());
     let (enc_user, enc_pass, warning) = match provided_user {
         Some(user) => {
-            let pass = body.password.clone().unwrap_or_default();
+            let pass = provided_pass.unwrap_or_default();
             if pass.is_empty() {
                 return Json(err("新填写用户名时必须同时提供密码"));
             }
@@ -1990,6 +2056,52 @@ async fn target_save(
         }
     };
 
+    // ── 插件自定义字段 ────────────────────────────────────────────────
+    //
+    // 键名由插件的 `describe_json.target.form` 声明，宿主**不解释语义**：
+    // - well-known 键（url/username/password）已由上面的逻辑归位到既有存储，这里跳过；
+    // - 其余键：按字段声明的 `secret` 决定是否加密，存入该目标自己的 `fields`。
+    //
+    // 未出现在本次请求里的键**保持原值**（与 `password` 缺省不改语义一致），
+    // 这样前端可以只提交改动的字段。
+    let declared = plugin.form_fields();
+    let mut new_fields = existing
+        .as_ref()
+        .map(|t| t.fields.clone())
+        .unwrap_or_default();
+    {
+        let mgr = state.config.lock().unwrap();
+        for f in &declared {
+            // well-known 键走既有存储，不重复落 fields
+            if matches!(f.key.as_str(), "url" | "username" | "password") {
+                continue;
+            }
+            let Some(raw) = body.fields.get(&f.key) else {
+                continue; // 未提交 = 保持原值
+            };
+            if !crate::plugin::cabi::writeback_key_ok(&f.key) {
+                return Json(err(format!(
+                    "非法字段键 {}（只允许 [A-Za-z0-9_-]，且不超过 64 字符、不含点号）",
+                    f.key
+                )));
+            }
+            // 空串 = 清除该字段（与 `plugin_data` 的「空值即删除」同语义）
+            if raw.is_empty() {
+                new_fields.remove(&f.key);
+                continue;
+            }
+            let stored = if f.is_secret() {
+                match mgr.encrypt_field(raw) {
+                    Ok(v) => v,
+                    Err(e) => return Json(err(format!("字段 {} 加密失败：{e:#}", f.key))),
+                }
+            } else {
+                raw.clone()
+            };
+            new_fields.insert(f.key.clone(), stored);
+        }
+    }
+
     let target = crate::infra::config::TargetConfig {
         id: id.clone(),
         name,
@@ -2001,6 +2113,7 @@ async fn target_save(
         // 编辑目标时**保留**该目标自己的并发度（并发度在目标页单独编辑，
         // 不该因为改了地址/凭据而被重置）
         parallel: existing.as_ref().and_then(|t| t.parallel),
+        fields: new_fields,
     };
     match cfg.targets.iter_mut().find(|t| t.id == id) {
         Some(slot) => *slot = target,
@@ -4220,6 +4333,7 @@ async fn config_import(
                     password_enc,
                     enabled: t.enabled,
                     parallel: t.parallel,
+                    fields: std::collections::BTreeMap::new(),
                 });
             }
             cfg.targets = targets;

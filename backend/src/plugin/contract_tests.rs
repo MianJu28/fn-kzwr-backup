@@ -565,6 +565,7 @@ fn plugin_entry_exposes_kind_and_credential_flag() {
         url_label: None,
         url_placeholder: None,
         url_hint: None,
+        form: Vec::new(),
     };
     let v = serde_json::to_value(&e).expect("应可序列化");
     assert_eq!(
@@ -579,3 +580,82 @@ fn plugin_entry_exposes_kind_and_credential_flag() {
     );
 }
 
+
+// ── 目标表单声明（`target.form`）契约 ────────────────────────────────────
+//
+// 「新建/编辑目标」弹窗的字段完全由插件声明，宿主只渲染与存取。
+// 这些测试钉住解析行为与**敏感字段判定**（涉及明文不外泄）。
+
+/// 空 `target` 段必须可解析（老插件不声明 form ⇒ 前端回退内置 WebDAV 表单）
+#[test]
+fn target_form_is_optional() {
+    use crate::plugin::abi::AbiTargetCaps;
+    let caps: AbiTargetCaps = serde_json::from_str("{}").expect("空对象应可解析");
+    assert!(caps.form.is_empty(), "未声明 form 时为空 ⇒ 前端用内置默认表单");
+}
+
+/// 声明 `form` 时必须解析出全部字段与属性
+#[test]
+fn target_form_parses_declared_fields() {
+    use crate::plugin::abi::AbiTargetCaps;
+    let caps: AbiTargetCaps = serde_json::from_str(
+        r#"{
+          "needs_credentials": false,
+          "form": [
+            {"key":"url","label":"目录路径","kind":"text","required":true,"placeholder":"/data"},
+            {"key":"token","label":"令牌","kind":"password"},
+            {"key":"mode","label":"模式","kind":"select",
+             "options":[{"value":"a"},{"value":"b","label":"B 模式"}]}
+          ]
+        }"#,
+    )
+    .expect("应可解析");
+    assert_eq!(caps.form.len(), 3);
+    assert_eq!(caps.form[0].key, "url");
+    assert!(caps.form[0].required);
+    assert_eq!(caps.form[0].placeholder.as_deref(), Some("/data"));
+    // 未写 kind ⇒ 缺省 text
+    assert_eq!(caps.form[0].kind, "text");
+    assert_eq!(caps.form[1].kind, "password");
+    // select 选项：label 可省略（用 value 兜底）
+    assert_eq!(caps.form[2].options.len(), 2);
+    assert!(caps.form[2].options[0].label.is_none());
+    assert_eq!(caps.form[2].options[1].label.as_deref(), Some("B 模式"));
+}
+
+/// **敏感字段判定**：显式 `secret` 优先；缺省时 `password` 类型视为敏感
+///
+/// 这直接决定该字段是否**加密存储**与**是否回传明文**，判错就是泄漏。
+#[test]
+fn target_field_secret_detection_is_conservative() {
+    use crate::plugin::abi::AbiTargetField;
+    let parse = |j: &str| -> AbiTargetField { serde_json::from_str(j).expect("应可解析") };
+
+    // password 类型 ⇒ 缺省敏感
+    assert!(parse(r#"{"key":"a","label":"A","kind":"password"}"#).is_secret());
+    // 显式 secret:true 即使不是 password 也敏感
+    assert!(parse(r#"{"key":"a","label":"A","kind":"text","secret":true}"#).is_secret());
+    // 显式 secret:false 可关闭（如「令牌名称」这类非敏感文本）
+    assert!(!parse(r#"{"key":"a","label":"A","kind":"password","secret":false}"#).is_secret());
+    // 普通 text ⇒ 不敏感
+    assert!(!parse(r#"{"key":"a","label":"A","kind":"text"}"#).is_secret());
+    assert!(!parse(r#"{"key":"a","label":"A"}"#).is_secret());
+}
+
+/// `example-localfs` 必须声明 form，且 `url` 是必填项
+///
+/// 回归：该插件此前没有任何 form 声明，弹窗只能回退到 WebDAV 默认表单，
+/// 于是「目录路径」以外的插件自有字段（如 subdir）在界面上根本无从填写。
+#[test]
+fn example_localfs_declares_its_own_form() {
+    let src = read_repo_file("plugins/example-localfs/src/lib.rs");
+    assert!(src.contains("\"form\": ["), "example-localfs 应声明 target.form");
+    assert!(
+        src.contains("\"key\": \"subdir\""),
+        "应声明插件自有字段（验证「非 well-known 键按目标存储」这条路径）"
+    );
+    assert!(
+        src.contains("\"key\": \"url\""),
+        "应声明 url 字段（well-known 键，映射到 TargetConfig.url）"
+    );
+}

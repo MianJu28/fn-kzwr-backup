@@ -620,6 +620,8 @@ impl WebdavAbiPlugin {
             url_label: None,
             url_placeholder: None,
             url_hint: None,
+            // 不声明 form ⇒ 前端按内置 WebDAV 默认表单渲染（行为与之前一致）
+            form: Vec::new(),
         };
         Self {
             inner: CApiTarget::from_static(abi, meta, caps, ui),

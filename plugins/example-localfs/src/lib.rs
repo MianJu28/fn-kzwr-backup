@@ -125,6 +125,10 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Value>) {
 }
 
 /// 取出目录根：优先 `config.root`，其次把 `url` 当路径用
+///
+/// 之后若本目标声明了 `subdir` 字段（见 `describe_json.target.form`），再拼一层子目录。
+/// `subdir` 来自宿主按**目标**存储的自定义字段，会合并进 `config`（同名时目标级优先），
+/// 因此这里从 `config.subdir` 读即可 —— 与读插件级配置同一路径，插件无需区分来源。
 fn root_from(json_str: &str) -> Option<PathBuf> {
     let v: Value = serde_json::from_str(json_str).ok()?;
     let cfg_root = v
@@ -135,10 +139,21 @@ fn root_from(json_str: &str) -> Option<PathBuf> {
     let url = v.get("url").and_then(|u| u.as_str()).unwrap_or("");
     let chosen = cfg_root.unwrap_or_else(|| url.trim_end_matches('/').to_string());
     if chosen.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(chosen))
+        return None;
     }
+    let mut root = PathBuf::from(chosen);
+    // 目标级子目录（可选）：只接受单层相对名，防越权逃逸
+    if let Some(sub) = v.get("config").and_then(|c| c.get("subdir")).and_then(|s| s.as_str()) {
+        let sub = sub.trim().trim_matches('/');
+        if !sub.is_empty()
+            && !sub.contains("..")
+            && !sub.contains('/')
+            && !sub.contains('\\')
+        {
+            root.push(sub);
+        }
+    }
+    Some(root)
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -464,7 +479,46 @@ extern "C" fn describe() -> *mut c_char {
                 // 告诉前端 `url` 字段的实际语义（否则标签是「地址」，用户不知道该填路径）
                 "url_label": "目录路径",
                 "url_placeholder": "/vol1/backup/kzwr-localfs",
-                "url_hint": "本机目录的绝对路径；插件只写入 age 密文，明文不会离开宿主机"
+                "url_hint": "本机目录的绝对路径；插件只写入 age 密文，明文不会离开宿主机",
+
+                // ── 「新建/编辑目标」弹窗的字段（完全由本插件声明）──────────────
+                //
+                // 宿主只渲染与存取，不解释语义。三个 well-known 键映射到既有存储：
+                //   url → TargetConfig.url，username/password → 加密凭据
+                // 其余键存入**本目标自己的** TargetConfig.fields（按目标，互不共用），
+                // 并注入 target_json.config（同时也在 target_json.fields）。
+                "form": [
+                    {
+                        "key": "url",
+                        "label": "目录路径",
+                        "kind": "text",
+                        "required": true,
+                        "placeholder": "/vol1/backup/kzwr-localfs",
+                        "hint": "本机目录的绝对路径；插件只写入 age 密文，明文不会离开宿主机"
+                    },
+                    {
+                        // 本插件自己的字段：验证「非 well-known 键按目标存储」这条路径
+                        "key": "subdir",
+                        "label": "子目录（可选）",
+                        "kind": "text",
+                        "placeholder": "my-backups",
+                        "hint": "在该路径下再建一层子目录；留空则直接写在根目录",
+                        "default": ""
+                    },
+                    {
+                        // 演示敏感字段：加密存储、回显只给「是否已设置」
+                        "key": "passphrase_hint",
+                        "label": "备注口令（演示加密字段）",
+                        "kind": "password",
+                        "hint": "演示用：敏感字段加密落盘，界面上只显示「已设置」"
+                    },
+                    {
+                        "key": "keep_local",
+                        "label": "保留本机明文副本",
+                        "kind": "toggle",
+                        "hint": "演示布尔字段；本插件当前不实现该行为"
+                    }
+                ]
             },
             "ui": {
                 "section": "settings",
