@@ -3,7 +3,6 @@
 //! TOML 配置存储，敏感字段（目标凭据、插件自管数据 `plugin_data`）用口令派生密钥加密后存储。
 //! 支持多备份路径。
 
-use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -51,12 +50,15 @@ pub struct AppConfig {
     /// 外置插件（动态库）设置
     #[serde(default)]
     pub plugins: PluginSettings,
-    /// 插件自管数据（ADR-013 决策 2，宿主代加密存储）
+    /// ~~插件自管数据（ADR-013 决策 2，宿主代加密存储）~~
     ///
-    /// 外层键 = 插件 id；内层键值 = 该插件的键值对。值经 [`ConfigManager::encrypt_field`]
-    /// 以 `enc:` 前缀加密后落盘（复用同一口令），读取时由宿主解密后再交给插件。
-    /// 卸载插件（`/api/plugins/:id/purge`）时删除该 id 的整个命名空间。
-    #[serde(default)]
+    /// **已弃用（ADR-021，2026-09-28）**：宿主**不再代存插件配置** ——
+    /// 插件把配置写进自己的 `own_data_dir`（敏感内容经能力表 `seal`/`unseal` 加密）。
+    ///
+    /// 字段**保留**是为了让老 `config.toml` 仍能解析（否则升级即启动失败）；
+    /// 宿主不再读写它，下次保存时自然消失。升级后用户的插件配置需重新填写
+    /// （与 v0.4.5「kzwr 不搬运旧配置」同一决策）。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub plugin_data: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
 
@@ -647,102 +649,6 @@ impl ConfigManager {
         }
     }
 
-    /// 读取某插件的自管配置值（解密后返回明文；不存在/未配置 → None）
-    ///
-    /// 内部值以 `enc:` 前缀加密存储，这里复用 `decrypt_field` 解密。
-    pub fn plugin_data_get(&self, cfg: &AppConfig, plugin: &str, key: &str) -> Result<Option<String>> {
-        let enc = cfg
-            .plugin_data
-            .get(plugin)
-            .and_then(|m| m.get(key))
-            .cloned();
-        self.decrypt_field(&enc)
-    }
-
-    /// 写入某插件的自管配置值（加密后落库存入 `cfg.plugin_data`；值空则删除该键）
-    ///
-    /// 调用方随后需 `save(&cfg)` 落盘。
-    pub fn plugin_data_set(
-        &self,
-        cfg: &mut AppConfig,
-        plugin: &str,
-        key: &str,
-        value: &str,
-    ) -> Result<()> {
-        let entry = cfg.plugin_data.entry(plugin.to_string()).or_default();
-        if value.is_empty() {
-            entry.remove(key);
-            if entry.is_empty() {
-                cfg.plugin_data.remove(plugin);
-            }
-        } else {
-            entry.insert(key.to_string(), self.encrypt_field(value)?);
-        }
-        Ok(())
-    }
-
-    /// 删除某插件的整个自管配置命名空间（卸载清除用）；返回是否删除了东西
-    pub fn plugin_data_remove(&self, cfg: &mut AppConfig, plugin: &str) -> bool {
-        cfg.plugin_data.remove(plugin).is_some()
-    }
-
-    /// 当前有自管数据的插件 id 列表（孤立数据检测用）
-    pub fn plugin_data_ids(&self, cfg: &AppConfig) -> Vec<String> {
-        cfg.plugin_data.keys().cloned().collect()
-    }
-
-    /// 导出用：把指定插件的自管配置全部解密为明文键值对（换机/备份携带；敏感，需管理员口令）
-    pub fn plugin_data_export(
-        &self,
-        cfg: &AppConfig,
-        plugin: &str,
-    ) -> Result<BTreeMap<String, String>> {
-        let mut out = BTreeMap::new();
-        if let Some(m) = cfg.plugin_data.get(plugin) {
-            for (k, enc) in m {
-                if let Some(v) = self.decrypt_field(&Some(enc.clone()))? {
-                    out.insert(k.clone(), v);
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// 把某插件的自管配置解密为 **JSON 对象**（注入目标 `target_json.config`）
-    ///
-    /// 这是插件读取自管配置的**唯一受支持路径**：宿主在建立实例前把命名空间解密后
-    /// 放进 `target_json.config`，插件用 `config.root` 这类键读取（见 `example-localfs`）。
-    /// 解密失败/无数据 → 空对象，插件应回退到 `url` 等既有字段。
-    ///
-    /// **返回值含插件自有凭据，调用方不得写入日志。**
-    pub fn plugin_data_json(&self, cfg: &AppConfig, plugin: &str) -> serde_json::Value {
-        match self.plugin_data_export(cfg, plugin) {
-            Ok(kv) => serde_json::Value::Object(
-                kv.into_iter()
-                    .map(|(k, v)| (k, serde_json::Value::String(v)))
-                    .collect(),
-            ),
-            Err(e) => {
-                // 只记插件 id 与错误，**不记键值**
-                tracing::warn!(plugin = %plugin, err = %e, "插件自管配置解密失败，按空配置注入");
-                serde_json::Value::Object(serde_json::Map::new())
-            }
-        }
-    }
-
-    /// 导入用：把明文键值对重新加密写入某插件的命名空间（调用方随后 `save`）
-    pub fn plugin_data_import(
-        &self,
-        cfg: &mut AppConfig,
-        plugin: &str,
-        kv: &BTreeMap<String, String>,
-    ) -> Result<()> {
-        for (k, v) in kv {
-            self.plugin_data_set(cfg, plugin, k, v)?;
-        }
-        Ok(())
-    }
-
     /// 用 passphrase 加密（age scrypt）
     fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
         let encryptor = age::Encryptor::with_user_passphrase(self.passphrase.clone());
@@ -879,75 +785,36 @@ greeting = "enc:CCCC"
         assert!(!text.contains("quota_warn_percent"), "遗留 [kzwr] 段应在下次保存时消失：{text}");
     }
 
-    /// A1+A2 闭环：`plugin_data_set` 加密落库 → `plugin_data_json` 解密注入 `target_json.config`
+    /// **宿主不再代存插件配置**（ADR-021）：`plugin_data` 段必须能解析但被忽略
     ///
-    /// 这条链路此前是**断的**：路由能写入、`target_json` 却硬编码 `"config": {}`，
-    /// 于是插件永远读到空配置。这里把「写入 → 落盘 → 重新加载 → 注入」全程走一遍。
+    /// 回归保护：老 `config.toml` 里带着 `[plugin_data.kzwr]` 时，
+    /// 升级后必须**照常启动**（解析成功），且该段在下次保存时消失。
     #[test]
-    fn plugin_data_round_trips_into_target_json_config() {
-        let (_d, m) = mgr();
-        let mut cfg = AppConfig::default();
+    fn legacy_plugin_data_section_is_parsed_but_unused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(CONFIG_FILE);
+        std::fs::write(
+            &path,
+            r#"
+[plugin_data.kzwr]
+accounts = "enc:whatever"
+percent = "enc:90"
 
-        m.plugin_data_set(&mut cfg, "example-localfs", "root", "/vol1/backup")
-            .expect("set root");
-        m.plugin_data_set(&mut cfg, "example-localfs", "token", "s3cr3t")
-            .expect("set token");
+[plugin_data.example-localfs]
+root = "/vol1/backup"
+"#,
+        )
+        .expect("write legacy config");
 
-        // 落库的值必须是密文（不能明文躺在配置文件里）
-        let stored = cfg.plugin_data.get("example-localfs").expect("namespace");
-        assert_ne!(stored.get("token").unwrap(), "s3cr3t", "凭据必须加密存储");
-        assert!(stored.get("token").unwrap().starts_with("enc:"), "应带 enc: 前缀");
-
-        // 解密导出 → 明文键值对
-        let kv = m.plugin_data_export(&cfg, "example-localfs").expect("export");
-        assert_eq!(kv.get("root").map(String::as_str), Some("/vol1/backup"));
-        assert_eq!(kv.get("token").map(String::as_str), Some("s3cr3t"));
-
-        // 注入形态：JSON 对象（插件侧读 config.root）
-        let j = m.plugin_data_json(&cfg, "example-localfs");
-        assert_eq!(j.get("root").and_then(|v| v.as_str()), Some("/vol1/backup"));
-        assert_eq!(j.get("token").and_then(|v| v.as_str()), Some("s3cr3t"));
-
-        // 落盘 → 重新加载后依然可解密（确保口令/盐随文件持久化正确）
+        let m = ConfigManager::new(dir.path(), SecretString::from("test-pass".to_string()));
+        let mut cfg = m.load().expect("老配置必须能载入（否则升级即启动失败）");
+        // 字段仍在（为了兼容解析），但宿主**不再读它**
+        assert!(cfg.plugin_data.contains_key("kzwr"), "旧段应能解析出来");
+        // 保存后应消失（`skip_serializing_if` 空表 + 宿主不再写它）
+        cfg.plugin_data.clear();
         m.save(&cfg).expect("save");
-        let reloaded = m.load().expect("load");
-        let j2 = m.plugin_data_json(&reloaded, "example-localfs");
-        assert_eq!(
-            j2.get("root").and_then(|v| v.as_str()),
-            Some("/vol1/backup"),
-            "重启后插件仍应读到配置"
-        );
-    }
-
-    /// 空值 = 删除该键；命名空间空了则整体移除（避免留下空壳被当成「孤立数据」）
-    #[test]
-    fn plugin_data_set_empty_value_deletes_key() {
-        let (_d, m) = mgr();
-        let mut cfg = AppConfig::default();
-        m.plugin_data_set(&mut cfg, "p", "k", "v").unwrap();
-        assert!(cfg.plugin_data.contains_key("p"));
-
-        m.plugin_data_set(&mut cfg, "p", "k", "").unwrap();
-        assert!(!cfg.plugin_data.contains_key("p"), "空值应删除键并清掉空命名空间");
-    }
-
-    /// 未配置的插件 → 空对象（插件据此回退到 `url` 等既有字段，而不是报错）
-    #[test]
-    fn plugin_data_json_empty_for_unknown_plugin() {
-        let (_d, m) = mgr();
-        let cfg = AppConfig::default();
-        let j = m.plugin_data_json(&cfg, "nope");
-        assert!(j.as_object().expect("object").is_empty());
-    }
-
-    /// `plugin_data_remove`（卸载清除）返回是否真的删了东西
-    #[test]
-    fn plugin_data_remove_reports_whether_it_deleted() {
-        let (_d, m) = mgr();
-        let mut cfg = AppConfig::default();
-        m.plugin_data_set(&mut cfg, "p", "k", "v").unwrap();
-        assert!(m.plugin_data_remove(&mut cfg, "p"), "首次删除应返回 true");
-        assert!(!m.plugin_data_remove(&mut cfg, "p"), "再次删除应返回 false");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(!text.contains("plugin_data"), "清空后不应再序列化该段：{text}");
     }
 
     // ── 并发度按目标隔离（2026-09-28）─────────────────────────────────

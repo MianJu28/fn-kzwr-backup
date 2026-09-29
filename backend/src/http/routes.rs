@@ -618,13 +618,9 @@ async fn plugins_list(State(state): State<AppState>) -> Json<serde_json::Value> 
     let mgr = state.config.lock().unwrap();
     let cfg = mgr.load().unwrap_or_default();
     let env_override = crate::plugin::loader::enabled_by_env();
-    // 孤立数据检测：`plugin_data` 里有记录但没有对应已加载插件的 id → 前端提示「清理遗留配置」
-    let loaded = state.plugins.plugin_ids();
-    let orphan_data: Vec<String> = mgr
-        .plugin_data_ids(&cfg)
-        .into_iter()
-        .filter(|id| !loaded.contains(id))
-        .collect();
+    // 孤立数据检测：宿主**不再代存插件配置**（ADR-021），故恒为空列表。
+    // 保留该响应字段是为了不破坏前端契约（前端仍会渲染「清理遗留配置」提示位）。
+    let orphan_data: Vec<String> = Vec::new();
     Json(serde_json::json!({
         "plugins": state.plugins.describe(&cfg, &mgr),
         // 有自管数据但插件未加载的 id（卸载残留；前端据此提示清理）
@@ -703,7 +699,7 @@ async fn plugin_parallel(
 /// `POST /api/plugins/:id/purge`：卸载清除插件自管数据（ADR-013 决策 2）
 ///
 /// 流程：引用检查（仍被目标 `kind` 或任务所引目标的 `kind` 引用 → 拒绝，并列出引用项）
-/// → 调插件 `destroy`（若实现，插件自身状态清理）→ 删除该 id 的 `plugin_data` 命名空间
+/// → 调插件 `destroy`（若实现）→ 删除该插件的**私有数据目录**（`own_data_dir`，ADR-021）
 /// → 记审计。动态库句柄由宿主保活到进程结束，此处不卸载 `.so` 本身。
 async fn plugin_purge(
     State(state): State<AppState>,
@@ -744,15 +740,13 @@ async fn plugin_purge(
     // 2.5) 插件能力表 ctx 立即失效：数据都要清了，在途效果不能再落库
     state.host_effects.revoke(&id);
 
-    // 3) 删除该 id 的 `plugin_data` 命名空间
-    let removed = mgr.plugin_data_remove(&mut cfg, &id);
+    // 3) 插件配置由插件自己保管（`own_data_dir`），宿主**不代存**（ADR-021）。
+    // 卸载清除时宿主删掉那个目录（连同其中的配置），这才是「清除」的实际动作。
+    let removed = remove_plugin_data_dir(&state, &id);
+    let _ = &mut cfg;
     if let Err(e) = mgr.save(&cfg) {
         return Json(err(format!("{:#}", e)));
     }
-    // 镜像同步清空（插件若被重新启用，读不到旧值）
-    state
-        .host_effects
-        .refresh_kv(&id, std::collections::BTreeMap::new());
     state.audit.record(
         "plugin.purge",
         format!("卸载清除插件 {id}（{}自管数据）", if removed { "删除了" } else { "无可删" }),
@@ -1201,136 +1195,42 @@ pub struct PluginInstallRequest {
     pub pubkey: String,
 }
 
-// ── 插件自管数据（宿主代存；ADR-013 决策 2）────────────────────────────
-
-/// `GET /api/plugins/:id/data`：回显该插件的自管配置（**密钥只回显是否已设置**）
-///
-/// 纯目标插件没有 `routes()`（`/api/p/<id>/*` 只挂在增强插件上），因此它声明的
-/// `ui.blocks` 表单无处提交；本路由即该表单的**宿主代存端点**：前端把
-/// `scope: "host"` 的字段 POST 到这里，值经 `plugin_data` 加密落盘，并注入到
-/// 目标实例的 `target_json.config`（见 `ConfigManager::plugin_data_json`）。
-///
-/// 安全：`secret: true` 的字段只返回 `true/false`（是否已设置），不回传明文——
-/// 页面不需要、也不应该拿到插件凭据。
-async fn plugin_data_get(
-    State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> Json<serde_json::Value> {
-    let mgr = state.config.lock().unwrap();
-    let cfg = mgr.load().unwrap_or_default();
-    // 哪些键属于密钥：由插件自己声明的 UI 决定（secret 字段）。
-    // 注意 `target_plugin` 对**未加载**的插件返回 `None`（例如 .so 已删除 = 孤立数据的场景）。
-    // 此时无法判断哪些键是密钥，必须 **fail-closed**：一律按密钥处理、只回传布尔值。
-    // 否则「插件没加载」会静默降级成「明文回显全部凭据」。
-    let loaded_ui = state.plugins.target_plugin(&id).and_then(|p| p.ui());
-    let redacted = loaded_ui.is_none();
-    let secret_fields: Vec<String> = loaded_ui
-        .map(|ui| {
-            ui.blocks
-                .iter()
-                .filter_map(|b| match b {
-                    crate::plugin::api::UiBlock::Text { field, secret: true, .. } => {
-                        Some(field.clone())
-                    }
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let kv = mgr.plugin_data_export(&cfg, &id).unwrap_or_default();
-    let data: serde_json::Map<String, serde_json::Value> = kv
-        .into_iter()
-        .map(|(k, v)| {
-            let val = if redacted || secret_fields.contains(&k) {
-                serde_json::json!(!v.is_empty())
-            } else {
-                serde_json::json!(v)
-            };
-            (k, val)
-        })
-        .collect();
-    Json(serde_json::json!({
-        "success": true,
-        "data": data,
-        // 插件未加载 → 上表所有值均已按密钥处理（前端据此换提示文案）
-        "redacted": redacted,
-        "error": null,
-    }))
-}
-
-/// 宿主代存写入请求：`{"fields": {"root": "/mnt/x"}, "remove": ["token"]}`
-#[derive(Deserialize, Default)]
-pub struct PluginDataSetRequest {
-    #[serde(default)]
-    pub fields: std::collections::BTreeMap<String, String>,
-    /// 要删除的键（空值亦可删除）
-    #[serde(default)]
-    pub remove: Vec<String>,
-}
-
-/// `POST /api/plugins/:id/data`：写入该插件的自管配置（加密落盘 + 热重建目标）
-///
-/// 保存后目标池会重建，使新配置在**下一次备份**即生效（无需重启）。
-/// 允许给**未加载**的插件写数据（先配好、再放 `.so`）；这也与孤立数据检测相容。
-async fn plugin_data_set(
-    State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-    body: Option<axum::extract::Json<PluginDataSetRequest>>,
-) -> Json<serde_json::Value> {
-    let req = body.map(|b| b.0).unwrap_or_default();
-    if req.fields.is_empty() && req.remove.is_empty() {
-        return Json(err("没有需要保存的字段"));
-    }
-    // 键名限定：不许空键/路径分隔符等（命名空间键会被注入 target_json.config）
-    for k in req.fields.keys().chain(req.remove.iter()) {
-        if k.trim().is_empty() || k.len() > 64 || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-            return Json(err(format!("非法的配置键：{k}")));
-        }
-    }
-    let cfg = {
-        let mgr = state.config.lock().unwrap();
-        let mut cfg = mgr.load().unwrap_or_default();
-        // 空值 = 删除该键（`plugin_data_set` 既有语义）
-        for (k, v) in &req.fields {
-            if let Err(e) = mgr.plugin_data_set(&mut cfg, &id, k, v) {
-                return Json(err(format!("{:#}", e)));
-            }
-        }
-        for k in &req.remove {
-            if let Err(e) = mgr.plugin_data_set(&mut cfg, &id, k, "") {
-                return Json(err(format!("{:#}", e)));
-            }
-        }
-        if let Err(e) = mgr.save(&cfg) {
-            return Json(err(format!("{:#}", e)));
-        }
-        cfg
-    };
-    // 目标实例按新配置重建（下一次备份生效；无需重启）
-    state.reload_targets(&cfg);
-    // 插件能力表的配置镜像同步刷新：让插件经 `config_get` 读到刚保存的值
-    // （否则镜像还停留在启动时的快照，插件会看到过期配置）
-    {
-        let mgr = state.config.lock().unwrap();
-        if let Ok(kv) = mgr.plugin_data_export(&cfg, &id) {
-            state.host_effects.refresh_kv(&id, kv);
-        }
-    }
-    // 审计只记**键名与数量**，绝不记值（可能含插件凭据）
-    let keys: Vec<&str> = req.fields.keys().map(|s| s.as_str()).collect();
-    state.audit.record(
-        "plugin.data",
-        format!("保存插件 {id} 自管配置（{} 项：{}）", keys.len(), keys.join("、")),
-        true,
-        None,
-    );
-    Json(serde_json::json!({ "success": true, "saved": keys.len(), "error": null }))
-}
-
 // ── 多任务 / 多目标（ADR-014）辅助 ──────────────────────────────────────
 /// 通用 JSON 错误响应（`{success:false, error}`）
 fn err(e: impl std::fmt::Display) -> serde_json::Value {
     serde_json::json!({ "success": false, "error": e.to_string() })
+}
+
+/// 删除某插件的私有数据目录（卸载清除用）；返回是否真的删除了东西
+///
+/// 宿主不再代存插件配置（ADR-021），插件把配置写在自己的 `own_data_dir` ——
+/// 所以「卸载清除」的实际动作就是删掉这个目录。
+///
+/// **只删插件自己的子目录**（`<plugins_dir>/<id>`），且校验 id 不含路径分隔符，
+/// 避免 `../` 之类的 id 删到别处。
+fn remove_plugin_data_dir(state: &AppState, plugin_id: &str) -> bool {
+    if plugin_id.is_empty()
+        || plugin_id.contains('/')
+        || plugin_id.contains('\\')
+        || plugin_id.contains("..")
+    {
+        tracing::warn!(plugin = %plugin_id, "插件 id 含路径分隔符，拒绝删除其数据目录");
+        return false;
+    }
+    let dir = state.var_dir.join("plugins").join(plugin_id);
+    if !dir.is_dir() {
+        return false;
+    }
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {
+            tracing::info!(plugin = %plugin_id, dir = %dir.display(), "已删除插件私有数据目录");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(plugin = %plugin_id, dir = %dir.display(), err = %e, "删除插件数据目录失败");
+            false
+        }
+    }
 }
 
 /// 生成稳定 id（前缀 + 时间戳/序号十六进制，无需第三方 uuid 依赖）
@@ -2015,12 +1915,10 @@ async fn target_save(
             // 实测只对「用凭据」的目标有意义：不用凭据的插件没有可测的连接，
             // 其 `url` 语义由插件自己解释（如本地路径），实测只会误报失败。
             if body.test && needs_creds {
-                // 与 `build()` 注入同一份自管配置（锁只在此短暂持有）
-                let plugin_cfg = {
-                    let mgr = state.config.lock().unwrap();
-                    let cfg = mgr.load().unwrap_or_default();
-                    mgr.plugin_data_json(&cfg, &plugin.meta().id)
-                };
+                // 宿主不再代存插件配置（ADR-021）⇒ 没有插件级 config 可注入。
+                // 目标级自定义字段由 `build()` 从 `TargetConfig.fields` 合并注入；
+                // 「保存前实测」时目标尚未落库，故只带空对象测 url/凭据本身。
+                let plugin_cfg = serde_json::Value::Object(Default::default());
                 match plugin
                     .verify_with_config(Some(&url), &user, &pass, plugin_cfg)
                     .await
@@ -2079,13 +1977,13 @@ async fn target_save(
             let Some(raw) = body.fields.get(&f.key) else {
                 continue; // 未提交 = 保持原值
             };
-            if !crate::plugin::cabi::writeback_key_ok(&f.key) {
+            if !crate::plugin::cabi::config_key_ok(&f.key) {
                 return Json(err(format!(
                     "非法字段键 {}（只允许 [A-Za-z0-9_-]，且不超过 64 字符、不含点号）",
                     f.key
                 )));
             }
-            // 空串 = 清除该字段（与 `plugin_data` 的「空值即删除」同语义）
+            // 空串 = 清除该字段（与旧 `plugin_data` 的「空值即删除」同语义）
             if raw.is_empty() {
                 new_fields.remove(&f.key);
                 continue;
@@ -2180,12 +2078,18 @@ async fn target_test(
     let (Some(user), Some(pass)) = creds else {
         return Json(err("该目标尚未配置用户名/密码"));
     };
-    // 自管配置需与 `build()` 注入的**同一份**（否则目标把连接参数放在 config 里时测连不准）。
-    // 锁在此处短暂获取后立即释放——`MutexGuard` 不可跨 `await`。
+    // 宿主不再代存插件配置（ADR-021）⇒ 没有插件级 config 可注入。
+    // 目标级的自定义字段随目标配置解密注入（见 `CApiTarget::build`），
+    // 但「测试连接」用的是已保存的 target，这里带上它自己的字段才准确。
     let plugin_cfg = {
         let mgr = state.config.lock().unwrap();
-        let cfg = mgr.load().unwrap_or_default();
-        mgr.plugin_data_json(&cfg, &plugin.meta().id)
+        serde_json::Value::Object(
+            target
+                .custom_fields_plain(&mgr)
+                .into_iter()
+                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                .collect(),
+        )
     };
     match plugin
         .verify_with_config(target.url.as_deref(), &user, &pass, plugin_cfg)
@@ -4199,18 +4103,9 @@ async fn config_export(
         key_backed_up: cfg.keys.backed_up,
         targets: bundle_targets,
         tasks: cfg.tasks.clone(),
-        plugin_data: (|| {
-            let mgr_ref = state.config.lock().unwrap();
-            let mut out = std::collections::BTreeMap::new();
-            for p in mgr_ref.plugin_data_ids(&cfg) {
-                if let Ok(kv) = mgr_ref.plugin_data_export(&cfg, &p) {
-                    if !kv.is_empty() {
-                        out.insert(p, kv);
-                    }
-                }
-            }
-            out
-        })(),
+        // 插件配置由插件自管（`own_data_dir`），**不随宿主的导出包携带**（ADR-021）：
+        // 其中常含凭据，本来也不该经宿主中转；换机时由用户在插件页重新填写。
+        plugin_data: std::collections::BTreeMap::new(),
     };
     match serde_json::to_string_pretty(&bundle) {
         Ok(text) => Json(ConfigExportResponse {
@@ -4357,20 +4252,10 @@ async fn config_import(
                 })
                 .collect();
         }
-        // 插件自管数据（明文键值对重新用当前口令加密；未携带则不覆盖）
-        if !bundle.plugin_data.is_empty() {
-            cfg.plugin_data.clear();
-            for (plugin, kv) in &bundle.plugin_data {
-                for (k, v) in kv {
-                    if let Err(e) = mgr.plugin_data_set(&mut cfg, plugin, k, v) {
-                        return Json(ConfigImportResponse {
-                            success: false,
-                            error: Some(format!("插件自管数据加密失败: {:#}", e)),
-                        });
-                    }
-                }
-            }
-        }
+        // 插件自管数据（`bundle.plugin_data`）：**已弃用（ADR-021）**。
+        // 宿主不再代存插件配置 —— 插件把配置写进自己的 `own_data_dir`，
+        // 随包导出/导入不再携带它们（含凭据，本来也不该经宿主中转）。
+        let _ = &bundle.plugin_data;
         if let Err(e) = mgr.save(&cfg) {
             return Json(ConfigImportResponse {
                 success: false,
@@ -4464,8 +4349,6 @@ pub fn router(state: AppState) -> Router {
         // 按插件启用/禁用（运行时生效，无需重启）
         .route("/plugins/:id/enable", post(plugin_set_enabled))
         .route("/plugins/:id/parallel", post(plugin_parallel))
-        // 插件自管数据（宿主代存）：纯目标插件没有自己的路由，表单提交走这里
-        .route("/plugins/:id/data", get(plugin_data_get).post(plugin_data_set))
         .route("/ws", get(ws::ws_handler))
         .route("/webdav/config", post(webdav_save))
         .route("/user/info", get(user_info))

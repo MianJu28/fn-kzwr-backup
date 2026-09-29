@@ -198,7 +198,8 @@ typedef struct KzwrPluginAbi {
       "target_id": "default", "target_folder": "fn-backup", "schedule_cron": "0 2 * * *",
       "empty_recycle_bin": true, "recycle_max_gb": 20, "recycle_min_age_days": 7 }
   ],
-  "self_config": { "accounts": "[{\"id\":\"a1\",\"name\":\"主账号\",\"token\":\"…\"}]", "percent-a1": "90" },
+  // 已弃用（ADR-021）：宿主不再代存插件配置，此字段恒为 {}
+  "self_config": {},
   "after_backup_task": "default"
 }
 ```
@@ -210,32 +211,45 @@ typedef struct KzwrPluginAbi {
 - `after_backup_task` **只有 `after_backup` 事件**非 `null`：告诉插件「刚完成的是哪个任务」，
   它才能套用**该任务自己**的门槛。其它事件为 `null`（JSON 里字段恒在，用 `Option`）。
 
-#### `self_config`：插件读自己设置的唯一路径
+#### ~~`self_config`~~：**已弃用**（宿主不再代存插件配置）
 
-| 规则 | 说明 |
-|---|---|
-| 内容 | `cfg.plugin_data[<本插件 id>]` 解密后的**明文**键值对 |
-| 隔离 | 由宿主按 `plugin_id` 过滤：插件**读不到其它插件**的键，也读不到宿主凭据 |
-| 键名 | 非空、≤64 字符、只允许 `[A-Za-z0-9_-]` —— **点号不允许**（见 §4.4） |
-| 保密 | 值可能含插件自有凭据：**宿主与插件都不得把它写入日志或回传前端** |
+**ADR-021（2026-09-28）起，宿主不再代存插件配置。** 该字段**恒为空对象**
+（保留仅为 ABI 兼容，老插件读到空对象后应回退到默认值）。
 
-增强插件的写入路径不是回调，而是返回值里的 `config` 字段（见 §4.4）。
-
-### 4.2.1 `target_json.config`：插件自管配置（决策 2）
-
-纯目标插件没有自己的 HTTP 路由，因此它提供设置表单、并持久化自己那份配置的唯一途径是
-**宿主代存**（命名空间 = 插件 id）：
+插件改用**能力表**自管配置：
 
 | 环节 | 机制 |
 |---|---|
-| 前端声明 | `describe_json.ui.blocks[]` 里给 `text`/`number` 块加 **`scope: "host"`** → 该字段提交给宿主而非插件的 `action` |
-| 写入 | `POST /api/plugins/<id>/data`（body：`{"fields": {键: 值}, "remove": [键]}`），值经 `ConfigManager::encrypt_field` **加密**落盘到 `AppConfig.plugin_data[<id>]` |
-| 读取 | 打开实例时按命名空间解密，注入 `target_json.config`（插件侧读 `config.<键>`）；前端回显走 `GET /api/plugins/<id>/data`（值**脱敏**，只答 `redacted`/是否已设置） |
-| 卸载 | `POST /api/plugins/<id>/purge`：该插件仍被任一目标（`TargetConfig.kind`）或任务引用时**拒绝**，并列出引用项 |
-| 孤立检测 | 启动时比对「有 `plugin_data` 但没有已加载插件」的 id → `GET /api/plugins` 的 `orphan_data[]`，「插件」页提示清理 |
+| 目录 | `own_data_dir`（能力表）→ `$TRIM_PKGVAR/plugins/<插件 id>/`，宿主已 `mkdir` |
+| 加密 | **`seal` / `unseal`**（能力表）：用**宿主密钥**加密，插件拿不到密钥本身 |
+| 存储 | 插件自行决定格式（建议「先写临时文件再改名」，避免半个文件） |
+| 卸载 | `POST /api/plugins/<id>/purge` 会**删除该目录** |
 
-> 注意：`KzwrTargetAbi.config_get` / `config_set` 两个函数指针**目前是预留位**
-> （SDK 导出时为 `None`，宿主未实现回调）。插件请走上表的 `target_json.config` 通道。
+> **为什么要提供 `seal`**：若不提供，插件自管配置就会从「宿主 age 加密」**降级为明文落盘**
+> —— 只靠目录权限（0700）保护，目录被读走凭据即泄漏。密钥留在宿主手里、只暴露
+> 「封/解」两个纯计算入口，就能既让插件自管、又不降级安全。
+>
+> **解密失败绝不回退成明文**：`unseal` 对非本宿主密钥加密的内容返回 NULL，
+> 插件必须当作「无此配置」处理（否则一个被篡改的密文会被当明文用）。
+
+**兼容**：老宿主（未下发能力表 / 无 `own_data_dir`）上，插件应退回**声明式 `config` 回写**
+（见 §4.4）—— 宿主仍接受该字段，但**新宿主会忽略它**。
+
+### 4.2.1 `target_json.config`：**目标自己的**字段（ADR-021 起）
+
+宿主不再代存**插件级**配置，但**目标级**的自定义字段仍然注入 `target_json.config`：
+它们由目标插件在 `describe_json.target.form` 里声明（见 §9.4.1），
+随该目标存储在 `TargetConfig.fields`（`secret` 的加密落盘）。
+
+| 环节 | 机制 |
+|---|---|
+| 前端声明 | `describe_json.target.form[]`（字段、类型、是否敏感）→ 「目标」页弹窗按声明渲染 |
+| 写入 | `POST /api/targets`（body 的 `fields` 对象），按声明加密后存进该目标的 `fields` |
+| 读取 | 打开实例时解密并**合并进 `target_json.config`**（同时单列在 `target_json.fields`） |
+| 卸载 | 目标删除即随之消失（它是目标自己的属性） |
+
+> `KzwrTargetAbi.config_get` / `config_set` 两个函数指针**仍是预留位**
+> （SDK 导出时为 `None`）—— 目标级字段走上表通道即可。
 
 ### 4.3 `available_json` / `health_json` / `action_json` / `event_json`
 
@@ -301,7 +315,7 @@ typedef struct KzwrPluginAbi {
 |---|---|---|
 | `alerts[]` | 以来源 `Plugin(插件id)` 落库，**同来源+同文案去重**（不重复外发 Webhook） | `level` 只认 `"error"`，其它一律 `warn`；**消解靠文案**，所以要把变化量（账号名）写进文案，且别写时间戳——否则每次都不重复、越积越多 |
 | `resolve[]` | 删除**本插件**中消息以这些**前缀**开头的告警 | 用于「条件恢复后自动消解」（空间回落）。前缀必须是 `alerts` 文案的开头若干字符；空串被忽略 |
-| `config` | 写入 `plugin_data[<本插件 id>]`（age 加密落盘），下次调用起出现在 `cfg.self_config` | 见下方键名规则；审计只记**键名**不记值 |
+| ~~`config`~~ | **已移除（ADR-021）**：宿主不再代存插件配置，该字段被**忽略**（不报错）。插件改用 `own_data_dir` + `seal`/`unseal` | 键名规则仍适用于**目标自定义字段**（§9.4.1） |
 | `audit[]` | `AuditLog.record(action, detail, ok, None)` | 让用户**看不见**的后台动作可追溯（如备份后自动清理）。`action` 自带插件命名空间，核心不猜语义 |
 
 #### `config` 键名规则（踩过的坑，必读）
@@ -374,21 +388,20 @@ if sdk::host::available() {
 | `audit` | 与宿主敏感操作**同一份** `audit.log` | 同上；`action` 自带插件命名空间 |
 | `alert` | 来源 `Plugin(id)`，与声明式 `alerts` **同一去重规则** | 两条通道混用**不会**产生重复告警 |
 | `resolve_alerts` | 按消息前缀消解**本插件**的告警 | 与声明式 `resolve` 同一实现 |
-| `config_get` | 同步读自己的配置（明文） | **唯一同步入口**；不取宿主锁 ⇒ 不会与宿主的 FFI 调用自死锁 |
-| `config_set` | 写/删自己的配置（空串 = 删除） | 键名规则同 §4.4（**不允许点号**）；写完立刻读能读回自己的值 |
-| `host_version` / `now_ms` / `own_data_dir` | 宿主版本串、毫秒时间戳、插件私有目录 | 前两者是纯读；目录在 `$TRIM_PKGVAR/plugins/<id>`（宿主已 `mkdir`） |
+| ~~`config_get`~~ / ~~`config_set`~~ | **已弃用（ADR-021）**：宿主不再代存插件配置 | 实现改为「读恒 NULL / 写恒拒绝」，让老插件**安全失败**并改用 `own_data_dir` |
+| `host_version` / `now_ms` / `own_data_dir` | 宿主版本串、毫秒时间戳、**插件私有目录** | 前两者是纯读；目录在 `$TRIM_PKGVAR/plugins/<id>`（宿主已 `mkdir`）——**插件配置的正式存放位置** |
+| **`seal` / `unseal`** | 用**宿主密钥**加密/解密密文（返回 base64） | 插件自管配置时用它保护凭据；**密钥留在宿主**，插件拿不到。解密失败返回 NULL，**绝不回退成明文** |
 | `progress` | 转发到 WebSocket，`kind="plugin"` | 前端**忽略**它对顶部任务卡的覆盖，不会顶掉备份状态 |
 | `schedule` | 注册周期任务（cron，宿主本地时区） | 到点回调 `event_json("timer", cfg)`，`cfg.timer_kind` = 注册的 `kind` |
 
 #### 三条硬纪律（插件必须知道）
 
-1. **写操作是"入队"而非同步落库**：`log`/`audit`/`alert`/`resolve`/`progress`/`config_set`/
-   `schedule` 只做一次 `try_send`，由宿主唯一的消费任务落库。队列满 ⇒ **丢弃**并计数
+1. **写操作是"入队"而非同步落库**：`log`/`audit`/`alert`/`resolve`/`progress`/`schedule`
+   只做一次 `try_send`，由宿主唯一的消费任务落库。队列满 ⇒ **丢弃**并计数
    （宿主宁可丢观测，也不让插件线程被阻塞）。因此这些调用**不保证**在同一毫秒内出现在日志里；
    但一次动作用 `action_json` 返回后，宿主会做一次**排空屏障**，告警与审计在同一个响应里就可见。
-2. **`config_get` 是唯一同步读**，因此宿主保证「**不跨 FFI 持锁**」。
-   反过来：插件**不要**在 `host_bind` 之外缓存 `config_get` 的返回值当配置真相——
-   用户可能刚在设置页改过，每次动作前重读。
+2. **`seal`/`unseal` 是同步的纯计算**（无落库、无副作用），因此宿主保证「**不跨 FFI 持锁**」。
+   配置的**读写时机由插件自己掌握**（写自己的文件），宿主不参与。
 3. **能力被 `ctx` 限定到本插件**：所有命名空间（配置键、告警、定时器、数据目录）都由 `ctx`
    决定，参数里**没有**插件 id 可填 ⇒ 改不了、也读不到别的插件。插件被**禁用/卸载后 `ctx`
    立即失效**，之后的调用被静默丢弃（不会崩，也**不会**再产生任何效果）。
@@ -400,6 +413,9 @@ if sdk::host::available() {
   SDK 的每个 API 都退化成**安全空操作**，插件行为与以前一致（不崩）。
 - 能力表**逐字段**探测 `size`：老宿主的表短一截时，插件仍接受整表、只跳过缺失的能力
   （`free_str` 因此在必需前缀里，见 `KzwrHostAbi::MIN_SIZE`）。
+- **老宿主没有 `seal`/`own_data_dir`** ⇒ 插件应退回**声明式 `config` 回写**（宿主代存）。
+  新宿主会**忽略**该字段，因此两条路径可以同时写在插件里、由插件按能力探测决定走哪条
+  （kzwr 即如此：见 `plugins/kzwr/src/store.rs` 与 `state.rs::Writeback`）。
 
 > **安全取舍**：`ctx` 是不透明指针而非密码学凭证——理论上知道了别人的 `ctx` 地址就能冒用。
 > 这是个**有意的**取舍：宿主从不 `dlclose` 插件、进程内插件互不信任程度有限；
@@ -633,7 +649,8 @@ typedef struct KzwrTargetAbi {
 - 前端在「新建目标」时**只能选 `kind == "target"` 的插件**（增强类插件不出现在类型下拉里）；
   **类型创建后不可更改**（换类型等于换一种存储，凭据与语义都不同）。
 - 插件自己的设置（如本地目录的 `root`）走 §4.4 的自管配置通道
-  （`ui.blocks` 里 `scope: "host"` 的 `text` 块，值存 `plugin_data` 并注入 `target_json.config`）。
+  （用上面的 `target.form` 声明，值存该目标自己的 `TargetConfig.fields` 并注入
+  `target_json.config`）。**不再**使用 `ui.blocks` 的 `scope: "host"`（已弃用，ADR-021）。
 
 ### 9.4.1 「新建/编辑目标」弹窗的表单由插件声明（`describe_json.target`）
 
@@ -681,8 +698,9 @@ typedef struct KzwrTargetAbi {
 
 - **三个 well-known 键**（`url`/`username`/`password`）映射到既有存储，
   是为了不破坏已发布插件的读取位置（它们一直读 `target_json.url` 等）。
-- **其余键按目标存储**，不放进 `plugin_data[插件id]` —— 后者是**插件级**的，
-  同一插件的多个目标会互相覆盖（与 §9.4 并发度踩过的坑同类）。
+- **其余键按目标存储**（`TargetConfig.fields`），**不用**插件级存储 ——
+  后者会让同一插件的多个目标互相覆盖（与 §9.4 并发度踩过的坑同类；
+  旧的插件级 `plugin_data` 通道已随 ADR-021 移除）。
 - **敏感字段永不回传明文**：`GET /api/targets` 里该键是 `true`/`false`（是否已设置）。
   留空提交 = **不修改**（与 `password` 既有语义一致）。
 - 空串提交 = **清除**该字段。

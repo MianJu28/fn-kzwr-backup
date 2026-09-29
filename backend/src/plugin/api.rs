@@ -197,7 +197,7 @@ pub enum UiBlock {
         action: String,
         #[serde(default)]
         button: String,
-        /// 值由谁保管：`host` = 宿主代存（`plugin_data` 命名空间，加密落盘）；
+        /// 值由谁保管：~~`host` = 宿主代存~~（**已弃用**，ADR-021：宿主不再代存）；
         /// 缺省/其它 = 插件自己的路由处理
         #[serde(default)]
         scope: Option<String>,

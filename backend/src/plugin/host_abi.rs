@@ -21,7 +21,6 @@
 //! 调用，指针也不会悬空；`revoked` 只决定「效果是否被采纳」。这是有意的取舍：
 //! 用一次进程生命周期的少量泄漏，换掉一整类 use-after-free。
 
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
@@ -35,7 +34,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::abi::{
     HostAlertFn, HostAuditFn, HostCfgGetFn, HostCfgSetFn, HostLogFn, HostProgressFn, HostResolveFn,
-    HostScheduleFn, KzwrHostAbi, HOST_ABI_VERSION,
+    HostScheduleFn, HostSealFn, HostUnsealFn, KzwrHostAbi, HOST_ABI_VERSION,
 };
 
 /// 队列容量：一次 `try_send` 的背压上限。插件爆发式上报时**宁可丢观测、不可拖慢插件**。
@@ -85,12 +84,9 @@ impl Queue {
 struct Ctx {
     plugin_id: String,
     queue: Queue,
-    /// 本插件自管配置的**只读镜像**（明文；来源为 `plugin_data` 命名空间）
-    kv: RwLock<BTreeMap<String, String>>,
-    /// **待落盘覆盖层**：`config_set` 已受理但消费任务尚未落库的值，
-    /// 让「写完立刻读」能读回自己的值。`None` = 已受理的删除（墓碑）。
-    pending: RwLock<BTreeMap<String, Option<String>>>,
     /// 本插件私有数据目录（`$TRIM_PKGVAR/plugins/<id>`，签发时已 `mkdir`）
+    ///
+    /// **插件配置的正式存放位置**：宿主不再代存插件配置（ADR-021）。
     own_dir: String,
     /// 失效标记：插件被禁用/卸载后置位，之后的回调效果一律不采纳
     revoked: AtomicBool,
@@ -120,38 +116,6 @@ impl Ctx {
         g.1 += 1;
         true
     }
-
-    /// 读一个键：**先看覆盖层**（read-your-writes），再看镜像
-    fn get(&self, key: &str) -> Option<String> {
-        if let Some(hit) = self.pending.read().unwrap().get(key) {
-            return hit.clone();
-        }
-        self.kv.read().unwrap().get(key).cloned()
-    }
-
-    /// 覆盖层与「已落库的值」一致时清除（消费任务落库成功后调用）
-    ///
-    /// `applied` = `None` 表示这次落的是删除。
-    fn clear_pending_if(&self, key: &str, applied: &Option<String>) {
-        let mut p = self.pending.write().unwrap();
-        if p.get(key) == Some(applied) {
-            p.remove(key);
-        }
-    }
-
-    /// 落库成功后同步镜像（覆盖层优先级更高，故先清覆盖层再改镜像）
-    fn commit(&self, key: &str, applied: &Option<String>) {
-        self.clear_pending_if(key, applied);
-        let mut kv = self.kv.write().unwrap();
-        match applied {
-            Some(v) => {
-                kv.insert(key.to_string(), v.clone());
-            }
-            None => {
-                kv.remove(key);
-            }
-        }
-    }
 }
 
 // ── 效果 ────────────────────────────────────────────────────────────────
@@ -177,12 +141,6 @@ enum Effect {
     Resolve {
         ctx: Arc<Ctx>,
         prefix: String,
-    },
-    /// 写/删自管配置（`value == None` = 删除）
-    ConfigSet {
-        ctx: Arc<Ctx>,
-        key: String,
-        value: Option<String>,
     },
     Progress {
         ctx: Arc<Ctx>,
@@ -259,9 +217,8 @@ impl HostEffects {
 
     /// 签发 ctx 并登记（重复签发同一插件会先失效旧 ctx）
     ///
-    /// `kv` 是该插件自管配置的明文镜像（通常来自 `plugin_data_export`）。
     /// 返回的不透明指针交给插件，在其 `host_bind` 回调之后长期有效。
-    pub fn issue(&self, plugin_id: &str, kv: BTreeMap<String, String>) -> *mut c_void {
+    pub fn issue(&self, plugin_id: &str) -> *mut c_void {
         // 先失效旧 ctx：热重载/重绑时旧的一律不再生效
         self.revoke(plugin_id);
 
@@ -274,8 +231,6 @@ impl HostEffects {
         let ctx = Arc::new(Ctx {
             plugin_id: plugin_id.to_string(),
             queue: self.queue.clone(),
-            kv: RwLock::new(kv),
-            pending: RwLock::new(BTreeMap::new()),
             own_dir: own_dir.to_string_lossy().into_owned(),
             revoked: AtomicBool::new(false),
             gate: Mutex::new((now_secs(), 0)),
@@ -288,7 +243,7 @@ impl HostEffects {
         raw
     }
 
-    /// 失效某插件的全部 ctx，并清掉它的定时器与待落盘覆盖层
+    /// 失效某插件的全部 ctx，并清掉它的定时器
     ///
     /// 用于禁用 / 卸载 / 卸载清除。**不释放 ctx 内存**（插件线程可能仍持有指针），
     /// 只让后续效果不被采纳。
@@ -297,7 +252,6 @@ impl HostEffects {
         for (_, (id, ctx)) in self.contexts.read().unwrap().iter() {
             if id == plugin_id {
                 ctx.revoked.store(true, Ordering::Relaxed);
-                ctx.pending.write().unwrap().clear();
                 n += 1;
             }
         }
@@ -310,15 +264,6 @@ impl HostEffects {
         if n > 0 || timers > 0 {
             // 便于运维确认「禁用确实让插件能力失效」，而不是只看路由 404
             tracing::info!(plugin = %plugin_id, ctx = n, timers, "插件能力表 ctx 已失效");
-        }
-    }
-
-    /// 刷新某插件的配置镜像（配置被宿主侧改写后调用：代存端点、导入、清理）
-    pub fn refresh_kv(&self, plugin_id: &str, kv: BTreeMap<String, String>) {
-        for (_, (id, ctx)) in self.contexts.read().unwrap().iter() {
-            if id == plugin_id {
-                *ctx.kv.write().unwrap() = kv.clone();
-            }
         }
     }
 
@@ -498,6 +443,9 @@ fn host_table() -> &'static KzwrHostAbi {
         own_data_dir: Some(ffi_own_data_dir),
         progress: Some(ffi_progress as HostProgressFn),
         schedule: Some(ffi_schedule as HostScheduleFn),
+        // 加密原语：宿主不再代存插件配置，但密钥仍留在宿主手里
+        seal: Some(ffi_seal as HostSealFn),
+        unseal: Some(ffi_unseal as HostUnsealFn),
     };
     Box::leak(Box::new(t))
 }
@@ -564,21 +512,6 @@ fn apply(state: &crate::AppState, eff: Effect) {
                 tracing::info!(plugin = %id, removed, "插件经能力表消解的告警");
             }
         }
-        Effect::ConfigSet { ctx, key, value } => {
-            if ctx.is_revoked() {
-                return;
-            }
-            let id = ctx.id().to_string();
-            let ok = apply_config_set(state, &id, &key, value.as_deref());
-            match ok {
-                Ok(()) => ctx.commit(&key, &value),
-                Err(e) => {
-                    tracing::warn!(plugin = %id, key = %key, err = %e, "插件自配置落盘失败");
-                    // 落盘失败 → 撤掉覆盖层，让后续读回到「真实已落库值」
-                    ctx.clear_pending_if(&key, &value);
-                }
-            }
-        }
         Effect::Progress {
             ctx,
             label,
@@ -604,41 +537,6 @@ fn apply(state: &crate::AppState, eff: Effect) {
             let _ = ack.send(());
         }
     }
-}
-
-/// 落库一条自管配置（与 `/api/plugins/:id/data` 走同一套语义与加密）
-fn apply_config_set(
-    state: &crate::AppState,
-    plugin_id: &str,
-    key: &str,
-    value: Option<&str>,
-) -> Result<(), String> {
-    let mgr = state.config.lock().unwrap();
-    let mut cfg = mgr.load().map_err(|e| format!("{e:#}"))?;
-    // 空串 = 删除（与 `plugin_data_set` 既有语义一致）
-    let set: Vec<(String, String)> = match value {
-        Some(v) if !v.is_empty() => vec![(key.to_string(), v.to_string())],
-        _ => Vec::new(),
-    };
-    let remove: Vec<String> = if set.is_empty() {
-        vec![key.to_string()]
-    } else {
-        Vec::new()
-    };
-    super::cabi::writeback_to_manager(&mgr, &mut cfg, plugin_id, &set, &remove)?;
-    mgr.save(&cfg).map_err(|e| format!("{e:#}"))?;
-    drop(mgr);
-    // 审计只记键名，绝不记值（可能含凭据）
-    state.audit.record(
-        "plugin.data",
-        format!(
-            "插件 {plugin_id} 经能力表{}自配置键 {key}",
-            if set.is_empty() { "删除" } else { "写入" }
-        ),
-        true,
-        None,
-    );
-    Ok(())
 }
 
 /// 把进度转发到 WebSocket 事件流（`kind = "plugin"`）
@@ -804,19 +702,41 @@ extern "C" fn ffi_resolve(ctx: *mut c_void, prefix: *const c_char) {
     });
 }
 
-/// 同步读一个配置键（**唯一同步入口**；不取宿主配置锁，故无死锁风险）
+/// ~~同步读一个配置键~~ —— **已弃用**：宿主不再代存插件配置，恒返回 NULL
 ///
-/// 返回的串由宿主分配，调用方须用能力表的 `free_str` 释放。
-extern "C" fn ffi_config_get(ctx: *mut c_void, key: *const c_char) -> *mut c_char {
+/// 保留实现（而非置为 `None`）是为了让老插件的调用**安全失败**：
+/// 拿到 NULL 后按「无此配置」处理，而不是因为函数指针为 NULL 而崩溃。
+extern "C" fn ffi_config_get(_ctx: *mut c_void, _key: *const c_char) -> *mut c_char {
+    std::ptr::null_mut()
+}
+
+/// ~~写/删一个配置键~~ —— **已弃用**：恒拒绝（非 0）
+///
+/// 老插件据此得知「宿主不再代存」，应改为把配置写进自己的 `own_data_dir`
+/// （敏感内容用 [`ffi_seal`] 加密）。
+extern "C" fn ffi_config_set(_ctx: *mut c_void, _key: *const c_char, _value: *const c_char) -> c_int {
+    // 返回 2（与「已失效」同码）而不是 1（入参错误）：插件据此可区分
+    // 「我传错了」与「宿主不支持了」。
+    2
+}
+
+/// 用宿主密钥加密明文（返回 base64 密文；NULL = 失败）
+///
+/// 插件拿不到密钥本身，只能要求宿主加解密 —— 这样「配置自管」不会降级为明文落盘。
+extern "C" fn ffi_seal(ctx: *mut c_void, plain: *const c_char) -> *mut c_char {
     guard(std::ptr::null_mut(), || unsafe {
-        let (Some(c), Some(k)) = (ctx_ref(ctx), cstr(key)) else {
+        let (Some(c), Some(p)) = (ctx_ref(ctx), cstr(plain)) else {
             return std::ptr::null_mut();
         };
-        if c.is_revoked() {
+        if c.is_revoked() || !c.allow() {
             return std::ptr::null_mut();
         }
-        match c.get(&k) {
-            Some(v) => CString::new(v)
+        // 限长：能力表是给「配置片段」用的，不是给大文件加密用的
+        if p.len() > MAX_VALUE_BYTES * 16 {
+            return std::ptr::null_mut();
+        }
+        match super::crypto::seal(&p) {
+            Some(sealed) => CString::new(sealed)
                 .map(|s| s.into_raw())
                 .unwrap_or(std::ptr::null_mut()),
             None => std::ptr::null_mut(),
@@ -824,38 +744,21 @@ extern "C" fn ffi_config_get(ctx: *mut c_void, key: *const c_char) -> *mut c_cha
     })
 }
 
-/// 写/删一个配置键：0 = 已受理（异部落盘），非 0 = 拒绝
-extern "C" fn ffi_config_set(ctx: *mut c_void, key: *const c_char, value: *const c_char) -> c_int {
-    guard(1, || unsafe {
-        let (Some(c), Some(k)) = (ctx_ref(ctx), cstr(key)) else {
-            return 1;
+/// 用宿主密钥解密 [`ffi_seal`] 的产物（NULL = 失败或非本宿主密钥加密）
+extern "C" fn ffi_unseal(ctx: *mut c_void, sealed: *const c_char) -> *mut c_char {
+    guard(std::ptr::null_mut(), || unsafe {
+        let (Some(c), Some(s)) = (ctx_ref(ctx), cstr(sealed)) else {
+            return std::ptr::null_mut();
         };
         if c.is_revoked() || !c.allow() {
-            return 2;
+            return std::ptr::null_mut();
         }
-        // 键名规则与宿主代存端点**完全一致**（含「不允许点号」）——整批校验、整批拒绝
-        if !super::cabi::writeback_key_ok(&k) {
-            return 3;
-        }
-        let v = cstr(value).unwrap_or_default();
-        if v.len() > MAX_VALUE_BYTES {
-            return 4;
-        }
-        // 空串 = 删除
-        let applied: Option<String> = if v.is_empty() { None } else { Some(v) };
-        // 先立覆盖层：保证写完立刻读能读回自己的值
-        c.pending.write().unwrap().insert(k.clone(), applied.clone());
-        let eff = Effect::ConfigSet {
-            ctx: ctx_arc(c),
-            key: k.clone(),
-            value: applied,
-        };
-        if c.queue.push(eff) {
-            0
-        } else {
-            // 队列满 ⇒ 拒绝并撤掉覆盖层，否则插件会以为写成功了
-            c.pending.write().unwrap().remove(&k);
-            5
+        // 解密失败一律 NULL（**绝不**回退成明文，见 crypto 模块说明）
+        match super::crypto::unseal(&s) {
+            Some(plain) => CString::new(plain)
+                .map(|s| s.into_raw())
+                .unwrap_or(std::ptr::null_mut()),
+            None => std::ptr::null_mut(),
         }
     })
 }
@@ -990,9 +893,9 @@ mod tests {
 
     #[test]
     fn key_rule_matches_host_endpoint() {
-        assert!(super::super::cabi::writeback_key_ok("kzwr_token"));
-        assert!(!super::super::cabi::writeback_key_ok("a.b"), "点号必须被拒绝");
-        assert!(!super::super::cabi::writeback_key_ok(""));
+        assert!(super::super::cabi::config_key_ok("kzwr_token"));
+        assert!(!super::super::cabi::config_key_ok("a.b"), "点号必须被拒绝");
+        assert!(!super::super::cabi::config_key_ok(""));
     }
 
     #[test]
@@ -1009,44 +912,90 @@ mod tests {
         assert_eq!(t.size, KzwrHostAbi::TABLE_SIZE);
         // 全部能力都必须有实现（尾部追加演进时这里会提醒补齐）
         assert!(t.log.is_some() && t.audit.is_some() && t.alert.is_some());
+        // config_get/set 保留为**已弃用桩**（老插件调用应安全失败，而非空指针崩溃）
         assert!(t.config_get.is_some() && t.config_set.is_some());
         assert!(t.own_data_dir.is_some() && t.free_str as usize != 0);
+        // 加密原语：插件自管配置靠它避免明文落盘
+        assert!(t.seal.is_some() && t.unseal.is_some(), "seal/unseal 必须实现");
         assert!(!host_version_cstr().is_null());
         assert!(now_ms() > 0);
     }
 
     #[test]
-    fn ctx_read_your_writes_and_revoke() {
+    fn ctx_issue_and_revoke() {
         let fx = HostEffects::new(std::env::temp_dir().join("kzwr-host-abi-test"));
-        let mut kv = BTreeMap::new();
-        kv.insert("a".to_string(), "1".to_string());
-        let raw = fx.issue("demo", kv);
+        let raw = fx.issue("demo");
         let c = unsafe { ctx_ref(raw) }.expect("ctx");
+        assert_eq!(c.id(), "demo");
+        assert!(!c.is_revoked());
+        // 私有目录应带插件 id（插件把配置写在这里）
+        assert!(c.own_dir.ends_with("demo"), "own_dir 应含插件 id：{}", c.own_dir);
 
-        // 镜像命中
-        assert_eq!(c.get("a").as_deref(), Some("1"));
-        // 覆盖层优先（模拟 config_set 已受理但未落盘）
-        c.pending
-            .write()
-            .unwrap()
-            .insert("a".to_string(), Some("2".to_string()));
-        assert_eq!(c.get("a").as_deref(), Some("2"));
-        // 落库后清覆盖层、同步镜像
-        c.commit("a", &Some("2".to_string()));
-        assert!(c.pending.read().unwrap().is_empty());
-        assert_eq!(c.get("a").as_deref(), Some("2"));
-
-        // 失效后读取被拒（FFI 层返回 NULL；这里直接验标记）
         fx.revoke("demo");
-        assert!(c.is_revoked());
-        assert!(c.pending.read().unwrap().is_empty());
+        assert!(c.is_revoked(), "revoke 后应标记失效");
         assert_eq!(fx.table().is_null(), false);
+    }
+
+    /// **已弃用的 config_get/config_set 必须安全失败**（而不是崩溃或静默成功）
+    ///
+    /// 宿主不再代存插件配置（ADR-021）：老插件若仍调用这两个入口，
+    /// `config_get` 应得到 NULL（当作「无此配置」），`config_set` 应被拒绝（非 0），
+    /// 从而让插件察觉「宿主不支持了」并改用 `own_data_dir`。
+    #[test]
+    fn deprecated_config_entries_fail_safely() {
+        let fx = HostEffects::new(std::env::temp_dir().join("kzwr-host-abi-dep"));
+        let raw = fx.issue("legacy");
+        let key = CString::new("accounts").unwrap();
+        let val = CString::new("[]").unwrap();
+        // 读：恒 NULL
+        assert!(
+            ffi_config_get(raw, key.as_ptr()).is_null(),
+            "config_get 应恒返回 NULL（宿主不再代存）"
+        );
+        // 写：恒拒绝（非 0）
+        assert_ne!(
+            ffi_config_set(raw, key.as_ptr(), val.as_ptr()),
+            0,
+            "config_set 应恒拒绝，让插件察觉宿主不再代存"
+        );
+    }
+
+    /// **加密原语**：seal/unseal 往返，且坏输入不得回退成明文
+    #[test]
+    fn seal_unseal_through_ffi() {
+        super::super::crypto::init(age::secrecy::SecretString::from("ffi-test".to_string()));
+        let fx = HostEffects::new(std::env::temp_dir().join("kzwr-host-abi-seal"));
+        let raw = fx.issue("sealer");
+        let plain = CString::new("access-token-秘密").unwrap();
+
+        let sealed = ffi_seal(raw, plain.as_ptr());
+        assert!(!sealed.is_null(), "seal 应成功");
+        let sealed_str = unsafe { CStr::from_ptr(sealed) }.to_string_lossy().into_owned();
+        assert!(!sealed_str.contains("秘密"), "密文不得含明文片段");
+        ffi_free_str(sealed);
+
+        // 解回明文
+        let c = CString::new(sealed_str).unwrap();
+        let back = ffi_unseal(raw, c.as_ptr());
+        assert!(!back.is_null());
+        assert_eq!(
+            unsafe { CStr::from_ptr(back) }.to_string_lossy(),
+            "access-token-秘密"
+        );
+        ffi_free_str(back);
+
+        // 坏输入 → NULL（**绝不**当明文返回）
+        let junk = CString::new("plain-token").unwrap();
+        assert!(ffi_unseal(raw, junk.as_ptr()).is_null(), "非密文必须被拒");
+        // NULL 入参安全
+        assert!(ffi_seal(std::ptr::null_mut(), plain.as_ptr()).is_null());
+        assert!(ffi_unseal(raw, std::ptr::null()).is_null());
     }
 
     #[test]
     fn revoked_ctx_clears_timers() {
         let fx = HostEffects::new(std::env::temp_dir().join("kzwr-host-abi-test2"));
-        fx.issue("p1", BTreeMap::new());
+        fx.issue("p1");
         assert!(fx.register_timer("p1", "nightly", "0 3 * * *"));
         assert!(fx.register_timer("p2", "nightly", "0 4 * * *"));
         fx.revoke("p1");
@@ -1103,7 +1052,7 @@ mod tests {
     #[test]
     fn rate_gate_limits_bursts() {
         let fx = HostEffects::new(std::env::temp_dir().join("kzwr-host-abi-test4"));
-        let raw = fx.issue("rl", BTreeMap::new());
+        let raw = fx.issue("rl");
         let c = unsafe { ctx_ref(raw) }.unwrap();
         let mut ok = 0;
         for _ in 0..(RATE_PER_SEC + 50) {
@@ -1115,30 +1064,9 @@ mod tests {
     }
 
     #[test]
-    fn config_set_through_ffi_updates_overlay_and_queues() {
-        let fx = HostEffects::new(std::env::temp_dir().join("kzwr-host-abi-test5"));
-        let raw = fx.issue("cfg", BTreeMap::new());
-        let key = CString::new("token").unwrap();
-        let val = CString::new("s3cr3t").unwrap();
-        let rc = ffi_config_set(raw, key.as_ptr(), val.as_ptr());
-        assert_eq!(rc, 0, "合法键应被受理");
-        let c = unsafe { ctx_ref(raw) }.unwrap();
-        assert_eq!(c.get("token").as_deref(), Some("s3cr3t"), "写完立刻读");
-        assert_eq!(fx.take_dropped(), 0);
-
-        // 非法键（含点号）必须拒绝，且**不得**留下覆盖层
-        let bad = CString::new("a.b").unwrap();
-        assert_eq!(ffi_config_set(raw, bad.as_ptr(), val.as_ptr()), 3);
-        assert!(c.get("a.b").is_none());
-        // 超长值拒绝
-        let huge = CString::new("x".repeat(MAX_VALUE_BYTES + 1)).unwrap();
-        assert_eq!(ffi_config_set(raw, key.as_ptr(), huge.as_ptr()), 4);
-    }
-
-    #[test]
     fn config_get_and_own_dir_survive_hostile_input() {
         let fx = HostEffects::new(std::env::temp_dir().join("kzwr-host-abi-test6"));
-        let raw = fx.issue("hostile", BTreeMap::new());
+        let raw = fx.issue("hostile");
         // NULL ctx / NULL key 必须安全返回空指针，不得 panic
         assert!(ffi_config_get(std::ptr::null_mut(), std::ptr::null()).is_null());
         assert!(ffi_config_get(raw, std::ptr::null()).is_null());
@@ -1158,7 +1086,7 @@ mod tests {
     #[test]
     fn revoked_ffi_entries_are_inert() {
         let fx = HostEffects::new(std::env::temp_dir().join("kzwr-host-abi-test7"));
-        let raw = fx.issue("gone", BTreeMap::new());
+        let raw = fx.issue("gone");
         fx.revoke("gone");
         let k = CString::new("k").unwrap();
         let v = CString::new("v").unwrap();

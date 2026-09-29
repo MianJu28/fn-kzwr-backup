@@ -150,16 +150,9 @@ impl CApiEnhance {
         };
         let id = self.describe.id.clone();
 
-        // 自管配置的明文镜像（隔离：只取自己那一份命名空间）。
-        // **锁必须在进插件之前释放** —— 宿主不变式：绝不跨 FFI 持锁。
-        let kv = {
-            let mgr = state.config.lock().unwrap();
-            match mgr.load() {
-                Ok(cfg) => mgr.plugin_data_export(&cfg, &id).unwrap_or_default(),
-                Err(_) => std::collections::BTreeMap::new(),
-            }
-        };
-        let ctx = state.host_effects.issue(&id, kv);
+        // 宿主不再代存插件配置（ADR-021）：插件用自己的 `own_data_dir`，
+        // 敏感内容经能力表的 `seal`/`unseal` 加密。故这里无需再注入配置镜像。
+        let ctx = state.host_effects.issue(&id);
         let table = state.host_effects.table();
 
         // `host_bind` 里插件可能做不少初始化（建 runtime、读盘），故兜异常：
@@ -195,9 +188,9 @@ impl CApiEnhance {
 /// - `alerts`：按 (来源, 消息) 去重后落库；
 /// - `resolve`：删除本插件中**消息以这些前缀开头**的告警 —— 用于「条件恢复后自动消解」
 ///   （如空间占用回落到阈值以下，之前的空间预警应自行消失，而不是一直挂着）；
-/// - `config`：写入本插件的 `plugin_data` 命名空间（age 加密落盘 + 审计只记键名）。
-///   这让增强插件能持久化自己的配置（多账号、阈值…）而**不需要任何回调**，
-///   下一次调用起 `cfg.self_config` 就能读回明文；
+/// - ~~`config`~~：**已移除（ADR-021）** —— 宿主不再代存插件配置。
+///   插件改用 `own_data_dir` 自管（敏感内容经能力表 `seal`/`unseal` 加密）。
+///   该字段现在被**忽略**（不报错，便于老插件平滑过渡）；
 /// - `audit`：`[{"action","detail","ok"}]` 写入审计日志（如「自动清空回收站」这类
 ///   用户看不见的后台动作必须可追溯）。`action` 由插件自带命名空间（如
 ///   `kzwr.trash.auto`），核心不猜语义。
@@ -239,88 +232,19 @@ pub fn apply_side_effects(state: &AppState, plugin_id: &str, raw: &str) {
             }
         }
     }
-    apply_config_writeback(state, plugin_id, &v);
+    // `config` 字段已不再处理（宿主不代存插件配置）；仅保留审计通道
     apply_audit_records(state, plugin_id, &v);
 }
 
-/// 解析插件返回值里的 `config` 字段为 (set, remove)
+/// **配置键名是否合法**（插件自管配置、目标自定义字段、声明式回写共用同一规则）
 ///
-/// 独立成函数是为了**可单测**：键名规则是插件与宿主之间最容易出错的地方
-/// （曾经的 `percent.<id>` 就是因为点号被整批拒绝，而插件以为写成功了）。
-///
-/// 语义：**整批校验、整批失败** —— 任一非法键名直接报错，不部分生效，
-/// 否则插件会误以为配置已持久化。
-pub fn parse_writeback(v: &Value) -> Result<(Vec<(String, String)>, Vec<String>), (String, String)> {
-    let Some(cfg_obj) = v.get("config") else {
-        return Ok((Vec::new(), Vec::new()));
-    };
-    let set: Vec<(String, String)> = cfg_obj
-        .get("set")
-        .and_then(|x| x.as_object())
-        .map(|m| {
-            m.iter()
-                .map(|(k, val)| {
-                    (
-                        k.clone(),
-                        match val {
-                            Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        },
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let remove: Vec<String> = cfg_obj
-        .get("remove")
-        .and_then(|x| x.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
-        .unwrap_or_default();
-    // 键名规则与宿主代存端点一致（命名空间键会被注入快照，必须严格限定）
-    for k in set.iter().map(|(k, _)| k).chain(remove.iter()) {
-        if !writeback_key_ok(k) {
-            return Err((k.clone(), "空串/超过 64 字符/含 [A-Za-z0-9_-] 之外的字符（**点号不允许**）".to_string()));
-        }
-    }
-    Ok((set, remove))
-}
-
-/// 回写键名是否合法（见 [`parse_writeback`]）
-pub fn writeback_key_ok(k: &str) -> bool {
+/// 非空、≤64 字符、只允许 `[A-Za-z0-9_-]`（**不允许点号**）。
+/// 点号曾被用来做命名空间（`percent.<id>`），导致整批键被拒而插件以为写成功
+/// —— 详见 `docs/PLUGIN_ABI.md` §4.4。
+pub fn config_key_ok(k: &str) -> bool {
     !k.trim().is_empty()
         && k.len() <= 64
         && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
-/// 把已校验的 set/remove 写入指定插件的 `plugin_data` 命名空间（只改内存中的 cfg）
-///
-/// 与落盘/审计分开，是为了能在只有 `ConfigManager` 的单元测试里验证**隔离性**：
-/// 写入只落在 `plugin_id` 自己的命名空间，别的插件读不到。
-/// `remove` 用空串删除（与 [`crate::infra::config::ConfigManager::plugin_data_set`] 同语义）。
-pub fn writeback_to_manager(
-    mgr: &crate::infra::config::ConfigManager,
-    cfg: &mut crate::infra::config::AppConfig,
-    plugin_id: &str,
-    set: &[(String, String)],
-    remove: &[String],
-) -> Result<(), String> {
-    for (k, val) in set {
-        if !writeback_key_ok(k) {
-            return Err(format!("非法配置键：{k}"));
-        }
-        if let Err(e) = mgr.plugin_data_set(cfg, plugin_id, k, val) {
-            return Err(format!("写入 {k} 失败：{e}"));
-        }
-    }
-    for k in remove {
-        if !writeback_key_ok(k) {
-            return Err(format!("非法配置键：{k}"));
-        }
-        if let Err(e) = mgr.plugin_data_set(cfg, plugin_id, k, "") {
-            return Err(format!("删除 {k} 失败：{e}"));
-        }
-    }
-    Ok(())
 }
 
 /// 声明式审计写入（见 [`apply_side_effects`] 的 `audit` 字段）
@@ -339,66 +263,20 @@ fn apply_audit_records(state: &AppState, plugin_id: &str, v: &Value) {
     tracing::debug!(plugin = %plugin_id, n = items.len(), "插件声明的审计条目已写入");
 }
 
-/// 声明式自配置回写（见 [`apply_side_effects`] 的 `config` 字段）
-fn apply_config_writeback(state: &AppState, plugin_id: &str, v: &Value) {
-    let (set, remove) = match parse_writeback(v) {
-        Ok(x) => x,
-        Err((key, reason)) => {
-            // 与宿主代存端点一致：非法键名一律拒绝
-            tracing::warn!(plugin = %plugin_id, key = %key, reason = %reason, "插件回写了非法配置键，已忽略整批");
-            return;
-        }
-    };
-    if set.is_empty() && remove.is_empty() {
-        return;
-    }
-    let mgr = state.config.lock().unwrap();
-    let mut cfg = match mgr.load() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(plugin = %plugin_id, err = %e, "插件回写自配置失败：读取配置出错");
-            return;
-        }
-    };
-    if let Err(e) = writeback_to_manager(&mgr, &mut cfg, plugin_id, &set, &remove) {
-        tracing::warn!(plugin = %plugin_id, err = %e, "插件回写自配置失败");
-        return;
-    }
-    if let Err(e) = mgr.save(&cfg) {
-        tracing::warn!(plugin = %plugin_id, err = %e, "插件回写自配置落盘失败");
-        return;
-    }
-    drop(mgr);
-    // 审计只记**键名与数量**，绝不记值（可能含凭据）
-    let keys: Vec<&str> = set.iter().map(|(k, _)| k.as_str()).collect();
-    state.audit.record(
-        "plugin.data",
-        format!(
-            "插件 {plugin_id} 回写自配置（{} 项：{}{}）",
-            keys.len() + remove.len(),
-            keys.join("、"),
-            if remove.is_empty() {
-                String::new()
-            } else {
-                format!("；删除 {}", remove.join("、"))
-            }
-        ),
-        true,
-        None,
-    );
-}
-
 /// 从 `AppState` 读出**指定插件视角**的配置快照 JSON
 ///
-/// 快照里会注入该插件自己的明文自配置（`self_config`）——隔离由 `plugin_id` 保证：
-/// 只取 `plugin_data[<plugin_id>]` 这一个命名空间，插件看不到其它插件的键。
-/// **返回值含凭据，调用方不得写入日志。**
+/// 快照**不再注入插件自配置**（`self_config`，ADR-021：宿主不代存插件配置）——
+/// 插件改用能力表的 `own_data_dir` 自管。快照里只剩宿主可公开的配置
+/// （目标/任务/时区等），**不含任何凭据**。
 ///
 /// `after_backup_task` 仅 `after_backup` 事件传（告诉插件刚完成的是哪个任务）。
-pub fn cfg_json_for(state: &AppState, plugin_id: &str, after_backup_task: Option<&str>) -> String {
+///
+/// `plugin_id` 保留在签名里（调用点众多），但**已不再参与**：宿主不代存插件配置，
+/// 快照对任何插件都相同。
+pub fn cfg_json_for(state: &AppState, _plugin_id: &str, after_backup_task: Option<&str>) -> String {
     let mgr = state.config.lock().unwrap();
     let cfg = mgr.load().unwrap_or_default();
-    let snap = CfgSnapshot::from_config(&cfg).with_self_config(&cfg, plugin_id, &mgr);
+    let snap = CfgSnapshot::from_config(&cfg);
     match after_backup_task {
         Some(t) => snap.with_after_backup_task(t).to_json(),
         None => snap.to_json(),
@@ -427,8 +305,8 @@ impl EnhancePlugin for CApiEnhance {
         self.describe.caps.into()
     }
 
-    fn available(&self, cfg: &crate::infra::config::AppConfig, mgr: &ConfigManager) -> bool {
-        let snap = CfgSnapshot::from_config(cfg).with_self_config(cfg, &self.describe.id, mgr);
+    fn available(&self, cfg: &crate::infra::config::AppConfig, _mgr: &ConfigManager) -> bool {
+        let snap = CfgSnapshot::from_config(cfg);
         self.call_available(&snap.to_json())
     }
 
@@ -526,14 +404,8 @@ impl EnhancePlugin for CApiEnhance {
         let Some(f) = self.table.0.health_json else {
             return Vec::new();
         };
-        // 快照在**独立作用域**里构造：`MutexGuard` 不是 `Send`，
-        // 必须确保它不跨越下面的 `.await`（否则 future 不 Send）。
-        let cfg_json = {
-            let mgr = state.config.lock().unwrap();
-            CfgSnapshot::from_config(cfg)
-                .with_self_config(cfg, &self.describe.id, &mgr)
-                .to_json()
-        };
+        // 快照不含插件配置（ADR-021）⇒ 无需解密，也就不必取配置锁
+        let cfg_json = CfgSnapshot::from_config(cfg).to_json();
         let table = self.table;
         let raw = match tokio::task::spawn_blocking(move || call1(table, f, &cfg_json))
             .await

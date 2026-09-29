@@ -5,16 +5,22 @@
 //! **全部**接了过来：厂商 HTTP 协议、凭据、阈值、回收站清理、空间预警，核心里不再
 //! 留任何 kzwr 专属代码或配置字段。
 //!
-//! ## 与宿主的交互方式（严格 C ABI v1，无回调）
+//! ## 与宿主的交互方式（严格 C ABI v1）
 //!
 //! | 方向 | 载体 |
 //! |------|------|
 //! | 宿主 → 插件 | `describe_json` / `available_json(cfg)` / `action_json(action, req)` / `health_json(cfg)` / `event_json(event, cfg)` |
-//! | 插件 → 宿主 | **返回值里的声明式字段**：`alerts` / `resolve` / `config`（自配置回写）/ `audit` |
+//! | 插件 → 宿主 | **返回值里的声明式字段**：`alerts` / `resolve` / `audit`；以及**能力表回调**（`host_bind` 之后）：日志/审计/告警/进度/定时/`seal` |
 //!
-//! 插件读自己配置的**唯一**路径是 `cfg.self_config`（宿主注入、只含本插件命名空间、
-//! 明文）；写配置通过 `config` 回写声明，下一次调用即可读回。凭据因此**永不**经过
-//! 前端：`/accounts` 只回 `configured`，绝不回传 token。
+//! ## 配置存储（ADR-021：宿主不再代存）
+//! 账号与阈值由**插件自己**保管：写进能力表给的 `own_data_dir`，
+//! 整份内容经宿主 `seal` 加密（密钥在宿主手里，插件拿不到）。
+//! 见 [`crate::store`]。
+//!
+//! **老宿主兼容**：拿不到私有目录时退回声明式 `config` 回写（宿主 `plugin_data` 代存），
+//! 两条路径的键值布局相同，上层逻辑不区分。
+//!
+//! 凭据**永不**经过前端：`/accounts` 只回 `configured`，绝不回传 token。
 //!
 //! ## 阻塞式 HTTP 的位置
 //!
@@ -26,6 +32,7 @@ mod api;
 mod log;
 mod rt;
 mod state;
+mod store;
 mod ui;
 
 use std::os::raw::c_char;

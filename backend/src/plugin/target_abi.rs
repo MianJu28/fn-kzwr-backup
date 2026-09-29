@@ -272,11 +272,11 @@ impl TargetPlugin for CApiTarget {
         let (user, pass) = (creds.0.as_deref().unwrap_or(""), creds.1.as_deref().unwrap_or(""));
         // 插件自管配置（命名空间 = 插件 id）解密后注入 `target_json.config`。
         // 注意：此处在 config 锁内（`reload_targets` 持锁调用），只能读、不能写。
-        let cfg = mgr.load().unwrap_or_default();
-        let mut config = mgr.plugin_data_json(&cfg, &self.meta.id);
+        // 宿主不再代存插件配置（ADR-021）⇒ `config` 里**只有本目标自己的字段**。
+        let mut config = serde_json::Value::Object(serde_json::Map::new());
         // **本目标**的自定义字段（按目标存储、已解密）：
-        // - 合并进 `config`（同名时**目标级优先**），让既有插件读 `config.xxx` 无需改动；
-        // - 同时单独放在 `fields` 里，便于插件区分「本目标」与「插件全局」。
+        // - 合并进 `config`，让既有插件读 `config.xxx` 无需改动；
+        // - 同时单独放在 `fields` 里，便于插件区分来源。
         let target_fields = target.custom_fields_plain(mgr);
         let fields_json = serde_json::Value::Object(
             target_fields

@@ -537,17 +537,11 @@ extern "C" fn describe() -> *mut c_char {
                         "hint": "插件自己决定分批顺序（小文件优先），宿主按并发度上传"
                     },
                     {
-                        // `scope: "host"` = 值由**宿主代存**：前端提交到
-                        // `/api/plugins/example-localfs/data`，加密落盘到 plugin_data，
-                        // 再解密注入 `target_json.config`（插件侧读 `config.root`）。
-                        // 纯目标插件没有自己的路由，故这是它提供设置表单的唯一途径。
-                        "type": "text",
-                        "field": "root",
-                        "label": "默认目录（可选）",
-                        "placeholder": "留空则用目标地址里的路径",
-                        "action": "save_root",
-                        "button": "保存",
-                        "scope": "host"
+                        // 目录等设置**不再由宿主代存**（ADR-021）：它们是**目标自己的属性**，
+                        // 已在「新建/编辑目标」弹窗里按 `target.form` 声明（见上方 form）。
+                        // 因此这里不再提供 `scope: "host"` 的表单块。
+                        "type": "tips",
+                        "text": "目录路径与子目录在「目标」页每个目标自己的编辑弹窗里填写（可建多个目标指向不同目录）。"
                     }
                 ]
             }

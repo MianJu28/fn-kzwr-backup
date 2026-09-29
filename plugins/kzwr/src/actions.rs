@@ -32,7 +32,7 @@ impl ActResult {
     fn ok(body: Value) -> Self {
         Self {
             body,
-            wb: Writeback::default(),
+            wb: Writeback::open(),
             alerts: Vec::new(),
             resolve: Vec::new(),
             audit: Vec::new(),
@@ -81,7 +81,7 @@ impl ActResult {
                 Value::Array(self.resolve.iter().cloned().map(Value::String).collect()),
             );
         }
-        if let Some(c) = self.wb.to_json() {
+        if let Some(c) = self.wb.commit() {
             out.insert("config".to_string(), c);
         }
         if !self.audit.is_empty() {

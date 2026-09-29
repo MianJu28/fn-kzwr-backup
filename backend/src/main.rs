@@ -130,6 +130,11 @@ async fn main() -> anyhow::Result<()> {
     let audit = Arc::new(fnos_backup::domain::audit::AuditLog::new(&var_dir));
 
     // 插件能力表（宿主 → 插件回调）：插件私有数据目录落在 `$TRIM_PKGVAR/plugins/<id>`
+    //
+    // 先注入**加解密口令**：宿主不再代存插件配置（ADR-021），
+    // 插件改用 `own_data_dir` + 能力表的 `seal`/`unseal`（密钥留在宿主手里），
+    // 因此这两个原语必须在插件绑定之前就绪。
+    fnos_backup::plugin::crypto::init(infra::keystore::secret(&passphrase_str));
     let host_effects =
         fnos_backup::plugin::host_abi::HostEffects::new(var_dir.join("plugins"));
 

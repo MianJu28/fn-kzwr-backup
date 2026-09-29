@@ -1,27 +1,23 @@
 //! 插件自管配置（多账号 + 按账号阈值）
 //!
-//! ## 为什么插件能写自己的配置，却不回调宿主
+//! ## 存储位置（ADR-021：宿主不再代存）
+//! 配置由**插件自己**保管：写进能力表给的 `own_data_dir`（见 [`crate::store`]），
+//! 整份内容经宿主 `seal` 加密后落盘 —— 密钥在宿主手里，插件拿不到。
 //!
-//! ABI v1 主表是**冻结**的：没有宿主 vtable，插件不能反过来调宿主的方法。
-//! 迁移方案因此采用**声明式回写**：插件在返回值里带
+//! **兼容**：拿不到私有目录（老宿主 / 未绑定能力表）时退回**声明式回写**，
+//! 由宿主 `plugin_data` 代存（`self_config`）。两条路径的**键值布局完全相同**，
+//! 因此上层逻辑不必区分。
 //!
-//! ```json
-//! {"config": {"set": {"k":"v"}, "remove": ["k"]}}
-//! ```
-//!
-//! 宿主解析后写入本插件的 `plugin_data` 命名空间（age 加密落盘，审计只记键名），
-//! **下一次调用**起 `cfg.self_config` 就能读回明文。本模块只负责生成这个回写声明。
-//!
-//! ## 存储布局（全部在 `cfg.plugin_data["kzwr"]` 命名空间内）
+//! ## 键值布局
 //!
 //! | 键 | 含义 |
 //! |----|------|
-//! | `accounts` | JSON 数组 `[{"id","name","token"}]`（整串存一个键：token 随命名空间一起加密） |
+//! | `accounts` | JSON 数组 `[{"id","name","token"}]`（整串存一个键：token 随之加密） |
 //! | `percent-<id>` | 该账号的空间用量预警阈值（%），缺省 90 |
 //! | `percent` | **遗留**全局阈值（迁移前只有单 token 时代）；作为未单独设置账号的兜底 |
 //! | `token` | **遗留**单 token；首次读到即迁移成一个名为「默认账号」的账号后删除 |
 //!
-//! 阈值默认 90%：这是本次迁移确立的行为（原内置固定 85%，多账号后按账号可各自设置）。
+//! 阈值默认 90%：这是迁移确立的行为（原内置固定 85%，多账号后按账号可各自设置）。
 
 use serde_json::Value;
 
@@ -57,14 +53,36 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// 从快照 JSON 的 `self_config` 构造
+    /// 从**插件自己的配置存储**读取（ADR-021 的正式路径）
+    ///
+    /// 拿不到私有目录时返回 `None` —— 调用方据此退回声明式回写（老宿主兼容）。
+    pub fn from_store() -> Option<Self> {
+        let store = crate::store::Store::open()?;
+        Some(Self::from_value(&store.load()))
+    }
+
+    /// 从 `cfg`（宿主快照）构造
+    ///
+    /// 优先读插件自管存储；**老宿主**（无能力表/无私有目录）才退回
+    /// `cfg.self_config`（宿主代存的旧路径）。
+    pub fn from_cfg(cfg: &Value) -> Self {
+        if let Some(s) = Self::from_store() {
+            return s;
+        }
+        // 兼容路径：宿主代存（`self_config`）
+        Self::from_value(
+            cfg.get("self_config")
+                .unwrap_or(&Value::Object(Default::default())),
+        )
+    }
+
+    /// 从一份**键值表**构造（自管存储与 `self_config` 共用同一布局）
     ///
     /// 解析容错：`accounts` 里的非法条目（缺 id / 缺 token）逐条跳过而不是整体失败
     /// —— 手工编辑过配置文件的场景下，一个坏条目不该让全部账号消失。
-    pub fn from_cfg(cfg: &Value) -> Self {
-        let sc = cfg.get("self_config");
+    pub fn from_value(sc: &Value) -> Self {
         let get = |k: &str| -> Option<String> {
-            sc?.get(k).and_then(|v| v.as_str()).map(str::to_string)
+            sc.get(k).and_then(|v| v.as_str()).map(str::to_string)
         };
         let mut out = Snapshot::default();
         if let Some(s) = get("accounts") {
@@ -101,7 +119,7 @@ impl Snapshot {
             }
         }
         // 按账号阈值：`percent-<id>`（宿主键名规则不允许点号）
-        if let Some(sc) = sc.and_then(|x| x.as_object()) {
+        if let Some(sc) = sc.as_object() {
             for (k, v) in sc {
                 if let Some(id) = k.strip_prefix("percent-") {
                     if id.is_empty() {
@@ -202,22 +220,72 @@ pub fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
-/// 声明式配置回写：`{"set":{…},"remove":[…]}`
+/// 配置写入器：**优先写插件自管存储**，老宿主退回声明式回写
+///
+/// 两条路径的键值布局相同，所以上层只调 `set_kv` / `remove_key`，
+/// 由本类型决定「落到自己的文件」还是「交给宿主代存」。
+///
+/// 之所以保留声明式路径：老宿主（未下发能力表 / 无 `own_data_dir`）上插件仍要能用，
+/// 那时只能靠返回值里的 `config` 声明让宿主代存。
 #[derive(Debug, Default)]
 pub struct Writeback {
-    pub set: Vec<(String, String)>,
-    pub remove: Vec<String>,
+    set: Vec<(String, String)>,
+    remove: Vec<String>,
+    /// 自管存储（拿到私有目录时有值）；`None` = 退回声明式回写
+    store: Option<crate::store::Store>,
 }
 
 impl Writeback {
+    /// 打开写入器：优先自管存储，拿不到则准备走声明式回写
+    pub fn open() -> Self {
+        Self {
+            store: crate::store::Store::open(),
+            ..Default::default()
+        }
+    }
+
     pub fn set_kv(&mut self, k: impl Into<String>, v: impl Into<String>) {
         self.set.push((k.into(), v.into()));
     }
     pub fn remove_key(&mut self, k: impl Into<String>) {
         self.remove.push(k.into());
     }
-    /// 转成返回值里的 `config` 字段（无内容时 `None`）
-    pub fn to_json(&self) -> Option<Value> {
+    /// 是否走自管存储（诊断/测试用）
+    pub fn is_self_managed(&self) -> bool {
+        self.store.is_some()
+    }
+
+    /// 落盘：自管存储则「读—改—写」整份配置；否则返回 `config` 声明交给宿主
+    ///
+    /// 返回 `Some(json)` 表示**需要**宿主代存（老宿主路径）；
+    /// 返回 `None` 表示已自行落盘（新路径）或无事可做。
+    pub fn commit(&self) -> Option<Value> {
+        if self.set.is_empty() && self.remove.is_empty() {
+            return None;
+        }
+        if let Some(store) = &self.store {
+            // 读—改—写：整份配置加密落盘（避免只写局部导致其余键丢失）
+            let mut kv = store.load();
+            let Some(obj) = kv.as_object_mut() else {
+                return self.declarative();
+            };
+            for (k, v) in &self.set {
+                obj.insert(k.clone(), Value::String(v.clone()));
+            }
+            for k in &self.remove {
+                obj.remove(k);
+            }
+            if !store.save(&kv) {
+                // 落盘失败：退回声明式回写，至少让宿主代存一次（不丢用户数据）
+                return self.declarative();
+            }
+            return None;
+        }
+        self.declarative()
+    }
+
+    /// 声明式回写形态：`{"set":{…},"remove":[…]}`（老宿主路径）
+    fn declarative(&self) -> Option<Value> {
         if self.set.is_empty() && self.remove.is_empty() {
             return None;
         }
@@ -236,5 +304,86 @@ impl Writeback {
             );
         }
         Some(Value::Object(j))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! 配置存储的**新路径**（自管 + 加密）与**兼容路径**（声明式回写）行为
+    use super::*;
+
+    /// 声明式回写形态（老宿主路径）必须与旧契约**逐字节兼容**
+    ///
+    /// 老宿主靠解析 `{"set":{…},"remove":[…]}` 落库；格式变了老宿主就读不到，
+    /// 所以这条测试钉住 JSON 形状。
+    #[test]
+    fn declarative_writeback_keeps_legacy_shape() {
+        let mut wb = Writeback::default(); // store=None ⇒ 走声明式
+        wb.set_kv("percent", "77");
+        wb.set_kv("accounts", "[]");
+        wb.remove_key("token");
+        let j = wb.commit().expect("应有回写声明");
+        assert_eq!(j["set"]["percent"], "77");
+        assert_eq!(j["set"]["accounts"], "[]");
+        assert_eq!(j["remove"][0], "token");
+    }
+
+    /// 无事可做时**不产生**回写声明（避免空 set/remove 触发无意义落盘）
+    #[test]
+    fn empty_writeback_emits_nothing() {
+        let wb = Writeback::default();
+        assert!(wb.commit().is_none(), "空回写不应产生声明");
+    }
+
+    /// 键值布局解析：`from_value` 吃的是**键值表**（自管存储与 self_config 同布局）
+    #[test]
+    fn snapshot_parses_shared_layout() {
+        let kv = serde_json::json!({
+            "accounts": r#"[{"id":"a1","name":"主账号","token":"tok-1"}]"#,
+            "percent": "55",
+            "percent-a1": "77"
+        });
+        let snap = Snapshot::from_value(&kv);
+        assert_eq!(snap.account_count(), 1);
+        assert_eq!(snap.find("a1").unwrap().token, "tok-1");
+        assert_eq!(snap.percent_for("a1"), 77, "按账号阈值优先");
+        assert_eq!(snap.percent_for("other"), 55, "未单独设置回落全局");
+        assert_eq!(snap.effective_default_percent(), 55);
+    }
+
+    /// `Some(0)`（显式关闭）与「缺键」（未设置）必须可区分
+    ///
+    /// 这是踩过的坑：曾用「删键」表达 0，导致「关闭预警」被当成「未设置」而回落默认值。
+    #[test]
+    fn explicit_zero_differs_from_unset() {
+        let kv = serde_json::json!({ "percent": "0" });
+        let snap = Snapshot::from_value(&kv);
+        assert_eq!(snap.default_percent, Some(0), "显式 0 应被记住");
+        assert_eq!(snap.percent_for("nobody"), 0, "0 = 关闭该账号预警");
+        // 完全没设置 → 用默认 90
+        let snap2 = Snapshot::from_value(&serde_json::json!({}));
+        assert_eq!(snap2.default_percent, None);
+        assert_eq!(snap2.percent_for("nobody"), DEFAULT_PERCENT);
+    }
+
+    /// 非法账号条目逐条跳过，不影响其余账号（手工编辑配置的场景）
+    #[test]
+    fn malformed_account_entries_are_skipped_not_fatal() {
+        let kv = serde_json::json!({
+            "accounts": r#"[{"id":"ok","name":"好","token":"t"},{"id":"no-token"},{"token":"no-id"},{"id":"blank","token":"  "}]"#
+        });
+        let snap = Snapshot::from_value(&kv);
+        assert_eq!(snap.account_count(), 1, "只应保留合法条目");
+        assert_eq!(snap.accounts[0].id, "ok");
+    }
+
+    /// 遗留单 token 自动迁移成「默认账号」
+    #[test]
+    fn legacy_token_migrates_into_default_account() {
+        let kv = serde_json::json!({ "token": "old-token" });
+        let snap = Snapshot::from_value(&kv);
+        assert_eq!(snap.account_count(), 1);
+        assert_eq!(snap.accounts[0].id, LEGACY_ACCOUNT_ID);
+        assert_eq!(snap.accounts[0].token, "old-token");
     }
 }

@@ -277,7 +277,7 @@ impl PluginRegistry {
 
     /// 全部已加载插件 id（目标 + 增强；含内置与外部）
     ///
-    /// **不过滤** disabled：被禁用的插件其 `plugin_data` 仍应被视为「有归属」，
+    /// **不过滤** disabled：被禁用的插件仍应被视为「有归属」，
     /// 不该被孤立数据检测提示成遗留配置。
     pub fn plugin_ids(&self) -> Vec<String> {
         let ext = self.external.read().unwrap();

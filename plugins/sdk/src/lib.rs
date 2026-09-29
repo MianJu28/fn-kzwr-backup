@@ -157,6 +157,12 @@ pub struct KzwrHostAbi {
     pub schedule: Option<
         extern "C" fn(*mut std::os::raw::c_void, *const c_char, *const c_char) -> i32,
     >,
+    /// 用**宿主密钥**加密明文（返回 base64 密文；NULL = 失败）
+    ///
+    /// 插件把敏感内容写进自己的数据目录时用它 —— 密钥在宿主手里，插件拿不到。
+    pub seal: Option<extern "C" fn(*mut std::os::raw::c_void, *const c_char) -> *mut c_char>,
+    /// 用宿主密钥解密 [`Self::seal`] 的产物（NULL = 失败或非本宿主密钥加密）
+    pub unseal: Option<extern "C" fn(*mut std::os::raw::c_void, *const c_char) -> *mut c_char>,
 }
 
 /// 宿主能力表的安全封装
@@ -467,6 +473,57 @@ pub mod host {
             return false;
         };
         f(ctx, k.as_ptr(), c.as_ptr()) == 0
+    }
+
+    /// 用**宿主密钥**加密一段明文（失败 → `None`）
+    ///
+    /// 插件自管配置时用它保护敏感内容（如 access-token）：密钥在宿主手里，
+    /// 插件只能请求加解密，因此「配置自管」不会降级成明文落盘。
+    ///
+    /// 典型用法：
+    /// ```ignore
+    /// let sealed = sdk::host::seal(&json!({"token": t}).to_string());
+    /// std::fs::write(dir.join("config.json"), sealed.unwrap_or_default())?;
+    /// ```
+    pub fn seal(plain: &str) -> Option<String> {
+        let off = std::mem::offset_of!(KzwrHostAbi, seal);
+        if !has(off, std::mem::size_of::<usize>()) {
+            return None;
+        }
+        let (table, ctx) = bound()?;
+        let f = unsafe { (*table).seal }?;
+        let c = CString::new(plain.replace('\0', "")).ok()?;
+        let p = f(ctx, c.as_ptr());
+        if p.is_null() {
+            return None;
+        }
+        let s = unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { ((*table).free_str)(p) };
+        Some(s)
+    }
+
+    /// 解密 [`seal`] 的产物（失败 → `None`）
+    ///
+    /// **失败绝不回退成明文**：调用方必须把 `None` 当作「无此配置」处理。
+    pub fn unseal(sealed: &str) -> Option<String> {
+        let off = std::mem::offset_of!(KzwrHostAbi, unseal);
+        if !has(off, std::mem::size_of::<usize>()) {
+            return None;
+        }
+        let (table, ctx) = bound()?;
+        let f = unsafe { (*table).unseal }?;
+        let c = CString::new(sealed.replace('\0', "")).ok()?;
+        let p = f(ctx, c.as_ptr());
+        if p.is_null() {
+            return None;
+        }
+        let s = unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { ((*table).free_str)(p) };
+        Some(s)
     }
 }
 
