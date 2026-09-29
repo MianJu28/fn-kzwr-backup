@@ -439,6 +439,19 @@ pub struct AbiTargetCaps {
     /// —— 与插件设置弹窗（`ui.blocks`）同一套思路。
     #[serde(default)]
     pub form: Vec<AbiTargetField>,
+
+    /// **哪些字段的值是「本机路径」**（缺省空 ⇒ 宿主不为其开放文件系统访问）
+    ///
+    /// 用于**沙箱白名单**：宿主不知道 `url` 对某插件是「目录路径」还是「主机名」，
+    /// 因此必须由插件声明。声明后宿主在建立该目标实例的沙箱时，
+    /// 把这些字段的值（路径）加入可读写白名单。
+    ///
+    /// 例：`example-localfs` 声明 `["url"]`（它的 url 就是目录）；
+    /// `webdav` **不声明**（它的 url 是远程 URL，插件只需网络）。
+    ///
+    /// 可写而非只读：目标插件要往这些路径**写入**密文（这正是它的职责）。
+    #[serde(default)]
+    pub path_fields: Vec<String>,
 }
 
 /// 目标表单里的一个字段（插件声明，宿主渲染）
@@ -528,6 +541,7 @@ impl Default for AbiTargetCaps {
             url_placeholder: None,
             url_hint: None,
             form: Vec::new(),
+            path_fields: Vec::new(),
         }
     }
 }

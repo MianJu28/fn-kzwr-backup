@@ -306,3 +306,148 @@ mod tests {
         );
     }
 }
+
+
+// ── 目标实例的沙箱线程（**每实例一个小池**）──────────────────────────────
+//
+// 为什么不是「每插件一条」：并发回传（ADR-013 决策 4）会**同时**调用同一个
+// 目标实例的 `write_stream`（`buffer_unordered(parallel)`，最多 `MAX_PARALLEL=8`）。
+// 若这些调用挤在一条线程上，`write_blocking` 的阻塞喂块会被**串行化** ——
+// 并发回传直接失效（性能回退，且与用户配置的并发度不符）。
+//
+// ⇒ 每个**目标实例**建一个大小 = 并发度的小池，池内每条线程各自施加沙箱。
+// 池随实例存在（实例由 `Arc<AbiTargetStorage>` 保活），实例销毁即池销毁。
+
+/// 目标实例的沙箱线程池
+pub struct InstancePool {
+    tx: crossbeam_like::Sender,
+    size: usize,
+}
+
+/// 一个极简的多生产者/多消费者通道（避免为此引入 crossbeam 依赖）
+///
+/// 实现：`Mutex<VecDeque>` + `Condvar`。分配一次、长期复用，
+/// 开销远小于每次 `spawn_blocking`。
+mod crossbeam_like {
+    use std::collections::VecDeque;
+    use std::sync::{Condvar, Mutex};
+
+    pub struct Sender {
+        inner: std::sync::Arc<Inner>,
+    }
+    struct Inner {
+        q: Mutex<VecDeque<super::Job>>,
+        cv: Condvar,
+        closed: Mutex<bool>,
+    }
+
+    impl Sender {
+        pub fn send(&self, job: super::Job) -> Result<(), ()> {
+            {
+                let mut q = self.inner.q.lock().unwrap();
+                q.push_back(job);
+            }
+            self.inner.cv.notify_one();
+            Ok(())
+        }
+        pub fn close(&self) {
+            *self.inner.closed.lock().unwrap() = true;
+            self.inner.cv.notify_all();
+        }
+    }
+
+    pub fn channel() -> (Sender, Receiver) {
+        let inner = std::sync::Arc::new(Inner {
+            q: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+            closed: Mutex::new(false),
+        });
+        (
+            Sender { inner: inner.clone() },
+            Receiver { inner },
+        )
+    }
+
+    pub struct Receiver {
+        inner: std::sync::Arc<Inner>,
+    }
+    impl Receiver {
+        /// 取一个任务；`None` = 已关闭且队列已空
+        pub fn recv(&self) -> Option<super::Job> {
+            let mut q = self.inner.q.lock().unwrap();
+            loop {
+                if let Some(job) = q.pop_front() {
+                    return Some(job);
+                }
+                if *self.inner.closed.lock().unwrap() {
+                    return None;
+                }
+                q = self.inner.cv.wait(q).unwrap();
+            }
+        }
+    }
+}
+
+impl InstancePool {
+    /// 建立一个 `size` 条线程的池，每条线程各自施加 `policy` 沙箱
+    ///
+    /// `size` 由调用方按该实例的并发度给出（至少 1）。
+    pub fn new(label: &str, policy: SandboxPolicy, size: usize) -> Option<Arc<Self>> {
+        let size = size.max(1);
+        let label = label.to_string();
+        let (tx, rx) = crossbeam_like::channel();
+        let rx = Arc::new(rx);
+        let mut spawned = 0usize;
+        for i in 0..size {
+            let rx = rx.clone();
+            let policy = policy.clone();
+            let name = format!("target-{label}-{i}");
+            let label = label.clone();
+            let ok = std::thread::Builder::new()
+                .name(name)
+                .spawn(move || {
+                    // 每条线程**各自**施加沙箱（Landlock per-thread）
+                    if let Err(e) = policy.apply_to_current_thread() {
+                        tracing::warn!(
+                            target = %label, idx = i, err = %e,
+                            "目标实例沙箱线程施加 Landlock 失败（该线程未受保护）"
+                        );
+                    }
+                    while let Some(job) = rx.recv() {
+                        job();
+                    }
+                })
+                .is_ok();
+            if ok {
+                spawned += 1;
+            }
+        }
+        if spawned == 0 {
+            return None;
+        }
+        tracing::info!(target = %label, threads = spawned, "目标实例沙箱线程池已就绪");
+        Some(Arc::new(Self { tx, size: spawned }))
+    }
+
+    /// 池大小（诊断用）
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// 投递任务（不等待）
+    pub fn submit(&self, job: Job) -> bool {
+        self.tx.send(job).is_ok()
+    }
+
+    /// 当前在跑的线程数（诊断用；`None` = 池已关闭）
+    pub fn shutdown(&self) {
+        self.tx.close();
+    }
+}
+
+impl Drop for InstancePool {
+    fn drop(&mut self) {
+        // 唤醒所有等待的线程，让它们看到 closed 后退出
+        self.tx.close();
+    }
+}

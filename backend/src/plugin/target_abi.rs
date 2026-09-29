@@ -220,6 +220,40 @@ impl CApiTarget {
         .to_string()
     }
 
+    /// 从「插件声明的路径字段」取出本实例的实际路径（供沙箱白名单）
+    ///
+    /// 只看 `caps.path_fields` 里列出的键 —— 宿主**不猜**哪个字段是路径。
+    /// `url` 是 well-known 键（存 `TargetConfig.url`），其余从该目标自己的
+    /// `fields` 取。
+    fn instance_paths(
+        &self,
+        target: &TargetConfig,
+        fields: &std::collections::BTreeMap<String, String>,
+    ) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for key in &self.caps.path_fields {
+            let v = if key == "url" {
+                target.url.clone()
+            } else {
+                fields.get(key).cloned()
+            };
+            if let Some(p) = v {
+                let p = p.trim();
+                // 只接受**绝对路径**：相对路径无法安全地映射到白名单
+                // （它相对谁？），宁可不开这个口子，让插件显式给绝对路径。
+                if !p.is_empty() && p.starts_with('/') {
+                    out.push(std::path::PathBuf::from(p));
+                } else if !p.is_empty() {
+                    tracing::warn!(
+                        target = %target.id, key = %key, value = %p,
+                        "path_fields 声明的值不是绝对路径，沙箱白名单已忽略该值"
+                    );
+                }
+            }
+        }
+        out
+    }
+
     /// 已建立实例后，从插件取最近错误并映射为 `StorageError`
     fn err_from(&self, th: *mut c_void, code: i32, what: &str) -> StorageError {
         let detail = plugin_detail(self.abi, th, format!("{}: 错误码 {}", what, code));
@@ -266,6 +300,10 @@ impl TargetPlugin for CApiTarget {
     fn form_fields(&self) -> Vec<crate::plugin::abi::AbiTargetField> {
         self.caps.form.clone()
     }
+    /// 由插件在 `describe_json.target.path_fields` 声明（供沙箱白名单）
+    fn path_fields(&self) -> Vec<String> {
+        self.caps.path_fields.clone()
+    }
     fn build(&self, target: &TargetConfig, mgr: &ConfigManager) -> Option<(Arc<dyn TargetStorage>, String)> {
         // 解密在调用方/mgr 内完成（与内置目标一致）
         let creds = mgr.target_credentials(target).ok().unwrap_or((None, None));
@@ -290,18 +328,67 @@ impl TargetPlugin for CApiTarget {
             }
         }
         let json = self.target_json(target, user, pass, config, fields_json);
-        let c = CString::new(json).ok()?;
-        let th = unsafe { (self.abi.target_open)(c.as_ptr()) };
-        if th.is_null() {
+
+        // **先建池、再开放实例**：`target_open` 与 `host_bind` 同类 ——
+        // 它是插件在本实例上**最早**执行的代码，能在里面读任意文件。
+        // 若先 open 再建池，沙箱就漏了实例初始化那一刻。
+        //
+        // 池大小 = 该实例并发度（并发回传会并行调用 `write_stream`）。
+        let caps = self.caps_for(target, mgr);
+        let parallel = if caps.supports_plan {
+            caps.max_parallel.max(1) as usize
+        } else {
+            1
+        };
+        // 沙箱白名单：插件在 `path_fields` 里声明的那些字段的**本机路径值**
+        // （宿主不猜哪个字段是路径；`example-localfs` 声明 url，`webdav` 不声明）
+        let extra = self.instance_paths(target, &target_fields);
+        let label = format!("{}-{}", self.meta.id, target.id);
+        let policy = super::worker::policy_for(&self.meta.id, &extra);
+        let pool = super::worker::InstancePool::new(&label, policy, parallel);
+
+        // `target_open` 走池线程（已施加沙箱）。池不可用则退回直调
+        // （功能不变，但**无沙箱** —— 建池失败时已记警告）。
+        let json_clone = json.clone();
+        let th = match pool.as_ref() {
+            Some(p) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let abi = self.abi;
+                let submitted = p.submit(Box::new(move || {
+                    let c = match CString::new(json_clone) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            let _ = tx.send(0usize);
+                            return;
+                        }
+                    };
+                    // SAFETY: 同步 FFI，参数在本次调用内有效
+                    let h = unsafe { (abi.target_open)(c.as_ptr()) } as usize;
+                    let _ = tx.send(h);
+                }));
+                if submitted {
+                    // 池线程执行；等结果（实例初始化通常很快，且此处本就必须同步拿到句柄）
+                    rx.recv().unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+            None => {
+                let c = CString::new(json).ok()?;
+                unsafe { (self.abi.target_open)(c.as_ptr()) as usize }
+            }
+        };
+        if th == 0 {
             return None;
         }
         let storage = AbiTargetStorage {
             abi: self.abi,
-            caps: self.caps_for(target, mgr),
+            caps,
             th: th as usize,
             name: self.meta.name.clone(),
             chunk_size: self.chunk_size(),
             target_name: target.name.clone(),
+            pool,
         };
         Some((Arc::new(storage), target.name.clone()))
     }
@@ -356,6 +443,11 @@ struct AbiTargetStorage {
     name: String,
     chunk_size: usize,
     target_name: String,
+    /// **本实例的沙箱线程池**（每实例一小池；并发回传会在池内并行）
+    ///
+    /// `None` = 池建立失败（线程创建失败），此时退化为原有的 `spawn_blocking`
+    /// 行为 —— 功能不受影响，只是没有沙箱保护（会记警告）。
+    pool: Option<Arc<super::worker::InstancePool>>,
 }
 
 // SAFETY: `th` 为插件句柄；线程安全由契约约定（插件自负），宿主按约定调度
@@ -363,6 +455,42 @@ unsafe impl Send for AbiTargetStorage {}
 unsafe impl Sync for AbiTargetStorage {}
 
 impl AbiTargetStorage {
+    /// 把阻塞闭包投递到**本实例的沙箱线程池**，返回可 `.await` 的句柄
+    ///
+    /// 池不可用（建立失败）时退回 `tokio::task::spawn_blocking` —— 功能完全一致，
+    /// 只是没有沙箱保护（建池时已记过警告）。
+    ///
+    /// 返回 `JoinHandle`，因此调用点的 `.await` / `map_err` 写法与原来一致。
+    fn submit_blocking<F, T>(&self, f: F) -> tokio::task::JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let Some(pool) = self.pool.clone() else {
+            return tokio::task::spawn_blocking(f);
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel::<T>();
+        let job: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
+            // panic 兜住：池线程必须存活（否则该实例的后续调用全废）
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+                Ok(v) => {
+                    let _ = tx.send(v);
+                }
+                Err(_) => {
+                    tracing::error!("目标插件回调 panic（已兜住，池线程存活）");
+                }
+            }
+        });
+        if !pool.submit(job) {
+            // 池已关闭（实例正在销毁）：退回公共池，保证功能不中断
+            return tokio::task::spawn_blocking(|| panic!("目标插件沙箱池已关闭"));
+        }
+        tokio::spawn(async move {
+            // 与 JoinHandle<T> 语义对齐：拿不到结果就 panic 成 JoinError
+            rx.await.expect("目标插件回调未返回结果（panic 或池关闭）")
+        })
+    }
+
     fn rel_cstr(&self, path: &Path) -> Result<CString, StorageError> {
         CString::new(path.as_os_str().to_string_lossy().as_bytes())
             .map_err(|_| StorageError::Protocol(format!("非法相对路径: {}", path.display())))
@@ -537,7 +665,9 @@ impl TargetStorage for AbiTargetStorage {
         let b_abort = abort.clone();
         let b_tick = last_tick.clone();
         let b_name = name.clone();
-        let blocking_fut = tokio::task::spawn_blocking(move || {
+        // 走**本实例的沙箱线程池**：并发回传会在池内并行（池大小 = 并发度），
+        // 因此不会退化成串行。池不可用时退回 spawn_blocking（功能不变，无沙箱）。
+        let blocking_fut = self.submit_blocking(move || {
             Self::write_blocking(abi, th, rel, rx, chunk_size, progress, b_abort, b_tick, &b_name)
         });
 
@@ -570,7 +700,7 @@ impl TargetStorage for AbiTargetStorage {
         let th = self.th;
         let c = CString::new(prefix).map_err(|_| StorageError::Protocol("非法前缀".into()))?;
         // (abi.list_json) 返回值是托管字符串指针（非 Send），在闭包内转成 String 再跨线程返回
-        let body = tokio::task::spawn_blocking(move || {
+        let body = self.submit_blocking(move || {
             let th = th as *mut c_void;
             let p = unsafe { (abi.list_json)(th, c.as_ptr()) };
             take_cstring(p, abi).unwrap_or_default()
@@ -585,7 +715,7 @@ impl TargetStorage for AbiTargetStorage {
         let abi = self.abi;
         let th = self.th;
         let rel = self.rel_cstr(path)?;
-        let code = tokio::task::spawn_blocking(move || {
+        let code = self.submit_blocking(move || {
             let th = th as *mut c_void;
             unsafe { (abi.delete)(th, rel.as_ptr()) }
         })
@@ -601,7 +731,7 @@ impl TargetStorage for AbiTargetStorage {
         if let Some(ed) = self.abi.ensure_dir {
             let th = self.th;
             let rel = self.rel_cstr(path)?;
-            let code = tokio::task::spawn_blocking(move || {
+            let code = self.submit_blocking(move || {
                 let th = th as *mut c_void;
                 unsafe { ed(th, rel.as_ptr()) }
             })
@@ -617,7 +747,7 @@ impl TargetStorage for AbiTargetStorage {
     async fn ping(&self) -> StorageResult<()> {
         if let Some(p) = self.abi.ping {
             let th = self.th;
-            let code = tokio::task::spawn_blocking(move || {
+            let code = self.submit_blocking(move || {
                 let th = th as *mut c_void;
                 unsafe { p(th) }
             })
@@ -904,6 +1034,7 @@ mod tests {
                 url_placeholder: None,
                 url_hint: None,
                 form: Vec::new(),
+                path_fields: Vec::new(),
             },
             None,
         );
@@ -938,6 +1069,7 @@ mod tests {
                 url_placeholder: None,
                 url_hint: None,
                 form: Vec::new(),
+                path_fields: Vec::new(),
             },
             None,
         );
@@ -968,6 +1100,7 @@ mod tests {
                 url_placeholder: None,
                 url_hint: None,
                 form: Vec::new(),
+                path_fields: Vec::new(),
             },
             None,
         );
@@ -999,6 +1132,7 @@ mod tests {
                 url_placeholder: None,
                 url_hint: None,
                 form: Vec::new(),
+                path_fields: Vec::new(),
             },
             None,
         );

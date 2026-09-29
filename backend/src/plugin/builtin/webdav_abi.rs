@@ -622,6 +622,9 @@ impl WebdavAbiPlugin {
             url_hint: None,
             // 不声明 form ⇒ 前端按内置 WebDAV 默认表单渲染（行为与之前一致）
             form: Vec::new(),
+            // WebDAV 的 url 是**远程 URL**（不是本机路径）⇒ 不声明 path_fields，
+            // 该插件无需任何本地文件系统访问（只要网络）
+            path_fields: Vec::new(),
         };
         Self {
             inner: CApiTarget::from_static(abi, meta, caps, ui),
