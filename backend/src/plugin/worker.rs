@@ -1,7 +1,7 @@
 //! **每插件专属执行线程** —— 沙箱的载体
 //!
 //! ## 为什么需要「专属线程」而不是用 `spawn_blocking`
-//! Landlock 的两条实测性质（`docs/PLUGIN_ISOLATION.md` §2）决定了这件事：
+//! Landlock 的两条实测性质（`docs/memory/dev/PLUGIN_ISOLATION.md` §2）决定了这件事：
 //!
 //! 1. **per-thread**：多线程进程必须在每个要受限的线程上分别施加；
 //! 2. **不可逆**：收紧后无法放宽。

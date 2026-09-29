@@ -8,7 +8,7 @@ name: 构建飞牛应用 (.fpk)
 #     安装时飞牛按 manifest 的 platform 拒绝架构不符的包。
 #   - 后端与插件统一 **glibc 动态链接**（不再是 musl 静态）。
 #     原因：musl 目标不支持 cdylib、静态 musl 也不支持 dlopen ⇒ 与「外置插件」互斥
-#     （随包插件必须能 dlopen；详见 docs/PLUGIN_PLAN.md §3.4.3）。
+#     （随包插件必须能 dlopen；详见 docs/ARCHITECTURE.md §7.2）。
 #   - 打包逻辑一律走 Scripts/build_fnos_app.sh（单一事实来源），
 #     CI 不再手工拼装（手工拼装曾漏掉换行符/权限归一化，且路径写错导致产物缺失）。
 #

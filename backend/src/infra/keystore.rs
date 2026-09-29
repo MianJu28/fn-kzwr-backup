@@ -37,7 +37,7 @@ pub fn save_keystore(keys: &AgeKeys, passphrase: &SecretString, path: &Path) -> 
 ///
 /// `std::fs::write` 走的是默认 mode 0666，再被 umask（通常 022）削成 **0644** ——
 /// 结果是密钥库对本机**任何用户**可读。虽然内容已用口令加密，但「密文 + 口令」
-/// 两份材料都在同 uid 下（见 `docs/PLUGIN_ISOLATION.md` §3），
+/// 两份材料都在同 uid 下（见 `docs/memory/dev/PLUGIN_ISOLATION.md` §3），
 /// 权限越紧越好：0644 → 0600 至少挡住其它用户。
 ///
 /// 用 `OpenOptions::mode` 而**不是**「先写再 chmod」：后者有一个短暂窗口，

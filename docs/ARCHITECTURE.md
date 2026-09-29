@@ -1,7 +1,11 @@
-# fnos 增量加密备份系统 · 架构设计文档
+# fn-kzwr-backup · 架构设计文档
 
-> 将飞牛 NAS 文件增量加密备份至酷族网软，支持 GUI 管理与选择性恢复。
-> 本文档为长期维护的权威架构基线，所有重大技术决策以 ADR 形式记录。
+> 将飞牛 NAS 文件增量加密备份至酷族网软（官方 WebDAV），支持 GUI 管理与选择性恢复。
+
+> **文档定位**：本文件描述**当前已实现**的系统 —— 架构、模块、目录结构、技术栈、
+> 质量属性与安全模型。**开发过程档案**（架构决策记录 ADR、演进路线图、逐版本进度、
+> 方案评审、选型分析）已移至 `docs/memory/dev/`，不入版本库；
+> 其中每条决策的**编号**在下文仍被引用，索引见文末「决策记录索引」。
 
 ---
 
@@ -146,1253 +150,256 @@
 | 调度 | `croner`（cron 解析）+ 自建 tokio 轮询循环 | tokio-cron-scheduler / 系统 cron | 不依赖系统 cron，可移植；进程内调度，便于中途检测配置热更新 |
 
 ---
-
-## 6. 架构决策记录 (ADR)
-
-### ADR-001：采用模块化单体架构
-
-**状态**：Accepted
-
-**背景**：系统运行于 fnos 嵌入式 Linux，资源有限，需 7×24 稳定运行、随系统启动。团队规模小，单机部署，无需水平扩展。但备份/同步/加密/恢复各模块需独立演进。
-
-**决策**：采用模块化单体。单进程内按限界上下文划分模块，模块间通过 trait 接口通信，共享 SQLite 但表归属明确。主流程同步执行保证强一致性；内部事件总线处理通知/审计旁路。
-
-**后果**：
-- (+) 单进程低资源占用，部署为单二进制 + Tauri 资源包
-- (+) 模块边界清晰，未来可按上下文拆分为独立服务
-- (+) 调试简单，事务边界清晰
-- (-) 需自律与工具（如 `cargo-deny`、自定义 lint）维持模块边界
-- (-) 共享数据库需约定表归属，禁止跨模块直接读写
-
-### ADR-002：技术栈选型 Rust + axum + Svelte
-
-**状态**：Accepted（修订：原 Tauri 方案已废弃，见下方背景）
-
-**背景**：fnos 原生应用要求低资源占用、长期稳定。加密是核心能力，需内存安全。经查阅飞牛应用开发文档，飞牛 UI 通过桌面 iframe 加载 Web 页面（`app/ui/config` 声明入口），**不支持独立原生窗口**，因此 Tauri 的原生窗口模式不适用。
-
-**决策**：后端 Rust + axum（HTTP 服务），前端 Svelte + Vite（SPA）。axum 既提供 REST API/WebSocket，又托管前端静态文件。应用以飞牛普通应用形态打包（`.fpk`），通过 `cmd/main` 脚本控制进程。
-
-**后果**：
-- (+) 契合飞牛端口服务入口模型（iframe 加载 `http://localhost:{port}/`）
-- (+) 无 GC 暂停，流式加密稳定；内存安全防整类漏洞
-- (+) 单二进制 + 静态前端资源，部署简单
-- (+) axum 与 tokio 原生集成，WebSocket 支持状态推送
-- (-) Rust 学习曲线陡，开发速度慢于 Go
-- (-) 放弃 Tauri 的原生菜单/托盘等桌面集成能力（飞牛场景不需要）
-- (-) 酷族对接需自建适配器（现已迁移官方 WebDAV，见 ADR-009）
-
-### ADR-003：age 加密方案与分块策略
-
-**状态**：Accepted（修订：原 Picocrypt/XChaCha20-Poly1305 + Argon2id 主密钥方案已废弃，改为 age 公私钥；私钥保护改用 age 内置 scrypt）
-
-**背景**：用户指定加密改为 age（X25519 公私钥 + ChaCha20-Poly1305 AEAD）。需支持大文件流式加密与选择性恢复（随机访问特定 chunk 解密）。采用 age 后无需口令派生，改用标准公钥加密。
-
-**决策**：
-- 文件按 64MB 分块，每块用 age 公钥独立加密（每块生成独立文件密钥，age 标准头部含 ephemeral key，无碰撞风险）
-- 加密方只持有 `age` 公钥即可备份；恢复方需 `age` 私钥
-- 流式管道：`Source 流 → Chunker → Encryptor(age) → Target 流`，明文仅在内存当前 chunk
-- `age` 私钥本身可被管理员口令（**age 内置 scrypt** 派生密钥）再次加密后存密钥库（`keystore.age`），实现口令保护
-- Rust crate：`age`（纯 Rust 实现，支持 musl 静态编译）
-
-**后果**：
-- (+) 支持随机访问恢复——只需解密目标 chunk，无需整文件
-- (+) 流式处理，任意大小文件常量内存
-- (+) age 为现代标准，纯 Rust 实现，避免 C 依赖；公钥加密免口令派生，加密侧更轻量
-- (+) 公钥可安全公开，配合备份目标实现"只写不可读"（目标侧仅公钥加密，私钥本地私藏）
-- (-) 64MB 分块在小文件场景有空间放大（需 padding 策略或小文件单独处理）
-- (-) ~~私钥丢失则无法恢复，需私钥备份/恢复机制（Phase 5）~~ → **已缓解（2026-09-19）**：设置页可口令校验后导出私钥另存，并「我已妥善保存」确认；未确认时持续提示丢失风险
-
-### ADR-004：增量检测双策略
-
-**状态**：Accepted
-
-**背景**：增量备份需平衡性能与精确性。mtime+size 快但可被欺骗；内容哈希精确但开销大。
-
-**决策**：提供双策略，按任务可配置：
-- **快速策略**（默认）：比较 `mtime + size`，命中即跳过。O(1)，覆盖 99% 场景。
-- **严格策略**：对 mtime/size 变化的文件再算 BLAKE3 内容哈希确认。防 mtime 欺骗、支持跨文件去重。
-- ~~大文件（>1GB）始终走严格策略 + 分块哈希，支持块级增量~~ → **块级增量不做**（用户决策，2026-09-19）：维持整文件差分，严格策略仅按任务配置启用、不按文件大小强制。
-
-**后果**：
-- (+) 默认场景高性能；需要时切严格模式
-- (+) BLAKE3 树形哈希支持流式/并行计算（块级增量未采用，见上）
-- (-) 双策略增加实现复杂度
-- (-) 严格策略下首次全量哈希计算耗时
-
-### ADR-005：存储抽象层（ACL 防腐）
-
-**状态**：Accepted
-
-**背景**：源仅本地 FS（`tokio::fs`）。目标为酷族官方 WebDAV（ADR-009，逆向 REST API 已移除）。WebDAV 凭据管理不应污染核心同步逻辑。
-
-**决策**：定义统一的 `SourceStorage` 与 `TargetStorage` trait，位于领域层。基础设施层为每种协议实现适配器。核心逻辑只依赖 trait，不感知具体协议。新增协议只需实现 trait + 注册。
-
-```rust
-// 领域层定义（基础设施层实现）
-trait SourceStorage {
-    async fn list(&self, path: &Path) -> Result<Vec<FileDescriptor>>;
-    async fn read_stream(&self, path: &Path) -> Result<impl Stream<Item = Result<Bytes>>>;
-    async fn stat(&self, path: &Path) -> Result<FileMeta>;
-}
-
-trait TargetStorage {
-    async fn write_stream(&self, path: &Path, stream: impl Stream<Item = Bytes>) -> Result<()>;
-    async fn read_stream(&self, path: &Path) -> Result<impl Stream<Item = Result<Bytes>>>;
-    async fn delete(&self, path: &Path) -> Result<()>;
-    async fn list(&self, prefix: &str) -> Result<Vec<FileDescriptor>>;
-}
-```
-
-**后果**：
-- (+) 核心逻辑与协议解耦，换存储后端零改动核心
-- (+) 新增协议（如 S3 源、阿里云 OSS 目标）成本低
-- (+) 测试可用 mock trait，无需真实 NAS
-- (-) 统一抽象可能屏蔽协议特有能力（如 S3 多播上传），需 trait 扩展点
-
-### ADR-006：SQLite 作为元数据存储
-
-**状态**：Accepted
-
-**背景**：需持久化文件快照、任务状态、审计日志。嵌入式部署，无需独立数据库服务。快照仅用于增量差分（kzwr 与本地保持镜像一致，不做多版本历史）。
-
-**决策**：SQLite + rusqlite，启用 WAL 模式。表按限界上下文归属命名（如 `sync_snapshots`、`backup_jobs`）。跨模块查询通过应用层服务，禁止跨模块直接 JOIN 他方表。
-
-**后果**：
-- (+) 嵌入式零配置，单文件易备份迁移
-- (+) WAL 模式支持并发读（GUI 查询）+ 单写（备份任务），不阻塞 UI
-- (+) SQL 表达力满足快照查询等需求
-- (-) 高写入吞吐下需批量提交（如 chunk 记录批量 insert）
-- (-) 元数据膨胀需定期 VACUUM 与归档策略
-
-### ADR-007：内部事件总线
-
-**状态**：Accepted
-
-**背景**：模块间需松耦合通知（如备份完成→通知 UI、审计）。但主流程需强一致性，不能用事件驱动核心路径。
-
-**决策**：进程内事件总线（tokio::broadcast），领域事件发布后异步分发。订阅者：UI 状态广播、审计日志写入、fnos 通知。主流程不依赖事件确认——事件丢失不影响数据正确性，仅影响通知。
-
-**后果**：
-- (+) 模块解耦，新订阅者零侵入
-- (+) 审计天然完整（订阅 AuditSubscriber）
-- (-) 事件丢失仅影响通知，需明确告知用户
-- (-) 不适合作为事务边界——主流程状态以数据库为准
-
-### ADR-008：飞牛原生应用集成方案
-
-**状态**：Accepted
-
-**背景**：系统需以 fnos 原生应用形态部署。经查阅飞牛应用开发文档（developer.fnnas.com），飞牛应用有两种形态：普通应用（生命周期脚本 + 原生进程 + Web UI）与 Docker 应用（docker-compose）。飞牛 UI 通过桌面 iframe 加载 Web 页面，不支持独立原生窗口。
-
-**决策**：采用**普通应用**形态（非 Docker），理由：
-- 备份系统需直接访问飞牛本地文件系统，普通应用权限模型更直接（Docker 需挂载卷）
-- 原生进程资源占用更低，契合 NAS 环境
-- Rust 编译为 Linux 二进制（x86_64 + aarch64），放入 `target/` 目录
-
-集成要点：
-- **打包**：`fnpack build` 生成 `.fpk`；项目结构遵循飞牛规范（`app/`、`cmd/`、`config/`、`wizard/`、`manifest`）
-- **生命周期**：`cmd/main` 脚本处理 `start`（启动 Rust 进程）/`stop`（优雅关闭）/`status`（检查存活）
-- **UI 入口**：`app/ui/config` 声明 iframe 桌面入口；**v0.3.2 起改用飞牛统一网关**（`protocol=""` + `gatewayPrefix=/app/fn-kzwr-backup` + `gatewaySocket=app.sock` + `url=/app/fn-kzwr-backup`）；**v0.3.10 起不再有端口直连**（只监听网关 Socket，详见 ADR-012）
-- **权限**：`run-as=package`，专用用户 `fnosbackup`；通过 `config/resource` 声明共享目录或引导用户授权源目录
-- **路径**：全部使用 `TRIM_*` 环境变量（`TRIM_APPDEST`/`TRIM_PKGETC`/`TRIM_PKGVAR`/`TRIM_PKGTMP`），禁止硬编码
-- **数据归属**：SQLite→`$TRIM_PKGVAR`，配置→`$TRIM_PKGETC`，密钥库→`$TRIM_PKGETC`，临时→`$TRIM_PKGTMP`
-- **安装向导**：`wizard/install` 只收集初始管理员口令（v0.3.10 起不再询问端口）；`wizard/uninstall` 收集「保留/清除数据」
-- ⚠️ **向导文件不能是空数组**：`wizard/config`、`wizard/upgrade` 写成 `[]` 时 `fnpack build` 通过，但**安装校验会失败**（`appcenter-cli` 报 `Verifying files... [Error] code 10111`，应用中心显示「应用包不符合系统要求」= `ErrCodePackageException`，且会先把旧版本卸掉）。不需要向导时**不要打包该文件**（缺省即不显示步骤，实测安装正常）。
-
-**后果**：
-- (+) 原生访问文件系统，无需 Docker 卷挂载复杂度
-- (+) 契合飞牛应用中心分发与升级流程（`upgrade_init`/`upgrade_callback` 处理数据迁移）
-- (+) 用户通过飞牛桌面直接访问，体验原生
-- (-) 需严格遵循飞牛目录与路径规范，移植性受限（但本系统专为 fnos 设计，可接受）
-- (-) x86_64 与 aarch64 需分别编译二进制或交叉编译
-- (-) 用户文件访问依赖授权机制，需设计清晰的授权引导 UI
-
-### ADR-009：kzwr 文件管理迁移至官方 WebDAV，弃用逆向 REST API
-
-**状态**：Accepted（已完全实施，2026-09-18：WebDAV 适配器上线，逆向 REST 适配器与登录二进制已从代码库完全移除）
-
-**背景**：项目初期酷族网软（kzwr.com）不支持标准协议，遂逆向其自定义 REST API（v1/v2/v3）用 Rust 重写了文件管理能力（分块上传/presigned-url/SHA1+SHA256 哈希对齐/session token 认证/两阶段物理删除/文件夹 CRUD）。该逆向 API 无稳定性保证，随前端版本演进可能变动，哈希对齐逻辑脆弱、维护成本高。**酷族官方现已支持 WebDAV**，提供稳定的标准协议。
-
-**决策**：
-- 文件管理（上传/下载/删除/列目录/建目录）全部迁移至 kzwr 官方 **WebDAV**
-- 逆向 REST API 适配器（`infra/target/kzwr/` client/storage/upload）**已从代码库完全移除**，无回退路径
-- 登录二进制（CloakBrowser/Camoufox + PyInstaller）及登录环境子系统（Xvfb/uBlock/镜像下载）**一并移除**；WebDAV 走独立专用凭据（HTTP Basic，已实测验证）
-- 用户信息不再依赖 REST API（get_member 移除）；WebDAV 无配额属性，UI 仅展示本地配置账号
-
-**验证记录（2026-09-18，WSL curl 实测）**：
-- HTTP Basic 认证可用：`PROPFIND`（Depth 0/1，207）、`MKCOL`（201）、`PUT`（201）、`DELETE`（204，文件/目录）全部通过
-- 下载链路：`GET /dav/<path>` 返回 **302** → `storage-na.kzwr.net` 的 S3 风格 presigned URL（约 300s 有效），**跟随重定向即可取回内容（200），无需二次认证**——Rust 侧 reqwest 需允许跨域重定向
-- WebDAV 专用凭据不落文档/代码/仓库，运行时经加密配置或密钥库提供
-
-**实现与端到端实测（2026-09-18，WSL）**：
-- 适配器：`infra/target/webdav.rs` `WebdavTarget`（实现 `TargetStorage`，核心逻辑零改动）；PUT 前逐级 MKCOL 确保父目录，下载跟随 302
-- 后端选择：`TRIM_DAV_*` 环境变量或加密配置 `[webdav]` 段；缺失时启动占位适配器（操作返回引导错误），UI 保存配置后经 `SwapTarget` 热切换生效（无需重启）
-- 端到端测试（`bin/webdav_backup_test.rs`，真实服务器）：ping ✓、多级目录+特殊字符文件名 roundtrip ✓、BackupJob 全量 4 上传/增量 0/修改 1 ✓、下载解密校验 4/4 ✓、清理 ✓
-
-**大文件分片与地址固定（2026-09-18 补充）**：
-- 网站限制单次上传 100MB（实测：不分片上传 120MB 被 Cloudflare 返回 `413 Payload Too Large`）→ 超过 `PART_SIZE`（默认 **90MiB**，即限制的 90%；`FNOS_DAV_PART_SIZE` 可覆盖）的密文文件自动拆分为 `<path>.part0001…` 依次 PUT；下载按序拼接、删除清理全部分片、列表将分片合并为逻辑文件（对核心逻辑透明）
-- WebDAV 地址固定为官方地址（`DEFAULT_URL`），UI 仅填用户名/密码；`TRIM_DAV_URL` 环境变量仍可用于开发覆盖
-- 实测坑：服务端/链路对长时 HTTP/2 上传不稳定（~20s 即 PROTOCOL_ERROR）→ 客户端强制 HTTP/1.1；PUT 带 30 分钟总超时 + 4 次重试（5xx/408/429/网络错误可重试）
-
-**迁移步骤**：
-1. 验证 WebDAV 端点、认证方式与流式 PUT/GET 行为
-2. 实现 `WebdavTargetStorage` 适配器（实现既有 `TargetStorage` trait，核心同步/加密逻辑零改动）
-3. 端到端回归：备份/恢复/删除/多级文件夹/保留策略/定时备份
-4. ✅ 逆向 REST API 适配器与登录二进制相关代码已完全移除（2026-09-18，含 routes 登录环境子系统、packaging/CI 引用、sha1/sha2/zip 依赖）
-
-**后果**：
-- (+) 基于官方稳定协议，不再随前端版本漂移
-- (+) 大幅简化适配器：标准协议，去除哈希对齐/presigned 分片等脆弱逻辑
-- (+) trait 抽象（ADR-005）使替换 Target 适配器不影响核心逻辑
-- (-) 需重写 Target 适配器并完整回归测试
-- (-) ~~WebDAV 认证方式与加密密文流式 PUT 的性能需实测（64MB 分块策略是否保留待验证）~~ → **已解除**：HTTP Basic 与密文流式 PUT 端到端实测通过；>90MiB 密文自动分片上传（`PART_SIZE`，见上「大文件分片与地址固定」），64MB 加密分块策略保持不变
-
 ---
 
-### ADR-010：备份目标端按源文件夹名分层
+## 6. 安全模型
 
-**背景**：早期实现把多个源目录直接平铺到目标前缀下（`/目标文件夹/<相对路径>`）。配置多个源文件夹时，不同源目录中的同名文件/目录会在同一层互相覆盖；且「所选文件夹」本身在网盘不可见（只存在其内容），用户难以把网盘目录对应回本地来源。
+| 资产 | 保护方式 |
+|---|---|
+| **备份明文** | 全程流式，不落盘（内存仅当前 chunk）；age 公钥加密后才离开本机 |
+| **age 私钥** | 永不明文落盘：经口令（age scrypt）派生密钥加密后存 `keystore.age`（权限 0600） |
+| **主口令** | 由安装向导写入 `$TRIM_PKGETC/.passphrase`（权限 0600），启动时经环境变量注入进程 |
+| **WebDAV 凭据** | TOML 中以 `enc:<age密文>` 存储；保存时 ping 验证并热切换 |
+| **插件配置** | **宿主不再代存**（ADR-021）：插件写自己的 `own_data_dir`，敏感内容经宿主能力表 `seal`/`unseal` 加密 |
+| **插件代码** | Ed25519 强制验签（内置官方公钥 + 可配公钥）；无签名则不加载 |
+| **插件运行时** | 每插件**专属线程 + Landlock 沙箱**（ADR-023）：白名单模式，`keystore.age`/`.passphrase`/宿主配置目录均不可读，并顺带挡住 `/proc/<宿主pid>/mem` |
+| **敏感操作** | 导出私钥 / 配置导入导出 / 锁屏等需管理员口令校验；凭据**永不回传前端**（只回显 `configured` 布尔） |
+| **审计** | 凭据/密钥/配置/备份/恢复/回收站操作写入 `audit.log`（JSON Lines，512KB 自动裁剪） |
 
-**决策**：每个源目录在目标端以其**文件夹名**单独建目录，即 `/目标文件夹/<源文件夹名>/<相对路径>`；备份时显式创建该目录及其空子目录。
-
-**实现**：
-- 备份：`BackupJob::run_multi` 用 `join_root_prefix()` 为每个源目录生成独立 `target_prefix`；`TargetStorage::ensure_dir`（WebDAV 实现为逐级 `MKCOL`）创建目录，空目录也会创建
-- 恢复：`RestoreJob.source_root_name` 还原同一层级（`/目标文件夹/<源文件夹名>/…`），并按该源路径对应的快照展示总大小
-- 事件：`run_multi` 以基准 `job_id` 发布**合并后**的整体进度
-
-**后果**：
-- (+) 多源目录互不干扰，网盘目录结构与本地来源一一对应
-- (+) 空文件夹也能在网盘保留
-- (-) 与 v0.1.3 之前的目标布局不兼容：旧备份需重新执行一次备份（或手工整理目录）
-- (-) 目录创建会多出少量 `MKCOL` 请求（已对「会被文件上传覆盖的父目录」跳过）
-
----
-
-### ADR-011：重新引入 kzwr REST API 作为**可选增强功能**（非备份通道）
-
-**背景**：ADR-009 曾将逆向 REST API 与登录二进制完全移除，备份/恢复统一走官方 WebDAV。但 WebDAV 无法提供账号级能力：存储空间/套餐信息、回收站查看与清空等。且登录二进制（Camoufox/Playwright）已被证实无法在飞牛原生环境运行。
-
-**决策**：
-- 仅恢复 REST **客户端**（`infra/kzwr_api/client.rs`，取自提交 `f8141d5`），**不恢复** storage/upload 适配器与登录二进制——备份/恢复通道仍是 WebDAV
-- 认证改为**用户手动提供 access-token**：浏览器登录酷族后从 Cookie 复制填入设置页（age 加密存储、永不回显、保存前实测、热更新）
-- 未配置 token 时所有增强接口优雅降级，不影响备份/恢复主链路
-
-**能力**：账号信息（存储空间/套餐/详情）、空间占用预警（阈值可配）、回收站清空（可跟随保留策略：占用门槛 + 最小保留天数，无法解析时间的条目保守保留）。
-
-**后果**：
-- (+) 无需登录二进制即可获得账号级增强能力，实现成本低（复用既有客户端）
-- (+) 主链路零依赖：不配置 token 完全不影响备份/恢复
-- (-) access-token 有效期有限，过期需重新复制（已用告警 + 启动/使用时校验缓解）
-- (-) 逆向接口非官方契约，字段可能变化（回收站条目的 size/时间字段做了多候选兼容，解析失败保守保留）
+> **已知边界**：插件与宿主**同进程**。沙箱挡住磁盘上的密钥与口令，但
+> **同进程内存仍可读**（age 私钥与主口令在宿主内存中）。彻底隔离需子进程模型，
+> 触发条件与方案见 `docs/memory/dev/PLUGIN_ISOLATION.md`。
+> 插件卡死无法强杀，看门狗只能判失败并泄漏一个专属线程。
 
 ---
-
-### ADR-012：页面访问改为飞牛统一网关（Unix Socket + `/app/{appname}` 前缀）
-
-**状态**：Accepted（v0.3.2 起实施，v0.3.4 起为默认分发形态）
-
-**背景**：桌面 iframe 原先以 `type=iframe, protocol=http, port=8080, url=/` 直连应用端口。当用户以 **https** 访问飞牛桌面时，`https` 页面里加载 `http://<nas>:8080/` 的 iframe 属于**混合内容，部分浏览器直接拦截**（页面空白）。备选方案均不理想：给应用自建 TLS 需要证书（飞牛未向应用提供证书，且自签会被浏览器拦）；改用 `index.cgi` 由宿主托管则**不支持 WebSocket**（本应用的实时进度依赖 WS）。
-
-**决策**：改用飞牛官方**统一网关**（`docs/fnnas-dev-docs/core-concepts/08-gateway-registration.md`）：
-- `app/ui/config` 声明 `protocol=""`、`gatewayPrefix="/app/fn-kzwr-backup"`、`gatewaySocket="app.sock"`、`url="/app/fn-kzwr-backup"`；网关入口会忽略 `protocol`/`port`
-- 应用监听 `$TRIM_APPDEST/app.sock`（Unix Socket），由 fnOS 校验 NAS 登录态后**同源反代**（转发时保留前缀）；`cmd/main` 通过 `GATEWAY_PREFIX`/`TRIM_APP_SOCK` 注入，并在启动前与停止后清理残留 socket 文件
-- 前端资源用**绝对前缀**引用（`vite.config.js` 的 `base` + `lib/appBase.js`），API 与 WebSocket 同样带前缀（`${APP_BASE}/api/...`、`ws(s)://host${APP_BASE}/api/ws`）
-- 后端同一套路由同时挂在**根路径与前缀**下；网关连接进入时**先剥离前缀**再交给路由（手写泛型 `tower::Service` 包装器）
-- ~~**保留** `service_port` 端口监听：直连访问（`http://<nas>:8080/`）与 `checkport` 健康检查继续可用~~ —— **2026-09-21（v0.3.10）作废并移除**：应用不再声明 `service_port`/`checkport`，后端只监听网关 Socket；直连调试改为显式设置 `FN_KZWR_DEBUG_PORT=<端口>` 临时开启
-
-**实现说明（axum 0.7 约束）**：
-- `axum::serve` 只接受 `TcpListener`，Unix Socket 需自行用 `hyper` + `hyper-util` 驱动（`TokioIo` + `TowerToHyperService` + `http1::Builder::serve_connection(...).with_upgrades()`，`with_upgrades` 是 WebSocket 101 的必要条件）
-- `Router::nest` 对 `/prefix` 与 `/prefix/` 的匹配行为不一致（后者返回 404），因此**不依赖 nest 语义**，改为在网关连接入口剥离前缀
-- `Router::merge` 在双方均有 fallback 时会 panic——路由改为「同一 Router 内挂两个 nest + 一个根 fallback」的方式组装
-
-**后果**：
-- (+) https 访问飞牛桌面时页面不再被拦（iframe 与桌面同源同协议）
-- (+) WebSocket 经网关可用；网关先校验登录态，多一层访问控制
-- ~~(+) 端口直连方式保留，调试与兼容旧书签不受影响~~（**已作废（v0.3.10）：移除端口直连**，旧书签 `http://<nas>:8080/` 不再可用；调试改用 `FN_KZWR_DEBUG_PORT`）
-- (+) 少一个对局域网暴露的入口（仅网关 Socket，且网关侧校验 NAS 登录态）
-- (-) 应用需适配「带前缀路由 + Unix Socket 监听」，前端资源与 API 必须使用同一前缀（四处需保持一致：`ui/config` 的 `gatewayPrefix`、`cmd/main` 的 `GATEWAY_PREFIX`、后端 `gateway_prefix()`、前端 `lib/appBase.js` + `vite.config.js`）
-- (-) 前缀变更需**升级安装**才生效（入口声明在安装/升级时注册）
-
----
-
-### ADR-014：多目标 · 多任务（多用户/多目标管理）
-
-**状态**：✅ 已实施（2026-09-26，v0.4.0）
-
-**背景**：早期决策为「单源集 + 单 WebDAV 目标」（多目标一度按用户决策放弃）。实际使用中用户需要：**同一份源备份到多个账号/目的地**，以及**不同源各自独立调度与保留策略**。此时架构上已有两处有利条件：① 快照表 `sync_snapshots` 的主键本就是 `(account, job_id, rel_path)`——按目标账号分桶的数据模型早已存在，只是运行时永远填同一个账号；② ADR-013 已把「目标」抽象成 `TargetPlugin`，多目标只是"多装配几个实例"。
-
-**决策**：
-
-- **配置模型**（`infra/config.rs`）：`AppConfig` 新增
-  - `targets: Vec<TargetConfig>`：一个目标 = 一个插件实例（`kind`）+ 地址 + 加密凭据 + 启用位
-  - `tasks: Vec<TaskConfig>`：一个任务 = 源路径集 + `target_id` + 目标目录前缀 + `schedule_cron` + `retention`
-  - **旧字段 `backup` / `webdav` 保留为兼容镜像**：载入时若 `targets`/`tasks` 为空 → `migrate()` 由旧字段生成 `default` 目标与 `default` 任务（幂等，落盘一次）；保存时 `sync_legacy_mirror()` 把首个任务/目标回写旧字段（降级到 0.3.x 仍可读）。**默认任务 id 刻意取 `default`**，与旧 `AppState.job_id`（`TRIM_JOB_ID`）一致 → 快照 key 仍是 `default-0`，**升级后不会全量重传**。
-- **目标池**（`infra/storage_trait.rs::TargetPool`）：`目标 id → 适配器`；`PluginRegistry::build_targets(cfg, mgr)` 装配全部目标（未就绪也入池，取用时回退占位适配器并给出明确提示）。`AppState.targets` 是池，`AppState.target`（`SwapTarget`）仍是**主目标**（首个启用目标），供 kzwr 增强等全局能力与兼容接口使用。
-- **任务执行**（`http/routes/tasks.rs::run_task_now`）：`job_id = "{task.id}-{源序号}"`、`account = 该目标任务凭据的用户名`、target 取自目标池 → **每个任务在每个目标上都各自独立快照/增量/保留策略**。互斥仍是全局 `backup_running`（同一时刻只跑一个备份任务，避免 NAS 带宽争抢）。
-- **调度**（`domain/scheduler.rs`）：由「单 cron」改为**每任务独立 cron**：维护 `任务 id → (cron, 下次触发)`，每轮 tick 重建/清理待触发表，到点调用 `run_task_now`；新增/删除/停用/改 cron 均热生效。
-- **API**：新增 `GET/POST /api/targets`、`POST /api/targets/:id/{delete,test}`、`GET/POST /api/tasks`、`POST /api/tasks/:id/{delete,run}`；恢复侧 `restore/files|tree|run|prune` 增加 `task` 维度（缺省按源路径自动定位）；`/api/config`、`/api/webdav/config`、`/api/backup/run` 保留并作用于「首个任务/主目标」（兼容旧前端与旧客户端）。配置导出/导入加入 `targets`（含明文凭据）/`tasks`。
-- **前端**：新增 `views/TasksPage.svelte`（任务列表 + 内联编辑：源路径/目标下拉/cron 预设与预览/保留策略；立即备份/停用/编辑/删除）、`views/TargetsPage.svelte`（目标列表 + 内联编辑，保存前实测连通性、测试连接、删除保护提示）；恢复页按「任务」分组展示并在调用中带上 `task`；`app.css` 增加通用列表行/编辑器类。
-- **权限边界**：目标选项由**人（用户）**决定并把关（地址、账号、应用密码、任务归属、删除），AI 不替用户决定目标与凭据。
-
-**后果**：
-- (+) 同一源可同时/分别备份到多个账号；每个目标独立增量、独立保留策略，某目标失败不影响其它目标
-- (+) 升级无感：旧配置自动迁移、快照 key 不变、旧接口继续可用
-- (+) 新增目标类型只需再写一个 `TargetPlugin`（ADR-013），配置与 UI 自动支持「再建一个」
-- (-) 配置模型变复杂（两套字段并存期）；`routes/tasks.rs` 的兼容分支（首个任务/主目标）在旧前端下线后可移除
-- ⚠️ 后端**不能持有 config 锁跨 await**（`target_save` 的连通性实测因此必须「先实测、后加密」，否则自锁）
-- ⚠️ 恢复页的多任务键：同一路径可能属于多个任务，UI 状态键用「任务 id + 路径」，并把 `task` 透传给树/恢复/清理接口
-
-**验证（2026-09-26，NAS 实测）**：以 `rclone serve webdav` 起两个本地 WebDAV 当目标——
-① 写入 legacy 单任务配置 → 启动后自动迁移（`/api/targets` 得到 `default` 目标含原地址/账号，`/api/tasks` 得到 `default` 任务含原路径/cron，config.toml 落盘 `[[targets]]`/`[[tasks]]`）；
-② 新建第二个目标（保存前实测连通性通过）与第二个任务（同源 → 目标 B / 目录 `backupB`）；
-③ 两任务各自运行 → **目标 A 落盘 `/fn-backup/src1/…`、目标 B 落盘 `/backupB/src1/…`**（真实上传）；
-④ `/api/restore/files` 返回两条任务项（同一本地路径在两个任务上各自独立的文件数/字节数）；
-⑤ 任务 B 二次运行 → `uploaded=0, unchanged=3`（独立增量）；
-⑥ 删除保护（被引用的目标拒绝删除）、错误路径（不存在任务/无效 cron/不存在目标）均返回明确文案；
-⑦ 前端 Playwright 实测：任务/目标页渲染正确，且**通过 UI 完成**新建目标、新建任务、两步确认删除任务、删除目标。
-
----
-
-### ADR-013：远程目标与增强功能插件化
-
-**状态**：✅ 已实施（内置插件 P1–P4 + **外置动态库 P5**，2026-09-26）
-
-**背景**：远程备份目标（当前仅官方 WebDAV）与"增强功能"（kzwr REST：账号空间、回收站、token）是两套**易变、可选**的能力，却写在核心里：目标由 `main.rs` 的工厂硬编码选择，增强功能直接挂在核心 Router（`GET /kzwr/user` 等）并由 `AppState` 持有具体客户端。新增一个目标或增强能力就要改核心。
-
-**决策**：引入插件层，核心只依赖契约：
-
-- `plugin::api`：`TargetPlugin`（提供 `TargetStorage`：`build(mgr)` / `verify(user,pass)`）与 `EnhancePlugin`（`caps()` / `available(cfg)`），外加 `PluginMeta`、`PluginKind`、`EnhanceCaps`
-- `plugin::registry::PluginRegistry`：**唯一装配点**，替代原 `main.rs::build_target()`；依次询问目标插件，第一个可用者即当前目标，全部不可用则回退 `UnconfiguredTarget`
-- `plugin::builtin`：内置插件 —— `webdav`（目标插件，默认启用）、`kzwr`（增强插件：账号/空间/回收站）
-- 新增 `GET /api/plugins`：返回 `meta + available + api_base + ui`，**前端唯一的区块数据来源**（有哪些卡片、顺序、用内置组件还是 `blocks` 通用渲染）
-- 首期（方案 D）**编译期装配**：插件随应用一同编译；外置加载（子进程 JSON-RPC / 动态库 / WASM）留作后续，届时只需替换 `PluginRegistry::builtin()` 的来源，trait 与核心不动
-
-**实施顺序**：
-- ✅ P1 抽 `plugin-api`（trait/meta/事件/自检项）
-- ✅ P2 `webdav` 插件化：`main.rs::build_target` 删除，装配与「保存凭据后的热切换」都走注册表；新增 `GET /api/plugins`
-- ✅ P3 `kzwr` 增强插件化：实现（DTO/回收站辅助/3 个 handler/一致性检查/巡检）整体迁入 `plugin/builtin/kzwr.rs`，路由挂 `/api/p/kzwr/*`（旧 `/api/kzwr/*` 下线）；核心通过 trait 钩子调用：`routes()`（插件路由）、`on_startup()`（启动自检）、`patrol()`（周期巡检 + 备份后）、`after_backup()`（清空回收站）、`health_check()`（一键体检项）、`reload()`（配置变更后刷新状态）；`raise_alert/raise_alert_once/human_bytes/webdav_username` 对插件开放为 `pub(crate)`
-- ✅ P4 前端插件驱动：`lib/plugins.js`（拉取/缓存 `/api/plugins`、按 `ui.section`+`ui.order` 排序）+ `views/SettingsPage.svelte` 按清单渲染卡片（内置组件映射 `webdav`/`kzwr`，**不认识的名字回退** `components/PluginBlocks.svelte` 通用 UI Schema 渲染：metric / text / number / toggle / button / tips，操作统一 POST `${api_base}${action}`）；接口不可用时用 `FALLBACK_SECTIONS` 兜底，页面不会白屏
-- ✅ **P5 外置加载 = 方案 B：动态库（`*.so`）**（用户 2026-09-26 选定）：
-  - ~~**契约**（`plugin/sdk.rs`）：插件编译为 `cdylib`，导出 3 个 C ABI 符号 —— `fn_kzwr_plugin_abi_version() -> u32`、`fn_kzwr_plugin_host_version() -> *const c_char`、`fn_kzwr_plugin_create() -> *mut PluginHandle`；宏 `export_plugin!(ctor)` 一次生成三者。`PluginHandle { target: Option<Box<dyn TargetPlugin>>, enhance: Option<Box<dyn EnhancePlugin>> }`~~ → **已移除（2026-09-26，决策 1）**：Rust 无稳定 ABI、升级必重编。删除面：`plugin/sdk.rs`、`plugins/example-rdirect/`、`export_plugin!`、`FN_KZWR_PLUGINS_ALLOW_MISMATCH`。外置插件契约统一为下方「P5（续）稳定 C ABI v1」
-  - **加载**（`plugin/loader.rs`）：目录优先级 `FN_KZWR_PLUGIN_DIR` 环境变量 > 配置 `plugins.dir` > `$TRIM_PKGETC/plugins`（用户） > `$TRIM_APPDEST/plugins`（随包）；`libloading` 打开后按 **`abi` + `size` 双校验**（`size >= 必需前缀长度`，尾部可选字段逐项探测、缺失视为 NULL）拒绝不匹配的插件。~~再校验「插件编译时链接的宿主版本」是否等于运行版本~~（**该版本闸属已移除的 Rust 直连机制，2026-09-26 起不再存在**）
-  - **安全默认**：加载 `*.so` 等价于执行任意本地代码 → **默认关闭**（配置 `plugins.enabled = true` 或 `FN_KZWR_PLUGINS=1` 开启，「插件」页有开关 + 安全说明）；开关/目录变更**重启生效**（不做运行中热加载，避免已注册 vtable 生命周期问题）；动态库句柄由注册表**保活到进程结束**
-  - **失败隔离**：符号缺失 / ABI 不符 / 版本不符 / 未提供实现 → 该文件只进诊断列表（`/api/plugins` 的 `external.reports`），核心与其它插件不受影响
-  - **前端**：`components/PluginSection.svelte`（「插件」页的外置插件管理区：开关 + 插件目录 + 签名公钥 + 加载结果列表 + 安全警告）；插件功能卡片一律走**通用 UI Schema 渲染**（内置 webdav/kzwr 也已改为 schema 描述，不再有 `component` 分支）→ 新增插件不必改前端，也不必重新打包
-  - **工具链**：`Scripts/build_plugins.sh`（构建 `plugins/*` 为 `*.so`）+ `build_fnos_app.sh` 自动把插件放进 `app/plugins/`（`SKIP_PLUGINS=1` 可跳过）；示例插件 `plugins/example-hello/`（增强插件：一张 schema 卡片 + `/api/p/example/hello` 接口 + 体检项）
-- ✅ **P5（续）：稳定 C ABI v1 —— 让插件不再随宿主升级重编**（2026-09-26，用户提出）：
-  - **问题**：Rust 直连插件传的是 Rust trait 对象，而 Rust **没有稳定 ABI**（vtable 布局/字段排布随编译器与源码变化）→ 每次升级主程序都要重编插件，只能靠「编译期宿主版本 == 运行版本」拦住不兼容的插件
-  - **决策**：跨边界契约降级为**版本化 C ABI + UTF-8 JSON**（`repr(C)` 静态函数表 + JSON 字符串，参考 nginx 模块 / GStreamer 的做法）。插件只依赖 `plugins/sdk`（**零第三方依赖**），宿主内部随便改，只要 `C_ABI_VERSION` 不变插件就一直可用
-  - **契约**（`plugin/abi.rs` ↔ `plugins/sdk`）：唯一入口 `fn_kzwr_plugin_abi_v1() -> *const KzwrPluginAbi`；表内回调 `describe_json` / `available_json` / `action_json` / `health_json` / `event_json`(可选) / `free_str` / `destroy`(可选)；`abi` + `size` 双校验（结构体只增字段）；数据一律 JSON（宿主 `plugin/cabi.rs` 适配成内部 `EnhancePlugin`，前端零改动）
-  - **配置快照** `cfg_json`：宿主 → 插件的稳定视图（host_version/时区/targets/tasks/enhance 状态），**不含任何凭据**（口令/token/账号名都不传）
-  - ~~**两条路径并存**~~ → **已改为机制唯一（2026-09-26）**：加载器只认稳定入口（`mechanism=c-abi-v1`），**不再回退 Rust 直连**（~~`mechanism=rust-direct`~~ 已不存在）；`/api/plugins` 与「插件」页只标出稳定 ABI
-  - 契约文档：[`docs/PLUGIN_ABI.md`](PLUGIN_ABI.md)（冻结的符号/JSON schema/版本演进规则/安全边界）
-  - **验证（NAS 实测）**：宿主 0.4.0 下两个示例插件同时加载（`example`=c-abi-v1、`example-rust`=rust-direct），动作接口与体检项均正常；**把宿主版本改到 0.4.1 并只重编宿主**（插件不动）→ 稳定 ABI 插件**仍然加载且动作可用**，Rust 直连插件被拒并提示「改用稳定 C ABI」；前端「插件」页出现机制徽标与两张插件卡片
-- ⏳ P6 文档收尾（本 ADR 已随 P5 同步；插件契约见 `docs/PLUGIN_ABI.md`）
-- 遗留（P3b）：`AppState.kzwr` 这个客户端实例仍由核心持有（插件驱动它），后续可移入插件自身
-- 遗留（P5b）：外置插件**无签名校验**（仅 ABI/版本），只应放可信插件；后续可加 sha256 白名单或签名
-
-**后果**：
-- (+) 新增远程目标/增强能力不改核心；增强插件禁用后核心仍可正常备份
-- (+) WebDAV 作为**内置默认插件**，基本备份能力不依赖插件机制本身
-- (+) 装配过程可观测（`fnos_backup::plugin::registry` 日志 + `/api/plugins`）
-- (+) **外置插件不改前端**：插件声明的 `ui.blocks` 由前端通用渲染器渲染，新增功能区块无需重新打包前端
-- (-) 多一层 trait/注册表间接；`routes/` 里的增强功能路由需逐步迁入插件（P3 已完成）
-- ⚠️ 装配日志必须打在**库 crate**（`fnos_backup::*`）内：`main.rs` 属二进制 crate，其 `info!` 会被默认过滤器挡掉
-- ~~⚠️ 外置插件与宿主共享 Rust trait 对象（**非稳定 ABI**）：插件必须与宿主同源码/同 toolchain 编译，宿主以「编译期宿主版本 == 运行版本」强制这一约束~~ → **该约束随 Rust 直连机制一并移除（2026-09-26）**。现行唯一机制为稳定 C ABI v1，跨边界只有 `repr(C)` 函数表 + JSON，**不存在 trait 对象共享**
-
-**验证（2026-09-26，NAS 实测）**：
-① 默认关闭时 `/api/plugins` 的 `external.enabled=false`、无任何外置插件（只有内置 `webdav`/`kzwr`）；
-② 放入示例插件与一个**伪装成插件的 `libz.so`** 并开启加载 → 示例插件 `loaded=true`（`source=external`、`builtin=false`、UI 3 个 block），伪装库 `loaded=false` + 明确错误「缺少符号 fn_kzwr_plugin_abi_version」，**核心与内置插件不受影响**；
-③ 插件自己的接口 `POST /api/p/example/hello` 返回自定义文案；一键体检出现插件自检项；
-④ 走**配置开关**（`POST /api/config {plugins_enabled, plugins_dir}` → 落盘 `[plugins]` → 重启）成功加载，证明不只依赖环境变量；
-⑤ ~~**版本闸**：把宿主版本临时改为 0.4.1（插件仍为 0.4.0 编译）→ 拒绝加载并提示重新编译；加 `FN_KZWR_PLUGINS_ALLOW_MISMATCH=1` 后强制加载并告警~~（**历史验证**：针对已移除的 Rust 直连机制；该环境变量与版本闸今已不存在，稳定 ABI 插件不受宿主版本影响）；
-⑥ 前端：「插件」页出现「外置插件（动态库）」管理卡片（开关/目录/公钥/加载结果/安全说明）与**示例外置插件卡片**（通用 UI Schema 渲染），点按钮返回插件自定义消息（卡片内 + toast）。
-
----
-
-### ADR-015：增强类插件一律外置，核心不掺厂商专属逻辑（2026-09-28，v0.4.5）
-
-**背景**：ADR-013 把 kzwr 从「核心里的散落代码」收拢成 `plugin/builtin/kzwr.rs`，但它仍是
-**编译进主程序的内置插件**：能 `use` 宿主内部库、配置仍存在宿主的 `[kzwr]` 段、告警来源
-`AlertSource::Kzwr` 与体检项 `enhance.kzwr_token_configured` 都写死在核心里。结果是
-「升级主程序必须连带重编 kzwr」「换个云盘厂商要改核心」，并且导出配置包会持续携带一个
-核心其实已经不需要读的敏感段。
-
-**决策**：kzwr 的功能与配置**全部移出核心**，成为 `plugins/kzwr/` 下的**外置 cdylib**，
-随 `.fpk` 一起分发并默认签名（内置官方公钥可验签，用户零配置即可加载）。规则上升为：
-**增强类（enhance）插件一律外置；内置只保留 `webdav` 目标插件。**
-
-- **不做向后兼容的旧配置搬运**（用户确认）：`[kzwr]` 段随核心代码一起删除，升级后用户
-  在「插件」页重新填写 access-token。一次性的重填成本，换核心彻底解耦与配置面缩小。
-- **载入容错保留**：老 `config.toml` 里的 `[kzwr]` 段必须能被**忽略并成功载入**
-  （`infra/config.rs::legacy_kzwr_section_is_ignored`），否则升级即服务起不来；下次保存自然消失。
-- **~~插件不得回调宿主~~**（ADR-013 的不变式在本条被再次逼实；**已于 ADR-016 放松为
-  「默认声明式，需要时用 `host_bind` 能力表」**）：原来 kzwr 用到的
-  `state.config` / `state.audit` / `raise_alert_once` / `state.alerts` 全部改成
-  **返回值里的声明**（`config` / `audit` / `alerts` / `resolve`），由宿主
-  `cabi::apply_side_effects` 落地。~~主表 `KzwrPluginAbi` 因此**保持冻结**，不需要 v2。~~
-  → **主表改为尾部追加演进（ADR-016）**：`host_bind` 作为可选尾部字段加入，`C_ABI_VERSION` 仍为 1。
-- **多凭据界面进契约而不是进前端**：新增 `UiBlock::Accounts` + 通用渲染器
-  `PluginAccounts.svelte`。判断标准被明确为「**新增插件不该要求改前端**」。
-- **去掉账号一致性检查**：备份目标与酷族账号可以不是同一账号，跨账号交叉比对是错的。
-- 阈值改为**按账号**存储（`percent-<id>`，默认 90%），不再全局一个值。
-
-**代价与边界**：
-
-- 增强插件不再能借用宿主的 reqwest/工具函数，必须自带依赖 → 单个 .so 体积涨到 ~4.4 MB。
-  可接受：插件只在需要时加载，且换来了「主程序升级不重编插件」。
-- 插件**可以** `block_on`（宿主把每个增强回调放进 `spawn_blocking`），但**目标插件不可以**
-  （`test_json` / `target_open` 仍在 async 线程上直调）。两类插件规则不同是历史事实，
-  已写进 `PLUGIN_ABI.md` §3 并在 `target_abi.rs` 注释钉住。
-- 凭据明文**永不回传前端**：`/accounts` 只回 `configured` + `meta`；宿主代管数据导出对
-  未声明 UI 的插件 **fail-closed** 一律只回布尔。
-
-**验证**（本机端到端，v0.4.5）：签名插件加载 → 添加账号（无效 token 被真实 API 拒绝、
-不落盘）→ 阈值读写（含 0=关闭、越界报错）→ 体检项 `kzwr.<账号id>` → 告警来源
-`{"plugin":"kzwr"}` → 审计标签通用回退 → 停用后路由 404 → 重新启用恢复 → 八个只读端点
-全量扫描无明文 token。
-
----
-
-### ADR-016：宿主能力表（`host_bind`）—— 主表改为尾部追加，插件可回调宿主（2026-09-28，v0.4.6）
-
-**背景**：ADR-015 把 kzwr 移出核心时，把「插件不得回调宿主」确立为不变式，代价是插件只能
-**先返回、再让宿主做事**。实测暴露了三个做不到的能力：
-
-1. **长任务中途的日志与进度**：多账号（10+ 账号）逐个清空回收站要跑几十秒到几分钟，
-   期间不能写日志、不能报进度；用户只看到按钮转圈，日志页一片空白。
-2. **后台周期任务**：插件想自己定个「每晚 3 点扫一遍空间」的节奏，只能搭宿主的 30 分钟
-   `patrol` 顺风车，无法表达自己的周期与语义。
-3. **`config_get` 的时效性**：插件在动作里读配置只能靠 `cfg_json.self_config` 快照，
-   而快照是**调用开始时**取的；同一个动作里「写完再读」读不到自己的新值。
-
-**决策**：在主表 `KzwrPluginAbi` **尾部**追加一个可选回调 `host_bind`，由宿主下发一张
-**宿主能力表** `KzwrHostAbi` + 一个不透明句柄 `ctx`。契约要点：
-
-- **两条通道并存**，不是替换：声明式副作用（§4.4）**始终可用**、老插件零改动；
-  能力表是**可选增强**。两者写**同一批**宿主汇点、共用**同一套**去重规则
-  （告警按「来源+文案」去重），因此混用**不会**产生重复告警。
-- **`config_get` 是唯一的同步调用**（**ADR-021 起改为 `seal`/`unseal`**：宿主不再代存配置），
-  其余写操作一律**入队**（`try_send`）+ 单消费任务落库。
-  原因很硬：插件回调跑在 `spawn_blocking` 线程甚至插件自己的 runtime 里，而宿主的
-  `raise_alert` 内部含 `tokio::spawn`，直接同步调用会 panic
-  「must be called from the context of a Tokio runtime」。队列满则**丢弃并计数**，
-  绝不打回插件线程。一次动作返回后宿主做**排空屏障**，保证同响应内告警/审计可见。
-- **ctx 把能力限定到本插件**：所有命名空间（配置键、告警、定时器、数据目录）都由 ctx 决定，
-  参数里没有插件 id 可填 ⇒ 无法触碰别的插件。禁用/卸载即 `revoke`，在途效果不再被采纳。
-- **主表改为「尾部追加 + 必需前缀」**（本 ADR **修订 ADR-013/015 的「主表冻结」**）：
-  `MIN_SIZE` 只覆盖到 `free_str`，`destroy`/`host_bind` 在它之后 ⇒ 老插件表短一截**仍能加载**。
-  `C_ABI_VERSION` **保持 1**（未发布，无兼容包袱）；`HOST_ABI_VERSION` 独立计数。
-- **`free_str` 放进能力表的必需前缀**（紧随 `abi`/`size`）：它是唯一非可选入口，
-  这样「新插件 + 老宿主」时插件仍接受整表、只逐字段跳过缺失能力，而不是整表拒绝。
-
-**代价与边界**：
-
-- **`ctx` 是能力边界但不是密码学凭证**：知道别人 `ctx` 地址理论上可冒用。**有意**接受：
-  宿主从不 `dlclose` 插件、进程内互不信任程度有限；真强隔离需进程级方案
-  （**已评估：见 [`PLUGIN_ISOLATION.md`](PLUGIN_ISOLATION.md)**，推荐先用
-  「每插件专属线程 + Landlock」拿到文件与 `/proc/<pid>/mem` 防护，子进程留待第三方插件需求）。
-- **宿主不变式新增一条**：「**不得跨 FFI 持任何锁**」——`config_get` 同步读逼迫此事。
-  已发现并规避的真实隐患：`/api/plugins` 先 `state.config.lock()` 再 `describe()`，
-  而 `describe()` 会进插件 `available_json`；若 `config_get` 也抢同一把锁就会**自死锁**。
-  故 ctx 自带配置**只读镜像** + **待落盘覆盖层**（read-your-writes），读路径完全不碰宿主锁。
-- **ctx 内存有意泄漏**：`Arc::into_raw` 交出后进程内不释放（禁用只置 `revoked`）。
-  用一次性的少量泄漏换掉一整类 use-after-free —— 插件可能在工作线程上仍持有指针。
-- 宿主侧每条入口都 `catch_unwind` + 入参校验（NULL / 非法 UTF-8 → 有损转换 / 超长 → 按
-  **字符边界**截断）+ 每插件固定窗口限流（512 次/秒），并有单元测试钉住。
-
-**验证**：`plugin/host_abi.rs` 11 项单元测试（限流、read-your-writes、revoke 惰性、
-NULL/非法入参、超长截断不切多字节字符、cron 校验、能力表完整性）；`contract_tests.rs`
-新增 4 项**布局哨兵**逐字段比对宿主与 SDK 的两张 `#[repr(C)]` 表（防止静默内存错位），
-并断言「老插件短表仍被接受」。宿主 46 项 + 插件 19 项全绿。
-
-> **对 ADR-015 的修订**：ADR-015 结尾的「插件不得回调宿主」在本条被**放松**为
-> 「**默认用声明式；仅当需要中途日志/进度/定时/同步读配置时，用 `host_bind` 能力表**」。
-
----
-
-### ADR-023：实施插件沙箱（每插件专属线程 + Landlock）（2026-09-28，v0.5.2）
-
-**背景**：ADR-016 把「插件与宿主同进程、同权限」记为有意取舍；
-`docs/PLUGIN_ISOLATION.md` 完成了进程级方案评估，结论是**分两步走**，
-第一步「每插件专属线程 + Landlock」零契约变更、拿下最现实的攻击面。本 ADR 实施第一步。
-
-**决策**：
-
-1. **每插件一条专属线程**（`plugin/worker.rs`）。原因来自两条实测性质：
-   Landlock **per-thread** 且**不可逆**。若施加到 tokio 的共享 `spawn_blocking`
-   池线程，该线程会被**永久污染**，之后宿主的其它阻塞任务（配置读写、快照落盘）
-   复用到它就莫名失败 —— 随机 I/O 故障极难定位。专属线程的首次使用即施加沙箱，
-   之后只跑本插件回调、**永不归还公共池**。
-2. **Landlock 白名单**（`plugin/sandbox.rs`）。`libc` 只提供 syscall 号，
-   结构体与常量按 `/usr/include/linux/landlock.h` **本地声明**（稳定 UAPI，`repr(C)`）。
-   默认允许：`/proc/self`（⚠️ **必须显式允许**，实测否则连它一起挡）、`/etc`、`/usr`、
-   `/dev/{urandom,null,zero}`、`/run`、`/tmp` + 插件私有目录。
-3. **降级而非阻断**：内核不支持 Landlock 或规则施加失败时**记警告并继续运行**
-   （可用性优先），但明确记录该插件**未受沙箱保护**。
-4. **逃生舱** `FN_KZWR_NO_SANDBOX=1`：沙箱若在真实 NAS 上误伤某插件的合法 I/O，
-   用户必须能立刻恢复可用，而不是等新版；启用时明确记警告便于定位。
-5. **keystore.age 收紧为 0600**（独立改动）：`std::fs::write` 会落成 0644，
-   密钥库对本机任何用户可读。用 `OpenOptions::mode(0o600)` + 显式 `set_permissions`。
-
-**代价与边界**：
-
-- **同进程内存仍可读**：age 私钥与主口令都在宿主内存里，同进程插件照样能取
-  ⇒ 本次**不解决**「插件读宿主内存」，只解决「插件读磁盘上的密钥与口令」。
-  真隔离需档位 C（子进程），见 `PLUGIN_ISOLATION.md` §4。
-- **卡死仍不可强杀**：专属线程让影响面更小（只污染该插件自己的线程，
-  不再消耗共享池），但同进程模型下依然无法中断阻塞调用。
-- **两侧均已接入**：增强侧用「每插件一条专属线程」（含 `host_bind`）；
-  目标侧用「**每目标实例一个小池**」，池大小 = 该实例并发度
-  （并发回传会并行调用 `write_stream`，单线程会串行化 ⇒ 性能回退）。
-- **目标侧的路径授权由插件声明**：ABI 尾部新增 `describe_json.target.path_fields`
-  —— 宿主**不猜**哪个字段是路径（`example-localfs` 的 url 是目录、`webdav` 的 url
-  是远程 URL）。插件声明后其值加入该实例白名单，且**只接受绝对路径**。
-  防线是「不声明就不给」。
-- **两次同类绕过修复**：`host_bind` 与 `target_open` 都曾是「插件最早执行、
-  却在未沙箱线程上跑」的入口 ⇒ 分别改为「经专属线程」与「**先建池、再开放实例**」。
-
-**验证**：新增 11 项测试（ABI 探测 / 白名单构建 / **沙箱确实挡住非白名单路径** /
-**挡住 `keystore.age` 与 `.passphrase`** / 默认策略不含配置目录 / 专属线程复用 /
-不同插件不同线程 / panic 不杀线程）。宿主 **76 项全绿**。E2E 实测：日志确认
-「专属线程已施加 Landlock」→ kzwr 阈值读写正常 → 建目标并**备份 41 字节成功落盘**
-→ 逃生舱生效（日志变为「未受沙箱保护」且功能正常）。
-
-> **测试方法上的一个教训**：首版隔离测试把「机密」目录放在 `/tmp` 下，
-> 而 `/tmp` 在默认白名单里 ⇒ 测出「能读」却误以为沙箱失效。改为**显式构造**策略
-> 后才真正验证到隔离。**测试若不控制变量，会给出相反的错误结论。**
-
----
-
-### ADR-022：拆分 `http/routes.rs`（4464 行 → 11 个模块）（2026-09-28，v0.5.1）
-
-**背景**：`backend/src/http/routes.rs` 长到 **4464 行**，是整个仓库最大的单文件，
-包含 70 个顶层函数与 40+ 个 DTO —— 备份/恢复/目标/任务/插件/配置/密钥/日志/审计
-全部挤在一起。改任何一处都要在一屏里定位，且容易误改到无关逻辑。
-
-**决策**：按**职责**拆成目录模块（保持 `http::routes` 这一模块名不变，外部调用点零改动）：
-
-| 模块 | 内容 | 行数 |
-|---|---|---|
-| `mod.rs` | `router` 装配 + 插件动作分发（唯一通配路由） | 189 |
-| `types.rs` | 请求/响应 DTO（**集中放置**：请求与响应成对使用，散落时改字段要来回跳） | 686 |
-| `common.rs` | 跨模块共享辅助：`err` / `new_id` / `raise_alert(_once)` / `human_bytes` / 日志清洗 | 164 |
-| `plugins.rs` | 插件管理（列表/启停/热重载/安装卸载/清除数据） | 647 |
-| `targets.rs` | 目标管理（多目标；`target_view` 是回显唯一出口，**凭据永不回传明文**） | 421 |
-| `tasks.rs` | 任务管理 + `run_backup_now` / `run_task_now`（也被调度器调用，故 `pub`） | 499 |
-| `restore.rs` | 恢复（列表/目录树/执行/清理缺失）+ 快照聚合辅助 | 652 |
-| `config.rs` | 配置读写 + 导出导入（**含明文凭据**，入口一律要管理员口令） | 654 |
-| `logs.rs` | 运行日志（查看/清空/下载） | 96 |
-| `audit.rs` | 审计 + 一键体检 + 定时预览 | 326 |
-| `keys.rs` | 密钥 + 告警 + Webhook（Webhook 是告警的外发通道） | 278 |
-
-**拆分方法（可复现的关键）**：写了一个**括号/字符串/注释感知**的解析器按顶层 item
-切分，再按职责分配。直接用行号切会把 `impl`、多行字符串、`#[derive]` 属性、
-以及**紧贴 item 的 `///` 文档注释**切碎 —— 会产生无法编译或丢失文档的半截代码。
-解析器保证 **0 行遗漏、0 行重复**（130 个 item 恰好覆盖全文），
-并对 `config_response` 这种**参数列表里含空行**的函数做了圆括号深度跟踪。
-
-**等价性验证**（这是纯重构，行为必须完全一致）：
-- **路由表**：拆分前后各提取一次 `.route("…")`，41 条**完全一致**
-- **handler 映射**：46 个 handler（含 `delete`/`any`/`ws::`）**完全一致**
-- 宿主 65 项测试全绿；所有 bins/tests 构建通过；**无新增编译告警**
-- 隔离实例冒烟：`/api/health` `/plugins` `/targets` `/tasks` `/audit` `/alerts`
-  `/keys` `/config` `/setup/check` 均 200；插件动作路由 `/api/p/kzwr/quota` 正常
-
-**代价与边界**：
-
-- 拆分后出现**跨模块调用**（如 `restore.rs` 用 `config.rs` 的 `webdav_ready`），
-  因此子模块内 item 统一 `pub(super)`、**不对外暴露**；外部仍只看到
-  `routes::{router, run_task_now, raise_alert_once}`。
-- `types.rs` 686 行仍偏大（都是 DTO 声明，没有逻辑），可接受；若继续增长可按
-  「目标/任务/恢复/配置」再分子模块。
-- 拆分脚本为一次性工具，**未入库**（保留在 `/tmp`），避免污染 `Scripts/`。
-
----
-
-### ADR-017：二进制产物不入库，并清理历史中的大二进制（2026-09-28，v0.4.6）
-
-**背景**：仓库体积达到 **670 MB**，而全部源码加起来只有 **2 MB** —— 99.7% 是历史上被误提交的
-二进制产物。它们在 WebDAV 重构（`58e57dd`）时就已从工作区删除，但**永远留在了 Git 历史里**：
-
-| 路径 | 版本数 | 解压后 |
-|---|---:|---:|
-| `bin/fnos-backup.fpk` | 11 | 892 MB |
-| `bin/kzwr_login_camoufox-linux-x64` | 3 | 223 MB |
-| `bin/kzwr_login_turnstile-linux-x64` | 1 | 71 MB |
-| `bin/ubo.xpi` | 1 | 4.5 MB |
-| **合计** | **16 blob** | **1.16 GiB** |
-
-**根因**：`.gitignore` **没有**任何二进制/打包产物规则（只有 `/dist/`），且本文档曾错误声称
-「`bin/` 不入库, gitignored」——**实际并未忽略**。于是「删掉文件」看起来像清理干净了，
-体积却纹丝不动；更糟的是每个新版本 fpk 都被再次提交（`chore: 更新 fnos-backup.fpk 二进制文件`）。
-
-**决策**：
-
-1. **补齐 `.gitignore`**：忽略 `*.fpk`、`*.xpi`、`kzwr_login_*`（保留 `*.so` 不忽略 ——
-   `Scripts/`、`packaging/` 下的脚本必须入库）。此类文件是**构建/运行产物**，一律不入库，
-   需要分发时走 GitHub Releases / CI 制品。
-2. **改写历史清除既有残留**：用 `git-filter-repo --invert-paths`（比 `filter-branch` 快两个数量级）
-   删除上述 4 个路径，`--prune-empty` 顺带剪掉那个纯二进制更新提交。
-3. **接受 hash 全变的代价**：改写命中 95 个提交，两条分支（`main`、`feat/plugin-architecture`）
-   必须 `--force-with-lease` 推送，其它克隆需重新 clone。
-
-**代价与边界**：
-
-- **改写是不可逆的**：执行前做了完整镜像备份（`git clone --mirror`），并逐分支比对
-  「最终树的逐文件 blob hash」保证**内容零改动**（`feat` 175 文件 / `main` 143 文件全部一致）。
-- **GitHub 侧 GC 有延迟**：服务端旧对象不会立即回收，网页显示的体积可能滞后；
-  要立刻生效需删除重建仓库（会丢 issue/star，通常不值得）。
-- **不删宣传图**（`docs/promo/*.png`，643 KB）：它是**导入资产**而非残留，且仍在使用 ——
-  现已是仓库里最大的对象。真要再瘦身应走 Git LFS，而不是删历史。
-
-**验证**：改写后 `.git` **670 MB → 4.9 MB**（真实内容 2.0 MB）；二进制残留 **0**；
-`git fsck` 无损坏；**从 GitHub 全新克隆**得到 126 提交、0 二进制、2.1 MB；
-重写后的工作树 `cargo test --lib` **49 项全绿**。
-
-> **环境坑（值得记）**：本环境下 git 新生成的文件会落成 `000` 权限（此前 `eventbus.rs`
-> 也踩过），导致 `git-filter-repo` 收尾的 `git gc` 失败并留下两个 `tmp_pack_*`
-> （598 MB + 633 MB），反而把 `.git` 撑到 1.3 GB。处置：`chmod` 修复 pack 权限 →
-> 删 `tmp_pack_*` → 待确认「全部可达对象都已在 pack 内」后 `git prune --expire=now`
-> 清掉 349 个不可达 loose 对象。
-
----
-
-### ADR-018：上传并发度改为**按目标**存储（2026-09-28，v0.4.7）
-
-**背景**：用户报告「**webdav 的并发设置未按目标隔离，修改一个全都变了**」。
-
-根因是配置的**粒度选错了**：并发度存在 `plugins.target_parallel[插件 id]`，而
-`CApiTarget::caps_for()` 正是用 `self.meta.id`（插件 id）去查的。但一个插件会被
-**多个目标同时实例化** —— 多账号各一套凭据、各自网络条件，用户显然期望
-「这个目标用几条连接」是**目标自己的属性**。于是改目标 A 的并发，同类型的 B、C 全跟着变。
-
-**决策**：并发度移入 `TargetConfig.parallel`（`Option<u32>`），按目标存储。
-
-- **解析优先级**：`TargetConfig.parallel` → `plugins.target_parallel[插件 id]` → 插件声明。
-  保留插件级作为**兼容回退**，老配置不会突然失效。
-- **`None` ≠ `0`**：`None` = 未设置（继续回退），`0`/`1` = 显式顺序上传，`≥2` = 并发路数。
-  用 `Option` 才能区分「显式设为顺序」与「跟随插件默认」—— 与阈值 `percent-<id>` 踩过的
-  「0 与未设置必须可区分」是同一个坑。
-- **启动迁移**：把旧的插件级值**继承**到当时存在的各目标上（不覆盖目标已显式设置的值）。
-  不这么做的话，升级后用户的并发设置会静默失效，症状是「明明配了并发却退回顺序上传」。
-- **接口**：新增 `POST /api/targets/:id/parallel`；旧 `POST /api/plugins/:id/parallel` 保留
-  （写插件级回退值）。前端控件从「插件卡片」移到「目标」页每个目标自己的行内。
-- **随配置导出/导入**：`BundleTarget.parallel` 一并携带，避免换机后退回默认值。
-- **编辑目标不重置并发**：`target_save` 重建 `TargetConfig` 时保留 `existing.parallel`
-  （改地址/凭据不该把并发度抹掉）。
-
-**验证**：新增 8 项单元测试（迁移继承 / 不覆盖显式值 / 两目标独立 / `None`≠`0` /
-回退插件级 / 显式 0 优先 / 上限夹取 / 同类插件两目标各自独立）。宿主 **57 项全绿**。
-隔离实例 E2E：建 A/B 两目标 → 设 A=2、B=6 → **各自保持**、默认目标不受影响 →
-重启后仍为 2/6（已落盘）→ 旧插件级接口仍可用且**不覆盖**按目标的值 →
-构造「旧配置（仅插件级=3）」启动 → **迁移把 3 继承到三个目标并落盘**。
-
----
-
-### ADR-019：目标表单由插件声明，打通「用插件目标」（2026-09-28，v0.4.8）
-
-**背景**：用户报告「**现在目标界面不能创建插件的目标，将其打通**」。
-
-调查发现**两道互相独立的门槛**，任何一道都足以让插件目标建不出来：
-
-1. **前端只会造 WebDAV 目标**：`startCreate()` 把 `kind` **硬编码**为 `'webdav'`，
-   表单字段（地址/账号/密码）也全是 WebDAV 专用 —— 界面上**没有任何地方能选目标类型**。
-   讽刺的是 `plugins/example-localfs` 自己的 UI 文案写着「在「目标」页新建目标时选它」，
-   但这个「选」从来不存在。
-2. **后端一律强制凭据**：`target_save` 对**所有**目标要求用户名+密码
-   （`"新目标必须填写用户名与密码"`）。而「本地目录」这类目标**根本不用凭据**，
-   于是即便前端能选类型，保存也会被拒。
-
-**决策**：把「目标表单长什么样」变成**插件的声明**，而不是前端写死。
-
-- `describe_json.target` 新增 4 个字段（全部有缺省，老插件零改动）：
-  `needs_credentials`（**缺省 `true`**）、`url_label`、`url_placeholder`、`url_hint`。
-- `TargetPlugin` trait 相应新增 `needs_credentials()` / `url_label()` / `url_placeholder()` /
-  `url_hint()`，`PluginEntry` 把它们下发给前端（前端据此渲染表单）。
-- `target_save` 按 `needs_credentials` 决定：允许凭据留空，且**跳过连通性实测**
-  （不用凭据的插件通常没有可测的连接；`url` 语义由插件解释，如本地绝对路径）。
-- 前端「新建目标」新增**类型下拉**，只列 `kind === 'target'` 且未被禁用的插件；
-  **类型创建后不可更改**（换类型等于换一种存储，凭据与语义都不同）。
-
-**为什么 `needs_credentials` 缺省是 `true` 而不是 `false`**：缺省必须是**保守**的一侧。
-若缺省 `false`，老插件（没写该字段）会突然被当作「不用凭据」，凭据校验被静默跳过 ——
-这是**安全相关**的默认值，宁可多要一次凭据，也不能悄悄放宽。
-
-**代价与边界**：
-
-- 前端仍需知道「WebDAV 的地址默认值」等细节，因此插件**不声明**时按 WebDAV 语义渲染
-  （向后兼容）；声明了才覆盖。
-- 类型不可改是**有意**的限制：已有目标的凭据是按类型加密存储的，换类型会让语义错乱。
-  需要换类型请新建目标。
-- 宿主对 `url` 只做「非空」校验，**不**校验它是否是合法路径/URL —— 语义归插件，
-  校验也应由插件在 `target_open` 里做（返回 NULL 即配置无效）。
-
-**验证**：新增 4 项契约测试（`needs_credentials` 缺省为 true / 显式 false 生效 /
-example-localfs 必须声明 / `PluginEntry` 暴露 kind 与凭据标志）。宿主 **61 项全绿**。
-隔离实例 E2E 全链路：插件清单带出 `needs_credentials=false` 与「目录路径」标签 →
-**不带凭据创建** `example-localfs` 目标成功（`ready:true`）→ 建任务指向它 →
-**备份 2 文件 / 200043 字节**（落盘为 `age-encryption.org/v1` 密文）→
-**恢复 2 文件 / 200043 字节**，`a.txt` 内容与 200000 字节二进制均**逐字节一致** →
-该目标也能按目标设并发（`parallel=4`）→ 回归：WebDAV 目标**仍**强制要求凭据、
-未知类型与增强插件仍被拒绝。
-
----
-
-### ADR-020：目标编辑改为弹窗，表单**完全由插件声明**（2026-09-28，v0.4.9）
-
-**背景**：用户要求「**创建目标使用弹窗，弹窗也想插件设置一样，让插件自定义，不由宿主来定义**」。
-
-ADR-019 把目标创建打通了，但表单仍是**宿主写死**的：`TargetsPage.svelte` 内联渲染
-「地址 / 账号 / 密码」三个固定输入框，只靠 `needs_credentials` 决定是否显示后两个。
-插件想加一个自己的字段（如本地目录的子目录、S3 的 region）**没有任何办法** ——
-只能去改宿主前端，违背了「新增插件不该要求改前端」这条既定判据（ADR-015）。
-
-**决策**：把「目标表单长什么样」整体交给插件，宿主退化为**渲染器 + 存取器**。
-
-1. **`describe_json.target.form`**：插件声明字段列表（`key`/`label`/`kind`/`required`/
-   `secret`/`placeholder`/`hint`/`default`/`options`），`kind` 支持
-   `text`/`password`/`number`/`toggle`/`select`。
-2. **新增 `TargetEditModal.svelte`**：按声明渲染弹窗；替换掉 `TargetsPage` 的内联编辑器。
-   宿主只额外渲染两个**所有目标都有**的字段：`name` 与 `enabled`。
-3. **`TargetConfig.fields`**（新增）：插件自定义字段**按目标**存储（`secret` 的加密落盘），
-   注入 `target_json` 时**合并进 `config`**（同名时目标级优先）并单列 `fields`
-   —— 既有插件读 `config.xxx` 无需改动。
-4. **三个 well-known 键**（`url`/`username`/`password`）仍映射到既有存储，
-   不破坏已发布插件的读取位置。
-5. **不声明 `form` 时回退内置 WebDAV 表单** —— 老插件零改动，行为与之前完全一致。
-
-**为什么自定义字段不复用 `plugin_data[插件id]`**：那是**插件级**的，
-一个插件的多个目标会共用同一份配置 —— 与 ADR-018 并发度踩过的坑**完全同类**
-（「本地目录 A 的路径」与「本地目录 B 的路径」必须是两回事）。故新增按目标的 `fields`。
-
-**为什么 `secret` 缺省按 `kind == "password"` 推断**：安全默认值要**保守**。
-插件写 `kind: "password"` 却忘了写 `secret: true` 时，若缺省按「不敏感」处理，
-明文就会直接落盘且回传前端 —— 这是不可接受的。反向可用 `secret: false` 显式关闭。
-
-**代价与边界**：
-
-- 宿主对自定义字段**只校验键名规则**（非空/≤64/`[A-Za-z0-9_-]`/不含点号），
-  不解释语义、不校验取值 —— 语义与合法性由插件在 `target_open` 里判断（返回 NULL 即配置无效）。
-- `kind` 是**开放字符串**而非枚举：前端认不出的一律按 `text` 渲染（前向兼容），
-  这样宿主加新控件类型不会让老前端崩、插件用新类型也不会让老宿主崩。
-- 编辑时**未提交的键保持原值**（敏感字段留空 = 不修改），因此前端可以只提交改动的字段。
-
-**验证**：新增 5 项测试（`form` 可选 / 字段与 `options` 解析 / **敏感判定保守性** /
-example-localfs 必须声明 form / **自定义字段按目标隔离** / 加解密往返）。宿主 **67 项全绿**。
-隔离实例 E2E：插件清单带出 4 个声明字段 → 建**两个同类目标**（`subdir` 分别为
-`alpha`/`beta`）→ 各自备份**落到各自的子目录**（`backup/alpha/...` vs `backup/beta/...`，
-互不干扰）→ 敏感字段回显为布尔、**明文不泄漏** → 只改名称时 `subdir` 与敏感值**保留**。
-
-> **修掉一个连带 bug**：`url` 原先只从请求**顶层**读，而声明式表单把 `url` 当普通字段
-> 提交在 `fields` 里 ⇒ 保存后 `url` 为空、目标 `ready:false`。现两处都收
-> （顶层优先，都没有才沿用原值），`username`/`password` 同理。
-隔离实例 E2E 全链路：插件清单带出 `needs_credentials=false` 与「目录路径」标签 →
-**不带凭据创建** `example-localfs` 目标成功（`ready:true`）→ 建任务指向它 →
-**备份 2 文件 / 200043 字节**（落盘为 `age-encryption.org/v1` 密文）→
-**恢复 2 文件 / 200043 字节**，`a.txt` 内容与 200000 字节二进制均**逐字节一致** →
-该目标也能按目标设并发（`parallel=4`）→ 回归：WebDAV 目标**仍**强制要求凭据、
-未知类型与增强插件仍被拒绝。
-
----
-
-### ADR-021：宿主不再代存插件配置，改由插件自管（+ 宿主提供加密原语）（2026-09-28，v0.5.0）
-
-**背景**：用户要求「**将老插件也按本次改动更改，宿主不再存插件配置**」。
-
-ADR-013 决策 2 当初把插件配置放进宿主的 `plugin_data`（宿主 age 加密代存），
-理由是「插件不该自己管加密」。但这一路走下来暴露出三个问题：
-
-1. **插件级粒度是错的**：`plugin_data[插件id]` 一个插件只有一份，
-   而 `example-localfs` 这类目标插件会被**多个目标**实例化（不同目录）
-   —— 与 ADR-018 并发度、ADR-020 目标字段**同一个坑**，已经栽过两次。
-2. **宿主成了凭据中转站**：kzwr 的 access-token 经宿主加密存储、随宿主的配置导入导出
-   一起流动（含明文解密后再加密），宿主承担的敏感面没有必要地大。
-3. **契约冗余**：`self_config` 快照注入 + 声明式 `config` 回写 + `/api/plugins/:id/data`
-   三套机制只为做「插件存自己的键值」，而插件已经有能力表与私有目录。
-
-**决策**：**宿主不再代存插件配置**，改由插件自管；但**密钥仍留在宿主**。
-
-1. **能力表新增 `seal` / `unseal`**（尾部追加，`HOST_ABI_VERSION` 不变）：
-   用**宿主口令**加解密，插件拿不到密钥本身。这是本 ADR 的**关键取舍** ——
-   若不给加密原语，「配置自管」会立刻**降级为明文落盘**（只靠目录 0700 保护），
-   那是不可接受的安全回退。
-2. **`own_data_dir` 成为配置的正式存放位置**（此前只是「可选的私有目录」）。
-3. **移除**：`plugin_data` 的读写（字段保留仅为解析老配置）、`self_config` 注入、
-   声明式 `config` 回写的处理、`/api/plugins/:id/data` 两个端点、孤儿数据检测
-   （恒为空，字段保留不破坏前端契约）。
-4. **`purge` 语义随之改变**：宿主没有命名空间可删了，改为**删除插件私有数据目录**
-   （`remove_plugin_data_dir`，校验 id 不含路径分隔符）。
-5. **老插件兼容**：`config_get`/`config_set` 保留为**已弃用桩**
-   （读恒 NULL、写恒拒绝非 0），让老插件**安全失败**而不是空指针崩溃。
-
-**为什么 `config_get`/`config_set` 不直接置为 `None`**：置 `None` 会让老插件在
-调用点遇到空函数指针而**崩溃**；保留实现并让它们「安全失败」，老插件才有机会察觉
-「宿主不支持了」并退回到自己的存储。
-
-**代价与边界**：
-
-- **旧配置不迁移**（用户决策，与 v0.4.5 同一取舍）：升级后插件配置需重新填写。
-  `plugin_data` 段仍能解析（否则升级即启动失败），宿主不再读它，下次保存自然消失。
-- **插件要自己保证落盘原子性**：kzwr 用「先写 `config.json.tmp` 再 `rename`」，
-  避免写到一半崩溃留下半个文件（下次读会解密失败）。
-- **换宿主口令后旧配置解不开**：`unseal` 返回 NULL，插件按「无配置」处理并**记警告**
-  （kzwr 明确提示「宿主口令是否变更？」），而不是静默当成空配置。
-- **导出包不再携带插件配置**：其中常含凭据，本来也不该经宿主中转。
-
-**验证**：宿主 **65 项**测试全绿（新增：`seal`/`unseal` 往返与坏输入拒绝、
-弃用桩安全失败、老 `plugin_data` 段能解析但被忽略）。隔离实例 E2E：
-插件私有目录按插件创建 → 老代存端点 **404** → kzwr 写阈值后
-**配置落在自己的目录且为 age 密文**（`{"sealed":"age-encryption.org/v1…"}`，
-**不含明文**）→ 读回 77 → **重启后仍在** → `purge` **删除该目录** →
-宿主 `config.toml` **无 `plugin_data`**、`orphan_data` 恒空。
-
-> **修掉一个连带问题**：`config_get` 此前是「唯一同步入口」并因此确立了
-> 「宿主不跨 FFI 持锁」的不变式（ADR-016）。现在同步入口换成 `seal`/`unseal`
-> （纯计算、不碰任何锁），该不变式**依然成立且更简单**。
-
-
----
-
 ## 7. 项目目录结构
 
-项目遵循飞牛应用规范，Rust 源码与前端源码在开发期独立，打包时合入飞牛目录结构。
+项目采用**开发期两段式**：`backend/`（Rust）与 `frontend/`（Svelte）独立演进；
+打包时由 `Scripts/build_fnos_app.sh` 合入飞牛应用目录（源在 `packaging/`）。
 
-> 以下为**目标结构**（飞牛应用部署形态）。开发期 `backend/` 与 `frontend/` 独立演进，打包时合入飞牛目录。**当前实际 Rust 源码结构**见文末"项目进度"一节。
+### 7.1 仓库结构（开发期，对应本仓库）
 
 ```
 fn-kzwr-backup/
-├── manifest                    # 飞牛应用元数据 (appname/version/platform/ctl_stop)
-├── ICON.PNG / ICON_256.PNG     # 应用图标
-├── app/
-│   ├── ui/
-│   │   ├── config              # 桌面入口 (iframe → http://localhost:{port}/)
-│   │   └── images/             # 入口图标
-│   └── www/                    # 前端构建产物 (Svelte → dist 拷贝至此)
-├── cmd/                        # 飞牛生命周期脚本 (bash)
-│   ├── main                    # start/stop/status 控制 Rust 进程
-│   ├── install_init            # 首次安装初始化 (建目录/权限)
-│   ├── install_callback
-│   ├── upgrade_init            # 升级数据迁移
-│   ├── upgrade_callback
-│   ├── uninstall_init
-│   ├── uninstall_callback
-│   ├── config_init             # 配置变更处理
-│   └── config_callback
-├── config/
-│   ├── privilege               # 运行权限 (run-as=package, user=fnosbackup)
-│   └── resource                # 资源声明 (共享目录/端口)
-├── wizard/                     # 安装/配置向导表单
-│   ├── install                 # 收集端口/初始口令
-│   └── config
-├── target/                     # Rust 编译产物 (开发期构建后拷入)
-│   └── bin/
-│       └── fn-kzwr-backup         # 主二进制
-├── backend/                    # Rust 后端源码 (开发期)
+├── backend/                    # Rust 后端
 │   ├── Cargo.toml
 │   └── src/
-│       ├── main.rs             # 入口: axum HTTP 服务启动
-│       ├── lib.rs              # 库入口 (AppState 等)
-│       ├── http/               # 接口层 (REST + WebSocket)
-│       │   ├── routes/         # 路由（**按职责拆分**，见下）
-│       │   └── ws.rs           # 状态推送 WebSocket
-│       ├── domain/             # 领域核心层 (纯逻辑, 无 IO)
-│       │   ├── backup.rs       # 备份调度 (BackupJob 聚合)
-│       │   ├── sync.rs         # 增量同步 (SyncSession 聚合)
-│       │   ├── crypto.rs       # 加密 (CryptoSession 聚合)
-│       │   ├── restore.rs      # 恢复编排 (RestoreJob 聚合)
-│       │   ├── pace.rs         # 传输速度计量 (SpeedMeter)
-│       │   └── retention.rs    # 保留策略 (孤儿文件清理)
-│       ├── infra/              # 基础设施层 (ACL 适配器)
-│       │   ├── source/local/   # Source 适配器: local/ (仅本地FS)
-│       │   ├── target/webdav.rs # Target 适配器: WebdavTarget (官方 WebDAV)
-│       │   ├── persistence/    # snapshot.rs (SQLite 快照)
-│       │   ├── config.rs       # TOML 配置 (读 TRIM_PKGETC)
-│       │   ├── keystore.rs     # 密钥加密存储
-│       │   └── storage_trait.rs
-│       ├── bin/                # 测试二进制 (开发期, 不入生产)
-│       └── eventbus.rs         # 内部事件总线
-├── frontend/                   # 前端源码 (开发期)
-│   ├── package.json
-│   ├── vite.config.ts
-│   ├── src/
-│   │   ├── App.svelte
-│   │   └── ...
-│   └── dist/                   # 构建产物 → 拷贝至 app/www/
+│       ├── main.rs             # 入口：启动 axum / 绑 Unix Socket / 加载插件
+│       ├── lib.rs              # AppState（配置·插件·目标池·事件总线·告警·审计）
+│       ├── eventbus.rs         # 内部事件总线（tokio::broadcast）
+│       ├── http/               # 接口层
+│       │   ├── routes/         # 路由（按职责拆分，见 7.3）
+│       │   └── ws.rs           # WebSocket 状态推送
+│       ├── domain/             # 领域层（纯逻辑）
+│       │   ├── backup.rs       # 备份调度 BackupJob
+│       │   ├── sync.rs         # 增量差分 SyncSession
+│       │   ├── crypto.rs       # age 加密 CryptoSession + AgeKeys
+│       │   ├── restore.rs      # 恢复编排 RestoreJob
+│       │   ├── retention.rs    # 保留策略（孤儿清理）
+│       │   ├── scheduler.rs    # **每任务**独立 cron 调度
+│       │   ├── pace.rs         # SpeedMeter 速度计量
+│       │   ├── alerts.rs       # 告警 + Webhook 外发
+│       │   └── audit.rs        # 操作审计
+│       ├── plugin/             # 插件层（ADR-013）
+│       │   ├── api.rs          # 内部契约 TargetPlugin / EnhancePlugin / PluginUi
+│       │   ├── abi.rs          # **稳定 C ABI v1 契约**（主表 + 目标能力表）
+│       │   ├── cabi.rs         # C ABI → EnhancePlugin 适配（catch_unwind 兜底）
+│       │   ├── target_abi.rs   # C ABI → TargetStorage 适配（含并发回传）
+│       │   ├── host_abi.rs     # 宿主能力表实现（日志/审计/告警/进度/定时/seal）
+│       │   ├── sandbox.rs      # **Landlock 沙箱**（ADR-023）
+│       │   ├── worker.rs       # **插件专属线程 / 目标实例线程池**（沙箱载体）
+│       │   ├── crypto.rs       # seal/unseal 原语（主口令派生）
+│       │   ├── loader.rs       # 目录扫描 + libloading + 验签 + 失败隔离
+│       │   └── registry.rs     # 唯一装配点
+│       └── infra/              # 基础设施（ACL 防腐）
+│           ├── storage_trait.rs # Source/Target trait + TargetPool + SwapTarget
+│           ├── config.rs       # TOML：targets/tasks + 凭据加解密 + 旧字段迁移
+│           ├── keystore.rs     # 密钥库（0600）
+│           ├── source/local/   # LocalFsSource
+│           └── target/webdav.rs # WebdavTarget（官方 WebDAV）
+├── frontend/                   # Svelte 前端
+│   └── src/
+│       ├── App.svelte          # 应用壳：导航 + 全局状态 + WebSocket
+│       ├── views/              # 页面（见 7.4）
+│       ├── components/         # 功能区块（见 7.4）
+│       └── lib/                # api / 工具
+├── plugins/                    # 插件源码（独立 crate）
+│   ├── sdk/                    # **插件 SDK**（零第三方依赖；稳定 ABI 的唯一依赖面）
+│   ├── kzwr/                   # 增强插件（外置）：空间/账号/回收站，自管配置
+│   ├── example-localfs/        # 目标插件示范：本地目录目标（声明 target.form + path_fields）
+│   └── example-hello/          # 最小示例
+├── packaging/fn-kzwr-backup-app/ # 飞牛应用**打包源**（见 7.2）
+├── Scripts/                    # build_fnos_app.sh / build_plugins.sh / sign_plugin.sh
 └── docs/
-    ├── ARCHITECTURE.md         # 本文档
-    └── TECH_SELECTION.md       # 技术选型分析
+    ├── ARCHITECTURE.md         # 本文件：当前实现的架构基线
+    ├── PLUGIN_ABI.md           # 插件接口契约（稳定 C ABI v1）
+    ├── fnnas-dev-docs/         # 抓取的飞牛官方文档镜像（只读参考）
+    └── promo/                  # 应用介绍用宣传图
 ```
 
-> **`bin/` 已不复存在**（历史遗留目录，曾误放 fpk/登录器二进制）。构建脚本现在统一在
-> `Scripts/`、打包源码在 `packaging/`；二进制产物一律不入库并已由 `.gitignore` 拦截
-> （`*.fpk` / `*.xpi` / `kzwr_login_*`）—— 见 **ADR-017**。
+### 7.2 飞牛应用部署形态（打包产物）
 
-**构建流程**：`cargo build --release` → 二进制入 `target/bin/`；`cd frontend && npm run build` → 产物入 `app/www/`；`fnpack build` → 生成 `.fpk`。
+`Scripts/build_fnos_app.sh` 把后端二进制、前端产物与插件合入 `packaging/fn-kzwr-backup-app/`
+（**打包源已入库**，产物输出到 `dist/`，不入库）：
 
-> 注：开发期构建**通过 SSH 在飞牛 NAS 上进行**，实际源码以 Windows 侧 `backend/`、`frontend/` 为准，构建前用 `pscp`/tar 同步至 NAS `/vol1/1000/Docker/kuzu-backup`。WSL 已废弃（上行仅 ~4KB/s、后台进程随会话被回收）。
+```
+packaging/fn-kzwr-backup-app/
+├── manifest                    # platform=x86, ctl_stop=true, checkport=false（无 service_port）
+├── ICON.PNG / ICON_256.PNG
+├── app/                        # → $TRIM_APPDEST
+│   ├── ui/config               # 桌面入口：统一网关（gatewayPrefix + gatewaySocket=app.sock）
+│   ├── bin/fn-kzwr-backup      # 后端二进制（构建时拷入）
+│   ├── plugins/*.so (+ .sig)   # 外置插件与其签名（构建时拷入）
+│   └── www/                    # 前端产物（构建时拷入）
+├── cmd/                        # 生命周期脚本 main/install_*/upgrade_*/uninstall_*/config_*
+├── config/
+│   ├── privilege               # run-as=package, user/group=fnosbackup
+│   └── resource                # data-share + api-scope 声明
+└── wizard/                     # install / config / uninstall（JSON 步骤数组）
+```
+
+**关键约束**（对照飞牛规范）：
+- **无 TCP 端口**：UI 经统一网关（`/app/fn-kzwr-backup` + Unix Socket）暴露（ADR-012）
+- **路径全部用 `TRIM_*` 环境变量**，禁止硬编码
+- **权限**：`run-as=package` 专用用户；`disable_authorization_path=false`，源目录由用户授权
+- **口令**：安装向导写入 `$PKGETC/.passphrase`（0600），用于配置与密钥库加密
+- **数据归属**：快照 → `$TRIM_PKGVAR`；配置 / 密钥库 → `$TRIM_PKGETC`
+- **链接方式**：**glibc 动态链接**（musl 静态不支持 `cdylib` 且无法 `dlopen`，与外置插件互斥）
+
+**构建**：`cargo build --release` + `npm run build` → `Scripts/build_fnos_app.sh` 组装
+（含插件构建与签名）→ `fnpack build` 产出 `.fpk` 至 `dist/`。
+CI 见 `.github/workflows/build-fnos-app.yml`（x86_64 / aarch64 双架构，tag 发布强制签名）。
+
+### 7.3 后端路由模块划分
+
+原 `http/routes.rs` 单文件 4464 行，已按职责拆分（ADR-022）：
+
+| 模块 | 内容 |
+|---|---|
+| `mod.rs` | `router` 装配 + 插件动作分发（唯一通配路由） |
+| `types.rs` | 请求/响应 DTO |
+| `common.rs` | 错误响应 / `new_id` / 告警 / 日志清洗 |
+| `plugins.rs` | 插件管理（列表/启停/热重载/安装卸载/清除数据） |
+| `targets.rs` | 目标管理（凭据永不回传明文） |
+| `tasks.rs` | 任务管理 + `run_backup_now` / `run_task_now` |
+| `restore.rs` | 恢复（列表/目录树/执行/清理缺失） |
+| `config.rs` | 配置读写 + 导出导入（需口令） |
+| `logs.rs` | 运行日志（查看/清空/下载） |
+| `audit.rs` | 审计 + 一键体检 + 定时预览 |
+| `keys.rs` | 密钥 + 告警 + Webhook |
+
+### 7.4 前端结构
+
+```
+frontend/src/
+├── App.svelte              # 应用壳：导航 + 页面切换 + 全局状态/WebSocket
+├── views/                  # 页面级组件
+│   ├── DashboardPage.svelte   # 概览：一键体检 + 按任务/目标聚合统计
+│   ├── TasksPage.svelte       # 任务管理（多任务）
+│   ├── TargetsPage.svelte     # 目标管理（多目标）
+│   ├── PluginsPage.svelte     # 插件页：插件卡片（通用 UI Schema）+ 外置插件管理
+│   ├── RestorePage.svelte     # 恢复
+│   ├── AuditPage.svelte       # 操作审计
+│   ├── LogsPage.svelte        # 日志（倒序、宿主时区）
+│   └── SettingsPage.svelte    # 设置：age 密钥 / 通知 / 配置迁移
+├── components/             # 功能区块组件
+│   ├── PluginBlocks.svelte      # **通用 UI Schema 渲染**（所有插件卡片）
+│   ├── TargetEditModal.svelte   # **通用目标表单弹窗**（字段由插件 target.form 声明）
+│   ├── PluginSettingsModal.svelte # 通用插件设置弹窗
+│   ├── LiveStatus.svelte        # 实时任务状态（右侧常驻面板）
+│   ├── KeySection.svelte        # age 密钥管理
+│   ├── MessagesPanel.svelte     # 「消息提醒」留存型通知出口
+│   ├── PluginSection.svelte     # 外置插件管理（开关/目录/公钥/诊断/卸载）
+│   ├── NotifySection.svelte     # 通知设置（Webhook + 模板 + 连通性测试）
+│   ├── ConfigSection.svelte     # 配置导出/导入
+│   ├── AuditSection.svelte / SetupCheckSection.svelte / RestoreSection.svelte
+│   └── ConfirmDialog / Toast / Icon / Logo / PluginAccounts / PluginInstallModal
+└── TreeNode.svelte         # 目录树节点（懒加载）
+```
+
+> **前端完全声明式**：插件界面由 `ui.blocks[]` 驱动 `PluginBlocks.svelte`，
+> 目标表单由 `target.form[]` 驱动 `TargetEditModal.svelte` ——
+> **新增插件无需改前端、无需重打包**（ADR-019 / ADR-020）。
 
 ---
 
-## 8. 演进路线图
+## 8. 质量属性分析
 
-> 状态图例：✅ 已完成 · 🔶 部分完成 · ⏳ 规划中
-
-| 阶段 | 交付物 | 状态 | 关键风险 | 可逆性 |
-|------|--------|------|----------|--------|
-| **Phase 1 · MVP** | 全量备份 · 单源单目标 · 基础 Web UI · 本地 FS 源 · 酷族官方 WebDAV 目标（ADR-009） · 飞牛 `.fpk` 打包 | ✅ 完成（x86 飞牛设备安装/运行实测通过；aarch64 待测） | WebDAV 对接（已解决）· 飞牛生命周期集成 | 完全可逆 |
-| **Phase 2 · 增量加密** | mtime 差分 · age 加密 · 流式管道 · 64MB 分块 · SQLite 元数据 | ✅ 完成 | 私钥管理（已用密钥库解决）· 大文件内存 | 完全可逆 |
-| **Phase 3 · 恢复能力** | 选择性恢复 · 恢复向导 UI · 完整性校验 · BLAKE3 严格模式 | ✅ 完成 | 索引膨胀（结合保留策略缓解） | 部分可逆（元数据格式定型需迁移） |
-| **Phase 4 · 生产强化** | 多目标支持 · 保留策略 · 断点续传 · 监控告警 · fnos 服务化 | ✅ 保留策略 / 断点续传 / WebSocket 监控 / `.fpk` 打包 / 监控告警 / 飞牛设备实测均已完成；**多目标支持已于 v0.4.0 落地（ADR-014，含多任务）** | 并发控制 · 资源争用 | 部分可逆 |
-| **Phase 5 · 演进扩展** | 异地恢复 · 密钥轮换 · 插件化 · 可选分布式 | ✅ **插件化已基本完成**（ADR-013/015/016：P1–P5 外置加载、**目标能力表**、**内置 webdav ABI 化**、**并发回传**、**签名强制校验**、**自管数据**、**kzwr 完全外置（v0.4.5）**、**宿主能力表 `host_bind`（v0.4.6）**）；剩余：aarch64 实测 · 密钥轮换 · 异地恢复 · 插件市场/sha256 白名单（可选） | 跨节点一致性 | 视需求启用 |
-
-**可逆性原则**：Phase 1-2 纯增量能力叠加，决策完全可逆；Phase 3-4 元数据格式定型后部分可逆（需写迁移脚本）；Phase 5 视实际需求启用，避免过早优化。
-
-**实际完成功能清单**（按 git 提交历史梳理）：
-- ✅ 增量加密备份（mtime+size 差分、age 加密、断点续传每文件即时快照）
-- ✅ BLAKE3 严格模式差分（内容哈希确认，ADR-004）
-- ✅ age 公私钥密钥库持久化（私钥被口令派生密钥加密存储）
-- ✅ kzwr 官方 WebDAV Target 适配器（`WebdavTarget`：MKCOL/PUT/GET 302 跟随/DELETE/PROPFIND，ADR-009 端到端实测通过）
-- ❌ kzwr 逆向 REST API 适配器与登录二进制（分块上传/下载/删除、session 认证、Camoufox 登录环境）——**已从代码库完全移除**（ADR-009，2026-09-18）
-- ✅ 恢复编排（RestoreJob）+ 恢复到源路径 + 多路径多 job 快照
-- ✅ 备份/恢复 HTTP API + Svelte Web UI（多路径配置、恢复树形视图；登录页随登录二进制一并移除，前端无登录态）
-- ✅ WebSocket 实时任务监控（ADR-007 事件总线）：多路径进度合并统计、**上传/下载完成后才计数**、后端计量的实时速度（仅统计实际传输时段）、明文总量与已传量展示
-- ✅ 保留策略：目标端孤儿文件清理（Phase 4）
-- ✅ 备份目标端**按源文件夹名分层**（`/目标文件夹/<源文件夹名>/…`，含空目录显式创建，ADR-010）
-- ✅ 大文件分片上传/下载与清理；分片请求使用**自定义带精确长度的流式请求体**（保留 `Content-Length` 且可上报进度）
-- ✅ 配置导入/导出（`/api/config/export`、`/api/config/import`，含 WebDAV 凭据与 age 私钥，需管理员口令）
-- ✅ 监控告警 Webhook 自定义（请求头 + 请求体模板 + 连通性测试）
-- ✅ 恢复后回写快照（size + 实际 mtime），**避免下次增量备份重复上传**
-- 🔶 飞牛 `.fpk` 打包部署：x86 设备实测通过；aarch64 待测
-
----
-
-## 9. 质量属性分析
-
-### 9.1 可扩展性
+### 8.1 可扩展性
 - 单进程内模块可独立演进，新增存储协议只需实现 trait
 - SQLite 单机写入上限约数千 TPS，NAS 备份场景足够
 - 若未来需多 NAS 集中备份，可将调度模块拆为独立服务（模块化单体的演进优势）
 
-### 9.2 可靠性
+### 8.2 可靠性
 - 断点续传：每 chunk 落盘后记录元数据，中断后从断点恢复
 - 完整性校验：AEAD tag 自动验证；恢复后可选 BLAKE3 复核
 - 故障隔离：单个备份任务失败不影响其他任务；事件总线故障不影响主流程
 
-### 9.3 可维护性
+### 8.3 可维护性
 - 模块边界清晰，依赖方向单向
 - ADR 记录所有重大决策的"为什么"
 - trait 抽象使核心逻辑可单元测试（mock storage）
 
-### 9.4 可观测性
+### 8.4 可观测性
 - tracing 结构化日志 + span 追踪跨模块调用链
 - 事件总线天然提供审计流
 - Web UI 实时聚合任务状态（通过 WebSocket 推送，飞牛 iframe 内支持）
 
-### 9.5 安全性
+### 8.5 安全性
 - age 私钥永不明文落盘（可被口令派生密钥加密存储于密钥库）
 - 明文不落临时盘（全程流式）
 - age 底层 ChaCha20-Poly1305 AEAD 认证加密防篡改
 - 每 chunk 独立文件密钥（age ephemeral key）防重放
 
----
+## 9. 技术选型状态
 
-## 10. 技术选型状态
+> 详细选型分析（候选方案、推荐理由、验证步骤）见 `docs/memory/dev/TECH_SELECTION.md`（开发期存档）。
 
-> 详细选型分析见 `TECH_SELECTION.md`。以下标注选型结论与待验证项。
+### 已定选型
 
-### 已选型（方案已定）
-
-| 选型项 | 结论 | Phase | 状态 |
-|--------|------|-------|------|
-| 酷族网软对接 | 官方 WebDAV（Basic 凭据，加密存储，保存时 ping 验证并热切换） | 1-2 | ✅ WebDAV 适配器已实现并端到端实测；REST 适配器与登录二进制已移除（ADR-009） |
-| 飞牛源访问 | 仅本地 FS（tokio::fs），不考虑 SMB/NFS | 1 | ✅ 已实现 |
-| 双架构编译 | **glibc 动态链接** + cross 工具，GitHub Actions matrix（2026-09-27 由 musl 静态改） | 1 | ✅ 已实现（x86_64 本机实测；ARM 交叉编译待真机验证）。改因见「链接方式」 |
-| 源目录授权 | config/resource 声明（`data-share`）+ 运行时引导，弃 root 模式 | 1 | ✅ `config/resource` 声明 + `disable_authorization_path=false`；x86 实测授权目录可读（`run-as=package`） |
-| UI 暴露认证 | 端口服务 + **敏感操作口令校验**（未采用 JWT/全站登录） | 1 | ✅ 端口服务与 iframe 内 WebSocket 已在 x86 实测；导私钥/配置导入导出等敏感操作校验管理员口令；**不做全站登录** |
-| 密钥管理 | age 公私钥（X25519）；备份用公钥加密、恢复用私钥解密；私钥可被管理员口令（age scrypt）加密存储 | 2 | ✅ 已实现（`keystore.age` 加密持久化，口令热切换） |
-
-### 待验证（需实际测试）
-
-1. ❌ **酷族 session token 对接**：**已作废**——属逆向 REST API 能力，随 ADR-009 从代码库移除（WebDAV 走 HTTP Basic 认证，无 session 复用/过期重登概念）
-2. ✅ **config/resource 格式**：共享目录声明（`data-share`）已在 x86 飞牛设备实测可用（授权目录读取正常）
-3. ✅ **iframe 内 WebSocket**：飞牛 iframe 内 localhost WebSocket 实测正常（2026-09-19 设备实测）
-4. ❌ **大文件块级增量**：**不做**（用户决策，2026-09-19）；维持整文件差分
-5. ✅ **飞牛 `.fpk` 打包部署**：x86 飞牛设备安装与运行实测通过（见 11.6）；aarch64 待测
+| 选型项 | 结论 | 依据 |
+|--------|------|------|
+| 酷族网软对接 | 官方 WebDAV（Basic 凭据，加密存储，保存时 ping 验证并热切换） | `infra/target/webdav.rs`；REST 与登录器已移除（ADR-009） |
+| 飞牛源访问 | 仅本地 FS（`tokio::fs`），不考虑 SMB/NFS | `infra/source/local/` |
+| 双架构编译 | **glibc 动态链接** + cross 工具，Actions matrix（x86_64 / aarch64） | **须**动态链接：musl 静态不支持 `cdylib` 且无法 `dlopen`，与外置插件互斥（见 §7.2） |
+| 源目录授权 | `config/resource` 声明（`data-share`）+ 运行时引导，弃 root | `packaging/.../config/resource`；`run-as=package` |
+| UI 暴露认证 | 统一网关 + **敏感操作口令校验**（未采用 JWT/全站登录） | 网关见 ADR-012；导出私钥/配置导入导出校验管理员口令 |
+| 密钥管理 | age 公私钥（X25519）；备份用公钥加密、恢复用私钥解密；私钥经口令（age scrypt）加密存储 | `infra/keystore.rs`（`keystore.age`，0600）；见 §6 |
 
 ---
 
-## 11. 项目进度（实现状态）
+## 10. 决策记录索引
 
-> 本节为**滚动更新的当前进度基线**，随每次功能迭代更新。状态图例：✅ 已完成并实测 · 🔶 部分完成 · ⏳ 规划中。
+> 完整 ADR（背景、取舍过程、后果）见 `docs/memory/dev/ADR.md`（开发期存档，不入版本库）。
+> 此表只保留**编号 → 决策 → 对当前实现的影响**，供正文引用时查阅。
 
-### 11.1 当前开发状态
-
-**核心备份/恢复主链路已完成并在 x86 飞牛设备实测通过**；当前功能版本 **v0.4.1**（**0.4.1 插件化收尾 + 前端重构**：独立「插件」页（插件卡片 + 外置插件管理）；插件界面全面改为声明式 UI Schema（内置 webdav/kzwr 亦同，前端不再有插件专用组件）；插件签名默认强制校验 + 内置官方公钥信任锚（随包插件开箱即用）+ 发布默认签名；插件自管配置（宿主代加密，随配置导入导出）与卸载保护；前端删除插件化前遗留视图（旧「备份」页、重复 WebDAV 凭据卡、不生效的全局保留策略卡、侧栏账号卡），概览改为按任务/目标聚合；发布链接方式由 musl 静态改为 glibc 动态（musl 不支持 cdylib 且无法 dlopen，与外置插件互斥）。**0.4.0 多目标 · 多任务（ADR-014）：配置改为 `targets` + `tasks` 两列表（旧字段自动迁移并保留兼容镜像）、目标池按任务取适配器、每任务独立 cron 调度与独立快照/增量/保留策略、新增目标与任务管理页（含保存前连通性实测与删除保护）、恢复侧支持按任务定位、导出导入含多目标多任务**；0.2.0 起项目更名 `fn-kzwr-backup`；0.2.1 恢复页懒加载与「全部恢复」；0.2.2 设置项回显；0.2.3 按 ADR-011 引入 kzwr REST 增强功能：存储空间/空间预警/回收站门槛清理，及定时可视化、一键体检、操作审计、账号一致性校验；0.2.4 修复飞牛目录选择器误报取消、操作审计独立成页；0.2.5 修复目录选择器 1003103——config/resource 权限声明键修正为官方的 api-scope；0.2.6 修复保留策略误删刚备份文件、上传/下载 4 路并发并重写速度计量、回收站年龄门槛按宿主时区、凭据解密缓存与恢复树聚合索引提速；0.2.7 恢复容忍云端缺失并新增「清理缺失」按钮、任务失败正确显示失败态；0.2.8 账号信息整合至侧边栏（可刷新）、网络请求自动重试 3 次、调试日志开关、依据实测修正回收站字段 length/deletedDate 使保留策略清空回收站全链路生效——已用真实 token 实测清理 70 项；0.2.9 传输改为顺序执行并保留网络自动重试、日志页（查看/清空/下载 + 调试开关）、审计页清空；0.2.10 调试开关迁移至日志页、需要管理员口令的操作统一改为弹窗输入；0.3.0 实时任务面板展示完整流程阶段（准备/传输/收尾，含扫描差分与保留策略清理）、侧栏卡片间距与 WebDAV 文案优化；0.3.1 修复口令弹窗与通知设置输入框无法输入（Svelte 响应式语句回写绑定变量）；0.3.2 **接入飞牛统一网关修复 https 混合内容拦截**（ADR-012）；0.3.3 应用介绍改用 HTML 富文本并接入宣传图；0.3.4 介绍精简为一句一行；**0.3.11 **修复安装失败**（`wizard/config`、`wizard/upgrade` 不能是空数组 `[]`——会被安装校验判为 `code 10111`「应用包不符合系统要求」；改为**不打包这两个文件**即不显示步骤）；0.3.10 **取消端口直连**（只监听统一网关 Socket，manifest 去掉 `service_port`，安装向导不再收集端口，调试端口 `FN_KZWR_DEBUG_PORT` 默认关闭）、应用介绍去掉宣传图；0.3.9 日志倒序显示、修复日志 ANSI 乱码、**时间口径统一为宿主时区**（日志写入端本地时区 + 历史 UTC 行读侧换算；前端 `fmtTime` 按 `/api/config.host_utc_offset_minutes` 渲染）、空间预警改为后台定期巡检并进入「消息提醒」（回落自动消解）、异常提示统一到「消息提醒」；宣传图显示修复：`desc` 的 `<img>` 只保留 src/alt/width，`style` 属性会被宿主转义成纯文本；文档同步**）。构建与测试**统一通过 SSH 在飞牛 NAS 上进行**（WSL 已废弃：上行仅 ~4KB/s、后台进程随会话被回收）；源码从 Windows 侧经 `pscp`/tar 同步至 NAS 后执行 `Scripts/build_fnos_app.sh`，运行编译好的二进制或通过 HTTP API 测试。
-
-### 11.2 已实现功能（按模块）
-
-| 模块 | 功能 | 状态 | 说明 |
-|------|------|------|------|
-| **备份调度** | 增量备份（mtime+size 差分） | ✅ | `BackupJob::run` / `run_strict` / `run_multi` |
-| | 断点续传 | ✅ | 每文件上传后即时存快照，中断可续 |
-| | 多路径备份 | ✅ | 每个源路径独立 job_id 快照，共享 target_prefix |
-| | 目标端分层与空目录 | ✅ | 每个源文件夹在目标端以其**文件夹名**建目录（`/目标文件夹/<源文件夹名>/…`），并显式创建该目录及其空子目录（ADR-010） |
-| | 保留策略（孤儿清理） | ✅ | `domain/retention.rs`，备份后自动清理目标端孤儿文件 |
-| | 定时备份（cron） | ✅ | `domain/scheduler.rs`（`croner` 解析），cron 表达式到点触发、配置热更新；**全局运行互斥**（`AppState.backup_running` CAS），已有备份在跑时跳过本次触发 |
-| | 定时任务可视化 | ✅ | `POST /api/schedule/preview`：cron → 未来 5 次触发时间；**按服务器本地时区解释**（调度器已从 UTC 修正，`0 0 * * *` 即本地零点） |
-| **增强功能**（v0.4.5 起为**外置插件**） | access-token（可选，ADR-011） | ✅ | `plugins/kzwr/`（外置 .so，随包分发并默认签名）：插件自带 REST 客户端与字节格式化；token 由**插件自管**：写进 `own_data_dir`（`$TRIM_PKGVAR/plugins/kzwr/`），整份内容经能力表 `seal` **用宿主密钥加密**（ADR-021，密钥在宿主手里）；保存前实测；未配置时降级，不影响备份/恢复。**核心已无一行 kzwr 代码，也不再代存其配置** |
-| | 账号信息与空间 | ✅ | `GET /api/p/kzwr/user`、`/api/p/kzwr/space`：存储空间/套餐/UID/单文件上限等；**支持多账号**，占用达该账号阈值（默认 90%，0=关闭）生成空间预警 |
-| | 回收站清理 | ✅ | 插件页手动清空（无门槛）；可跟随保留策略自动清理：占用 ≥N GB 才清 + 仅清理 N 天前条目（解析不出时间的保守保留）；由 `after_backup` 事件驱动，门槛取自 `cfg.tasks[]` |
-| | ~~账号一致性校验~~ | ❌ 已去除 | （2026-09-28 决策）备份目标与酷族账号**可以不是同一账号**，跨账号交叉比对是错的 |
-| | token 失效告警 | ✅ | 启动与使用时校验登录态（官方 API 对无效 token 仍返回 200，须查 `isLogin`），失效生成 kzwr 告警 |
-| **可观测** | 一键体检 | ✅ | `GET /api/setup/check`：服务/WebDAV 实连/路径+快照数/私钥确认/定时/增强 token 实连/空间阈值，逐项带修复建议 |
-| | 操作审计 | ✅ | `$TRIM_PKGVAR/audit.log`（JSON Lines，512KB 自动裁剪保留 1000 行）：凭据/密钥/配置/备份/恢复/回收站操作留痕；`GET /api/audit`；独立「审计」页查看（侧边导航入口） |
-| **增量同步** | 双策略差分 | ✅ | 快速 mtime+size / 严格 BLAKE3（ADR-004） |
-| **加密** | age 公私钥加密 | ✅ | 64MB 分块，公钥加密/私钥解密（ADR-003） |
-| | 密钥库持久化 | ✅ | 私钥被口令派生密钥加密存储，跨重启可用 |
-| **恢复** | 恢复编排 | ✅ | `RestoreJob`，选择性恢复、恢复到源路径（按备份源文件夹名还原目标子目录层级） |
-| | 完整性校验 | ✅ | age AEAD tag 自动验证；恢复后内容对比校验 |
-| | 恢复后防重传 | ✅ | 恢复写完文件后回写该文件快照（size + 实际 mtime），下次增量备份命中「未变化」不再重复上传 |
-| | 恢复树懒加载与聚合计数 | ✅ | `GET /api/restore/files` 返回每个备份文件夹的 `{file_count, dir_count, total_bytes}`（不再下发整棵树）；`GET /api/restore/tree?source&dir` 按目录返回**直接子项**（目录附递归统计），前端展开时才加载。目录树由后端从快照推导（`snapshot_aggregate`/`snapshot_children`），不依赖快照行序、不怕缺目录条目 |
-| | 全部恢复 | ✅ | `POST /api/restore/run` 支持 `all` 与 `dir`：`all=true` 用快照全部文件（`dir` 可限定子目录前缀），实现「全部恢复」与「恢复整个目录」一次请求 |
-| **kzwr 目标** | 官方 WebDAV 适配器 | ✅ | `WebdavTarget`：MKCOL/PUT/GET(302 跟随)/DELETE/PROPFIND；凭据加密存储，保存时 ping 验证并热切换（ADR-009） |
-| | 大文件分片上传 | ✅ | 超过 `PART_SIZE`（默认 90MiB = 100MB 网站限制的 90%）自动拆分为 `.part0001…` 依次 PUT；`FNOS_DAV_PART_SIZE` 可覆盖 |
-| | 带长度的流式请求体 | ✅ | 分片 PUT 使用自定义 `http_body`（精确 `size_hint`）——保留 `Content-Length` 的同时按 256KiB 分块上报进度；修复「分片请求误用整文件长度导致 Cloudflare 413」 |
-| | 分片下载拼接与清理 | ✅ | 读取时逻辑文件 404 则按序拼接分片；删除同时清理逻辑文件与全部分片；列表将分片合并为逻辑文件 |
-| | 目录与删除 | ✅ | 写入前逐级 `MKCOL` 确保父目录；`DELETE` 直接删除（无回收站，两阶段物理删除已随 REST 移除） |
-| **存储抽象** | Source/Target trait | ✅ | `storage_trait.rs`（ADR-005），ACL 防腐层 |
-| **元数据** | SQLite 快照 | ✅ | `sync_snapshots` 表，WAL 模式（ADR-006） |
-| **事件总线** | 内部事件总线 | ✅ | tokio::broadcast，备份/恢复进度事件（ADR-007） |
-| **WebSocket** | 实时状态推送 | ✅ | `/api/ws`，前端实时进度条，断线重连；事件携带 `bytes_done`/`bytes_total`/`elapsed_ms`/`speed` |
-| | 任务阶段（phase） | ✅ | 事件新增 `phase`：`prepare`（扫描源目录/差分、列取云端文件）→ `transfer`（上传/下载）→ `cleanup`（删除云端多余文件、保留策略清理、落盘快照）；面板展示完整流程；保留策略改在 `Completed` 之前完成 |
-| **访问方式** | 飞牛统一网关（ADR-012） | ✅ | `app/ui/config` 声明 `gatewayPrefix`/`gatewaySocket`；后端监听 `$TRIM_APPDEST/app.sock` 并在连接入口剥离前缀；**无端口直连**（`service_port` 已移除）；前端资源/API/WS 统一带前缀 |
-| **运行日志** | 日志页（查看/清空/下载） | ✅ | `GET /api/logs?tail=N`（末尾 N 行）、`POST /api/logs/clear`、`GET /api/logs/download`；文件超 5MB 轮转为 `app.old.log`；调试日志开关（`POST /api/config` 的 `debug`）即时热生效 |
-| | 日志无 ANSI 颜色码 | ✅ | tracing 的 stdout 与文件两层均 `with_ansi(false)`；读取/下载时再剥离历史 ANSI 序列（旧日志也不会显示 `[2m`/`[32m`） |
-| **性能** | 凭据解密缓存 | ✅ | `ConfigManager::decrypt_field` 以**密文**为键缓存解密结果（age scrypt 单次数百毫秒，凭据属热路径） |
-| | 恢复树聚合索引 | ✅ | `SnapshotAgg` 一次遍历建索引：`/api/restore/files`、`/api/restore/tree` 由 O(条目×节点) 降为 O(1) 查询 |
-| **可靠性** | 网络失败自动重试 | ✅ | 上传/下载按 `NETWORK_RETRY_ATTEMPTS`（3 次、线性退避）重试；认证/不存在类错误不重试；恢复遇云端缺失跳过并提示「清理缺失记录」 |
-| **应用元数据** | HTML 应用介绍 | ✅ | `manifest.desc` 使用 HTML（`<b>`/`<br>`/`<a>`/`<img>`）：一句一行、含官网与反馈渠道、图床宣传图自适应宽度 |
-| **Web UI** | Svelte 前端 | ✅ | 导航栏多页面（概览/备份/恢复/设置）；views+components 分层 |
-| | 用户信息 | ✅ | WebDAV 账号卡片（UserCard 组件；WebDAV 无套餐/容量接口，不展示容量条） |
-| **HTTP API** | 备份/恢复/配置 | ✅ | `http/routes/`（按职责拆分：mod/types/common/plugins/targets/tasks/restore/config/logs/audit/keys），axum 路由 |
-| | 用户信息 | ✅ | `/api/user/info` 返回本地配置的 WebDAV 账号（WebDAV 无配额/套餐属性） |
-| | 密钥管理 | ✅ | `GET/POST /api/keys`（查公钥 / 自定义私钥）、`POST /api/keys/generate`（自动生成并一次性回传私钥；密钥热切换无需重启） |
-| **配置** | 加密 TOML 配置 | ✅ | WebDAV 用户名/密码以 `enc:<age密文>` 形式加密存储（age scrypt 口令派生；REST 时代的密码/token 字段已不存在） |
-| | 记录账号 | ✅ | 配置解密 username_enc（`webdav_credentials()`） |
-| | 导入/导出 | ✅ | `POST /api/config/export`、`POST /api/config/import`（均需管理员口令）：导出备份路径/定时/通知/WebDAV 凭据/age 私钥为 JSON；导入后重新加密凭据并热切换密钥与目标 |
-| **测试** | 端到端测试 | ✅ | 真实 kzwr 备份/恢复/删除/多级文件夹/物理删除/保留策略/定时触发 |
-| **飞牛部署** | `.fpk` 打包 | ✅ | 完整包结构 + 生命周期脚本 + wizard + GitHub Actions 双架构构建（见 11.6） |
-| **监控告警** | 失败通知/告警 | ✅ | 备份/恢复失败与配置缺失生成告警：应用内横幅展示 + 可选 Webhook 外发（`domain/alerts.rs`、`/api/alerts`、`/api/notify/webhook`） |
-| | Webhook 自定义 | ✅ | 支持自定义请求头与请求体模板（占位符 `{{message}}`/`{{level}}`/`{{source}}`/`{{ts}}`/`{{id}}`）；`POST /api/notify/webhook/test` 可用当前表单值直接测连通性 |
-| **密钥管理** | age 密钥查看/更换 | ✅ | `GET/POST /api/keys`、`POST /api/keys/generate`；密钥热切换无需重启（设置页 KeySection） |
-| | 私钥备份/恢复 | ✅ | `POST /api/keys/export`（**需管理员口令校验**后导出另存，导出即重置为未确认）、`POST /api/keys/backup-ack`（备份确认）；未确认备份时设置页持续提示「私钥丢失将无法恢复」 |
-| **多目标** | 备份到多个目标 | ✅ | v0.4.0 起支持（ADR-014）：`targets` 列表 + 目标池；每个目标的凭据独立加密、快照按目标账号分桶、独立增量与保留策略（`GET/POST /api/targets`、`/api/targets/:id/{test,delete}`） |
-| **多任务** | 多个独立备份任务 | ✅ | v0.4.0 起支持（ADR-014）：`tasks` 列表 = 源路径集 + 目标 + cron + 保留策略；每任务独立调度（`domain/scheduler.rs`）与快照（`job_id = "{task.id}-{源序号}"`）；`GET/POST /api/tasks`、`POST /api/tasks/:id/{run,delete}`；前端「任务」「目标」两页 |
-| **插件** | 内置插件（编译期） | ✅ | ADR-013 P1–P4：`TargetPlugin`/`EnhancePlugin` 契约 + 注册表装配 + `/api/plugins` 驱动前端区块（`webdav` 目标插件、`kzwr` 增强插件） |
-| | 外置插件（动态库） | ✅ | ADR-013 **方案 B（P5）**：`*.so` + `libloading`；目录 `FN_KZWR_PLUGIN_DIR` > 配置 `plugins.dir` > `$TRIM_PKGETC/plugins` > `$TRIM_APPDEST/plugins`；**默认关闭**（「插件」页开关，重启生效）；失败只进诊断不影响核心；工具链 `Scripts/build_plugins.sh` |
-| | 稳定 C ABI（免重编） | ✅ | 唯一入口 `fn_kzwr_plugin_abi_v1` + `repr(C)` 函数表 + JSON 数据交换（`plugin/abi.rs` ↔ `plugins/sdk`，插件零第三方依赖）；`abi`+`size` 双校验；**宿主升级不需要重编插件**；契约见 `docs/PLUGIN_ABI.md`；示例 `plugins/example-hello/` |
-| | ~~Rust 直连（进阶）~~ | ❌ | **已移除（2026-09-26，ADR-013 决策 1）**：Rust 无稳定 ABI、升级必重编，维护两条路径收益为负。删除面：`plugin/sdk.rs`、`plugins/example-rdirect/`、`export_plugin!`、`FN_KZWR_PLUGINS_ALLOW_MISMATCH`。原「只有它能写自定义目标」的限制已由下方**目标能力表**解除 |
-| | 目标能力表（自定义备份目标） | ✅ | `KzwrTargetAbi`（独立符号 `fn_kzwr_plugin_target_v1`）+ `AbiTargetStorage` 适配器；**推块模式**（宿主加密后喂密文，插件不碰明文与密钥）；字节复查 + 看门狗；契约见 `docs/PLUGIN_ABI.md` §9 |
-| | 外置插件提供备份目标 | ✅ | SDK `export_target_v1!` 宏 + 静态表，外置 `.so` 也能作为备份目标；示范插件 `plugins/example-localfs/`（本地目录目标，含路径越权防护与并发回传）；NAS 实测：加载 → 建目标 → 备份 30 文件 1600016 字节写入插件管理的目录，并发回传生效。**v0.4.9（ADR-020）目标编辑改弹窗、表单完全由插件 `target.form` 声明**；**v0.4.8（ADR-019）打通「目标」页创建**：类型下拉只列 `kind=target` 的插件，表单字段（是否需要凭据、地址标签/占位/说明）由插件 `describe_json.target` 声明 —— 此前前端把 `kind` 硬编码为 webdav 且后端一律强制凭据，导致插件目标**建不出来** |
-| | 内置 webdav 目标 ABI 化 | ✅ | **方案 C（2026-09-26）**：内置插件同样提供静态 `KzwrTargetAbi` 表（`builtin/webdav_abi.rs`），由 `WebdavAbiPlugin`（组合 `CApiTarget`）注册；与外部 `.so` 走同一份契约。传输 = 临时文件累积密文 → `write_end` 一次性喂 `WebdavTarget`；NAS 端到端实测备份/恢复均逐字节一致 |
-| | 并发回传（计划式） | ✅ | `plan_begin`/`plan_next`/`plan_end`：目标**自己决定**分批与节奏，宿主按批并发推送。能力由插件 `supports_plan()` 声明；**开关/并发度按「目标」存** `TargetConfig.parallel`（缺省沿用声明，0/1 关闭，≥2 启用，上限 8）—— 同一个插件会被多个目标实例化，按插件存一份会导致「改一个目标、同类型目标全变」；`POST /api/targets/:id/parallel`，保存后热重建无需重启；前端控件在「目标」页每个目标自己的行内（插件级 `plugins.target_parallel` 仅作旧配置回退） |
-
-### 11.3 当前实际 Rust 源码结构
-
-```
-backend/src/
-├── main.rs              # 入口: axum HTTP 服务启动
-├── lib.rs               # 库入口 (AppState 等)
-├── http/
-│   ├── mod.rs
-│   ├── routes/          # 路由（原单文件 4464 行，已按职责拆分）
-│   │   ├── mod.rs       # router 装配 + 插件动作分发（唯一通配路由）
-│   │   ├── types.rs     # 请求/响应 DTO（集中放置，成对字段不用来回跳）
-│   │   ├── common.rs    # 跨模块共享辅助：错误响应 / new_id / 告警 / 日志清洗
-│   │   ├── plugins.rs   # 插件管理（列表/启停/热重载/安装卸载/清除数据）
-│   │   ├── targets.rs   # 目标管理（多目标；凭据永不回传明文）
-│   │   ├── tasks.rs     # 任务管理 + run_backup_now / run_task_now
-│   │   ├── restore.rs   # 恢复（列表/目录树/执行/清理缺失）
-│   │   ├── config.rs    # 配置读写 + 导出导入（含明文凭据，入口要口令）
-│   │   ├── logs.rs      # 运行日志（查看/清空/下载）
-│   │   ├── audit.rs     # 审计 + 一键体检 + 定时预览
-│   │   └── keys.rs      # 密钥 + 告警 + Webhook
-│   └── ws.rs            # WebSocket 状态推送
-├── domain/
-│   ├── mod.rs
-│   ├── alerts.rs        # AlertSink / Alert（监控告警，含 Webhook 外发）
-│   ├── backup.rs        # BackupJob (备份调度 + 保留策略接入)
-│   ├── sync.rs          # SyncSession (差分)
-│   ├── crypto.rs        # CryptoSession (age 加密) + AgeKeys
-│   ├── pace.rs          # SpeedMeter（传输速度计量：累计实际字节/实际传输耗时）
-│   ├── restore.rs       # RestoreJob (恢复编排 + 恢复后回写快照)
-│   ├── retention.rs     # RetentionPolicy (孤儿文件清理)
-│   └── scheduler.rs     # Scheduler (**每任务独立 cron**，ADR-014)
-├── plugin/              # 插件层（ADR-013）
-│   ├── api.rs           # 内部契约：TargetPlugin/EnhancePlugin/PluginMeta/PluginUi/UiBlock/PluginEntry
-│   ├── abi.rs           # **稳定 C ABI v1 契约**（KzwrPluginAbi 表 + JSON schema + 配置快照）
-│   ├── cabi.rs          # 稳定 C ABI → 内部 EnhancePlugin 适配（动作路由/体检/事件/panic 兜底）
-│   ├── abi.rs           # 稳定 C ABI v1 契约：KzwrPluginAbi（增强）+ KzwrTargetAbi（目标）
-│   ├── cabi.rs          # C ABI → 内部 EnhancePlugin 适配（catch_unwind 兜底、free_str 释放）
-│   ├── target_abi.rs    # KzwrTargetAbi → TargetStorage 适配（AbiTargetStorage）+ 并发回传
-│   ├── loader.rs        # 加载：目录扫描 + libloading + 稳定入口校验 + 失败隔离（已无 Rust 直连回退）
-│   ├── registry.rs      # 唯一装配点：builtin()/load_external()/build_targets()/describe()
-│   └── builtin/
-│       └── webdav.rs    # 目标插件（默认启用；每个目标一份实例）——**内置增强插件已清零**
-├── infra/
-│   ├── mod.rs
-│   ├── storage_trait.rs # TargetStorage/SourceStorage trait + **TargetPool(多目标池，ADR-014)** + SwapTarget(主目标)/UnconfiguredTarget
-│   ├── source/local/    # LocalFsSource
-│   ├── target/webdav.rs # WebdavTarget (官方 WebDAV，ADR-009)
-│   ├── persistence/snapshot.rs  # SnapshotStore (SQLite；`(account, job_id, rel_path)` 主键 → 每目标/每任务独立分桶)
-│   ├── config.rs        # ConfigManager (TOML)：**targets/tasks 多目标多任务** + 旧字段迁移与兼容镜像 + 凭据加解密
-│   └── keystore.rs      # 密钥库
-├── bin/                 # 测试二进制 (开发期)
-├── eventbus.rs          # EventBus (tokio::broadcast)
-└── ...
-```
-
-### 11.3.1 当前前端结构
-
-```
-frontend/src/
-├── App.svelte              # 应用壳：导航 + 页面切换 + 全局状态/WebSocket
-├── main.js                 # Svelte 挂载入口
-├── views/                  # 页面级组件
-│   ├── DashboardPage.svelte  # 概览：一键体检 + **按任务/目标聚合统计**（实时任务为右侧常驻面板）
-│   ├── TasksPage.svelte      # 任务管理（多任务，ADR-014）：列表 + 内联编辑 + 立即备份/停用/删除
-│   ├── TargetsPage.svelte    # 目标管理（多目标，ADR-014）：列表 + 内联编辑 + 测试连接/删除
-│   ├── PluginsPage.svelte    # **插件页**：插件卡片区（通用 UI Schema）+ 外置插件管理（开关/目录/公钥/诊断/卸载）
-│   ├── RestorePage.svelte    # 恢复
-│   ├── AuditPage.svelte      # 操作审计
-│   ├── LogsPage.svelte       # 日志（倒序、宿主时区）
-│   └── SettingsPage.svelte   # 设置：**核心项**（age 密钥 / 通知 / 配置迁移）——插件已移至「插件」页
-├── components/             # 功能区块组件
-│   ├── LiveStatus.svelte      # 实时任务状态（右侧常驻面板：文件进度/明文大小/速度/用时 + 空闲态）
-│   ├── KeySection.svelte      # age 密钥管理（公钥展示 / 自定义私钥 / 自动生成 / 口令校验后显示私钥 / 备份确认）
-│   ├── MessagesPanel.svelte   # 「消息提醒」：唯一的留存型通知出口（级别/来源/时间 + 清空）
-│   ├── PluginBlocks.svelte    # 通用 UI Schema 渲染（**所有插件卡片**，含内置 webdav/kzwr；支持动态 metric）
-│   ├── PluginSection.svelte   # 外置插件管理（开关/目录/公钥/加载诊断/卸载/安全说明）
-│   ├── NotifySection.svelte   # 通知设置（Webhook 地址 + 自定义请求头/请求体模板 + 连通性测试）
-│   ├── ConfigSection.svelte   # 配置备份/恢复（导出/复制/下载 JSON；粘贴或选文件导入）
-│   ├── AuditSection.svelte    # 审计列表
-│   ├── SetupCheckSection.svelte # 一键体检（结果项 + 按项跳转）
-│   └── RestoreSection.svelte  # 恢复：文件夹概况 + 「全部恢复」+ 懒加载目录树
-└── TreeNode.svelte          # 目录树节点（子项由父级懒加载后经 cache 传入；目录显示文件数/文件夹数与直接恢复按钮）
-```
-
-> **前端页面（插件化重构后，2026-09-27）**：导航为
-> 概览 / 任务 / 目标 / 插件 / 恢复 / 设置 / 审计 / 日志（8 项，7 个页面 + 概览）。
-> 已删除插件化前的遗留视图：`BackupPage`（全局路径+定时，与任务页重叠且后端只写首个任务）、
-> `WebdavSection`（凭据改在「目标」页按多目标管理）、`KzwrSection`（改为插件 schema 渲染）、
-> `RetentionSection`（保留策略是**任务级**配置，全局那份不生效）、
-> `RailAccount`（侧栏账号卡，账号信息在插件卡片内）、`OverviewSection`（并入 DashboardPage）。
-
-### 11.4 关键决策落地说明
-
-- **镜像一致而非多版本**：目标端与本地保持一致（`8ee9b0a` 移除版本树），不做多版本历史，简化恢复与保留语义
-- **保留策略语义**：因无多版本，保留策略聚焦"目标端孤儿文件清理"（不在任何 job 快照中的残留），防目标空间膨胀
-- **恢复目标**：支持恢复到配置源路径（原位置）或指定目录；目录用"新建/覆盖"按钮控制
-- **配置热切换**：UI 保存目标凭据后由注册表**重建目标池**（`AppState::reload_targets`），全部目标即时生效，无需重启（`storage_trait.rs::TargetPool`，ADR-014）
-- **多任务/多目标隔离**：`job_id = "{task.id}-{源序号}"` + `account = 目标任务凭据用户名` → 每个任务在每个目标上都有独立快照/增量/保留策略；目标失败只影响该任务（ADR-014）
-- **升级无感**：旧 `[backup]`/`[webdav]` 配置自动迁移为 `default` 任务/目标，快照 key 不变（`default-0`）→ 装机升级后不会全量重传；旧字段持续作为兼容镜像回写
-- **外置插件安全边界**（ADR-013 方案 B）：加载动态库 = 执行任意本地代码 → 默认关闭、必须由用户在「插件」页显式开启；宿主以 **`abi` + `size` 双校验**拒绝不匹配的插件（`size >= 必需前缀长度`，尾部可选字段逐项探测、缺失视为 NULL）；单个插件加载失败只进诊断，不影响核心；插件开关/目录变更**重启生效**。（~~「编译期宿主版本 == 运行版本」校验~~ 属已移除的 Rust 直连机制，2026-09-26 起不再存在）
-- **插件前端零改动**：插件通过 `/api/plugins` 的 `ui.blocks`（metric/text/number/toggle/button/tips）声明界面，前端用 `PluginBlocks.svelte` 通用渲染 → 新增插件不必改前端、不必重新打包前端
-- **插件契约冻结（稳定 C ABI v1）**：跨边界只走 `repr(C)` 函数表 + UTF-8 JSON（`docs/PLUGIN_ABI.md` 为权威契约）；`abi`+`size` 双校验、字段只增不改 → **主程序升级不需要重编插件**；破坏性改动才升 `abi` 版本，届时宿主并存 v1/v2。~~Rust 直连路径保留给需要自定义备份目标的进阶插件（须同版本编译）~~ → **Rust 直连已移除（2026-09-26）**；**自定义备份目标现由目标能力表 `KzwrTargetAbi` 提供**（`docs/PLUGIN_ABI.md` §9，推块模式下插件只碰密文，升级同样免重编）
-- **定时备份**：cron 表达式到点触发，运行中改配置热更新（`domain/scheduler.rs`）；调度循环 await 备份完成后才排下一轮
-- **备份运行互斥**：定时调度与手动触发共用 `AppState.backup_running`（`AtomicBool`，`run_backup_now` 入口 CAS 抢占 + RAII 守卫复位），已有备份在执行时第二次触发立即返回 `skipped = true` 与提示文案，避免并发备份争抢带宽与快照写入
-- **用户信息**：账号记录在配置（username_enc 解密），`/api/user/info` 返回本地账号；WebDAV 无套餐/容量接口
-- **备份目标布局**（ADR-010）：每个所选源文件夹在目标端以其**文件夹名**分目录存放，避免多路径在同一层互相覆盖，并保证「所选文件夹」本身在网盘可见
-- **进度口径**：上传/下载的「大小」按**明文**展示（总量来自扫描/快照），完成数在**单个文件传输完成后**才 +1
-- **速度口径**：由后端 `domain/pace.rs::SpeedMeter` 计量（累计实际传输字节 ÷ 累计实际传输耗时），文件/请求之间的空闲不计入，前端只展示不重算
-- **恢复防重传**：恢复写盘后回写该文件快照（size + 实际 mtime），下次增量差分命中「未变化」，避免恢复后又全量重传
-
-### 11.5 后续待办（按优先级）
-
-1. ✅ **飞牛生产环境回归**（WebDAV 模式）：`.fpk` 安装启动、WebDAV 凭据配置与热切换、备份/恢复/保留策略/定时全链路已在 x86 飞牛设备实测通过
-2. ✅ **飞牛 `.fpk` 打包 + GitHub Actions 双架构构建**（见 11.6）；x86 实测通过
-3. ✅ **监控告警**：备份/恢复失败与配置缺失生成告警，应用内横幅展示 + 可选 Webhook 外发
-4. ✅ **密钥丢失恢复流程**：设置页可随时「显示私钥」另存备份，并可「我已妥善保存」确认；未备份时持续提示丢失风险（`POST /api/keys/export`、`POST /api/keys/backup-ack`）
-5. ❌ **大文件块级增量**：**不做**（用户决策，2026-09-19）——维持整文件差分（mtime+size / 严格 BLAKE3），不引入块级哈希
-6. ✅ **交互与能力补齐（v0.1.4 → v0.1.9）**：备份目标按源文件夹名分层（ADR-010）、实时任务合并统计与后端计量速度、上传/下载显示明文总量与已传量、Webhook 自定义请求头/请求体模板与连通性测试、配置导入/导出、显示私钥需管理员口令校验、恢复后回写快照防重复上传、修复分片请求 413
-7. **aarch64 设备实测**：CI 已产出双架构包，需在 aarch64 飞牛设备上验证二进制可用性
-8. **0.4.x 打包与真机回归**：多任务/多目标与插件化代码已通过 NAS 端到端测试（rclone 双 WebDAV 目标、插件加载/验签/自管配置），`.fpk` 已能正常打包（v0.4.1，含已签名随包插件）。**仍待真机装机验证**：① 旧配置自动迁移 + 旧快照继续增量（NAS 测试用的是构造的 legacy 配置）；② 在真实 fnOS 上确认升级覆盖安装与统一网关访问；③ aarch64 设备实测
-9. ✅ **插件外置加载（ADR-013 P5，方案 B：动态库）**：已落地并通过 NAS 实测（ABI/版本双校验、失败隔离、默认关闭、「插件」页开关与诊断）
-9a. ✅ **目标能力表 + 内置 webdav ABI 化 + 并发回传（2026-09-26）**：`KzwrTargetAbi`（推块，插件只碰密文）与 `AbiTargetStorage` 适配器；内置 webdav 改为静态 ABI 表（方案 C），与外部插件同契约；`plan_*` 并发回传按插件独立开关。NAS 端到端实测：备份/恢复逐字节一致、并发开关即时生效、0 panic
-9b. ✅ **kzwr 增强插件完全外置（2026-09-28，v0.4.5）**：不是「内置的 ABI 版」，而是把功能与配置**整体移出核心**成为 `plugins/kzwr/` 外置 `.so`（含多账号、空间预警、回收站清理）；宿主侧 kzwr 代码与配置段全删 → **ADR-015**
-9c. ✅ **宿主能力表 `host_bind`（2026-09-28，v0.4.6）**：主表尾部追加可选回调，插件可写日志/审计/告警/进度/注册定时任务，并同步读自身配置；声明式通道保留 → **ADR-016**
-9d. **插件生态完善（可选，未做）**：插件签名 sha256 白名单、插件市场或一键安装、`PluginUi` 增加更多块类型（表格/分组/条件显隐）
-9e. ✅ **仓库体积治理（2026-09-28）**：历史中的 1.16 GiB 二进制清除，670 MB → 4.9 MB，并补齐 `.gitignore` 防重犯 → **ADR-017**
-10. **兼容层收尾**：待旧前端下线后，可移除「首个任务/主目标」兼容分支与 `[backup]`/`[webdav]` 镜像字段（另一大版本）
-
-### 11.6 飞牛应用打包实现（基于抓取到的飞牛开发文档）
-
-> 已依据 `docs/fnnas-dev-docs/`（抓取自 developer.fnnas.com）完成 `.fpk` 打包结构。
-
-**打包源目录**：`packaging/fn-kzwr-backup-app/`（可提交，CI 与本地构建共用）；构建产物与 `.fpk` 输出至 `dist/fn-kzwr-backup-app/`（gitignored，脚本 `Scripts/build_fnos_app.sh`）
-
-```
-packaging/fn-kzwr-backup-app/
-├── manifest                    # 元数据：platform=x86, ctl_stop=true, checkport=false（无 service_port）
-├── ICON.PNG / ICON_256.PNG     # 128/256 图标
-├── app/                        # → $TRIM_APPDEST（安装后为 /var/apps/{appname}/target）
-│   ├── ui/config               # 桌面入口：统一网关（gatewayPrefix=/app/fn-kzwr-backup, gatewaySocket=app.sock）
-│   ├── ui/images/              # 入口图标
-│   ├── bin/                    # fn-kzwr-backup（Rust）
-│   └── www/                    # 前端构建产物（Svelte dist）
-├── cmd/                        # main/install/upgrade/uninstall/config 生命周期脚本
-├── config/
-│   ├── privilege               # run-as=package, user/group=fnosbackup
-│   └── resource                # data-share: fn-kzwr-backup/restore
-└── wizard/                     # install/config/upgrade/uninstall（JSON 步骤数组）
-```
-
-**关键落地点（对照飞牛规范）**：
-- **应用形态**：普通应用（非 Docker）；UI 经**统一网关**（`/app/fn-kzwr-backup` + Unix Socket）暴露，**不监听 TCP 端口**（ADR-008 / ADR-012 / 选型 5）
-- **路径**：全部使用 `TRIM_*` 环境变量（`TRIM_APPDEST`/`TRIM_PKGETC`/`TRIM_PKGVAR`/`TRIM_PKGTMP`/`TRIM_USERNAME`），禁止硬编码
-- **权限**：`run-as=package` 专用用户 `fnosbackup`；`cmd/main` 用 `runuser -u $TRIM_USERNAME` 降权启动服务进程
-- **源目录授权**：`disable_authorization_path=false`，用户在应用设置授权备份源目录
-- **端口（v0.3.10 起）**：**无**。manifest 不再声明 `service_port`（`checkport=false`），安装向导不再收集端口，`cmd/main` 不再写/读 `$PKGETC/.port`；仅保留 `FN_KZWR_DEBUG_PORT` 显式开启的本地调试端口（默认关闭）
-- **口令**：安装向导收集管理员口令 → `$PKGETC/.passphrase`（权限 600），用作配置/age 密钥库加密
-- **数据归属**：快照→`$TRIM_PKGVAR`；配置/密钥库→`$TRIM_PKGETC`
-- **错误输出**：生命周期脚本失败时写 `TRIM_TEMP_LOGFILE`
-- **升级**：`upgrade_init` 备份快照/配置/密钥库，支持回滚
-- **卸载**：默认保留数据；`wizard/uninstall` 勾选清除时删除
-
-**构建与 CI**：
-- 本地脚本 `Scripts/build_fnos_app.sh`：`cargo build --release` + `npm run build` + 组装包（含外置插件签名）+ `fnpack build`（产物输出至 `dist/`）
-  - 关键环境变量：`TARGET_TRIPLE`（交叉编译目标，留空=本机）、`PLATFORM`（manifest 的 platform，留空按三元组推断）、
-    `PREBUILT_BIN`（复用已构建后端）、`SKIP_PLUGINS=1`、`SKIP_SIGN=1`、`MUSL_TARGET=1`（须配 `SKIP_PLUGINS=1`）
-- GitHub Actions `.github/workflows/build-fnos-app.yml`：`x86_64-unknown-linux-gnu` + `aarch64-unknown-linux-gnu`
-  双架构交叉编译（**glibc 动态链接**，见下）、前端构建、**插件签名**（`secrets.PLUGIN_SIGN_KEY_B64`）、
-  fnpack 打包、**产物自检**（platform/动态链接/插件与 `.sig` 数量一致）、artifact 上传
-  - 每个架构一个 `.fpk`（`platform=x86` / `arm`）；`install_init` **不做**架构选择，由飞牛按 `platform` 判定
-  - tag 发布若未配置签名私钥 → 直接失败；手动触发 → 告警并产出**不含插件**的包
-
-**链接方式（2026-09-27 由 musl 静态改为 glibc 动态）**：
-- 原方案为 musl 静态（无运行时依赖）。但**外置插件（ADR-013）与 musl 静态不可能共存**：
-  1. musl 目标**不支持 `cdylib`** —— rustc 直接报
-     `the target 'x86_64-unknown-linux-musl' does not support these crate types`，插件根本编译不出来（本机实测）；
-  2. **静态链接的二进制没有动态装载器**，`dlopen` 不可用（`libloading` 必然失败，故 musl 静态包无法加载任何插件）。
-- 插件是一等功能，故发布包统一 glibc 动态链接；线上已安装的 v0.3.9 同样是动态链接 glibc
-  （`U dlopen@GLIBC_2.34`），说明该路径已在真机长期运行。
-- 代价：需要目标机 glibc 版本 ≥ 构建机。缓解：在较旧的构建镜像里编译
-  （当前线上二进制仅要求 GLIBC ≤ 2.34，而 NAS 为 2.36）。
-- 仍需纯静态包时：`MUSL_TARGET=1 SKIP_PLUGINS=1 ./Scripts/build_fnos_app.sh`（**不含插件**）。
-
-**早期 WSL 构建测试（2026-08-22，构建环境已废弃，仅存档）**：
-- 后端 `cargo build --release` 编译成功（2m02s，4 个 warning）
-- 前端 `vite build` 产物生成（52KB JS + 10.6KB CSS）
-- 后端运行实测：`/api/health`、`/api/config`、`/api/user/info` 返回 200；前端 SPA 静态托管正常；WebSocket `/api/ws` 握手 `101 Switching Protocols`
-- `fnpack build` 生成 `fn-kzwr-backup.fpk`（gzip 格式，3.6MB），包内 manifest/cmd/config/wizard/app.tgz 结构完整、脚本可执行
-
-**已知限制**：fnpack v1.2.3 校验 wizard 时**不支持 `checkbox`/`switch` 字段类型**（文档虽列出但实际打包会失败），需用 `radio`/`select` 替代。本应用卸载确认已改用 `select`（keep/purge）。
-
-**设备实测结果（2026-09-19，x86 飞牛设备）**：`.fpk` 安装与启动正常；iframe 内 WebSocket 实时状态正常；WebDAV 凭据配置与热切换正常；备份/恢复/保留策略/定时触发全链路验证通过；`run-as=package` 读取授权目录正常。
-
-**待实测**：aarch64 架构二进制在对应飞牛设备上的可用性（GitHub Actions 已产出双架构包）。
+| 编号 | 决策 | 对当前实现的影响 |
+|---|---|---|
+| ADR-001 | 模块化单体架构 | 单进程部署；模块间 trait 通信 |
+| ADR-002 | 技术栈 Rust + axum + Svelte | 见 §5 |
+| ADR-003 | age 加密方案与 64MB 分块 | 加密管道（§4.3） |
+| ADR-004 | 增量检测双策略 | 快速 mtime+size / 严格 BLAKE3 |
+| ADR-005 | 存储抽象层（ACL 防腐） | `infra/storage_trait.rs` |
+| ADR-006 | SQLite 元数据 | `sync_snapshots` 表，WAL |
+| ADR-007 | 内部事件总线 | tokio::broadcast，进度旁路 |
+| ADR-008 | 飞牛原生应用集成 | `packaging/` + 生命周期脚本 |
+| ADR-009 | 文件管理迁移至官方 WebDAV | `infra/target/webdav.rs`；逆向 REST 与登录器已移除 |
+| ADR-010 | 备份目标按源文件夹名分层 | 目标端 `/目标文件夹/<源文件夹名>/…` |
+| ADR-011 | 重新引入 kzwr REST 作可选增强 | 现为外置 `plugins/kzwr/` |
+| ADR-012 | 页面访问改用飞牛统一网关 | Unix Socket + `/app/{appname}`，无 TCP 端口 |
+| ADR-013 | 远程目标与增强功能插件化 | `plugin/` 层 + 稳定 C ABI（`PLUGIN_ABI.md`） |
+| ADR-014 | 多目标 · 多任务 | `targets`/`tasks` 两列表；`job_id={task.id}-{源序号}` |
+| ADR-015 | 增强类插件一律外置 | 核心无厂商专属逻辑；kzwr 完全外置 |
+| ADR-016 | 宿主能力表 `host_bind` | 主表尾部追加；插件可写日志/审计/告警/进度/定时 |
+| ADR-017 | 二进制产物不入库 | `.gitignore` 拦截；产物走 Releases |
+| ADR-018 | 上传并发度按**目标**存储 | `TargetConfig.parallel` |
+| ADR-019 | 目标表单由插件声明 | `describe_json.target`（打通插件目标创建） |
+| ADR-020 | 目标编辑改为弹窗、表单完全由插件声明 | `target.form[]` → `TargetEditModal.svelte` |
+| ADR-021 | 宿主不再代存插件配置 | 插件自管 `own_data_dir`；宿主提供 `seal`/`unseal` |
+| ADR-022 | 拆分 `http/routes.rs` | 4464 行 → 11 个模块（见 §7） |
+| ADR-023 | 实施插件沙箱 | 每插件专属线程 + Landlock（见 §6） |
 
 ---
 
-> 本文档为权威架构基线。功能迭代时同步更新第 8 节（路线图状态）、第 10 节（选型状态）与第 11 节（项目进度）。
+> 本文件为**当前实现**的架构基线。功能迭代时同步更新本文件；
+> 决策的**过程记录**写入 `docs/memory/dev/ADR.md`，进度写入 `docs/memory/dev/PROGRESS.md`。

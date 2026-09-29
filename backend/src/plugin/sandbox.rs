@@ -1,14 +1,14 @@
 //! **插件线程沙箱**（Landlock）——档位 B：同进程内的最小权限
 //!
 //! ## 为什么需要
-//! 插件与宿主**同进程、同 uid**（见 `docs/PLUGIN_ISOLATION.md`）：
+//! 插件与宿主**同进程、同 uid**（见 `docs/memory/dev/PLUGIN_ISOLATION.md`）：
 //! 插件代码可以读走解密备份所需的全部材料 ——
 //! `keystore.age`（age 私钥密文）+ `.passphrase`（主口令），
 //! 两者属主与运行进程**同一个 uid**，`0600` 挡不住同 uid，
 //! 于是同 uid 子进程/同进程代码都能拿到，**进而解出能解密全部备份的私钥**。
 //!
 //! ## 为什么用 Landlock 而不是子进程
-//! 实测（`docs/PLUGIN_ISOLATION.md` §2）：
+//! 实测（`docs/memory/dev/PLUGIN_ISOLATION.md` §2）：
 //! - 应用 `CapEff=0` ⇒ 不能 `mount`/`chroot`/建 netns；
 //! - 非特权 `unshare` 返回 `EPERM` ⇒ 容器方案不可用；
 //! - **Landlock ABI v7 无需任何特权即可用**，且能限制文件路径与 TCP 端口。
