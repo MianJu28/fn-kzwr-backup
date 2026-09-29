@@ -484,3 +484,98 @@ fn real_plugin_completes_host_bind_handshake() {
     assert!(dir.contains("kzwr-so"), "目录应带插件 id：{dir}");
     unsafe { ((*host).free_str)(dp) };
 }
+
+// ── 目标插件「表单能力」契约 ─────────────────────────────────────────────
+//
+// 有些目标根本不用凭据（如本地目录只认一个路径）。若宿主一律强制要求账号密码，
+// 用户在「目标」页就**建不出**这类目标 —— 这正是本次修的问题。
+// 因此 `needs_credentials` / `url_label` 等字段必须能从插件 describe 解析出来。
+
+/// `needs_credentials` 缺省为 `true`（老插件不写该字段 ⇒ 行为不变）
+#[test]
+fn target_caps_default_to_needing_credentials() {
+    use crate::plugin::abi::AbiTargetCaps;
+    let caps: AbiTargetCaps =
+        serde_json::from_str("{}").expect("空对象应可解析（全字段有缺省）");
+    assert!(
+        caps.needs_credentials,
+        "缺省必须是 true —— 否则老插件会突然变成「不用凭据」，凭据校验被静默跳过"
+    );
+    assert!(caps.url_label.is_none(), "标签缺省为空，由前端按 WebDAV 渲染");
+}
+
+/// 显式声明 `needs_credentials: false` 时必须被采纳（本地目录这类目标靠它建出来）
+#[test]
+fn target_caps_honours_explicit_no_credentials() {
+    use crate::plugin::abi::AbiTargetCaps;
+    let caps: AbiTargetCaps = serde_json::from_str(
+        r#"{"needs_credentials":false,"url_label":"目录路径","url_placeholder":"/vol1/backup"}"#,
+    )
+    .expect("应可解析");
+    assert!(!caps.needs_credentials, "显式 false 必须生效");
+    assert_eq!(caps.url_label.as_deref(), Some("目录路径"));
+    assert_eq!(caps.url_placeholder.as_deref(), Some("/vol1/backup"));
+}
+
+/// example-localfs 的 describe 必须能被宿主解析，且声明「不用凭据」
+///
+/// 这是**回归测试**：该插件此前没声明 `needs_credentials`，导致它的目标在
+/// 「目标」页建不出来（保存时被「新目标必须填写用户名与密码」拒绝）。
+#[test]
+fn example_localfs_declares_credential_free_target() {
+    let src = read_repo_file("plugins/example-localfs/src/lib.rs");
+    // 从源码里抽出 describe 的 JSON 字面量不现实，这里断言关键声明存在，
+    // 真正的端到端解析由 `AbiTargetCaps` 的反序列化测试覆盖。
+    assert!(
+        src.contains("\"needs_credentials\": false"),
+        "example-localfs 必须声明 needs_credentials=false，否则其目标无法在「目标」页创建"
+    );
+    assert!(
+        src.contains("\"url_label\""),
+        "应声明 url_label，让前端把「地址」渲染成「目录路径」（否则用户不知道该填路径）"
+    );
+}
+
+/// `PluginEntry` 必须把「是否需要凭据」与 `kind` 暴露给前端
+///
+/// `PluginEntry` 只实现 `Serialize`（它是**出站**视图），故验证序列化输出：
+/// 前端靠 `kind === 'target'` 筛选可选的目标类型，靠 `needs_credentials` 决定
+/// 是否渲染账号/密码输入框 —— 两者缺一，插件目标就建不出来。
+#[test]
+fn plugin_entry_exposes_kind_and_credential_flag() {
+    use crate::plugin::api::{PluginEntry, PluginKind, PluginMeta};
+    let e = PluginEntry {
+        meta: PluginMeta {
+            id: "x".to_string(),
+            name: "X".to_string(),
+            version: "1".to_string(),
+            kind: PluginKind::Target,
+            builtin: false,
+            description: String::new(),
+        },
+        available: true,
+        api_base: "/api/p/x".to_string(),
+        ui: None,
+        source: "external".to_string(),
+        path: None,
+        supports_plan: false,
+        parallel: None,
+        disabled: false,
+        needs_credentials: true,
+        url_label: None,
+        url_placeholder: None,
+        url_hint: None,
+    };
+    let v = serde_json::to_value(&e).expect("应可序列化");
+    assert_eq!(
+        v.get("kind").and_then(|x| x.as_str()),
+        Some("target"),
+        "前端据 kind 筛选「可作为备份目标」的插件"
+    );
+    assert_eq!(
+        v.get("needs_credentials").and_then(|x| x.as_bool()),
+        Some(true),
+        "前端据 needs_credentials 决定是否显示账号/密码"
+    );
+}
+

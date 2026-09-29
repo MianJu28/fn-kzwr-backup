@@ -1931,6 +1931,9 @@ async fn target_save(
     //
     // 注意：实测是 await，**绝不能持有 config 锁**（MutexGuard 跨 await 不但阻塞其它请求，
     // 且再次加锁会自锁），因此这里按「先实测、后加密」两步走。
+    // 该插件是否用凭据：不用凭据的目标（如本地目录）允许留空，且不做连通性实测
+    // —— 否则用户在「目标」页根本建不出这类目标（旧行为正是一律强制要求账号密码）。
+    let needs_creds = plugin.needs_credentials();
     let provided_user = body
         .username
         .as_deref()
@@ -1943,7 +1946,9 @@ async fn target_save(
                 return Json(err("新填写用户名时必须同时提供密码"));
             }
             let mut warning = None;
-            if body.test {
+            // 实测只对「用凭据」的目标有意义：不用凭据的插件没有可测的连接，
+            // 其 `url` 语义由插件自己解释（如本地路径），实测只会误报失败。
+            if body.test && needs_creds {
                 // 与 `build()` 注入同一份自管配置（锁只在此短暂持有）
                 let plugin_cfg = {
                     let mgr = state.config.lock().unwrap();
@@ -1966,7 +1971,14 @@ async fn target_save(
         }
         None => {
             let old = existing.as_ref();
-            if old.map(|t| t.configured()).unwrap_or(false) {
+            // 不用凭据的插件：允许「本来就没有凭据」，不报错
+            if !needs_creds {
+                (
+                    old.and_then(|t| t.username_enc.clone()),
+                    old.and_then(|t| t.password_enc.clone()),
+                    None,
+                )
+            } else if old.map(|t| t.configured()).unwrap_or(false) {
                 (
                     old.and_then(|t| t.username_enc.clone()),
                     old.and_then(|t| t.password_enc.clone()),

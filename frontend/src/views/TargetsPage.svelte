@@ -81,8 +81,81 @@
     }
   }
 
+  /**
+   * 可选的目标类型（**只列目标插件**）
+   *
+   * `/api/plugins` 里同时有 target 与 enhance 两类，只有 `kind === 'target'`
+   * 的插件能作为备份目标。被禁用的插件也排除（选了也装配不出来）。
+   */
+  $: targetPlugins = (plugins || []).filter(
+    (p) => p.kind === 'target' && !p.disabled
+  );
+
+  /** 插件显示名（查不到则回退 id 本身，避免表单里出现空白） */
+  function pluginName(kind) {
+    const p = pluginOf(kind);
+    return (p && p.name) || kind;
+  }
+
+  /** 某目标类型是否需要凭据（缺省 true，与后端一致） */
+  function needsCreds(kind) {
+    const p = pluginOf(kind);
+    return p ? p.needs_credentials !== false : true;
+  }
+
+  /** 地址字段的标签 / 占位 / 说明（插件可自定义，缺省按 WebDAV） */
+  function urlLabel(kind) {
+    const p = pluginOf(kind);
+    return (p && p.url_label) || '地址';
+  }
+  function urlPlaceholder(kind) {
+    const p = pluginOf(kind);
+    return (p && p.url_placeholder) || DEFAULT_URL;
+  }
+  function urlHint(kind) {
+    const p = pluginOf(kind);
+    return (
+      (p && p.url_hint) ||
+      `留空则用官方默认地址 ${DEFAULT_URL}`
+    );
+  }
+
+  /** 新建时的默认类型：优先 webdav（保持老用户习惯），否则第一个目标插件 */
+  function defaultKind() {
+    const has = targetPlugins.some((p) => p.id === 'webdav');
+    return has ? 'webdav' : (targetPlugins[0] && targetPlugins[0].id) || 'webdav';
+  }
+
+  /** 按插件声明的语义给出默认地址（不用凭据的插件通常需要绝对路径，不能填 WebDAV 地址） */
+  function defaultUrl(kind) {
+    return needsCreds(kind) ? DEFAULT_URL : '';
+  }
+
   function startCreate() {
-    editing = { id: '', name: '', kind: 'webdav', url: DEFAULT_URL, username: '', password: '', enabled: true };
+    const kind = defaultKind();
+    editing = {
+      id: '',
+      name: '',
+      kind,
+      url: defaultUrl(kind),
+      username: '',
+      password: '',
+      enabled: true,
+    };
+    formMsg = '';
+  }
+
+  /** 切换目标类型：地址等字段的语义随之改变，故重置为适合该插件的默认值 */
+  function changeKind(kind) {
+    if (!editing) return;
+    editing = {
+      ...editing,
+      kind,
+      // 换类型后旧地址多半不适用（WebDAV 地址 vs 本地路径），清成该类型的默认
+      url: defaultUrl(kind),
+      username: '',
+      password: '',
+    };
     formMsg = '';
   }
 
@@ -91,7 +164,7 @@
       id: t.id,
       name: t.name || '',
       kind: t.kind || 'webdav',
-      url: t.url || DEFAULT_URL,
+      url: t.url || '',
       username: t.username || '',
       password: '',
       enabled: t.enabled !== false,
@@ -107,34 +180,40 @@
 
   async function save() {
     if (!editing) return;
+    const creds = needsCreds(editing.kind);
     if (!editing.url.trim()) {
-      formMsg = '请填写目标地址';
+      formMsg = `请填写${urlLabel(editing.kind)}`;
       formOk = false;
       return;
     }
-    if (!editing.username.trim()) {
-      formMsg = '请填写账号';
-      formOk = false;
-      return;
-    }
-    if (!editing.id && !editing.password) {
-      formMsg = '新建目标需要填写应用密码';
-      formOk = false;
-      return;
+    // 只有「需要凭据」的目标才校验账号密码；本地目录这类目标留空是正常的
+    if (creds) {
+      if (!editing.username.trim()) {
+        formMsg = '请填写账号';
+        formOk = false;
+        return;
+      }
+      if (!editing.id && !editing.password) {
+        formMsg = '新建目标需要填写应用密码';
+        formOk = false;
+        return;
+      }
     }
     saving = true;
-    formMsg = editing.password ? '正在实测连通性…' : '正在保存…';
+    formMsg =
+      creds && editing.password ? '正在实测连通性…' : '正在保存…';
     formOk = true;
     try {
       const body = {
         name: editing.name.trim() || undefined,
         kind: editing.kind || 'webdav',
         url: editing.url.trim(),
-        username: editing.username.trim(),
         enabled: !!editing.enabled,
+        // 不用凭据的目标不提交账号密码（后端也不会因缺凭据而拒绝）
+        username: creds ? editing.username.trim() : undefined,
       };
       if (editing.id) body.id = editing.id;
-      if (editing.password) body.password = editing.password;
+      if (creds && editing.password) body.password = editing.password;
       const r = await api.saveTarget(body);
       if (r.error) {
         formMsg = r.error;
@@ -268,25 +347,53 @@
           <input id="tg-name" placeholder="如：酷族主账号" value={editing.name}
             on:input={(e) => (editing = { ...editing, name: e.target.value })} disabled={saving} />
         </div>
+
+        <!-- 目标类型：来自**目标插件**清单（enhance 类插件不会出现在这里）。
+             编辑既有目标时不允许改类型（改了等于换一种存储，凭据/语义都不同）。 -->
         <div class="field">
-          <label for="tg-url">地址</label>
-          <input id="tg-url" placeholder={DEFAULT_URL} value={editing.url}
+          <label for="tg-kind">类型</label>
+          {#if editing.id}
+            <input id="tg-kind" value={pluginName(editing.kind)} disabled />
+            <p class="field-hint">类型创建后不可更改（如需换类型请新建目标）</p>
+          {:else}
+            <select id="tg-kind" value={editing.kind}
+              on:change={(e) => changeKind(e.target.value)} disabled={saving}>
+              {#each targetPlugins as p (p.id)}
+                <option value={p.id}>{p.name}{p.builtin ? '' : '（外置插件）'}</option>
+              {/each}
+            </select>
+            <p class="field-hint">每种类型对应一个目标插件；选错类型会导致备份无法写入</p>
+          {/if}
+        </div>
+
+        <div class="field">
+          <label for="tg-url">{urlLabel(editing.kind)}</label>
+          <input id="tg-url" placeholder={urlPlaceholder(editing.kind)} value={editing.url}
             on:input={(e) => (editing = { ...editing, url: e.target.value })} disabled={saving} />
-          <p class="field-hint">留空则用官方默认地址 {DEFAULT_URL}</p>
+          <p class="field-hint">{urlHint(editing.kind)}</p>
         </div>
-        <div class="field">
-          <label for="tg-user">账号</label>
-          <input id="tg-user" placeholder="酷族用户名 / 邮箱" value={editing.username}
-            on:input={(e) => (editing = { ...editing, username: e.target.value })} disabled={saving} />
-        </div>
-        <div class="field">
-          <label for="tg-pass">应用密码</label>
-          <input id="tg-pass" type="password"
-            placeholder={editing.password_set ? '留空 = 不修改已保存的密码' : '在 kzwr 官网「应用密码」创建'}
-            value={editing.password}
-            on:input={(e) => (editing = { ...editing, password: e.target.value })} disabled={saving} />
-          <p class="field-hint">保存前会实测一次连通性；建议选择「永不过期」与读写权限</p>
-        </div>
+
+        <!-- 账号/密码：只有声明「需要凭据」的插件才显示。
+             本地目录这类目标不用凭据，强制要求会让用户根本建不出目标。 -->
+        {#if needsCreds(editing.kind)}
+          <div class="field">
+            <label for="tg-user">账号</label>
+            <input id="tg-user" placeholder="酷族用户名 / 邮箱" value={editing.username}
+              on:input={(e) => (editing = { ...editing, username: e.target.value })} disabled={saving} />
+          </div>
+          <div class="field">
+            <label for="tg-pass">应用密码</label>
+            <input id="tg-pass" type="password"
+              placeholder={editing.password_set ? '留空 = 不修改已保存的密码' : '在 kzwr 官网「应用密码」创建'}
+              value={editing.password}
+              on:input={(e) => (editing = { ...editing, password: e.target.value })} disabled={saving} />
+            <p class="field-hint">保存前会实测一次连通性；建议选择「永不过期」与读写权限</p>
+          </div>
+        {:else}
+          <p class="field-hint">
+            该目标类型**不需要账号密码**，只需填写上面的{urlLabel(editing.kind)}。
+          </p>
+        {/if}
         <label class="switch-row">
           <input type="checkbox" checked={editing.enabled}
             on:change={(e) => (editing = { ...editing, enabled: e.target.checked })} disabled={saving} />

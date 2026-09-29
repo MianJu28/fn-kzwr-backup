@@ -81,6 +81,35 @@ pub trait TargetPlugin: Send + Sync {
     fn supports_plan(&self) -> bool {
         false
     }
+
+    /// **是否需要用户名/密码**（缺省 `true`，与既有行为一致）
+    ///
+    /// 有些目标根本不需要凭据 —— 典型是「本地目录」这类目标：它只认一个路径。
+    /// 若宿主仍强制要求填账号密码，用户在「目标」页就**建不出**这种目标
+    /// （旧行为正是如此：`target_save` 一律要求凭据，导致插件目标无法创建）。
+    ///
+    /// 声明为 `false` 时：新建目标允许凭据留空，且保存前**不**做连通性实测
+    /// （插件通常没有可测的连接；`url` 的语义由插件自己解释，如本地路径）。
+    fn needs_credentials(&self) -> bool {
+        true
+    }
+
+    /// 目标地址字段的展示标签（缺省「地址」）
+    ///
+    /// 让插件说明 `url` 的实际含义：WebDAV 是「地址」，本地目录则是「目录路径」。
+    fn url_label(&self) -> Option<String> {
+        None
+    }
+
+    /// 目标地址字段的占位提示（缺省由前端按 WebDAV 处理）
+    fn url_placeholder(&self) -> Option<String> {
+        None
+    }
+
+    /// 目标地址字段的说明文字（缺省由前端按 WebDAV 处理）
+    fn url_hint(&self) -> Option<String> {
+        None
+    }
 }
 
 /// 增强插件提供的能力（前端据此决定是否渲染对应区块）
@@ -325,6 +354,26 @@ pub struct PluginEntry {
     /// 但**仍会出现在清单里**，以便插件页把它列出来并允许重新启用。
     #[serde(default)]
     pub disabled: bool,
+    /// 该目标插件**是否需要用户名/密码**（`kind=target` 时有意义）
+    ///
+    /// 前端据此决定新建目标表单是否显示账号/密码字段
+    /// —— 有些目标（如本地目录）根本不用凭据，强制要求会导致**建不出目标**。
+    #[serde(default = "default_true_entry")]
+    pub needs_credentials: bool,
+    /// 目标地址字段的展示标签（如「地址」/「目录路径」）
+    #[serde(default)]
+    pub url_label: Option<String>,
+    /// 目标地址字段的占位提示
+    #[serde(default)]
+    pub url_placeholder: Option<String>,
+    /// 目标地址字段的说明文字
+    #[serde(default)]
+    pub url_hint: Option<String>,
+}
+
+/// `needs_credentials` 的 serde 缺省：`true`（老前端/未知插件按需要凭据处理）
+fn default_true_entry() -> bool {
+    true
 }
 
 /// 插件自检项（供「一键体检」汇总；由核心映射成 UI 的检查项）

@@ -385,6 +385,33 @@ pub struct AbiTargetCaps {
     /// 宿主推荐的推送块大小（KiB；0 = 宿主默认 1024）
     #[serde(default)]
     pub preferred_chunk_kib: u32,
+    /// 是否需要用户名/密码（缺省 `true`，与既有插件行为一致）
+    ///
+    /// 声明 `false` 表示该目标不用凭据（如「本地目录」只认一个路径）。
+    /// 否则宿主会强制要求填账号密码，用户在「目标」页**建不出**这类目标。
+    /// 同时这也意味着保存前不做连通性实测（没有可测的连接）。
+    #[serde(default = "default_true_caps")]
+    pub needs_credentials: bool,
+    /// 目标地址字段的展示标签（缺省「地址」）
+    ///
+    /// 让插件说明 `url` 的实际含义：WebDAV 是「地址」，本地目录则是「目录路径」。
+    /// 前端据此渲染标签与占位提示，避免用户对着「地址」输入框填不出本地路径。
+    #[serde(default)]
+    pub url_label: Option<String>,
+    /// 地址字段的占位提示（缺省按 WebDAV 的官方地址）
+    #[serde(default)]
+    pub url_placeholder: Option<String>,
+    /// 地址字段的说明文字（缺省按 WebDAV 的语义）
+    #[serde(default)]
+    pub url_hint: Option<String>,
+}
+
+/// `#[serde(default)]` 的 bool 缺省值：`true`
+///
+/// 注意与 [`Default`] 实现配合：**反序列化时**缺省为 `true`（老插件不写该字段
+/// 就按「需要凭据」处理，行为不变），因此不能直接用 `#[derive(Default)]` 的 `false`。
+fn default_true_caps() -> bool {
+    true
 }
 
 impl Default for AbiTargetCaps {
@@ -393,6 +420,10 @@ impl Default for AbiTargetCaps {
             supports_plan: false,
             max_parallel: 1,
             preferred_chunk_kib: 1024,
+            needs_credentials: true,
+            url_label: None,
+            url_placeholder: None,
+            url_hint: None,
         }
     }
 }

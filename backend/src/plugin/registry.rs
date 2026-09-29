@@ -320,10 +320,15 @@ impl PluginRegistry {
         {
             let meta = p.meta();
             let path = ext_paths.and_then(|m| m.get(&meta.id)).cloned();
-            // 并发回传：能力由插件声明，并发度由用户**按插件**配置（缺省沿用声明）
+            // 并发回传：能力由插件声明；并发度**按目标**存（这里是插件级旧值，仅作回退展示）
             let supports_plan = p.supports_plan();
             let parallel = cfg.plugins.target_parallel.get(&meta.id).copied();
             let disabled = self.is_disabled(&meta.id);
+            // 表单形态由插件声明：有些目标不用凭据（如本地目录），地址字段的语义也不同。
+            // 前端据此渲染「新建目标」表单，否则这类目标根本建不出来。
+            let needs_credentials = p.needs_credentials();
+            let (url_label, url_placeholder, url_hint) =
+                (p.url_label(), p.url_placeholder(), p.url_hint());
             out.push(PluginEntry {
                 api_base: format!("/api/p/{}", meta.id),
                 source: if path.is_some() { "external" } else { "builtin" }.to_string(),
@@ -335,6 +340,10 @@ impl PluginRegistry {
                 ui: p.ui(),
                 supports_plan,
                 parallel,
+                needs_credentials,
+                url_label,
+                url_placeholder,
+                url_hint,
             });
         }
         for p in self
@@ -355,6 +364,11 @@ impl PluginRegistry {
                 meta,
                 supports_plan: false,
                 parallel: None,
+                // 增强插件不是备份目标：这些表单字段无意义（前端只对 kind=target 使用）
+                needs_credentials: true,
+                url_label: None,
+                url_placeholder: None,
+                url_hint: None,
             });
         }
         out

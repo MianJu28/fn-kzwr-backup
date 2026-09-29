@@ -688,6 +688,55 @@ NULL/非法入参、超长截断不切多字节字符、cron 校验、能力表�
 
 ---
 
+### ADR-019：目标表单由插件声明，打通「用插件目标」（2026-09-28，v0.4.8）
+
+**背景**：用户报告「**现在目标界面不能创建插件的目标，将其打通**」。
+
+调查发现**两道互相独立的门槛**，任何一道都足以让插件目标建不出来：
+
+1. **前端只会造 WebDAV 目标**：`startCreate()` 把 `kind` **硬编码**为 `'webdav'`，
+   表单字段（地址/账号/密码）也全是 WebDAV 专用 —— 界面上**没有任何地方能选目标类型**。
+   讽刺的是 `plugins/example-localfs` 自己的 UI 文案写着「在「目标」页新建目标时选它」，
+   但这个「选」从来不存在。
+2. **后端一律强制凭据**：`target_save` 对**所有**目标要求用户名+密码
+   （`"新目标必须填写用户名与密码"`）。而「本地目录」这类目标**根本不用凭据**，
+   于是即便前端能选类型，保存也会被拒。
+
+**决策**：把「目标表单长什么样」变成**插件的声明**，而不是前端写死。
+
+- `describe_json.target` 新增 4 个字段（全部有缺省，老插件零改动）：
+  `needs_credentials`（**缺省 `true`**）、`url_label`、`url_placeholder`、`url_hint`。
+- `TargetPlugin` trait 相应新增 `needs_credentials()` / `url_label()` / `url_placeholder()` /
+  `url_hint()`，`PluginEntry` 把它们下发给前端（前端据此渲染表单）。
+- `target_save` 按 `needs_credentials` 决定：允许凭据留空，且**跳过连通性实测**
+  （不用凭据的插件通常没有可测的连接；`url` 语义由插件解释，如本地绝对路径）。
+- 前端「新建目标」新增**类型下拉**，只列 `kind === 'target'` 且未被禁用的插件；
+  **类型创建后不可更改**（换类型等于换一种存储，凭据与语义都不同）。
+
+**为什么 `needs_credentials` 缺省是 `true` 而不是 `false`**：缺省必须是**保守**的一侧。
+若缺省 `false`，老插件（没写该字段）会突然被当作「不用凭据」，凭据校验被静默跳过 ——
+这是**安全相关**的默认值，宁可多要一次凭据，也不能悄悄放宽。
+
+**代价与边界**：
+
+- 前端仍需知道「WebDAV 的地址默认值」等细节，因此插件**不声明**时按 WebDAV 语义渲染
+  （向后兼容）；声明了才覆盖。
+- 类型不可改是**有意**的限制：已有目标的凭据是按类型加密存储的，换类型会让语义错乱。
+  需要换类型请新建目标。
+- 宿主对 `url` 只做「非空」校验，**不**校验它是否是合法路径/URL —— 语义归插件，
+  校验也应由插件在 `target_open` 里做（返回 NULL 即配置无效）。
+
+**验证**：新增 4 项契约测试（`needs_credentials` 缺省为 true / 显式 false 生效 /
+example-localfs 必须声明 / `PluginEntry` 暴露 kind 与凭据标志）。宿主 **61 项全绿**。
+隔离实例 E2E 全链路：插件清单带出 `needs_credentials=false` 与「目录路径」标签 →
+**不带凭据创建** `example-localfs` 目标成功（`ready:true`）→ 建任务指向它 →
+**备份 2 文件 / 200043 字节**（落盘为 `age-encryption.org/v1` 密文）→
+**恢复 2 文件 / 200043 字节**，`a.txt` 内容与 200000 字节二进制均**逐字节一致** →
+该目标也能按目标设并发（`parallel=4`）→ 回归：WebDAV 目标**仍**强制要求凭据、
+未知类型与增强插件仍被拒绝。
+
+---
+
 ## 7. 项目目录结构
 
 项目遵循飞牛应用规范，Rust 源码与前端源码在开发期独立，打包时合入飞牛目录结构。
@@ -928,7 +977,7 @@ fn-kzwr-backup/
 | | 稳定 C ABI（免重编） | ✅ | 唯一入口 `fn_kzwr_plugin_abi_v1` + `repr(C)` 函数表 + JSON 数据交换（`plugin/abi.rs` ↔ `plugins/sdk`，插件零第三方依赖）；`abi`+`size` 双校验；**宿主升级不需要重编插件**；契约见 `docs/PLUGIN_ABI.md`；示例 `plugins/example-hello/` |
 | | ~~Rust 直连（进阶）~~ | ❌ | **已移除（2026-09-26，ADR-013 决策 1）**：Rust 无稳定 ABI、升级必重编，维护两条路径收益为负。删除面：`plugin/sdk.rs`、`plugins/example-rdirect/`、`export_plugin!`、`FN_KZWR_PLUGINS_ALLOW_MISMATCH`。原「只有它能写自定义目标」的限制已由下方**目标能力表**解除 |
 | | 目标能力表（自定义备份目标） | ✅ | `KzwrTargetAbi`（独立符号 `fn_kzwr_plugin_target_v1`）+ `AbiTargetStorage` 适配器；**推块模式**（宿主加密后喂密文，插件不碰明文与密钥）；字节复查 + 看门狗；契约见 `docs/PLUGIN_ABI.md` §9 |
-| | 外置插件提供备份目标 | ✅ | SDK `export_target_v1!` 宏 + 静态表，外置 `.so` 也能作为备份目标；示范插件 `plugins/example-localfs/`（本地目录目标，含路径越权防护与并发回传）；NAS 实测：加载 → 建目标 → 备份 30 文件 1600016 字节写入插件管理的目录，并发回传生效 |
+| | 外置插件提供备份目标 | ✅ | SDK `export_target_v1!` 宏 + 静态表，外置 `.so` 也能作为备份目标；示范插件 `plugins/example-localfs/`（本地目录目标，含路径越权防护与并发回传）；NAS 实测：加载 → 建目标 → 备份 30 文件 1600016 字节写入插件管理的目录，并发回传生效。**v0.4.8（ADR-019）打通「目标」页创建**：类型下拉只列 `kind=target` 的插件，表单字段（是否需要凭据、地址标签/占位/说明）由插件 `describe_json.target` 声明 —— 此前前端把 `kind` 硬编码为 webdav 且后端一律强制凭据，导致插件目标**建不出来** |
 | | 内置 webdav 目标 ABI 化 | ✅ | **方案 C（2026-09-26）**：内置插件同样提供静态 `KzwrTargetAbi` 表（`builtin/webdav_abi.rs`），由 `WebdavAbiPlugin`（组合 `CApiTarget`）注册；与外部 `.so` 走同一份契约。传输 = 临时文件累积密文 → `write_end` 一次性喂 `WebdavTarget`；NAS 端到端实测备份/恢复均逐字节一致 |
 | | 并发回传（计划式） | ✅ | `plan_begin`/`plan_next`/`plan_end`：目标**自己决定**分批与节奏，宿主按批并发推送。能力由插件 `supports_plan()` 声明；**开关/并发度按「目标」存** `TargetConfig.parallel`（缺省沿用声明，0/1 关闭，≥2 启用，上限 8）—— 同一个插件会被多个目标实例化，按插件存一份会导致「改一个目标、同类型目标全变」；`POST /api/targets/:id/parallel`，保存后热重建无需重启；前端控件在「目标」页每个目标自己的行内（插件级 `plugins.target_parallel` 仅作旧配置回退） |
 

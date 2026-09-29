@@ -88,6 +88,26 @@ impl CApiTarget {
         Self { meta, abi, caps, ui }
     }
 
+    /// 该目标是否需要用户名/密码（插件在 `describe_json.target.needs_credentials` 声明）
+    pub fn needs_credentials(&self) -> bool {
+        self.caps.needs_credentials
+    }
+
+    /// 目标地址字段的展示标签（插件可自定义，如「目录路径」）
+    pub fn url_label(&self) -> Option<String> {
+        self.caps.url_label.clone()
+    }
+
+    /// 目标地址字段的占位提示
+    pub fn url_placeholder(&self) -> Option<String> {
+        self.caps.url_placeholder.clone()
+    }
+
+    /// 目标地址字段的说明文字
+    pub fn url_hint(&self) -> Option<String> {
+        self.caps.url_hint.clone()
+    }
+
     /// 是否支持并发回传：插件声明支持，且确实实现了 `plan_begin` / `plan_next`
     pub fn supports_plan(&self) -> bool {
         self.caps.supports_plan
@@ -221,6 +241,19 @@ impl TargetPlugin for CApiTarget {
     }
     fn supports_plan(&self) -> bool {
         CApiTarget::supports_plan(self)
+    }
+    /// 由插件在 `describe_json.target.needs_credentials` 声明（缺省 `true`）
+    fn needs_credentials(&self) -> bool {
+        CApiTarget::needs_credentials(self)
+    }
+    fn url_label(&self) -> Option<String> {
+        CApiTarget::url_label(self)
+    }
+    fn url_placeholder(&self) -> Option<String> {
+        CApiTarget::url_placeholder(self)
+    }
+    fn url_hint(&self) -> Option<String> {
+        CApiTarget::url_hint(self)
     }
     fn build(&self, target: &TargetConfig, mgr: &ConfigManager) -> Option<(Arc<dyn TargetStorage>, String)> {
         // 解密在调用方/mgr 内完成（与内置目标一致）
@@ -840,6 +873,10 @@ mod tests {
                 supports_plan: true,
                 max_parallel: 0,
                 preferred_chunk_kib: 1024,
+                needs_credentials: true,
+                url_label: None,
+                url_placeholder: None,
+                url_hint: None,
             },
             None,
         );
@@ -869,6 +906,10 @@ mod tests {
                 supports_plan: true,
                 max_parallel: 0,
                 preferred_chunk_kib: 1024,
+                needs_credentials: true,
+                url_label: None,
+                url_placeholder: None,
+                url_hint: None,
             },
             None,
         );
@@ -894,6 +935,10 @@ mod tests {
                 supports_plan: true,
                 max_parallel: 0,
                 preferred_chunk_kib: 1024,
+                needs_credentials: true,
+                url_label: None,
+                url_placeholder: None,
+                url_hint: None,
             },
             None,
         );
@@ -920,6 +965,10 @@ mod tests {
                 supports_plan: true,
                 max_parallel: 0,
                 preferred_chunk_kib: 1024,
+                needs_credentials: true,
+                url_label: None,
+                url_placeholder: None,
+                url_hint: None,
             },
             None,
         );

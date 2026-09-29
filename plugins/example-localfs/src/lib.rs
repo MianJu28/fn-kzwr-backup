@@ -457,7 +457,14 @@ extern "C" fn describe() -> *mut c_char {
                 "write": "push",
                 "supports_plan": true,
                 "max_parallel": 4,
-                "preferred_chunk_kib": 1024
+                "preferred_chunk_kib": 1024,
+                // 本地目录目标**不用凭据**：只认一个路径。
+                // 不声明的话宿主会强制要求账号密码，用户在「目标」页建不出本插件目标。
+                "needs_credentials": false,
+                // 告诉前端 `url` 字段的实际语义（否则标签是「地址」，用户不知道该填路径）
+                "url_label": "目录路径",
+                "url_placeholder": "/vol1/backup/kzwr-localfs",
+                "url_hint": "本机目录的绝对路径；插件只写入 age 密文，明文不会离开宿主机"
             },
             "ui": {
                 "section": "settings",

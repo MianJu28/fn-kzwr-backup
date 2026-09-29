@@ -602,6 +602,39 @@ typedef struct KzwrTargetAbi {
   - `POST /api/plugins/:id/parallel` 仍保留（写插件级回退值），但新代码请用按目标的接口。
 - 插件本身不支持时（未声明 `supports_plan`），即便用户配了并发度也不会启用
 
+### 9.4.1 目标表单的形态由插件声明（`describe_json.target`）
+
+「目标」页的**新建表单**是通用的：字段形态由目标插件声明，前端据此渲染。
+不声明也能用（按 WebDAV 语义渲染），但**不用凭据**的目标必须显式声明，
+否则宿主会强制要求账号密码 —— 用户**根本建不出**这类目标。
+
+```json
+"target": {
+  "needs_credentials": false,
+  "url_label": "目录路径",
+  "url_placeholder": "/vol1/backup/kzwr-localfs",
+  "url_hint": "本机目录的绝对路径；插件只写入 age 密文"
+}
+```
+
+| 字段 | 缺省 | 含义 |
+|---|---|---|
+| `needs_credentials` | **`true`** | 是否需要用户名/密码。`false` = 新建目标允许凭据留空，且保存前**不**做连通性实测（插件通常没有可测的连接） |
+| `url_label` | `"地址"` | `url` 字段的展示标签。让插件说明其含义（WebDAV 是「地址」，本地目录是「目录路径」） |
+| `url_placeholder` | WebDAV 官方地址 | 输入框占位提示 |
+| `url_hint` | WebDAV 说明 | 输入框下方的说明文字 |
+
+要点：
+
+- **`needs_credentials` 缺省为 `true`**（不是 `false`）：老插件不写该字段时行为**完全不变**，
+  不会因为升级而突然跳过凭据校验。
+- `url` 的语义由插件自己解释：WebDAV 是服务地址，本地目录是绝对路径 ——
+  宿主只做「非空」校验并原样透传（`target_json.url`）。
+- 前端在「新建目标」时**只能选 `kind == "target"` 的插件**（增强类插件不出现在类型下拉里）；
+  **类型创建后不可更改**（换类型等于换一种存储，凭据与语义都不同）。
+- 插件自己的设置（如本地目录的 `root`）走 §4.4 的自管配置通道
+  （`ui.blocks` 里 `scope: "host"` 的 `text` 块，值存 `plugin_data` 并注入 `target_json.config`）。
+
 ### 9.5 写一个目标插件（SDK）
 
 SDK 提供了目标表与导出宏，用法与增强插件一致：
@@ -656,7 +689,21 @@ sdk::export_target_v1!(
 
 ## 10. 诊断（目标插件）
 
-- `GET /api/plugins`：每个插件带 `supports_plan`（能力声明）与 `parallel`（该插件的并发度配置）
-- `POST /api/plugins/:id/parallel`：`{"parallel": N}` → 设置该插件的上传并发路数
+- `GET /api/plugins`：每个插件带 `kind`（`target` / `enhance`）、`supports_plan`（能力声明）、
+  `parallel`（**插件级**并发度，仅作回退）与 `needs_credentials` / `url_label` 等表单声明
+- `POST /api/targets/:id/parallel`：`{"parallel": N}` → 设置**该目标**的上传并发路数（推荐）
+- `POST /api/plugins/:id/parallel`：同上，但写的是**插件级回退值**（旧接口，仅兼容保留）
+- `POST /api/targets`：新建/更新目标。`kind` 必须是一个**已注册的目标插件 id**；
+  `needs_credentials=false` 的插件允许不带账号密码
 - 日志：`fnos_backup::plugin::target_abi`（推块/复查/看门狗）、`fnos_backup::domain::backup`（是否走并发回传）
 - 插件与宿主同进程、同权限运行；若不需要这一点，请勿启用
+
+### 10.1 「插件目标建不出来」的排查顺序
+
+1. **插件是否加载**：`GET /api/plugins` 里有没有它？`external.reports` 里的签名/加载诊断怎么说？
+2. **`kind` 是否为 `target`**：增强类插件（`kind: "enhance"`）**不能**作为备份目标，
+   也不会出现在「新建目标」的类型下拉里。
+3. **是否被禁用**：`disabled: true` 的插件不会出现在类型下拉里（禁用了就装配不出来）。
+4. **是否声明了 `needs_credentials: false`**：若插件不用凭据却没声明，保存会被
+   「新目标必须填写用户名与密码」拒绝 —— 这是**最常见**的原因。
+5. **`url` 是否非空**：宿主只校验非空，语义由插件解释（本地目录要填**绝对路径**）。

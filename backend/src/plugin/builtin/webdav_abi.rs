@@ -615,6 +615,11 @@ impl WebdavAbiPlugin {
             supports_plan: true,
             max_parallel: 0,
             preferred_chunk_kib: 1024,
+            // WebDAV 需要账号/密码，且地址就是「地址」（用前端默认文案即可）
+            needs_credentials: true,
+            url_label: None,
+            url_placeholder: None,
+            url_hint: None,
         };
         Self {
             inner: CApiTarget::from_static(abi, meta, caps, ui),
