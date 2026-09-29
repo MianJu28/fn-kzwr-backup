@@ -448,6 +448,10 @@ pub trait EnhancePlugin: Send + Sync {
     ///
     /// **必须在 `AppState` 建好之后**调用：能力表的实现依赖 `AppState`。
     /// 返回 `true` = 插件接受了能力表。
+    ///
+    /// 实现会把它投递到该插件的**专属沙箱线程**上执行 ——
+    /// `host_bind` 是插件启动时最容易被滥用的入口（能读任意文件），
+    /// 不能在未沙箱的调用线程上跑。
     fn bind_host(&self, _state: &crate::AppState) -> bool {
         false
     }

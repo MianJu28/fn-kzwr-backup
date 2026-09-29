@@ -85,6 +85,39 @@ where
     done_rx.await.ok()
 }
 
+/// **同步**版本：在专属线程上执行并**阻塞等待**结果
+///
+/// 用于本来就在同步上下文的调用点（如 `host_bind` 在启动时下发能力表）。
+/// 避免为此把整条调用链改成 async（那会让 axum handler 的 future 突然要求 `Send`，
+/// 波及一片）。
+///
+/// ⚠️ 不要在 tokio worker 线程上跑长任务 —— 它会阻塞该 worker。
+/// `host_bind` 只做初始化（存表 + 建 runtime），耗时可控。
+pub fn run_on_plugin_thread_blocking<F, T>(plugin_id: &str, policy: SandboxPolicy, f: F) -> Option<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let worker = get_or_spawn(plugin_id, policy)?;
+    let (done_tx, done_rx) = mpsc::channel::<T>();
+    let job: Job = Box::new(move || {
+        // 与异步版一致：panic 兜住，不让线程死掉
+        match std::panic::catch_unwind(AssertUnwindSafe(f)) {
+            Ok(v) => {
+                let _ = done_tx.send(v);
+            }
+            Err(_) => {
+                tracing::error!("插件回调 panic（已兜住，专属线程存活）");
+            }
+        }
+    });
+    if worker.tx.send(job).is_err() {
+        tracing::warn!(plugin = %plugin_id, "插件专属线程已退出，本次调用跳过");
+        return None;
+    }
+    done_rx.recv().ok()
+}
+
 /// 该插件的专属线程是否已施加沙箱（诊断用）
 pub fn is_sandboxed(plugin_id: &str) -> Option<bool> {
     workers()

@@ -173,10 +173,31 @@ impl CApiEnhance {
         let ctx = state.host_effects.issue(&id);
         let table = state.host_effects.table();
 
-        // `host_bind` 里插件可能做不少初始化（建 runtime、读盘），故兜异常：
-        // 绑定失败绝不能影响加载与其它插件。
-        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(table, ctx)))
-            .unwrap_or(-1);
+        // **必须走该插件的专属线程（已施加沙箱）**：`host_bind` 是插件启动时
+        // 唯一的、最容易被滥用的入口（它能在这里读任何文件）。
+        // 若直接在调用线程上跑，沙箱就被绕过了。
+        // 同时兜异常：绑定失败绝不能影响加载与其它插件。
+        let policy = super::worker::policy_for(&id, &[]);
+        // 裸指针不是 `Send`，但这两个指针都由宿主签发、**进程内永不释放**
+        // （见 `host_abi` 模块头「指针有效性」），跨线程使用是契约允许的。
+        // 用局部 newtype 显式承担这个保证，而不是靠 `unsafe impl Send` 放宽全局。
+        struct SendPtr(*const super::abi::KzwrHostAbi, *mut std::os::raw::c_void);
+        // 闭包只捕获 SendPtr 本身
+        impl SendPtr {
+            fn parts(&self) -> (*const super::abi::KzwrHostAbi, *mut std::os::raw::c_void) {
+                (self.0, self.1)
+            }
+        }
+        // SAFETY: 能力表是 `&'static`；ctx 由 `HostEffects::contexts` 永久持有。
+        unsafe impl Send for SendPtr {}
+        let sp = SendPtr(table, ctx);
+        let ok = super::worker::run_on_plugin_thread_blocking(&id, policy, move || {
+            // 在闭包**内部**取出裸指针：闭包只捕获 `sp`（Send），
+            // 裸指针不跨线程边界出现在闭包的捕获列表里。
+            let (table, ctx) = sp.parts();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(table, ctx))).unwrap_or(-1)
+        })
+        .unwrap_or(-1);
         if ok == 0 {
             tracing::info!(plugin = %id, "插件已接受宿主能力表（日志/审计/告警/自配置/进度/定时）");
             true
