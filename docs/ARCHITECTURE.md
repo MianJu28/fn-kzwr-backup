@@ -589,7 +589,9 @@ trait TargetStorage {
 **代价与边界**：
 
 - **`ctx` 是能力边界但不是密码学凭证**：知道别人 `ctx` 地址理论上可冒用。**有意**接受：
-  宿主从不 `dlclose` 插件、进程内互不信任程度有限；真强隔离需进程级方案（未实施）。
+  宿主从不 `dlclose` 插件、进程内互不信任程度有限；真强隔离需进程级方案
+  （**已评估：见 [`PLUGIN_ISOLATION.md`](PLUGIN_ISOLATION.md)**，推荐先用
+  「每插件专属线程 + Landlock」拿到文件与 `/proc/<pid>/mem` 防护，子进程留待第三方插件需求）。
 - **宿主不变式新增一条**：「**不得跨 FFI 持任何锁**」——`config_get` 同步读逼迫此事。
   已发现并规避的真实隐患：`/api/plugins` 先 `state.config.lock()` 再 `describe()`，
   而 `describe()` 会进插件 `available_json`；若 `config_get` 也抢同一把锁就会**自死锁**。

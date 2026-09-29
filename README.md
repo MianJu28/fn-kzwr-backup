@@ -143,6 +143,7 @@ url = "https://dav.kzwr.com/dav"
 - `docs/TECH_SELECTION.md` — 技术选型分析
 - `docs/PLUGIN_ABI.md` — **插件接口契约（稳定 C ABI v1）**：符号、JSON schema、**目标能力表（自定义备份目标）**、并发回传、版本演进规则、安全边界（内置与外置插件同契约）
 - `docs/PLUGIN_PLAN.md` — 插件方案评审记录与分批实施进度（ADR-013 配套）
+- `docs/PLUGIN_ISOLATION.md` — **插件同进程隔离的进程级方案评估**（Landlock 实测、四档对比、推荐路线）
 
 ## 📦 产物与仓库约定
 

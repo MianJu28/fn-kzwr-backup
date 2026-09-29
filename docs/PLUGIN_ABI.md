@@ -419,7 +419,8 @@ if sdk::host::available() {
 
 > **安全取舍**：`ctx` 是不透明指针而非密码学凭证——理论上知道了别人的 `ctx` 地址就能冒用。
 > 这是个**有意的**取舍：宿主从不 `dlclose` 插件、进程内插件互不信任程度有限；
-> 真要强隔离得上进程级方案（文档另述）。宿主侧不变式（不跨 FFI 持锁、每入口 `catch_unwind`、
+> 真要强隔离得上进程级方案（**评估见 [`docs/PLUGIN_ISOLATION.md`](PLUGIN_ISOLATION.md)**：
+> 含 Landlock 实测、四个档位对比与推荐路线）。宿主侧不变式（不跨 FFI 持锁、每入口 `catch_unwind`、
 > 入参校验 + 4 KiB 截断 + 令牌桶限流）已由 `plugin/host_abi.rs` 落实，并有单元测试钉住。
 
 ## 5. 版本演进规则
@@ -573,7 +574,7 @@ typedef struct KzwrTargetAbi {
 | 传输句柄 `h` | 一次传输的上下文；`write_end` / `write_abort` / `read_end` 之后即失效 |
 | 错误码 | `int < 0` = 失败，宿主随后调 `last_error_json` 取详情；`-2` 映射为认证错误 |
 | **字节复查** | `write_end` 返回**实写密文字节数**；宿主与已喂出的字节数比对，不一致 → 该文件不落快照、任务标记失败（防静默截断） |
-| 看门狗 | 宿主侧检测进度停滞（默认 120s）→ 判失败并告警。单次阻塞 FFI **无法强制中断**（同进程模型固有限制） |
+| 看门狗 | 宿主侧检测进度停滞（默认 120s）→ 判失败并告警。单次阻塞 FFI **无法强制中断**（同进程模型固有限制；子进程方案才可强杀，见 [`PLUGIN_ISOLATION.md`](PLUGIN_ISOLATION.md)） |
 | 快照粒度 | 按文件：每个 `write_end` 成功即 upsert 该文件的快照（真断点续传） |
 | 路径口径 | **`rel_path` 一律是目标端路径**（含目标前缀）。多源备份时源内相对路径会重名，只有目标端路径唯一 |
 
@@ -771,7 +772,8 @@ sdk::export_target_v1!(
 - `POST /api/targets`：新建/更新目标。`kind` 必须是一个**已注册的目标插件 id**；
   `needs_credentials=false` 的插件允许不带账号密码
 - 日志：`fnos_backup::plugin::target_abi`（推块/复查/看门狗）、`fnos_backup::domain::backup`（是否走并发回传）
-- 插件与宿主同进程、同权限运行；若不需要这一点，请勿启用
+- 插件与宿主同进程、同权限运行（**隔离评估与缓解路线见 [`docs/PLUGIN_ISOLATION.md`](PLUGIN_ISOLATION.md)**）；
+  若不需要这一点，请勿启用
 
 ### 10.1 「插件目标建不出来」的排查顺序
 
