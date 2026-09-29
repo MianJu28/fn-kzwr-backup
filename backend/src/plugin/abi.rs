@@ -334,7 +334,7 @@ pub struct KzwrTargetAbi {
     /// 保存前的连通性测试（实例尚未建立时用；入参 `target_json`）
     pub test_json: Option<extern "C" fn(*const c_char) -> *mut c_char>,
 
-    // ── 插件自管配置（宿主代加密存储，命名空间 = 插件 id） ──────────
+    // ── 插件自管配置（**已弃用**：ADR-021 起宿主不再代存）──────────────
     /// 读一个键（返回 JSON 字符串或裸字符串；NULL = 不存在）
     pub config_get: Option<extern "C" fn(*const c_char) -> *mut c_char>,
     /// 写一个键：0 = 成功

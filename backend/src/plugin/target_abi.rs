@@ -191,7 +191,7 @@ impl CApiTarget {
 
     /// 构造 `target_json`（含该目标凭据，仅传给 `target_open`，不落日志）
     ///
-    /// `config` 是该插件的自管配置命名空间（宿主代加密存储，此处已解密）：插件从这里读
+    /// `config` 是**本目标自己的**自定义字段（`TargetConfig.fields`，按目标加密存储、此处已解密）：插件从这里读
     /// 自己的设置（如 `config.root`）。**整体不得写日志。**
     fn target_json(
         &self,
@@ -208,7 +208,7 @@ impl CApiTarget {
             "url": target.url.clone().unwrap_or_default(),
             "username": user,
             "password": pass,
-            // 插件自管配置（命名空间 = 插件 id；宿主代加密存储，此处解密注入）
+            // 本目标的自定义字段（ADR-021：宿主不再代存**插件级**配置）
             "config": config,
             // **本目标**的插件自定义字段（按目标存储、已解密）
             //
