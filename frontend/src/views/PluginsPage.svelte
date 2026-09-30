@@ -18,11 +18,12 @@
    */
   import Icon from '../components/Icon.svelte';
   import PluginSection from '../components/PluginSection.svelte';
+  import MarketPanel from '../components/MarketPanel.svelte';
   import PluginSettingsModal from '../components/PluginSettingsModal.svelte';
   import { api } from '../lib/api.js';
   import { toast } from '../lib/toast.js';
   import { confirmDialog } from '../lib/confirm.js';
-  import { sectionsFor, FALLBACK_SECTIONS } from '../lib/plugins.js';
+  import { pluginCards, FALLBACK_PLUGINS } from '../lib/plugins.js';
 
   /** 插件清单（来自 /api/plugins） */
   export let plugins = [];
@@ -34,6 +35,10 @@
   /** 是否由环境变量放行未签名插件（只读，仅本机调试） */
   export let pluginsAllowUnsigned = false;
   export let onSavePlugins = null; // (enabled) => Promise<{error?}>
+  /** 插件市场是否启用（来自 /api/config） */
+  export let marketEnabled = false;
+  /** 市场配置保存回调：(patch) => Promise<{error?}> */
+  export let onSaveMarket = null;
 
   export let busy = false;
 
@@ -42,10 +47,9 @@
   /** 正在切换启停的插件 id（按钮 loading 用） */
   let toggling = null;
 
-  // 插件卡片：顺序与组成由后端决定；接口不可用时退回内置兜底，保证页面始终可用
-  $: pluginSections = sectionsFor(
-    plugins && plugins.length ? plugins : FALLBACK_SECTIONS,
-    'settings'
+  // 插件卡片：组成与顺序由后端 `/api/plugins` 决定；接口不可用时退回内置兜底，保证页面可用
+  $: pluginSections = pluginCards(
+    plugins && plugins.length ? plugins : FALLBACK_PLUGINS
   );
 
   /**
@@ -263,6 +267,14 @@
   allowUnsigned={pluginsAllowUnsigned}
   {busy}
   onSave={onSavePlugins}
+/>
+
+<!-- ── 插件市场（默认关闭；关闭时不联网）────────────────────────── -->
+<MarketPanel
+  enabled={marketEnabled}
+  {busy}
+  onSave={onSaveMarket}
+  onDone={onPluginDone}
 />
 
 <!-- ── 插件设置弹窗（内容由插件自己声明）────────────────────────── -->

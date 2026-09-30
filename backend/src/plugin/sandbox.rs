@@ -164,10 +164,21 @@ impl SandboxPolicy {
     /// 构建「插件专用」策略：给它自己的数据目录、目标需要的路径、以及必要系统目录
     ///
     /// - `own_data_dir`：插件私有目录（读写）——它的配置与缓存都在这
+    /// - `plugin_id`：用于派生**该插件专属**的临时目录（见下）
     /// - `extra`：额外需要读写的路径（如本地目录目标的根、任务源路径）
     /// - 系统只读：`/etc`（时区/证书）、`/usr`（动态库）、`/dev/urandom`、
     ///   **`/proc/self`**（很多库要读，必须显式允许）
-    pub fn for_plugin(own_data_dir: &Path, extra: &[PathBuf]) -> Self {
+    ///
+    /// ## 为什么临时目录要按插件隔离（而不是共享 `/tmp`）
+    ///
+    /// 曾经把 `/tmp` 整目录设为**可写**。问题：所有插件进程内共享同一个 `/tmp`，
+    /// 于是插件 A 能写文件、插件 B 读走 —— **插件之间存在一条宿主看不见的信道**。
+    /// 市场场景下装多个第三方插件是常态，这条信道没有正当用途、只有风险
+    /// （还附带符号链接/竞态一类的共享临时目录问题）。
+    ///
+    /// 改为 `/tmp/fn-kzwr-plugin-<id>/`（**只**给本插件读写），既保留插件做中间
+    /// 文件的能力（`example-localfs` 的临时落定等），又切断插件间信道。
+    pub fn for_plugin(plugin_id: &str, own_data_dir: &Path, extra: &[PathBuf]) -> Self {
         let mut paths: Vec<(PathBuf, bool)> = vec![
             // ⚠️ `/proc/self` 必须显式允许：Landlock 会连它一起挡住
             (PathBuf::from("/proc/self"), false),
@@ -180,8 +191,8 @@ impl SandboxPolicy {
             (PathBuf::from("/run"), false),
         ];
         paths.push((own_data_dir.to_path_buf(), true));
-        // /tmp：插件可能用它做中间文件（如 example-localfs 的临时落定）
-        paths.push((PathBuf::from("/tmp"), true));
+        // 插件专属临时目录（替代共享可写的 /tmp）
+        paths.push((Self::plugin_tmp_dir(plugin_id), true));
         for p in extra {
             paths.push((p.clone(), true));
         }
@@ -190,6 +201,31 @@ impl SandboxPolicy {
             net_ports: Vec::new(),
             restrict_net: false,
         }
+    }
+
+    /// 该插件专属的临时目录：`/tmp/fn-kzwr-plugin-<id>`
+    ///
+    /// `id` 里的路径分隔符会被替换成 `_`：插件 id 来自插件自报的 `describe_json`
+    /// （第三方可控），绝不能让它靠 `../` 之类把白名单指到别处。
+    ///
+    /// 目录在**施加沙箱之前**创建（Landlock 白名单路径必须已存在，否则规则会被跳过，
+    /// 表现为插件写临时文件失败）。创建失败不阻断 —— 白名单仍然生效，
+    /// 只是该目录可能因不存在而被跳过，插件会拿到「写不了」的错误。
+    pub fn plugin_tmp_dir(plugin_id: &str) -> PathBuf {
+        let safe: String = plugin_id
+            .chars()
+            .map(|c| if c == '/' || c == '\\' || c == '.' { '_' } else { c })
+            .collect();
+        let dir = std::env::temp_dir().join(format!("fn-kzwr-plugin-{safe}"));
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(
+                plugin = %plugin_id,
+                dir = %dir.display(),
+                err = %e,
+                "创建插件专属临时目录失败（该插件写临时文件会失败）"
+            );
+        }
+        dir
     }
 
     /// 限制网络为「只允许连这些端口」（kzwr 只需 443）
@@ -316,7 +352,7 @@ mod tests {
 
     #[test]
     fn policy_builder_includes_proc_self() {
-        let p = SandboxPolicy::for_plugin(Path::new("/tmp/plug"), &[]);
+        let p = SandboxPolicy::for_plugin("test-plugin", Path::new("/tmp/plug"), &[]);
         assert!(
             p.paths.iter().any(|(path, _)| path == Path::new("/proc/self")),
             "必须显式允许 /proc/self —— Landlock 会连它一起挡住"
@@ -329,9 +365,52 @@ mod tests {
 
     #[test]
     fn allow_tcp_ports_enables_net_restriction() {
-        let p = SandboxPolicy::for_plugin(Path::new("/tmp/plug"), &[]).allow_tcp_ports(&[443]);
+        let p = SandboxPolicy::for_plugin("test-plugin", Path::new("/tmp/plug"), &[]).allow_tcp_ports(&[443]);
         assert!(p.restrict_net);
         assert_eq!(p.net_ports, vec![443]);
+    }
+
+    /// 临时目录必须**按插件隔离**，且不再把共享的 `/tmp` 整目录设为可写
+    ///
+    /// 共享可写 `/tmp` 会让插件之间形成一条宿主看不见的信道
+    /// （A 写文件、B 读走）。市场场景下多插件共存是常态，这条信道没有正当用途。
+    #[test]
+    fn tmp_dir_is_per_plugin_not_shared() {
+        let a = SandboxPolicy::for_plugin("plug-a", Path::new("/tmp/a"), &[]);
+        let b = SandboxPolicy::for_plugin("plug-b", Path::new("/tmp/b"), &[]);
+
+        // 1) 共享的 /tmp 不应出现在白名单里
+        for p in [&a, &b] {
+            assert!(
+                !p.paths.iter().any(|(path, w)| path == Path::new("/tmp") && *w),
+                "不应把共享的 /tmp 整目录设为可写（会形成插件间信道）"
+            );
+        }
+        // 2) 各自拿到不同的、可写的专属目录
+        let ta = a
+            .paths
+            .iter()
+            .find(|(path, w)| *w && path.to_string_lossy().contains("fn-kzwr-plugin-"))
+            .map(|(path, _)| path.clone())
+            .expect("应有插件专属临时目录");
+        let tb = b
+            .paths
+            .iter()
+            .find(|(path, w)| *w && path.to_string_lossy().contains("fn-kzwr-plugin-"))
+            .map(|(path, _)| path.clone())
+            .expect("应有插件专属临时目录");
+        assert_ne!(ta, tb, "不同插件的临时目录必须不同");
+    }
+
+    /// 插件 id 含路径分隔符时不得逃出白名单目录（`../` 之类）
+    #[test]
+    fn plugin_tmp_dir_neutralizes_path_separators() {
+        let d = SandboxPolicy::plugin_tmp_dir("../../etc");
+        let s = d.to_string_lossy();
+        assert!(
+            !s.contains("..") && !s.contains("/etc"),
+            "插件 id 里的分隔符必须被中和，实际得到：{s}"
+        );
     }
 
     /// 施加沙箱后：**未列入白名单**的路径不可读，列入的可读
@@ -391,7 +470,7 @@ mod tests {
     /// 沙箱就白做了 —— 这条测试会立刻报错。
     #[test]
     fn default_policy_does_not_whitelist_config_dir() {
-        let p = SandboxPolicy::for_plugin(Path::new("/tmp/plug"), &[]);
+        let p = SandboxPolicy::for_plugin("test-plugin", Path::new("/tmp/plug"), &[]);
         for (path, _) in &p.paths {
             let s = path.to_string_lossy();
             assert!(

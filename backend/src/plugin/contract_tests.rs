@@ -35,7 +35,6 @@ fn kzwr_describe_parses_with_host_types() {
     assert_eq!(v.kind.as_deref(), Some("enhance"));
     assert!(!v.name.trim().is_empty());
     let ui = v.ui.expect("kzwr 必须声明 ui（否则插件页只有空卡片）");
-    assert_eq!(ui.section, "settings", "分区必须是既有稳定取值");
     assert!(!ui.blocks.is_empty(), "必须有通用区块：前端没有 kzwr 专属组件了");
 
     // 必须包含多账号区块，且数据契约字段齐备（前端按这些路径直接发请求）
@@ -94,22 +93,17 @@ fn kzwr_describe_parses_with_host_types() {
 
 #[test]
 fn kzwr_declares_no_host_stored_fields() {
-    // 迁移要点：kzwr 的凭据/阈值由**插件自己**存（plugin_data 命名空间 + 声明式回写），
+    // 迁移要点：kzwr 的凭据/阈值由**插件自己**存（自己的 `own_data_dir` + 声明式回写），
     // 不再走宿主代管的 `scope:"host"` 表单，也不该有 `cfg.kzwr.*` 残留。
+    //
+    // 注意：`UiBlock` 的 `scope` 字段已随 ADR-021 一并删除，故这里只能对**原始文本**
+    // 断言（而不是像以前那样反序列化后检查字段值）—— 效果相同且更严格：
+    // 任何形式出现的 `scope`/`host` 都会被挡下。
     let v: crate::plugin::abi::AbiDescribe =
         serde_json::from_str(&read_describe("kzwr")).unwrap();
-    let ui = v.ui.unwrap();
-    for b in &ui.blocks {
-        let scope = match b {
-            UiBlock::Text { scope, .. } => scope.as_deref(),
-            UiBlock::Number { scope, .. } => scope.as_deref(),
-            UiBlock::Toggle { scope, .. } => scope.as_deref(),
-            _ => None,
-        };
-        assert_ne!(scope, Some("host"), "kzwr 不得使用宿主代管字段（配置归插件所有）");
-    }
+    assert!(v.ui.is_some(), "kzwr 必须声明 ui");
     let raw = read_describe("kzwr");
-    for banned in ["access_token", "quota_warn_percent", "cfg.kzwr"] {
+    for banned in ["access_token", "quota_warn_percent", "cfg.kzwr", "\"scope\"", "\"host\""] {
         assert!(!raw.contains(banned), "describe 里不该再出现核心时代的字段名 {banned}");
     }
 }
@@ -260,15 +254,61 @@ fn struct_fields(src: &str, name: &str) -> Vec<String> {
     out
 }
 
+
+/// 读取 `abi-layout.txt` 快照里的某张表字段名
+///
+/// **为什么需要它**：插件源码迁到独立仓库 `fn-kzwr-backup-plugins` 后，本仓库不再有
+/// `plugins/sdk/src/lib.rs` 可读。快照是两仓库的**共同契约**：
+/// 本仓库比对「宿主 abi.rs ↔ 快照」，插件仓库 CI 比对「SDK ↔ 快照」，
+/// 任一侧漂移都会在自己的 CI 变红 —— 跨 FFI 布局错位依然拦得住。
+///
+/// 快照不存在时返回 `None`（迁移期兼容）。
+fn snapshot_fields(name: &str) -> Option<Vec<String>> {
+    let p = std::path::Path::new(PLUGINS_DIR).join("..").join("abi-layout.txt");
+    let raw = std::fs::read_to_string(&p).ok()?;
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            cur = line.trim_matches(['[', ']']).to_string();
+            continue;
+        }
+        if cur == name {
+            out.push(line.to_string());
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// SDK 源码路径（迁移到独立仓库后不存在）
+fn sdk_path() -> std::path::PathBuf {
+    std::path::Path::new(PLUGINS_DIR).join("sdk/src/lib.rs")
+}
+
 #[test]
 fn host_plugin_abi_fields_match_sdk_exactly() {
     let host = read_repo_file("backend/src/plugin/abi.rs");
-    let sdk = read_repo_file("plugins/sdk/src/lib.rs");
     let h = struct_fields(&host, "KzwrPluginAbi");
-    let s = struct_fields(&sdk, "KzwrPluginAbi");
+    // 插件源码仍在同仓库时直接比对 SDK；已迁出则退回比对 abi-layout.txt 快照
+    let s = if sdk_path().is_file() {
+        struct_fields(&read_repo_file("plugins/sdk/src/lib.rs"), "KzwrPluginAbi")
+    } else {
+        snapshot_fields("KzwrPluginAbi").expect(
+            "既无 plugins/sdk/src/lib.rs 也无 abi-layout.txt —— \
+             无法校验 ABI 布局（跨 FFI 错位会静默崩）",
+        )
+    };
     assert_eq!(
         h, s,
-        "主表 KzwrPluginAbi 两侧字段不一致（宿主 abi.rs vs SDK lib.rs）：\n宿主: {h:?}\nSDK : {s:?}\n\
+        "主表 KzwrPluginAbi 字段与 SDK/快照不一致：\n宿主: {h:?}\n对方: {s:?}\n\
          规则：只能**尾部追加**；顺序/名称必须逐字段相同，否则是静默内存错位"
     );
     // 尾部字段的存在性也要断言，避免有人把 host_bind 放到中间
@@ -278,12 +318,15 @@ fn host_plugin_abi_fields_match_sdk_exactly() {
 #[test]
 fn host_capability_table_fields_match_sdk_exactly() {
     let host = read_repo_file("backend/src/plugin/abi.rs");
-    let sdk = read_repo_file("plugins/sdk/src/lib.rs");
     let h = struct_fields(&host, "KzwrHostAbi");
-    let s = struct_fields(&sdk, "KzwrHostAbi");
+    let s = if sdk_path().is_file() {
+        struct_fields(&read_repo_file("plugins/sdk/src/lib.rs"), "KzwrHostAbi")
+    } else {
+        snapshot_fields("KzwrHostAbi").expect("既无 SDK 也无 ABI 快照，无法校验能力表布局")
+    };
     assert_eq!(
         h, s,
-        "能力表 KzwrHostAbi 两侧字段不一致（宿主 abi.rs vs SDK lib.rs）：\n宿主: {h:?}\nSDK : {s:?}\n\
+        "能力表 KzwrHostAbi 字段与 SDK/快照不一致：\n宿主: {h:?}\n对方: {s:?}\n\
          这是宿主**下发给插件**的表：错位会让插件的日志/告警调用跳错地址"
     );
     assert_eq!(h.first().map(String::as_str), Some("abi"));
@@ -305,7 +348,7 @@ fn host_table_min_size_covers_all_but_optional_tail() {
         KzwrHostAbi::TABLE_SIZE > KzwrHostAbi::MIN_SIZE,
         "能力表的可选尾部字段让完整长度大于必需前缀（若相等，说明 free_str 后没有可选字段了）"
     );
-    assert_eq!(HOST_ABI_VERSION, 1);
+    assert_eq!(HOST_ABI_VERSION, 2);
 
     // 主表：必需前缀只到 free_str 为止，尾部可选字段（destroy/host_bind）不计入
     use crate::plugin::abi::KzwrPluginAbi;
@@ -386,13 +429,9 @@ fn real_plugin_completes_host_bind_handshake() {
         "插件拒绝了宿主能力表（返回 {rc}）—— 说明两侧 ABI 版本或必需前缀不一致"
     );
 
-    // 再经能力表调用一次 `config_get`：验证「宿主分配串 + 插件用 free_str 释放」
+    // 经能力表调用 `own_data_dir`：验证「宿主分配串 + 插件用 free_str 释放」
     // 这条**双向**路径在真实进程里能跑通（布局错位会在这里崩或读到垃圾）。
-    let cfg_get = unsafe { (*host).config_get }.expect("config_get 槽位");
-    let key = std::ffi::CString::new("token").unwrap();
-    let p = unsafe { cfg_get(ctx, key.as_ptr()) };
-    assert!(p.is_null(), "该插件命名空间为空，应返回 NULL");
-    // own_data_dir 则应返回有效路径，且可用 free_str 释放
+    // （原先用 `config_get` 验证，该槽位已随 ABI v2 移除。）
     let own = unsafe { (*host).own_data_dir }.expect("own_data_dir 槽位");
     let dp = unsafe { own(ctx) };
     assert!(!dp.is_null(), "宿主应给出插件私有目录");
@@ -576,4 +615,24 @@ fn example_localfs_declares_its_own_form() {
         src.contains("\"key\": \"url\""),
         "应声明 url 字段（well-known 键，映射到 TargetConfig.url）"
     );
+}
+
+/// `abi-layout.txt` 必须与宿主 `abi.rs` 同步
+///
+/// 这条测试的意义：快照是**两仓库的共同契约**。如果只靠上面两条测试，
+/// 当 SDK 恰好还在本仓库时它们走 SDK 分支，**快照漂移不会被发现**；
+/// 等将来插件迁出（SDK 消失）才暴露，就太晚了。所以这里无条件校验快照本身。
+#[test]
+fn abi_layout_snapshot_is_in_sync_with_host() {
+    for name in ["KzwrPluginAbi", "KzwrHostAbi", "KzwrTargetAbi"] {
+        let host = struct_fields(&read_repo_file("backend/src/plugin/abi.rs"), name);
+        let snap = snapshot_fields(name)
+            .unwrap_or_else(|| panic!("abi-layout.txt 缺少 [{name}] 段"));
+        assert_eq!(
+            host, snap,
+            "[{name}] 宿主字段与 abi-layout.txt 快照不一致：\n宿主: {host:?}\n快照: {snap:?}\n\
+             改动 ABI 表时必须同步更新 abi-layout.txt（两仓库同时提交），\
+             否则插件仓库 CI 会与主仓库判定不一致"
+        );
+    }
 }

@@ -15,6 +15,7 @@ mod common;
 mod config;
 mod keys;
 mod logs;
+mod market;
 mod plugins;
 mod restore;
 mod targets;
@@ -26,7 +27,7 @@ pub(crate) use common::raise_alert_once;
 pub(crate) use tasks::run_task_now;
 
 use types::HealthResponse;
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::response::Json;
 use axum::routing::{get, post};
 use axum::Router;
@@ -74,6 +75,11 @@ pub fn router(state: AppState) -> Router {
         // 按插件启用/禁用（运行时生效，无需重启）
         .route("/plugins/:id/enable", post(plugin_set_enabled))
         .route("/plugins/:id/parallel", post(plugin_parallel))
+        // ── 插件市场（默认关闭；关闭时不发起任何网络请求）──
+        .route("/market/catalog", get(market::market_catalog))
+        .route("/market/install", post(market::market_install))
+        .route("/market/check-updates", post(market::market_check_updates))
+        .route("/market/refresh", post(market::market_refresh))
         .route("/ws", get(ws::ws_handler))
         .route("/webdav/config", post(webdav_save))
         .route("/user/info", get(user_info))

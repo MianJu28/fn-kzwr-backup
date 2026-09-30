@@ -24,7 +24,7 @@ pub(super) async fn plugins_list(State(state): State<AppState>) -> Json<serde_js
     // 保留该响应字段是为了不破坏前端契约（前端仍会渲染「清理遗留配置」提示位）。
     let orphan_data: Vec<String> = Vec::new();
     Json(serde_json::json!({
-        "plugins": state.plugins.describe(&cfg, &mgr),
+        "plugins": state.plugins.describe(&cfg),
         // 有自管数据但插件未加载的 id（卸载残留；前端据此提示清理）
         "orphan_data": orphan_data,
         // 被禁用的插件 id（前端置灰 + 允许重新启用）
@@ -330,7 +330,8 @@ pub(super) async fn plugin_set_enabled(
 pub(super) async fn plugin_reload(State(state): State<AppState>) -> Json<serde_json::Value> {
     let mgr = state.config.lock().unwrap();
     let cfg = mgr.load().unwrap_or_default();
-    drop(mgr);
+    
+    // 走统一入口：内部会把旧 ctx 全部失效、对新插件重新下发能力表
 
     // 走统一入口：内部会把旧 ctx 全部失效、对新插件重新下发能力表
     apply_plugin_switch(&state, &cfg);
@@ -507,12 +508,26 @@ pub(super) async fn plugin_install(
 
 /// `POST /api/plugins/:file/uninstall`：卸载一个**外置**插件（删 .so/.sig + 解绑公钥）
 ///
-/// 与 `purge` 的分工：`purge` 清的是**宿主代管数据**；本接口删的是**插件文件本体**。
+/// 与 `purge` 的分工：`purge` 清的是插件的**自管数据**；本接口删的是**插件文件本体**。
 /// 内置插件不可卸载（它们的代码编译在宿主里）。
+///
+/// body（可选）：`{"purge_data": true|false}`
+/// - 缺省/`false` = **保留**插件的数据目录（重装同一插件时配置与凭据仍在）；
+/// - `true` = 一并删除（复用 `purge` 的语义：引用检查 + `remove_plugin_data_dir`）。
+///
+/// 为什么让调用方显式指定：**卸载**与**删数据**是两件事，后者不可恢复。
+/// 前端据此做「无预选单选」，避免用户不假思索地把凭据一起删掉（评审决策 3）。
 pub(super) async fn plugin_uninstall(
     State(state): State<AppState>,
     axum::extract::Path(file): axum::extract::Path<String>,
+    body: Option<Json<serde_json::Value>>,
 ) -> Json<serde_json::Value> {
+    let purge_data = body
+        .as_ref()
+        .and_then(|Json(v)| v.get("purge_data"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let file = file.trim().to_string();
     if file.is_empty() || file.contains('/') || file.contains("..") {
         return Json(err("文件名不合法"));
@@ -532,6 +547,14 @@ pub(super) async fn plugin_uninstall(
     }
 
     let sig = crate::plugin::loader::sig_path_of(&so_path);
+    // 数据目录按**插件 id** 命名，而本接口拿到的是**文件名** —— 必须在删文件
+    // **之前**从注册表的诊断报告里取出映射，否则删完就查不到了。
+    let plugin_id = state
+        .plugins
+        .external_reports()
+        .into_iter()
+        .find(|r| r.file == file)
+        .and_then(|r| r.id);
     let mut removed = Vec::new();
     for p in [&so_path, &sig] {
         if p.is_file() {
@@ -550,6 +573,21 @@ pub(super) async fn plugin_uninstall(
     }
     drop(mgr);
 
+    // 按用户选择决定数据去留（评审决策 3：卸载与删数据是两件事）
+    let data_removed = if purge_data {
+        match &plugin_id {
+            Some(id) => {
+                state.plugins.call_destroy(id);
+                state.host_effects.revoke(id);
+                remove_plugin_data_dir(&state, id)
+            }
+            // 拿不到 id（如插件本就未加载）：明确告知无法删数据，而不是静默跳过
+            None => false,
+        }
+    } else {
+        false
+    };
+
     // 卸载后**立即热重加载**：让列表与目标池反映删除后的状态（无需重启）
     {
         let cfg2 = { state.config.lock().unwrap().load().unwrap_or_default() };
@@ -559,7 +597,18 @@ pub(super) async fn plugin_uninstall(
 
     state.audit.record(
         "plugin.uninstall",
-        format!("卸载外置插件 {file}（解绑公钥：{untied}）"),
+        format!(
+            "卸载外置插件 {file}（解绑公钥：{untied}；{}数据目录）",
+            if purge_data {
+                if data_removed {
+                    "已删除"
+                } else {
+                    "未能删除"
+                }
+            } else {
+                "保留"
+            }
+        ),
         true,
         None,
     );
@@ -568,7 +617,17 @@ pub(super) async fn plugin_uninstall(
         "file": file,
         "removed": removed,
         "unbound_pubkey": untied,
-        "note": "已删除插件文件并重新加载插件列表。",
+        "data_purged": purge_data,
+        "data_removed": data_removed,
+        "note": if purge_data {
+            if data_removed {
+                "已删除插件文件与数据目录，并重新加载插件列表。"
+            } else {
+                "已删除插件文件；数据目录未能删除（插件未加载时无法定位其数据目录，可稍后用「清除数据」）。"
+            }
+        } else {
+            "已删除插件文件；配置数据已保留（重装同一插件后仍可用）。"
+        },
     }))
 }
 

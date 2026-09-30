@@ -23,7 +23,11 @@ struct ExternalSet {
     targets: Vec<Arc<dyn TargetPlugin>>,
     enhances: Vec<Arc<dyn EnhancePlugin>>,
     /// 动态库句柄：与上面两组插件**配套**保活（Drop 会让 vtable 悬空）
-    libs: Vec<libloading::Library>,
+    ///
+    /// 命名为 `_libs`：本字段**从不被读取**，它的用途恰恰是「在这里被持有、
+    /// 在 `ExternalSet` drop 时才 drop」—— 下划线前缀如实表达这一点，
+    /// 也让 dead_code  lint 静音（若哪天误删它，插件会在运行中被卸载）。
+    _libs: Vec<libloading::Library>,
     /// 加载报告（供 `/api/plugins` 诊断）
     reports: Vec<ExternalPluginReport>,
     /// 外置插件 id → 动态库路径（标注来源）
@@ -34,8 +38,10 @@ struct ExternalSet {
 
 pub struct PluginRegistry {
     /// 内置插件（编译期固定，不可增删）
+    ///
+    /// 只有目标插件有内置（webdav）；增强类插件**一律外置**（ADR-015），
+    /// 曾有的 `builtin_enhances` 恒空，已删 —— 所有增强都从 `external` 取。
     builtin_targets: Vec<Arc<dyn TargetPlugin>>,
-    builtin_enhances: Vec<Arc<dyn EnhancePlugin>>,
     /// **外置插件**（可热替换：`RwLock<Option<ExternalSet>>`）
     ///
     /// 用 `Option` 表达「尚未加载/已关闭」；用 `RwLock` 是因为注册表被
@@ -59,7 +65,6 @@ impl PluginRegistry {
     pub fn builtin() -> Self {
         Self {
             builtin_targets: vec![Arc::new(builtin::webdav_abi::WebdavAbiPlugin::new())],
-            builtin_enhances: Vec::new(),
             external: std::sync::RwLock::new(None),
             disabled: std::sync::RwLock::new(std::collections::HashSet::new()),
         }
@@ -114,7 +119,7 @@ impl PluginRegistry {
         let set = ExternalSet {
             targets: outcome.targets,
             enhances: outcome.enhances,
-            libs: outcome.libs,
+            _libs: outcome.libs,
             reports: outcome.reports,
             paths,
             dirs: dirs
@@ -195,9 +200,8 @@ impl PluginRegistry {
     /// 因此禁用后插件立即不再被调用。
     pub fn enhance_plugins(&self) -> Vec<Arc<dyn EnhancePlugin>> {
         let ext = self.external.read().unwrap();
-        self.builtin_enhances
-            .iter()
-            .chain(ext.iter().flat_map(|s| s.enhances.iter()))
+        ext.iter()
+            .flat_map(|s| s.enhances.iter())
             .filter(|p| !self.is_disabled(&p.meta().id))
             .cloned()
             .collect()
@@ -209,11 +213,7 @@ impl PluginRegistry {
     /// 插件对象仍存活；绑定让插件在重新启用后立刻可用，且禁用时用 `revoke` 收口。
     pub fn all_enhance_plugins(&self) -> Vec<Arc<dyn EnhancePlugin>> {
         let ext = self.external.read().unwrap();
-        self.builtin_enhances
-            .iter()
-            .chain(ext.iter().flat_map(|s| s.enhances.iter()))
-            .cloned()
-            .collect()
+        ext.iter().flat_map(|s| s.enhances.iter()).cloned().collect()
     }
 
     /// 向所有已加载的增强插件下发宿主能力表，返回接受者数量
@@ -232,32 +232,20 @@ impl PluginRegistry {
         if self.is_disabled(id) {
             return None;
         }
-        self.builtin_enhances
-            .iter()
-            .find(|p| p.meta().id == id)
-            .cloned()
-            .or_else(|| {
-                self.external
-                    .read()
-                    .unwrap()
-                    .as_ref()
-                    .and_then(|s| s.enhances.iter().find(|p| p.meta().id == id).cloned())
-            })
+        self.external
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|s| s.enhances.iter().find(|p| p.meta().id == id).cloned())
     }
 
     /// 按 id 取增强插件（**含被禁用者**；诊断/卸载等管理操作用）
     pub fn enhance_plugin_any(&self, id: &str) -> Option<Arc<dyn EnhancePlugin>> {
-        self.builtin_enhances
-            .iter()
-            .find(|p| p.meta().id == id)
-            .cloned()
-            .or_else(|| {
-                self.external
-                    .read()
-                    .unwrap()
-                    .as_ref()
-                    .and_then(|s| s.enhances.iter().find(|p| p.meta().id == id).cloned())
-            })
+        self.external
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|s| s.enhances.iter().find(|p| p.meta().id == id).cloned())
     }
 
     /// 按 id 取目标插件（**含被禁用者**；诊断与管理操作用）
@@ -287,9 +275,8 @@ impl PluginRegistry {
             .chain(ext.iter().flat_map(|s| s.targets.iter()))
             .map(|p| p.meta().id.clone())
             .chain(
-                self.builtin_enhances
-                    .iter()
-                    .chain(ext.iter().flat_map(|s| s.enhances.iter()))
+                ext.iter()
+                    .flat_map(|s| s.enhances.iter())
                     .map(|p| p.meta().id.clone()),
             )
             .collect();
@@ -309,7 +296,7 @@ impl PluginRegistry {
     ///
     /// **包含被禁用的插件**（`disabled: true`）：插件页需要列出它们以便重新启用。
     /// 其它消费方（目标装配、路由分发、生命周期钩子）走的是过滤后的接口。
-    pub fn describe(&self, cfg: &AppConfig, mgr: &ConfigManager) -> Vec<PluginEntry> {
+    pub fn describe(&self, cfg: &AppConfig) -> Vec<PluginEntry> {
         let ext = self.external.read().unwrap();
         let ext_paths = ext.as_ref().map(|s| &s.paths);
         let mut out = Vec::new();
@@ -349,11 +336,7 @@ impl PluginRegistry {
                 form,
             });
         }
-        for p in self
-            .builtin_enhances
-            .iter()
-            .chain(ext.iter().flat_map(|s| s.enhances.iter()))
-        {
+        for p in ext.iter().flat_map(|s| s.enhances.iter()) {
             let meta = p.meta();
             let path = ext_paths.and_then(|m| m.get(&meta.id)).cloned();
             let disabled = self.is_disabled(&meta.id);
@@ -361,7 +344,7 @@ impl PluginRegistry {
                 api_base: format!("/api/p/{}", meta.id),
                 source: if path.is_some() { "external" } else { "builtin" }.to_string(),
                 path,
-                available: !disabled && p.available(cfg, mgr),
+                available: !disabled && p.available(cfg),
                 disabled,
                 ui: p.ui(),
                 meta,
@@ -481,7 +464,7 @@ mod tests {
         assert!(reg.target_plugin_any("webdav").is_some());
 
         // 清单：仍在，且标注 disabled
-        let list = reg.describe(&cfg, &mgr);
+        let list = reg.describe(&cfg, );
         assert_eq!(list.len(), 1, "被禁用的插件仍要出现在清单里");
         for e in &list {
             assert!(e.disabled, "{} 应标注 disabled", e.meta.id);
@@ -493,7 +476,7 @@ mod tests {
         // 重新启用 → 立即恢复
         reg.set_disabled(&[]);
         assert!(reg.target_plugin("webdav").is_some());
-        assert!(reg.describe(&cfg, &mgr).iter().all(|e| !e.disabled));
+        assert!(reg.describe(&cfg, ).iter().all(|e| !e.disabled));
     }
 
     /// 空串与空白项应被忽略（前端传空行不应误禁用某插件）

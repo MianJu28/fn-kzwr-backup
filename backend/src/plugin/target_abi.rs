@@ -254,22 +254,6 @@ impl CApiTarget {
         out
     }
 
-    /// 已建立实例后，从插件取最近错误并映射为 `StorageError`
-    fn err_from(&self, th: *mut c_void, code: i32, what: &str) -> StorageError {
-        let detail = plugin_detail(self.abi, th, format!("{}: 错误码 {}", what, code));
-        if code == -2 {
-            StorageError::Auth(detail)
-        } else {
-            StorageError::Protocol(detail)
-        }
-    }
-}
-
-impl CApiTarget {
-    /// 实例建立后（`build` 成功），在传输回调里把错误码映射成 `StorageError`。
-    fn map_err(&self, th: *mut c_void, code: i32, what: &str) -> StorageError {
-        self.err_from(th, code, what)
-    }
 }
 
 #[async_trait]
@@ -305,9 +289,28 @@ impl TargetPlugin for CApiTarget {
         self.caps.path_fields.clone()
     }
     fn build(&self, target: &TargetConfig, mgr: &ConfigManager) -> Option<(Arc<dyn TargetStorage>, String)> {
+        // 停用的目标不装配（回退占位适配器 ⇒「未就绪」）。
+        // 旧的内置实现有此判断，ABI 化时漏了 ⇒ 停用目标仍显示「已就绪」。
+        if !target.enabled {
+            return None;
+        }
         // 解密在调用方/mgr 内完成（与内置目标一致）
         let creds = mgr.target_credentials(target).ok().unwrap_or((None, None));
         let (user, pass) = (creds.0.as_deref().unwrap_or(""), creds.1.as_deref().unwrap_or(""));
+        // **凭据完整性**：插件声明 `needs_credentials` 时，用户名/密码缺一不可。
+        //
+        // 为什么必须在这里判：插件的 `target_open` 对缺失凭据是**刻意宽容**的 ——
+        // 它返回一个「带 last_error 的实例」好在后续操作时报出人话错误
+        // （见 `builtin/webdav_abi.rs`：凭据缺失时用空凭据建实例并把错误记进 last_error）。
+        // 于是 `target_open` 恒返回非空句柄 ⇒ 这里若只看句柄，就会把
+        // **完全没配凭据的默认目标**报成「已就绪」（用户实际看到的就是这个 bug）。
+        if self.caps.needs_credentials && (user.trim().is_empty() || pass.is_empty()) {
+            tracing::info!(
+                target = %target.id,
+                "目标缺少凭据，回退占位适配器（未就绪）"
+            );
+            return None;
+        }
         // 插件自管配置（命名空间 = 插件 id）解密后注入 `target_json.config`。
         // 注意：此处在 config 锁内（`reload_targets` 持锁调用），只能读、不能写。
         // 宿主不再代存插件配置（ADR-021）⇒ `config` 里**只有本目标自己的字段**。
@@ -387,7 +390,6 @@ impl TargetPlugin for CApiTarget {
             th: th as usize,
             name: self.meta.name.clone(),
             chunk_size: self.chunk_size(),
-            target_name: target.name.clone(),
             pool,
         };
         Some((Arc::new(storage), target.name.clone()))
@@ -442,7 +444,6 @@ struct AbiTargetStorage {
     th: usize,
     name: String,
     chunk_size: usize,
-    target_name: String,
     /// **本实例的沙箱线程池**（每实例一小池；并发回传会在池内并行）
     ///
     /// `None` = 池建立失败（线程创建失败），此时退化为原有的 `spawn_blocking`
@@ -453,6 +454,29 @@ struct AbiTargetStorage {
 // SAFETY: `th` 为插件句柄；线程安全由契约约定（插件自负），宿主按约定调度
 unsafe impl Send for AbiTargetStorage {}
 unsafe impl Sync for AbiTargetStorage {}
+
+impl Drop for AbiTargetStorage {
+    /// 归还插件实例：调用 `target_close` 释放 `target_open` 分配的句柄
+    ///
+    /// **这是 `target_open` 的配对方**（`docs/PLUGIN_ABI.md` 把它列为契约字段，
+    /// 各插件也都实现了 `Box::from_raw` 释放）。此前宿主**从不调用**它 ⇒
+    /// 每次 `reload_targets`（保存配置即触发）都会泄漏一份插件实例。
+    ///
+    /// 与 [`AbiPlanSession`] 的 `Drop` → `plan_end` 是同一模式。
+    /// 注意：`target_close` 是可选字段，且 `th == 0` 表示从未成功打开
+    /// （构建失败时也会构造本结构，故必须判零）。
+    fn drop(&mut self) {
+        let (Some(close), th) = (self.abi.target_close, self.th) else {
+            return;
+        };
+        if th == 0 {
+            return;
+        }
+        // SAFETY: th 由 target_open 发放；Drop 是最后一次使用，
+        // 且 AbiTargetStorage 独占该句柄（每实例一个，不共享）。
+        unsafe { close(th as *mut c_void) };
+    }
+}
 
 impl AbiTargetStorage {
     /// 把阻塞闭包投递到**本实例的沙箱线程池**，返回可 `.await` 的句柄
@@ -981,8 +1005,6 @@ mod tests {
             ensure_dir: None,
             ping: None,
             test_json: None,
-            config_get: None,
-            config_set: None,
             last_error_json: None,
             plan_begin: Some(stub_plan_begin),
             plan_next: Some(stub_plan_next),

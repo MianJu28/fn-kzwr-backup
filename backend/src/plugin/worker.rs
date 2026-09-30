@@ -225,7 +225,7 @@ pub fn policy_for(plugin_id: &str, extra: &[PathBuf]) -> SandboxPolicy {
         Some(root) => root.join(plugin_id),
         None => PathBuf::from("/nonexistent-uninitialized"),
     };
-    SandboxPolicy::for_plugin(&own, extra)
+    SandboxPolicy::for_plugin(plugin_id, &own, extra)
 }
 
 /// 逃生舱：`FN_KZWR_NO_SANDBOX=1` 时不施加沙箱（**仅排障用**）

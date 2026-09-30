@@ -224,10 +224,7 @@
     <div class="icon-wrap"><Icon name="cloud" size={18} /></div>
     <div class="grow">
       <h2 class="card-title">备份目标</h2>
-      <p class="card-desc">
-        远程存储目的地（当前支持 WebDAV）。一个目标 = 一个地址 + 一套账号凭据；
-        <strong>多个任务可共用同一个目标</strong>，每个目标在云端各自独立（快照按目标账号分桶）
-      </p>
+      <p class="card-desc">一个目标 = 一个地址 + 一套凭据；<strong>多个任务可共用</strong></p>
     </div>
     <span class="badge">{targets.length} 个</span>
   </div>
@@ -275,10 +272,7 @@
         <div class="parallel-row">
           <div class="grow">
             <div class="parallel-label">上传并发路数</div>
-            <p class="field-hint">
-              0 或 1 = 顺序上传；≥2 = 并发回传（最多 8）。**仅作用于本目标**；
-              保存后下次备份生效，无需重启。并发会同时占用多条连接。
-            </p>
+            <p class="field-hint">0/1 = 顺序；≥2 = 并发（最多 8）。仅作用于本目标，下次备份生效</p>
           </div>
           <input
             class="parallel-input"

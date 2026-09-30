@@ -558,8 +558,6 @@ pub extern "C" fn fn_kzwr_plugin_target_v1() -> *const KzwrTargetAbi {
         ensure_dir: Some(ensure_dir),
         ping: Some(ping),
         test_json: Some(test_json),
-        config_get: None,
-        config_set: None,
         last_error_json: Some(last_error_json),
         plan_begin: Some(plan_begin),
         plan_next: Some(plan_next),
@@ -598,10 +596,7 @@ impl WebdavAbiPlugin {
         // - 凭据本身在「目标」页管理（多目标模型，ADR-014），这里只作说明与指引；
         // - 上传并发由 `supports_plan` 驱动，前端 `PluginBlocks` 会自动渲染该设置项。
         let ui = Some(PluginUi {
-            section: "settings".to_string(),
             title: "备份目标（WebDAV）".to_string(),
-            order: 10,
-            component: None,
             blocks: vec![UiBlock::Tips {
                 text: "kzwr 官方 WebDAV 备份目标。账号与密码在「目标」页配置 \
                        （支持多个目标，各自独立凭据与快照）。"

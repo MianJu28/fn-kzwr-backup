@@ -131,6 +131,9 @@ pub(super) fn config_response(
         plugins_allow_unsigned: crate::plugin::loader::allow_unsigned_by_env(),
         plugins_disabled: cfg.plugins.disabled.clone(),
         plugins_plugin_pubkeys: cfg.plugins.plugin_pubkeys.clone(),
+        market_enabled: cfg.market.enabled,
+        market_auto_check: cfg.market.auto_check,
+        market_max_artifact_mb: cfg.market.max_artifact_mb,
         error,
     }
 }
@@ -166,6 +169,9 @@ pub(super) async fn config_get(State(state): State<AppState>) -> Json<ConfigResp
             plugins_allow_unsigned: crate::plugin::loader::allow_unsigned_by_env(),
             plugins_disabled: Vec::new(),
             plugins_plugin_pubkeys: std::collections::BTreeMap::new(),
+            market_enabled: false,
+            market_auto_check: false,
+            market_max_artifact_mb: 32,
             webhook_url: None,
             webhook_headers: Vec::new(),
             webhook_body: None,
@@ -292,6 +298,18 @@ pub(super) async fn config_save(
         }
         cleaned.dedup();
         cfg.plugins.pubkeys = cleaned;
+    }
+    // 插件市场：落盘即生效。**打开时只允许一次显式动作** —— 不在这里自动联网，
+    // 用户点「刷新」或进市场页时才拉索引（"不在用户未要求时联网"）。
+    if let Some(v) = body.market_enabled {
+        cfg.market.enabled = v;
+    }
+    if let Some(v) = body.market_auto_check {
+        cfg.market.auto_check = v;
+    }
+    if let Some(v) = body.market_max_artifact_mb {
+        // 下限 1MB、上限 512MB：过小会把正常插件挡掉，过大失去防打爆的意义
+        cfg.market.max_artifact_mb = v.clamp(1, 512);
     }
     match cfg_guard.save(&cfg) {
         Ok(_) => {
@@ -422,9 +440,8 @@ pub(super) async fn config_export(
         key_backed_up: cfg.keys.backed_up,
         targets: bundle_targets,
         tasks: cfg.tasks.clone(),
-        // 插件配置由插件自管（`own_data_dir`），**不随宿主的导出包携带**（ADR-021）：
-        // 其中常含凭据，本来也不该经宿主中转；换机时由用户在插件页重新填写。
-        plugin_data: std::collections::BTreeMap::new(),
+        // 插件配置由插件自管（`own_data_dir`），**不随导出包携带**（ADR-021），
+        // 因此 bundle 里根本没有该字段；换机时由用户在插件页重新填写。
     };
     match serde_json::to_string_pretty(&bundle) {
         Ok(text) => Json(ConfigExportResponse {
@@ -571,10 +588,8 @@ pub(super) async fn config_import(
                 })
                 .collect();
         }
-        // 插件自管数据（`bundle.plugin_data`）：**已弃用（ADR-021）**。
-        // 宿主不再代存插件配置 —— 插件把配置写进自己的 `own_data_dir`，
-        // 随包导出/导入不再携带它们（含凭据，本来也不该经宿主中转）。
-        let _ = &bundle.plugin_data;
+        // 导入包若带着老版本的 `plugin_data` 键：serde 会直接忽略（字段已删）。
+        // 宿主不再代存插件配置 —— 插件把配置写进自己的 `own_data_dir`。
         if let Err(e) = mgr.save(&cfg) {
             return Json(ConfigImportResponse {
                 success: false,

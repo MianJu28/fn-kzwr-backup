@@ -116,10 +116,7 @@ typedef struct KzwrPluginAbi {
   "description": "一句话说明",
   "caps": { "account": false, "quota": false, "recycle_bin": false, "notify": false },
   "ui": {
-    "section": "settings",
     "title": "卡片标题",
-    "order": 90,
-    "component": null,
     "blocks": [
       { "type": "tips", "text": "说明文字" },
       { "type": "metric", "label": "指标名", "value": "值", "hint": "补充说明" },
@@ -177,8 +174,10 @@ typedef struct KzwrPluginAbi {
   该路径，并用响应里的 `{"value": "...", "hint": "..."}` 覆盖静态文案 ——
   用于「空间用量」这类**实时数字**，避免为一个数字写专用前端组件。
   读取失败时保留静态 `value`（可当作兜底文案）。
-- `section` 取值 `settings`/`dashboard` 是**既有约定**（外置插件已按此发送，不要改名）；
-  重构后 `settings` 类卡片渲染在独立的**「插件」页**，与「设置」页无关。
+- ~~`section` 取值 `settings`/`dashboard`~~ **已移除**（`ui.section`/`ui.order`/`ui.component`
+  随插件页重构一并删除）：插件卡片一律渲染在**「插件」页**，不再有分区概念，
+  顺序以 `/api/plugins` 返回为准。老插件的 `describe` 里若仍带这些键，
+  宿主 serde 会忽略未知字段，不影响解析，但建议删掉以免误导。
 
 ### 4.2 `cfg_json`（宿主 → 插件：配置快照，**不含任何凭据**）
 

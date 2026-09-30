@@ -15,10 +15,13 @@
   let inputEl = null;
   let state = null;
   let inputValue = '';
+  /** choices 模式下用户的选择（**初始 null = 无预选**，未选则确认按钮禁用） */
+  let choice = null;
 
   const unsub = confirmState.subscribe((s) => {
     state = s;
     inputValue = '';
+    choice = null;
     if (s) {
       tick().then(() => {
         if (s.input) inputEl?.focus();
@@ -62,6 +65,25 @@
           on:keydown={(e) => e.key === 'Enter' && answerConfirm(inputValue)}
         />
       {/if}
+      {#if state.choices}
+        <div class="choice-list">
+          {#each state.choices as c}
+            <label class="choice" class:sel={choice === c.value}>
+              <input
+                type="radio"
+                name="confirm-choice"
+                value={c.value}
+                checked={choice === c.value}
+                on:change={() => (choice = c.value)}
+              />
+              <span class="choice-body">
+                <span class="choice-label" class:danger={c.danger}>{c.label}</span>
+                {#if c.desc}<span class="choice-desc">{c.desc}</span>{/if}
+              </span>
+            </label>
+          {/each}
+        </div>
+      {/if}
       <div class="modal-actions">
         <button class="btn btn-ghost" on:click={() => answerConfirm(false)}>
           {state.cancelText}
@@ -69,7 +91,9 @@
         <button
           class="btn {state.danger ? 'btn-danger' : 'btn-primary'}"
           bind:this={confirmBtn}
-          on:click={() => answerConfirm(state.input ? inputValue : true)}
+          disabled={state.choices && !choice}
+          on:click={() =>
+            answerConfirm(state.choices ? choice : state.input ? inputValue : true)}
         >
           {state.confirmText}
         </button>
@@ -85,6 +109,50 @@
   .modal-input {
     width: 100%;
     margin: 0;
+  }
+  /* 单选组：每个选项是一整块可点区域，选中态有明显边框 */
+  .choice-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+    margin-top: var(--s3);
+  }
+  .choice {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--s3);
+    padding: var(--s3);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    cursor: pointer;
+    background: var(--surface-2);
+  }
+  .choice.sel {
+    border-color: var(--primary);
+    background: var(--surface);
+  }
+  .choice input {
+    margin-top: 2px;
+    flex-shrink: 0;
+  }
+  .choice-body {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+  }
+  .choice-label {
+    font-size: 13.5px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .choice-label.danger {
+    color: var(--danger);
+  }
+  .choice-desc {
+    font-size: 12.5px;
+    color: var(--text-3);
+    white-space: pre-wrap;
   }
   /* 输入模式：输入框与按钮之间留足间距，避免拥挤 */
   .modal-actions {

@@ -56,10 +56,7 @@
     <div class="icon-wrap"><Icon name="grid" size={18} /></div>
     <div class="grow">
       <h2 class="card-title">备份概况</h2>
-      <p class="card-desc">
-        按「任务 × 目标」聚合。每个任务 = 源文件夹 + 目标 + 定时 + 保留策略，
-        各自独立增量与快照
-      </p>
+      <p class="card-desc">按「任务 × 目标」聚合</p>
     </div>
     <span class="badge">{taskReady}/{taskTotal} 个任务可运行</span>
   </div>

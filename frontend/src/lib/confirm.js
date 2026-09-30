@@ -25,7 +25,12 @@ let resolver = null;
  * @param {boolean} [opts.input]      显示输入框（确认时 resolve 输入字符串，取消 resolve false）
  * @param {string} [opts.placeholder] 输入框占位符
  * @param {string} [opts.inputType]   输入框类型（默认 password）
- * @returns {Promise<boolean|string>} 常规模式 resolve 布尔；input 模式 resolve 字符串或 false
+ * @param {Array<{value:string,label:string,desc?:string,danger?:boolean}>} [opts.choices]
+ *        显示一组**单选**；确认时 resolve 所选项的 `value`。
+ *        **刻意不设默认选中项**：确认按钮在用户做出选择前保持禁用 ——
+ *        用于「卸载时数据去留」这类不可恢复的选择，避免不假思索点确认。
+ * @returns {Promise<boolean|string>} 常规模式 resolve 布尔；input 模式 resolve 字符串或 false；
+ *          choices 模式 resolve 所选项 value（取消 resolve false）
  */
 export function confirmDialog(opts = {}) {
   // 若已有弹窗未处理，先取消上一个，避免 promise 悬挂
@@ -42,6 +47,9 @@ export function confirmDialog(opts = {}) {
     input: !!opts.input,
     placeholder: opts.placeholder || '',
     inputType: opts.inputType || 'password',
+    choices: opts.choices || null,
+    // 选择模式下初始无选中项（见上方注释：不可恢复的选择不预选）
+    choice: null,
   });
   return new Promise((resolve) => {
     resolver = resolve;

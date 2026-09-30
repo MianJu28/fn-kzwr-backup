@@ -159,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
         plugins: registry,
         host_effects,
         audit,
+        market: Arc::new(fnos_backup::plugin::market::Market::default()),
         backup_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         running_task_id: Arc::new(std::sync::RwLock::new(None)),
         crypto,

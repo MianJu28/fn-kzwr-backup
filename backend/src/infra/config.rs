@@ -1,6 +1,6 @@
 //! 配置管理（数据归属：配置 → $TRIM_PKGETC）
 //!
-//! TOML 配置存储，敏感字段（目标凭据、插件自管数据 `plugin_data`）用口令派生密钥加密后存储。
+//! TOML 配置存储，敏感字段（目标凭据）用口令派生密钥加密后存储。
 //! 支持多备份路径。
 
 use std::io::{Read, Write};
@@ -50,16 +50,44 @@ pub struct AppConfig {
     /// 外置插件（动态库）设置
     #[serde(default)]
     pub plugins: PluginSettings,
-    /// ~~插件自管数据（ADR-013 决策 2，宿主代加密存储）~~
-    ///
-    /// **已弃用（ADR-021，2026-09-28）**：宿主**不再代存插件配置** ——
-    /// 插件把配置写进自己的 `own_data_dir`（敏感内容经能力表 `seal`/`unseal` 加密）。
-    ///
-    /// 字段**保留**是为了让老 `config.toml` 仍能解析（否则升级即启动失败）；
-    /// 宿主不再读写它，下次保存时自然消失。升级后用户的插件配置需重新填写
-    /// （与 v0.4.5「kzwr 不搬运旧配置」同一决策）。
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub plugin_data: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    /// 插件市场设置（**默认关闭**：不在用户未要求时联网或加载代码）
+    #[serde(default)]
+    pub market: MarketSettings,
+}
+
+/// 插件市场设置
+///
+/// 市场是**可选功能**：默认不启用、不自动联网。理由与 `PluginSettings::enabled`
+/// 一致 —— 从网络下载并执行第三方 `*.so` 必须由用户显式开启。
+///
+/// 索引地址**故意不在配置里**（评审决策：不允许用户自定义源），它是
+/// `crate::plugin::market::INDEX_URLS` 里的编译期常量 —— 这样"信任面"无法被
+/// 用户或攻击者改写，多源只是**官方维护**的可用性冗余。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketSettings {
+    /// 是否启用市场（关闭时市场页折叠、且不发起任何网络请求）
+    #[serde(default)]
+    pub enabled: bool,
+    /// 启动时自动检查插件更新（**默认关**：不在用户没要求时联网）
+    #[serde(default)]
+    pub auto_check: bool,
+    /// 单个制品下载上限（MB）：防被塞超大文件打爆磁盘/内存
+    #[serde(default = "default_max_artifact_mb")]
+    pub max_artifact_mb: u32,
+}
+
+fn default_max_artifact_mb() -> u32 {
+    32
+}
+
+impl Default for MarketSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_check: false,
+            max_artifact_mb: default_max_artifact_mb(),
+        }
+    }
 }
 
 /// 外置插件设置（ADR-013 方案 B：动态库）
@@ -175,13 +203,13 @@ pub struct TargetConfig {
     /// **插件自定义的目标字段**（键 → 值，`enc:` 前缀表示加密存储）
     ///
     /// 由目标插件的 `describe_json.target.form` 声明字段，宿主**只负责存取、不解释语义**；
-    /// 这些键与 `plugin_data` 合并后注入 `target_json.config`，插件从自己的命名空间读。
+    /// 这些键注入 `target_json.config`，插件从自己的命名空间读。
     ///
-    /// 为什么按**目标**存而不是复用 `plugin_data[插件id]`：后者是**插件级**的，
+    /// 为什么按**目标**存：曾有**插件级**的 `plugin_data[插件id]`（已删），
     /// 一个插件的多个目标会共用同一份配置 —— 正是并发度踩过的那个坑
     /// （「本地目录 A 的路径」与「本地目录 B 的路径」必须是两回事）。
     ///
-    /// 键名规则与 `plugin_data` 一致（非空、≤64、`[A-Za-z0-9_-]`，**不允许点号**）。
+    /// 键名规则（非空、≤64、`[A-Za-z0-9_-]`，**不允许点号**）。
     #[serde(default)]
     pub fields: std::collections::BTreeMap<String, String>,
 }
@@ -774,23 +802,24 @@ greeting = "enc:CCCC"
         assert_eq!(cfg.tasks[0].retention.recycle_max_gb, 20, "任务级回收站门槛应完好");
         assert!(cfg.tasks[0].retention.empty_recycle_bin, "保留策略开关应完好");
         assert!(cfg.plugins.enabled, "外置插件开关应完好");
-        assert_eq!(
-            cfg.plugin_data.keys().collect::<Vec<_>>(),
-            vec!["example"],
-            "其它插件的自管数据不得受迁移影响"
-        );
+        // `[plugin_data.example]` 与 `[kzwr]` 一样是旧宿主代存段 ⇒ 被直接忽略
+        // （字段已删），插件配置一律由各插件在 own_data_dir 自管
         // 迁移是**不搬运**旧 token 的（用户重填）：这里确认宿主确实不再持有该段，
         // 而不是「还在但没人读」——留着只会让导出包继续带敏感明文。
         let text = toml::to_string(&cfg).expect("重新序列化");
-        assert!(!text.contains("quota_warn_percent"), "遗留 [kzwr] 段应在下次保存时消失：{text}");
+        assert!(
+            !text.contains("quota_warn_percent") && !text.contains("plugin_data"),
+            "遗留段应在下次保存时消失：{text}"
+        );
     }
 
-    /// **宿主不再代存插件配置**（ADR-021）：`plugin_data` 段必须能解析但被忽略
+    /// 老 `config.toml` 里的 `[plugin_data.*]` 段必须**被忽略而不是报错**
     ///
-    /// 回归保护：老 `config.toml` 里带着 `[plugin_data.kzwr]` 时，
-    /// 升级后必须**照常启动**（解析成功），且该段在下次保存时消失。
+    /// ADR-021 起宿主不再代存插件配置，字段本身已随代码清理删除。
+    /// 回归保护：带着旧段的配置升级后必须**照常启动**（serde 默认忽略未知段），
+    /// 且该段在下次保存时自然消失。
     #[test]
-    fn legacy_plugin_data_section_is_parsed_but_unused() {
+    fn legacy_plugin_data_section_is_ignored() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(CONFIG_FILE);
         std::fs::write(
@@ -807,11 +836,8 @@ root = "/vol1/backup"
         .expect("write legacy config");
 
         let m = ConfigManager::new(dir.path(), SecretString::from("test-pass".to_string()));
-        let mut cfg = m.load().expect("老配置必须能载入（否则升级即启动失败）");
-        // 字段仍在（为了兼容解析），但宿主**不再读它**
-        assert!(cfg.plugin_data.contains_key("kzwr"), "旧段应能解析出来");
-        // 保存后应消失（`skip_serializing_if` 空表 + 宿主不再写它）
-        cfg.plugin_data.clear();
+        let cfg = m.load().expect("老配置必须能载入（否则升级即启动失败）");
+        // 空配置也必须能正常保存（不因被忽略的旧段而报错）
         m.save(&cfg).expect("save");
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(!text.contains("plugin_data"), "清空后不应再序列化该段：{text}");

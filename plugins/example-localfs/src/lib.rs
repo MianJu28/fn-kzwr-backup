@@ -527,10 +527,7 @@ extern "C" fn describe() -> *mut c_char {
                 ]
             },
             "ui": {
-                "section": "settings",
                 "title": "示例目标：本地目录",
-                "order": 95,
-                "component": null,
                 "blocks": [
                     {
                         "type": "tips",
@@ -545,7 +542,7 @@ extern "C" fn describe() -> *mut c_char {
                     {
                         // 目录等设置**不再由宿主代存**（ADR-021）：它们是**目标自己的属性**，
                         // 已在「新建/编辑目标」弹窗里按 `target.form` 声明（见上方 form）。
-                        // 因此这里不再提供 `scope: "host"` 的表单块。
+                        // 因此这里不提供表单块（`scope` 字段本身也已从 ABI 移除）。
                         "type": "tips",
                         "text": "目录路径与子目录在「目标」页每个目标自己的编辑弹窗里填写（可建多个目标指向不同目录）。"
                     }

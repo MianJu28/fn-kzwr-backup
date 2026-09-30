@@ -23,7 +23,7 @@
 //! use fn_kzwr_plugin_sdk as sdk;
 //!
 //! extern "C" fn describe() -> *mut std::os::raw::c_char {
-//!     sdk::to_c_string(r#"{"id":"hello","name":"示例","ui":{"section":"settings","title":"示例","order":90,"blocks":[]}}"#)
+//!     sdk::to_c_string(r#"{"id":"hello","name":"示例","ui":{"title":"示例","blocks":[]}}"#)
 //! }
 //! extern "C" fn available(_cfg: *const std::os::raw::c_char) -> *mut std::os::raw::c_char {
 //!     sdk::to_c_string(r#"{"available":true}"#)
@@ -52,7 +52,11 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 
 /// ABI 版本（与宿主保持一致；破坏性改动才会 +1）
-pub const ABI_VERSION: u32 = 1;
+///
+/// **v2**：三张表移除全部 `config_get`/`config_set` 死字段（字段位于表中部的
+/// 破坏性布局改动）。宿主对 `abi != 2` 的 v1 插件会**干净拒绝**并给出明确
+/// 错误（而不是错读函数指针），因此老 .so 升级宿主后需重新编译。
+pub const ABI_VERSION: u32 = 2;
 
 /// 返回 JSON 字符串的无参回调
 pub type JsonFn0 = extern "C" fn() -> *mut c_char;
@@ -98,7 +102,10 @@ pub type HostBindFn =
 // ── 宿主能力表（宿主 → 插件；用 `host::*` 安全 API 访问，不要直接解引用）──
 
 /// 宿主能力表 ABI 版本（独立于 [`ABI_VERSION`] 计数）
-pub const HOST_ABI_VERSION: u32 = 1;
+///
+/// **v2**：移除已弃用的 `config_get`/`config_set` 桩。`host_bind` 先校验版本，
+/// v1 老宿主给 v2 表时本 SDK 会拒绝接受并安全降级（声明式通道不受影响）。
+pub const HOST_ABI_VERSION: u32 = 2;
 
 /// 日志级别（与宿主一致）
 pub const LOG_TRACE: i32 = 0;
@@ -136,13 +143,6 @@ pub struct KzwrHostAbi {
     pub alert: Option<extern "C" fn(*mut std::os::raw::c_void, i32, *const c_char)>,
     /// 消解本插件告警（按消息前缀）：`(ctx, prefix)`
     pub resolve_alerts: Option<extern "C" fn(*mut std::os::raw::c_void, *const c_char)>,
-    /// 同步读自管配置：返回 NULL = 不存在（返回串须用 `free_str` 释放）
-    pub config_get:
-        Option<extern "C" fn(*mut std::os::raw::c_void, *const c_char) -> *mut c_char>,
-    /// 写自管配置：0 = 已受理
-    pub config_set: Option<
-        extern "C" fn(*mut std::os::raw::c_void, *const c_char, *const c_char) -> i32,
-    >,
     /// 宿主版本串（静态内存，**不得释放**）
     pub host_version: Option<extern "C" fn() -> *const c_char>,
     /// 当前毫秒时间戳
@@ -172,7 +172,6 @@ pub struct KzwrHostAbi {
 /// ```ignore
 /// if sdk::host::available() {
 ///     sdk::host::log(sdk::LOG_INFO, "插件已就绪");
-///     if let Some(token) = sdk::host::config_get("token") { /* 用明文 token */ }
 ///     sdk::host::audit("kzwr.trash.auto", "自动清空回收站：3 个文件", true);
 /// }
 /// ```
@@ -318,51 +317,6 @@ pub mod host {
         }
     }
 
-    /// 读自管配置（**同步**返回明文；不存在 → `None`）
-    ///
-    /// 需要配置的动作前应**每次重读**（用户可能刚在设置页改过）。
-    pub fn config_get(key: &str) -> Option<String> {
-        let off = std::mem::offset_of!(KzwrHostAbi, config_get);
-        if !has(off, std::mem::size_of::<usize>()) {
-            return None;
-        }
-        let (table, ctx) = bound()?;
-        let f = unsafe { (*table).config_get }?;
-        let k = CString::new(key.replace('\0', "")).ok()?;
-        let p = f(ctx, k.as_ptr());
-        if p.is_null() {
-            return None;
-        }
-        // 宿主分配的串必须用宿主表的 `free_str` 释放
-        let s = unsafe { std::ffi::CStr::from_ptr(p) }
-            .to_string_lossy()
-            .into_owned();
-        unsafe { ((*table).free_str)(p) };
-        Some(s)
-    }
-
-    /// 写自管配置（值空串 = 删除该键）；返回是否已受理
-    ///
-    /// 键名规则与宿主一致：非空、≤64、仅 `[A-Za-z0-9_-]`（**不允许点号**）。
-    pub fn config_set(key: &str, value: &str) -> bool {
-        let off = std::mem::offset_of!(KzwrHostAbi, config_set);
-        if !has(off, std::mem::size_of::<usize>()) {
-            return false;
-        }
-        let Some((table, ctx)) = bound() else {
-            return false;
-        };
-        let Some(f) = (unsafe { (*table).config_set }) else {
-            return false;
-        };
-        let (Ok(k), Ok(v)) = (
-            CString::new(key.replace('\0', "")),
-            CString::new(value.replace('\0', "")),
-        ) else {
-            return false;
-        };
-        f(ctx, k.as_ptr(), v.as_ptr()) == 0
-    }
 
     /// 宿主版本串（无能力表或字段缺失 → 空串）
     ///
@@ -407,7 +361,8 @@ pub mod host {
 
     /// 本插件私有的数据目录（宿主已创建；不可用 → `None`）
     ///
-    /// 存放插件自己的缓存/临时文件；**不要**把凭据写这里（用 `config_set`，它加密落盘）。
+    /// 存放插件自己的缓存/临时文件；**凭据不要明文写这里**——
+    /// 先用 [`seal`] 加密（密钥在宿主手里），密文落盘。
     pub fn own_data_dir() -> Option<String> {
         let off = std::mem::offset_of!(KzwrHostAbi, own_data_dir);
         if !has(off, std::mem::size_of::<usize>()) {
@@ -543,10 +498,116 @@ pub fn to_c_string(s: impl AsRef<str>) -> *mut c_char {
     }
 }
 
+/// **推荐写法**：把入口函数体写成**普通闭包**交给本函数，panic 会被吃掉
+///
+/// ⚠️ **为什么必须这样写**（语言机制限制，实测）：
+/// Rust 中 `extern "C" fn` 具有 `nounwind` 属性 —— 若 panic 发生在
+/// **extern "C" fn 的函数体里**，panic **无法展开**，运行时直接
+/// `panic_cannot_unwind` → **abort 整个进程**，外层任何 `catch_unwind` 都拦不住。
+///
+/// 因此**入口函数体必须是普通闭包**，让 panic 发生在可被捕获的上下文里：
+///
+/// ```ignore
+/// extern "C" fn describe() -> *mut c_char {
+///     sdk::guard_str(|| json!({ ... }).to_string())   // ✅ panic 可捕获
+/// }
+/// extern "C" fn bad() -> *mut c_char {
+///     panic!("...");                                  // ❌ 直接 abort 宿主
+/// }
+/// ```
+///
+/// 这也是宿主 release 用 `panic = "abort"` 的**放大器**：宿主侧的
+/// `catch_unwind` 在 release 下同样失效（panic 直接 abort），
+/// 所以兜底只能在插件侧、且必须以这种闭包形态写。
+pub fn guard_str<F>(f: F) -> *mut c_char
+where
+    F: FnOnce() -> String + std::panic::UnwindSafe,
+{
+    match std::panic::catch_unwind(f) {
+        Ok(s) => to_c_string(s),
+        Err(e) => {
+            let msg = e
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "未知 panic".to_string());
+            to_c_string(format!(
+                "{{\"success\":false,\"error\":\"插件内部错误（已在插件侧捕获，宿主进程安全）：{msg}\"}}"
+            ))
+        }
+    }
+}
+
+/// **panic 兜底**（入口已返回 `*mut c_char` 的版本）
+///
+/// 现有插件的入口自己返回 C 字符串（内部可能已有 `catch_unwind`），
+/// 这里再兜一层，保证 panic **绝不越过 C 边界**。
+///
+/// 正常路径原样透传 `f` 的返回值；`f` panic 则返回
+/// `{"success":false,"error":…}` 的 C 字符串。
+pub fn guard_ptr<F>(f: F) -> *mut c_char
+where
+    F: FnOnce() -> *mut c_char + std::panic::UnwindSafe,
+{
+    match std::panic::catch_unwind(f) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = e
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "未知 panic".to_string());
+            to_c_string(format!(
+                "{{\"success\":false,\"error\":\"插件内部错误（已在插件侧捕获，宿主进程安全）：{msg}\"}}"
+            ))
+        }
+    }
+}
+
+/// **panic 兜底**：执行 `f`，把 panic 转成 `{"success":false,"error":…}`
+///
+/// 供 [`guarded_entry!`] / 插件自带包装使用。**绝不让 panic 越过 C 边界** ——
+/// 宿主 release 是 `panic = "abort"`，panic 一旦越界就是整个进程 abort。
+///
+/// ## 与 `panic = "abort"` 的关系（重要）
+///
+/// 本 SDK（插件侧）**不设** `panic` 策略，即插件默认是 `unwind`，
+/// 因此这里的 `catch_unwind` **有效**。若某个插件自己在 `Cargo.toml` 里
+/// 设了 `panic = "abort"`，本函数将**失效** —— 那时 panic 会直接 abort。
+/// 故 `security_gate.sh` 会检查插件不得设 `panic = "abort"`。
+pub fn catch_c_str<F>(f: F) -> *mut c_char
+where
+    F: FnOnce() -> String + std::panic::UnwindSafe,
+{
+    let out = std::panic::catch_unwind(f).unwrap_or_else(|e| {
+        let msg = e
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| e.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "未知 panic".to_string());
+        format!(
+            "{{\"success\":false,\"error\":\"插件内部错误（已在插件侧捕获，宿主进程安全）：{msg}\"}}"
+        )
+    });
+    to_c_string(out)
+}
+
 /// 释放插件返回的字符串（由宿主通过 `free_str` 回调调用）
 ///
 /// # Safety
 /// `p` 必须是 [`to_c_string`] 返回且**尚未释放**的指针，或空指针。
+///
+/// ## 跨 allocator 约束（务必遵守）
+///
+/// `to_c_string` 用 **本插件的全局分配器** 分配，这里用 `CString::from_raw` 归还给
+/// **同一个分配器**。因此插件必须与自身保持一致：
+/// - ✅ 默认（glibc 动态链接、系统 malloc）→ 正常；
+/// - ❌ 插件改用 `jemalloc`/`mimalloc` 的 `#[global_allocator]`，或静态链接另一份
+///   malloc（musl 等）→ **释放时可能崩溃**（把别的分配器的指针还给本分配器）。
+///
+/// 宿主同理：它返回给插件的字符串用宿主分配器分配、由宿主的 `free_str` 释放，
+/// 两侧各自成对 —— **插件绝不要**用 `free_c_string` 去释放宿主给的字符串，
+/// 也不要让宿主释放插件自己 malloc 的内存。
 pub extern "C" fn free_c_string(p: *mut c_char) {
     if p.is_null() {
         return;
@@ -577,26 +638,113 @@ macro_rules! export_plugin_v1 {
     ($describe:path, $available:path, $action:path, $health:path $(,)?) => {
         $crate::export_plugin_v1!($describe, $available, $action, $health, None);
     };
-    ($describe:path, $available:path, $action:path, $health:path, $event:expr $(,)?) => {
+    ($describe:path, $available:path, $action:path, $health:path, Some($event:path) $(,)?) => {
         /// 稳定 C ABI v1 入口：返回插件持有的静态函数表
         #[no_mangle]
         pub extern "C" fn fn_kzwr_plugin_abi_v1() -> *const $crate::KzwrPluginAbi {
-            static TABLE: $crate::KzwrPluginAbi = $crate::KzwrPluginAbi {
-                abi: $crate::ABI_VERSION,
-                size: std::mem::size_of::<$crate::KzwrPluginAbi>() as u32,
-                describe_json: $describe,
-                available_json: $available,
-                action_json: $action,
-                health_json: $health,
-                event_json: $event,
-                free_str: $crate::free_c_string,
-                destroy: None,
-                // 宿主能力表：统一走 SDK 的绑定器，插件零改动即获得安全 API
-                host_bind: Some($crate::host::bind_trampoline),
-            };
-            &TABLE
+            $crate::guarded_entry!(
+                $describe, $available, $action, $health,
+                event: Some(__gw_event), __gw_event => $event
+            )
         }
     };
+    ($describe:path, $available:path, $action:path, $health:path, None $(,)?) => {
+        /// 稳定 C ABI v1 入口：返回插件持有的静态函数表
+        #[no_mangle]
+        pub extern "C" fn fn_kzwr_plugin_abi_v1() -> *const $crate::KzwrPluginAbi {
+            $crate::guarded_entry!($describe, $available, $action, $health, event: None)
+        }
+    };
+}
+
+/// 生成插件函数表（供 [`export_plugin_v1!`] 内部使用）
+///
+/// ## panic 兜底的**真实能力边界**（实测，勿夸大）
+///
+/// 实测三条结论（2026-09-29，用 release 构建的真实 .so + 宿主验证）：
+///
+/// 1. **宿主 release 用 `panic = "abort"` ⇒ 宿主侧 `catch_unwind` 全部失效**
+///    （panic 直接 abort，连返回值都打印不出来）。所以兜底只能在**插件侧**。
+/// 2. **panic 若发生在 `extern "C" fn` 的函数体内 ⇒ 无法被任何 `catch_unwind` 拦截**：
+///    `extern "C" fn` 带 `nounwind`，运行时报 `panic_cannot_unwind` 并 abort 整个进程。
+///    —— **这是语言机制限制，包装救不了它**。
+/// 3. **panic 发生在普通闭包内 ⇒ 可被捕获**（实测宿主进程存活）。
+///
+/// 因此真正有效的约定只有一条：**插件入口的函数体必须是普通闭包**，
+/// 用 [`guard_str`] 包裹（现有三个插件均已如此）。
+///
+/// 本宏额外包的一层 `guard_ptr` 是**纵深防御**：对已用 `guard_str` 的插件是幂等的，
+/// 对「入口直接返回 C 字符串、且内部走闭包」的插件也能兜住。
+/// 但它**兜不住**"panic 写在 extern "C" 函数体里"的情形 —— 那种只能靠
+/// 文档约束 + PR 闸门（检查入口是否用了 guard_str / 闭包形态）。
+#[macro_export]
+macro_rules! guarded_entry {
+    ($d:path, $a:path, $act:path, $h:path, event: None $(,)?) => {{
+        extern "C" fn __gw_describe() -> *mut std::os::raw::c_char {
+            $crate::guard_ptr(|| $d())
+        }
+        extern "C" fn __gw_available(c: *const std::os::raw::c_char) -> *mut std::os::raw::c_char {
+            $crate::guard_ptr(|| $a(c))
+        }
+        extern "C" fn __gw_action(
+            x: *const std::os::raw::c_char,
+            y: *const std::os::raw::c_char,
+        ) -> *mut std::os::raw::c_char {
+            $crate::guard_ptr(|| $act(x, y))
+        }
+        extern "C" fn __gw_health(c: *const std::os::raw::c_char) -> *mut std::os::raw::c_char {
+            $crate::guard_ptr(|| $h(c))
+        }
+        static TABLE: $crate::KzwrPluginAbi = $crate::KzwrPluginAbi {
+            abi: $crate::ABI_VERSION,
+            size: std::mem::size_of::<$crate::KzwrPluginAbi>() as u32,
+            describe_json: __gw_describe,
+            available_json: __gw_available,
+            action_json: __gw_action,
+            health_json: __gw_health,
+            event_json: None,
+            free_str: $crate::free_c_string,
+            destroy: None,
+            host_bind: Some($crate::host::bind_trampoline),
+        };
+        &TABLE
+    }};
+    ($d:path, $a:path, $act:path, $h:path, event: Some($ef:path), $gw:ident => $e:path $(,)?) => {{
+        extern "C" fn __gw_describe() -> *mut std::os::raw::c_char {
+            $crate::guard_ptr(|| $d())
+        }
+        extern "C" fn __gw_available(c: *const std::os::raw::c_char) -> *mut std::os::raw::c_char {
+            $crate::guard_ptr(|| $a(c))
+        }
+        extern "C" fn __gw_action(
+            x: *const std::os::raw::c_char,
+            y: *const std::os::raw::c_char,
+        ) -> *mut std::os::raw::c_char {
+            $crate::guard_ptr(|| $act(x, y))
+        }
+        extern "C" fn __gw_health(c: *const std::os::raw::c_char) -> *mut std::os::raw::c_char {
+            $crate::guard_ptr(|| $h(c))
+        }
+        extern "C" fn $gw(
+            x: *const std::os::raw::c_char,
+            y: *const std::os::raw::c_char,
+        ) -> *mut std::os::raw::c_char {
+            $crate::guard_ptr(|| $e(x, y))
+        }
+        static TABLE: $crate::KzwrPluginAbi = $crate::KzwrPluginAbi {
+            abi: $crate::ABI_VERSION,
+            size: std::mem::size_of::<$crate::KzwrPluginAbi>() as u32,
+            describe_json: __gw_describe,
+            available_json: __gw_available,
+            action_json: __gw_action,
+            health_json: __gw_health,
+            event_json: Some($gw),
+            free_str: $crate::free_c_string,
+            destroy: None,
+            host_bind: Some($crate::host::bind_trampoline),
+        };
+        &TABLE
+    }};
 }
 
 // ── 目标能力表（自定义备份目标）────────────────────────────────────────────
@@ -648,10 +796,6 @@ pub struct KzwrTargetAbi {
     pub ping: Option<extern "C" fn(*mut c_void) -> i32>,
     /// 设置页「测试连接」（实例尚未建立时）
     pub test_json: Option<extern "C" fn(*const c_char) -> *mut c_char>,
-
-    // ── 插件自管配置（宿主代加密存储，命名空间 = 插件 id） ──
-    pub config_get: Option<extern "C" fn(*const c_char) -> *mut c_char>,
-    pub config_set: Option<extern "C" fn(*const c_char, *const c_char) -> i32>,
 
     /// 最近一次错误的详情（JSON）
     pub last_error_json: Option<extern "C" fn(*mut c_void) -> *mut c_char>,
@@ -711,8 +855,6 @@ macro_rules! export_target_v1 {
                 ensure_dir: $ensure_dir,
                 ping: $ping,
                 test_json: $test_json,
-                config_get: None,
-                config_set: None,
                 last_error_json: $last_error_json,
                 plan_begin: $plan_begin,
                 plan_next: $plan_next,
@@ -759,5 +901,45 @@ pub mod json {
         }
         out.push('"');
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 固化本次排查的核心结论：**panic 发生在普通闭包内可被捕获**
+    ///
+    /// 反向的那半（panic 写在 `extern "C" fn` 函数体内 ⇒ `panic_cannot_unwind`、
+    /// 直接 abort，**任何包装都拦不住**）无法写成单测 —— 它会终止测试进程。
+    /// 已用 release 构建的真实 `.so` + 宿主实测确认，结论记录在
+    /// [`guard_str`] 与 [`guarded_entry`] 的文档里。
+    #[test]
+    fn guard_str_catches_panic_in_closure() {
+        let p = guard_str(|| -> String { panic!("boom") });
+        assert!(!p.is_null(), "panic 时应返回错误 JSON，而不是空指针");
+        let s = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy();
+        assert!(s.contains("success"), "应返回 JSON：{s}");
+        assert!(s.contains("宿主进程安全"), "错误文案应说明宿主安全：{s}");
+        free_c_string(p);
+    }
+
+    /// 正常路径：原样返回闭包产生的字符串
+    #[test]
+    fn guard_str_passes_through_normal_result() {
+        let p = guard_str(|| r#"{"ok":true}"#.to_string());
+        let s = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy();
+        assert_eq!(s, r#"{"ok":true}"#);
+        free_c_string(p);
+    }
+
+    /// `guard_ptr` 对「入口返回 C 字符串且内部走闭包」的情形兜底
+    #[test]
+    fn guard_ptr_catches_panic() {
+        let p = guard_ptr(|| -> *mut c_char { panic!("boom") });
+        assert!(!p.is_null());
+        let s = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy();
+        assert!(s.contains("success"));
+        free_c_string(p);
     }
 }

@@ -43,6 +43,8 @@
   let targetOptions = []; // 目标精简项（/api/tasks 附带，供任务表单下拉）
   // 外置插件（动态库，ADR-013 方案 B）
   let pluginsEnabledCfg = false;
+  /** 插件市场是否启用（来自 /api/config） */
+  let marketEnabledCfg = false;
   let pluginsDirCfg = '';
   /** 插件签名公钥（base64 32 字节 Ed25519；空 = 拒绝加载任何外置插件） */
   let pluginsPubkeysCfg = [];
@@ -120,6 +122,7 @@
       setHostTimezone(d.host_utc_offset_minutes);
       scheduleTimezone = d.schedule_timezone || '';
       pluginsEnabledCfg = !!d.plugins_enabled;
+      marketEnabledCfg = !!d.market_enabled;
       pluginsDirCfg = d.plugins_dir || '';
       pluginsPubkeysCfg = d.plugins_pubkeys || [];
       pluginsAllowUnsigned = !!d.plugins_allow_unsigned;
@@ -296,6 +299,30 @@
    * - 目录固定用默认位置（少一个「填错就静默不加载」的故障点）；
    * - 公钥在**安装插件时**随文件一起登记（一插件一公钥），不在这里批量粘贴。
    */
+  /**
+   * 保存插件市场配置（目前只用于「开启市场」）
+   *
+   * 注意：**只在用户显式点击时**保存，不在这里自动拉索引 ——
+   * "不在用户未要求时联网"由 MarketPanel 负责（开启后才 `marketCatalog`）。
+   */
+  async function handleSaveMarket(patch) {
+    busy = true;
+    error = null;
+    try {
+      const d = await api.saveConfig(patch);
+      if (d.error) {
+        error = d.error;
+        return { error: d.error };
+      }
+      marketEnabledCfg = !!d.market_enabled;
+      return {};
+    } catch (e) {
+      return { error: e.message };
+    } finally {
+      busy = false;
+    }
+  }
+
   async function handleSavePlugins(enabled) {
     busy = true;
     error = null;
@@ -574,6 +601,8 @@
               pluginsEnabled={pluginsEnabledCfg}
               pluginsAllowUnsigned={pluginsAllowUnsigned}
               onSavePlugins={handleSavePlugins}
+              marketEnabled={marketEnabledCfg}
+              onSaveMarket={handleSaveMarket}
               {busy}
             />
           {:else if currentPage === 'restore'}

@@ -5,13 +5,12 @@
 //! 1. **写操作入队**：插件的回调跑在 `spawn_blocking` 线程、甚至插件自己的 tokio
 //!    runtime 里；而宿主的告警链路内部含 `tokio::spawn` → 在非 runtime 上下文直接调用
 //!    会 panic「must be called from the context of a Tokio runtime」。故
-//!    `log`/`audit`/`alert`/`resolve`/`progress`/`config_set`/`schedule` 一律只做一次
+//!    `log`/`audit`/`alert`/`resolve`/`progress`/`schedule` 一律只做一次
 //!    `try_send`，由**唯一的**消费任务落到宿主各汇点。队列满 ⇒ 丢弃并计数（绝不打回插件线程）。
-//! 2. **`config_get` 是唯一同步读**，且**绝不取宿主配置锁**：宿主存在「持配置锁跨 FFI」
-//!    的既有调用路径（`/api/plugins` 就是先 `state.config.lock()` 再 `describe()`，
-//!    而 `describe()` 会进插件 `available_json`）。若 `config_get` 也去拿同一把锁，
-//!    插件在 `available_json` 里读自己的配置就会**自死锁**。因此每个 ctx 自带一份
-//!    **只读镜像** + 一份**待落盘覆盖层**（写完立刻读能拿到自己的值）。
+//! 2. **同步入口只做纯计算**（`now_ms`/`own_data_dir`/`seal`/`unseal`），**绝不取宿主
+//!    配置锁**：宿主存在「持配置锁跨 FFI」的既有调用路径（`/api/plugins` 就是先
+//!    `state.config.lock()` 再 `describe()`，而 `describe()` 会进插件
+//!    `available_json`）。同步入口若也去拿同一把锁，插件回调就会**自死锁**。
 //! 3. **ctx 把能力限定到本插件**：所有命名空间都由 ctx 决定，参数里没有插件 id 可填。
 //!    ctx 在插件被禁用/卸载时**失效**（`revoked`），之后的调用被静默丢弃。
 //!
@@ -33,7 +32,7 @@ use chrono::Local;
 use tokio::sync::{mpsc, oneshot};
 
 use super::abi::{
-    HostAlertFn, HostAuditFn, HostCfgGetFn, HostCfgSetFn, HostLogFn, HostProgressFn, HostResolveFn,
+    HostAlertFn, HostAuditFn, HostLogFn, HostProgressFn, HostResolveFn,
     HostScheduleFn, HostSealFn, HostUnsealFn, KzwrHostAbi, HOST_ABI_VERSION,
 };
 
@@ -436,8 +435,6 @@ fn host_table() -> &'static KzwrHostAbi {
         audit: Some(ffi_audit as HostAuditFn),
         alert: Some(ffi_alert as HostAlertFn),
         resolve_alerts: Some(ffi_resolve as HostResolveFn),
-        config_get: Some(ffi_config_get as HostCfgGetFn),
-        config_set: Some(ffi_config_set as HostCfgSetFn),
         host_version: Some(host_version_cstr),
         now_ms: Some(now_ms),
         own_data_dir: Some(ffi_own_data_dir),
@@ -582,7 +579,7 @@ fn publish_progress(
 // ── FFI 入口（每个都 catch_unwind；绝不让 panic 越过 C 边界）──────────────
 
 /// 取回 ctx 引用（NULL → None）。`revoked` 的判定留给消费/读取方，
-/// 因为 `config_get` 等只读入口也统一在这里做空指针防护。
+/// 因为只读入口（`own_data_dir`/`seal`/`unseal`）也统一在这里做空指针防护。
 #[inline]
 unsafe fn ctx_ref(p: *mut c_void) -> Option<&'static Ctx> {
     if p.is_null() {
@@ -700,24 +697,6 @@ extern "C" fn ffi_resolve(ctx: *mut c_void, prefix: *const c_char) {
         };
         c.queue.push(eff);
     });
-}
-
-/// ~~同步读一个配置键~~ —— **已弃用**：宿主不再代存插件配置，恒返回 NULL
-///
-/// 保留实现（而非置为 `None`）是为了让老插件的调用**安全失败**：
-/// 拿到 NULL 后按「无此配置」处理，而不是因为函数指针为 NULL 而崩溃。
-extern "C" fn ffi_config_get(_ctx: *mut c_void, _key: *const c_char) -> *mut c_char {
-    std::ptr::null_mut()
-}
-
-/// ~~写/删一个配置键~~ —— **已弃用**：恒拒绝（非 0）
-///
-/// 老插件据此得知「宿主不再代存」，应改为把配置写进自己的 `own_data_dir`
-/// （敏感内容用 [`ffi_seal`] 加密）。
-extern "C" fn ffi_config_set(_ctx: *mut c_void, _key: *const c_char, _value: *const c_char) -> c_int {
-    // 返回 2（与「已失效」同码）而不是 1（入参错误）：插件据此可区分
-    // 「我传错了」与「宿主不支持了」。
-    2
 }
 
 /// 用宿主密钥加密明文（返回 base64 密文；NULL = 失败）
@@ -912,8 +891,6 @@ mod tests {
         assert_eq!(t.size, KzwrHostAbi::TABLE_SIZE);
         // 全部能力都必须有实现（尾部追加演进时这里会提醒补齐）
         assert!(t.log.is_some() && t.audit.is_some() && t.alert.is_some());
-        // config_get/set 保留为**已弃用桩**（老插件调用应安全失败，而非空指针崩溃）
-        assert!(t.config_get.is_some() && t.config_set.is_some());
         assert!(t.own_data_dir.is_some() && t.free_str as usize != 0);
         // 加密原语：插件自管配置靠它避免明文落盘
         assert!(t.seal.is_some() && t.unseal.is_some(), "seal/unseal 必须实现");
@@ -934,30 +911,6 @@ mod tests {
         fx.revoke("demo");
         assert!(c.is_revoked(), "revoke 后应标记失效");
         assert_eq!(fx.table().is_null(), false);
-    }
-
-    /// **已弃用的 config_get/config_set 必须安全失败**（而不是崩溃或静默成功）
-    ///
-    /// 宿主不再代存插件配置（ADR-021）：老插件若仍调用这两个入口，
-    /// `config_get` 应得到 NULL（当作「无此配置」），`config_set` 应被拒绝（非 0），
-    /// 从而让插件察觉「宿主不支持了」并改用 `own_data_dir`。
-    #[test]
-    fn deprecated_config_entries_fail_safely() {
-        let fx = HostEffects::new(std::env::temp_dir().join("kzwr-host-abi-dep"));
-        let raw = fx.issue("legacy");
-        let key = CString::new("accounts").unwrap();
-        let val = CString::new("[]").unwrap();
-        // 读：恒 NULL
-        assert!(
-            ffi_config_get(raw, key.as_ptr()).is_null(),
-            "config_get 应恒返回 NULL（宿主不再代存）"
-        );
-        // 写：恒拒绝（非 0）
-        assert_ne!(
-            ffi_config_set(raw, key.as_ptr(), val.as_ptr()),
-            0,
-            "config_set 应恒拒绝，让插件察觉宿主不再代存"
-        );
     }
 
     /// **加密原语**：seal/unseal 往返，且坏输入不得回退成明文
@@ -1064,14 +1017,10 @@ mod tests {
     }
 
     #[test]
-    fn config_get_and_own_dir_survive_hostile_input() {
+    fn own_dir_survives_hostile_input() {
         let fx = HostEffects::new(std::env::temp_dir().join("kzwr-host-abi-test6"));
         let raw = fx.issue("hostile");
-        // NULL ctx / NULL key 必须安全返回空指针，不得 panic
-        assert!(ffi_config_get(std::ptr::null_mut(), std::ptr::null()).is_null());
-        assert!(ffi_config_get(raw, std::ptr::null()).is_null());
-        let missing = CString::new("nope").unwrap();
-        assert!(ffi_config_get(raw, missing.as_ptr()).is_null());
+        // NULL ctx 必须安全返回空指针，不得 panic
         assert!(ffi_own_data_dir(std::ptr::null_mut()).is_null());
 
         // own_data_dir 返回宿主分配的串，必须能经 free_str 安全释放
@@ -1088,10 +1037,7 @@ mod tests {
         let fx = HostEffects::new(std::env::temp_dir().join("kzwr-host-abi-test7"));
         let raw = fx.issue("gone");
         fx.revoke("gone");
-        let k = CString::new("k").unwrap();
         let v = CString::new("v").unwrap();
-        assert_eq!(ffi_config_set(raw, k.as_ptr(), v.as_ptr()), 2, "失效 ctx 应拒绝写入");
-        assert!(ffi_config_get(raw, k.as_ptr()).is_null());
         assert!(ffi_own_data_dir(raw).is_null());
         // 日志/审计/告警/进度/定时在失效后一律不入队
         ffi_log(raw, 2, v.as_ptr());

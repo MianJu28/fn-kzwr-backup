@@ -120,6 +120,8 @@ pub struct AppState {
     pub host_effects: Arc<crate::plugin::host_abi::HostEffects>,
     /// 操作审计日志（敏感/破坏性操作留痕，存 $TRIM_PKGVAR/audit.log）
     pub audit: Arc<crate::domain::audit::AuditLog>,
+    /// 插件市场客户端（索引缓存；**默认关闭**，见 `infra::config::MarketSettings`）
+    pub market: Arc<crate::plugin::market::Market>,
 }
 
 impl AppState {

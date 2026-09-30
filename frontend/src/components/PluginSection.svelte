@@ -26,8 +26,7 @@
   /** 保存回调：(enabled) => Promise<{error?}> */
   export let onSave = null;
 
-  let info = null; // /api/plugins 的 external / orphan_data 字段
-  let orphanData = [];
+  let info = null; // /api/plugins 的 external 字段
   let loading = false;
   let formEnabled = enabled;
   let saved = false;
@@ -48,10 +47,8 @@
     try {
       const d = await api.plugins();
       info = d.external || null;
-      orphanData = d.orphan_data || [];
     } catch (e) {
       info = null;
-      orphanData = [];
     } finally {
       loading = false;
     }
@@ -156,24 +153,49 @@
   }
 
   /** 卸载**外置**插件：删除 .so/.sig 并解绑其公钥（内置/随包插件删不掉） */
+  /**
+   * 卸载**外置**插件
+   *
+   * **数据去留由用户显式选择**（评审决策 3）：卸载与删数据是两件事，后者不可恢复。
+   * 单选**不设预选**，未选则确认按钮禁用 —— 避免用户顺手确认而意外删掉凭据。
+   */
   async function uninstall(file) {
-    const yes = await confirmDialog({
+    const choice = await confirmDialog({
       title: `卸载插件 ${file}？`,
       message:
         '将从插件目录删除该 .so 与其签名文件，并解绑它的公钥。\n' +
         '若它仍被目标或任务使用，那些任务会失效（建议先停用相关任务）。\n\n' +
-        '注意：已加载到内存的代码要等**重启应用**才真正释放。',
+        '注意：已加载到内存的代码要等**重启应用**才真正释放。\n\n' +
+        '数据去留（必须选择）：',
       confirmText: '卸载',
       danger: true,
+      choices: [
+        {
+          value: 'keep',
+          label: '保留配置数据（推荐）',
+          desc:
+            '仅删除 .so 与签名文件。下次重装同一插件时配置与凭据仍在。\n' +
+            '数据位置：$TRIM_PKGVAR/plugins/<插件 id>',
+        },
+        {
+          value: 'purge',
+          label: '一并删除配置数据',
+          danger: true,
+          desc:
+            '同时删除上述目录（含凭据）。此操作不可恢复。\n' +
+            '若该插件管理云端账号，删除后需重新填写凭据。',
+        },
+      ],
     });
-    if (!yes) return;
+    if (!choice) return; // 取消（或未选）
     uninstallBusy = file;
     try {
-      const r = await api.pluginUninstall(file);
+      const r = await api.pluginUninstall(file, choice === 'purge');
       if (r && r.error) {
         toast.error(r.error, '卸载失败');
       } else {
         toast.success(`${file} 已卸载`, '重启应用后彻底释放');
+        if (r && r.note) toast.info(r.note);
         await loadInfo();
       }
     } catch (e) {
@@ -242,10 +264,7 @@
             {formEnabled ? '已启用' : '已停用'}
           </span>
         </div>
-        <p class="field-hint">
-          启用后会加载插件目录中的 <code>.so</code> 插件。
-          <strong>已改为热生效，无需重启应用。</strong>
-        </p>
+        <p class="field-hint">加载插件目录中的 <code>.so</code>，热生效</p>
       </div>
       <button
         class="btn {formEnabled ? 'btn-ghost danger' : 'btn-primary'}"
@@ -261,19 +280,14 @@
     </div>
 
     {#if !formEnabled}
-      <p class="field-hint">
-        未启用：不会加载任何外置插件。下面的安装与管理在启用后才可用。
-      </p>
+      <p class="field-hint">未启用：不会加载外置插件</p>
     {:else}
       <!-- 安装插件：弹窗内完成（文件名不要求输入） -->
       <div class="install-block">
         <div class="install-head">
           <div class="grow">
             <div class="install-title">安装插件</div>
-            <p class="field-hint">
-              选择插件文件 <code>.so</code> 与它的签名 <code>.so.sig</code>，
-              并填写<strong>该插件的公钥</strong>。安装时会先验签，不通过不会写入磁盘。
-            </p>
+            <p class="field-hint">选择 <code>.so</code> 与 <code>.so.sig</code>，并填该插件的公钥（先验签后安装）</p>
           </div>
           <button class="btn btn-sm btn-primary" on:click={() => (showInstall = true)} disabled={busy || saving}>
             <Icon name="plus" size={14} />安装插件
@@ -300,17 +314,6 @@
         单个插件加载失败不影响核心功能。
       </div>
     </div>
-
-    {#if orphanData.length}
-      <div class="alert alert-info">
-        <Icon name="info" size={15} />
-        <div class="alert-body">
-          发现<strong>遗留的插件配置</strong>：{orphanData.join('、')}。
-          这些插件当前未加载（可能已卸载或未启用），但其代管配置仍在。
-          确认不再需要时可点击下方对应插件的「清除代管数据」。
-        </div>
-      </div>
-    {/if}
 
     {#if info}
       <div class="row-sub">
@@ -380,30 +383,10 @@
       {:else if formEnabled}
         <p class="field-hint">插件目录中没有发现 <code>.so</code> 文件</p>
       {/if}
-
-      {#if orphanData.length && !(info.reports || []).length}
-        <div>
-          {#each orphanData as id}
-            <div class="row-item">
-              <div class="grow">
-                <div class="row-title">
-                  <code>{id}</code>
-                  <span class="badge badge-warn">未加载</span>
-                </div>
-                <div class="row-sub">
-                  <button class="btn btn-ghost btn-sm" on:click={() => purge(id)} disabled={purgeBusy === id}>
-                    {purgeBusy === id ? '清除中…' : '清除代管数据'}
-                  </button>
-                </div>
-              </div>
-            </div>
-          {/each}
-        </div>
-      {/if}
     {/if}
 
     {#if !formEnabled}
-      <p class="field-hint">当前未启用：不会加载任何外置插件，已加载列表为空属正常现象</p>
+      <p class="field-hint">未启用：已加载列表为空属正常</p>
     {/if}
   </div>
   <!-- 安装弹窗 -->

@@ -5,9 +5,7 @@
   "kind": "enhance",
   "description": "读取酷族账号登录态与云端空间用量、按账号设置空间预警、清空云端回收站（支持多账号）。备份与恢复本身走 WebDAV，不需要本插件。",
   "ui": {
-    "section": "settings",
     "title": "增强功能（酷族账号）",
-    "order": 20,
     "blocks": [
       {
         "type": "tips",

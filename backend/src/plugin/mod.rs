@@ -22,6 +22,7 @@ pub mod cabi;
 pub mod crypto;
 pub mod host_abi;
 pub mod loader;
+pub mod market;
 pub mod registry;
 pub mod sandbox;
 pub mod target_abi;

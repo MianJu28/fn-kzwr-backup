@@ -1,7 +1,7 @@
 //! 运行日志（查看 / 清空 / 下载）
 
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::response::Json;
 
 use crate::AppState;

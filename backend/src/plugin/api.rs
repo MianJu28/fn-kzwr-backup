@@ -146,26 +146,18 @@ pub struct EnhanceCaps {
     pub notify: bool,
 }
 
-/// 插件 UI 描述：前端据此决定「设置页/概览页」显示哪些卡片、顺序如何。
+/// 插件 UI 描述：前端据此渲染插件卡片与设置弹窗。
 ///
-/// 内置插件可以只填 `component`（前端有手写组件）；外置插件填 `blocks`，
-/// 由前端通用渲染器渲染 —— 这样新增插件**不需要重新打包前端**。
+/// 界面**完全由 `blocks` 声明**，前端用通用渲染器渲染 → 新增插件不需要重打包前端。
+///
+/// 曾有 `section`/`order`/`component` 三个字段（宿主内嵌手写组件时代的遗留），
+/// 已随插件页重构（取消「设置页/概览页」分区，顺序以接口返回为准）一并移除；
+/// 前端 `pluginCards()` 相应地不再过滤排序。老插件的 describe 里若仍带这些键，
+/// serde 会忽略未知字段，不影响解析。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginUi {
-    /// 分区：`settings` | `dashboard`
-    ///
-    /// 注：`settings` 是**稳定 ABI 的既有取值**（外置插件已按此发送，不可改名）。
-    /// 前端插件化重构后，它渲染在独立的**「插件」页**而非设置页 ——
-    /// 该字段现在只表示「配置类卡片」，与具体页面解耦。
-    pub section: String,
     /// 卡片标题
     pub title: String,
-    /// 排序（小的在前）
-    #[serde(default)]
-    pub order: i32,
-    /// 内置组件名（如 `kzwr`）；前端认识时优先用它，不认识则回退到 `blocks`
-    #[serde(default)]
-    pub component: Option<String>,
     /// 通用渲染块
     #[serde(default)]
     pub blocks: Vec<UiBlock>,
@@ -206,10 +198,6 @@ pub enum UiBlock {
         action: String,
         #[serde(default)]
         button: String,
-        /// 值由谁保管：~~`host` = 宿主代存~~（**已弃用**，ADR-021：宿主不再代存）；
-        /// 缺省/其它 = 插件自己的路由处理
-        #[serde(default)]
-        scope: Option<String>,
         /// **回显**：渲染时 GET 该路径（相对 `api_base`）取真实值，覆盖 `value`。
         ///
         /// `value` 只是描述里的**静态默认值**，插件的持久化配置它并不知道；
@@ -233,9 +221,6 @@ pub enum UiBlock {
         action: String,
         #[serde(default)]
         button: String,
-        /// 见 [`UiBlock::Text::scope`]
-        #[serde(default)]
-        scope: Option<String>,
         /// 见 [`UiBlock::Text::echo`]
         #[serde(default)]
         echo: Option<String>,
@@ -255,9 +240,6 @@ pub enum UiBlock {
         label: String,
         value: bool,
         action: String,
-        /// 见 [`UiBlock::Text::scope`]
-        #[serde(default)]
-        scope: Option<String>,
         /// 见 [`UiBlock::Text::echo`]
         #[serde(default)]
         echo: Option<String>,
@@ -373,7 +355,7 @@ pub struct PluginEntry {
     ///
     /// 被禁用时：`available` 恒为 `false`、不参与路由分发与目标装配，
     /// 但**仍会出现在清单里**，以便插件页把它列出来并允许重新启用。
-    #[serde(default)]
+    // PluginEntry 只有 Serialize，#[serde(default)] 无用
     pub disabled: bool,
     /// 该目标插件**是否需要用户名/密码**（`kind=target` 时有意义）
     ///
@@ -398,11 +380,6 @@ pub struct PluginEntry {
     pub form: Vec<crate::plugin::abi::AbiTargetField>,
 }
 
-/// `needs_credentials` 的 serde 缺省：`true`（老前端/未知插件按需要凭据处理）
-fn default_true_entry() -> bool {
-    true
-}
-
 /// 插件自检项（供「一键体检」汇总；由核心映射成 UI 的检查项）
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckOutcome {
@@ -422,9 +399,10 @@ pub trait EnhancePlugin: Send + Sync {
     fn caps(&self) -> EnhanceCaps;
     /// 是否已可用（如 access-token 已配置）；未就绪时 UI 隐藏相关区块
     ///
-    /// `mgr` 用来解密**本插件自己的** `plugin_data`（注入快照的 `self_config`）。
-    /// **调用方不得把注入结果写入日志**（含明文凭据）。
-    fn available(&self, cfg: &AppConfig, mgr: &ConfigManager) -> bool;
+    /// 曾有第二参数 `mgr`（用于解密宿主代存的 `plugin_data`）—— ADR-021 后
+    /// 宿主不再代存插件配置，参数已随之移除；插件的可用性一律由它自己的
+    /// `own_data_dir` 决定（C ABI 侧经 `available_json` 传入配置快照）。
+    fn available(&self, cfg: &AppConfig) -> bool;
 
     /// 插件自带的 HTTP 子路由；核心统一挂在 `/api/p/<插件id>` 下（默认空）
     fn routes(&self) -> axum::Router<crate::AppState> {

@@ -89,10 +89,7 @@
     <div class="icon-wrap"><Icon name="file" size={18} /></div>
     <div class="grow">
       <h2 class="card-title">运行日志</h2>
-      <p class="card-desc">
-        服务端运行日志（app.log）末尾 {TAIL} 行 · 共 {fmtBytes(size)}；<strong>最新在上面</strong>，时间为宿主本地时区；
-        需要更详细日志请开启下方「调试日志」
-      </p>
+      <p class="card-desc">末尾 {TAIL} 行 · 共 {fmtBytes(size)} · <strong>最新在上</strong> · 宿主本地时区</p>
     </div>
     {#if truncated}
       <span class="badge badge-warn" title="仅显示日志末尾">已截断</span>

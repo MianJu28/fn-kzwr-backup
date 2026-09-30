@@ -136,14 +136,31 @@ export const api = {
   pluginInstall: (body) => post('/api/plugins/install', body),
   /** 热重加载外置插件（按当前配置重新扫描装载；无需重启应用） */
   pluginReload: () => post('/api/plugins/reload', {}),
-  /** 卸载**外置**插件（删 .so/.sig + 解绑公钥；内置/随包插件不可卸载） */
-  pluginUninstall: (file) =>
-    post(`/api/plugins/${encodeURIComponent(file)}/uninstall`, {}),
-  /** 读取该插件的宿主代管配置（`secret` 字段只回传「是否已设置」） */
-  pluginData: (id) => get(`/api/plugins/${encodeURIComponent(id)}/data`),
-  /** 写入该插件的宿主代管配置（fields 明文，后端加密落盘；remove 为要删除的键） */
-  pluginDataSet: (id, fields, remove = []) =>
-    post(`/api/plugins/${encodeURIComponent(id)}/data`, { fields, remove }),
+  /**
+   * 卸载**外置**插件（删 .so/.sig + 解绑公钥；内置/随包插件不可卸载）
+   *
+   * `purgeData = true` 时**一并删除**该插件的配置数据目录（含凭据，不可恢复）；
+   * 缺省 `false` = 保留（重装同一插件后配置仍在）。由调用方让用户显式选择。
+   */
+  pluginUninstall: (file, purgeData = false) =>
+    post(`/api/plugins/${encodeURIComponent(file)}/uninstall`, { purge_data: !!purgeData }),
+
+  // ── 插件市场（默认关闭；关闭时后端不发起任何网络请求）──────────
+  /**
+   * 插件市场列表
+   *
+   * `refresh=true` 强制重新拉取索引（否则先用缓存，缓存每次读取都会重新验签）。
+   * 返回里的 `installable` / `blocked_reason` **由后端判定** —— 前端不做任何
+   * 兼容性推断（架构/ABI/glibc/宿主版本只有宿主自己知道）。
+   */
+  marketCatalog: (refresh = false) =>
+    get(`/api/market/catalog${refresh ? '?refresh=1' : ''}`),
+  /** 从市场安装：`version` 留空 = 装最新的兼容版本 */
+  marketInstall: (id, version = '') => post('/api/market/install', { id, version }),
+  /** 检查已装插件是否有新版本（不自动安装） */
+  marketCheckUpdates: () => post('/api/market/check-updates', {}),
+  /** 强制刷新索引 */
+  marketRefresh: () => post('/api/market/refresh', {}),
 
   // 注：kzwr 增强（token / 空间阈值 / 回收站）不再有专用方法 ——
   // 它现在是普通插件，界面由后端 `ui.blocks` 驱动，统一走 pluginGet/pluginPost。

@@ -261,10 +261,7 @@
     <div class="icon-wrap"><Icon name="package" size={18} /></div>
     <div class="grow">
       <h2 class="card-title">备份任务</h2>
-      <p class="card-desc">
-        每个任务 = 源文件夹 + 目标 + 定时 + 保留策略，各自独立增量与快照；
-        同一个源可以出现在多个任务里（分别备份到不同目标）
-      </p>
+      <p class="card-desc">源文件夹 + 目标 + 定时 + 保留策略，各自独立增量与快照</p>
     </div>
     <span class="badge">{tasks.length} 个任务</span>
   </div>
@@ -348,12 +345,12 @@
               disabled={saving} />
             <button class="btn" on:click={() => { addPath(pathInput); pathInput = ''; }}
               disabled={saving}>添加</button>
-            {#if inTrimHost}
-              <button class="btn" on:click={pickDirs} disabled={saving}>选择目录</button>
-            {/if}
+            <button class="btn" on:click={pickDirs} disabled={saving}>选择目录</button>
           </div>
           {#if editing.paths.length === 0}
-            <p class="field-hint">尚未添加任何文件夹</p>
+            <p class="field-hint">
+              {inTrimHost ? '尚未添加任何文件夹' : '尚未添加任何文件夹（独立浏览器无法调用系统选择器，请手动输入路径）'}
+            </p>
           {/if}
         </div>
 
@@ -382,7 +379,7 @@
           <label for="tk-folder">目标目录</label>
           <input id="tk-folder" placeholder="fn-backup" value={editing.target_folder}
             on:input={(e) => setField('target_folder', e.target.value)} disabled={saving} />
-          <p class="field-hint">目标端的存放前缀；不同任务可用不同目录区分</p>
+          <p class="field-hint">云端存放前缀，不同任务可用不同目录区分</p>
         </div>
 
         <div class="field">
@@ -406,7 +403,7 @@
         </div>
 
         <div class="field">
-          <p class="field-hint">保留策略（清理目标端孤儿文件）</p>
+          <p class="field-hint">清理云端多余文件</p>
           <label class="switch-row">
             <input type="checkbox" checked={!!editing.retention.enabled}
               on:change={(e) => setRetention('enabled', e.target.checked)} disabled={saving} />

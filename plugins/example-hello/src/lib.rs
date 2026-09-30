@@ -35,10 +35,7 @@ extern "C" fn describe() -> *mut c_char {
             "description": "通过稳定 C ABI（.so 动态库）加载的示例插件：宿主升级后无需重新编译",
             "caps": { "account": false, "quota": false, "recycle_bin": false, "notify": false },
             "ui": {
-                "section": "settings",
                 "title": "示例外置插件（稳定 ABI）",
-                "order": 90,
-                "component": null,
                 "blocks": [
                     {
                         "type": "tips",
@@ -91,7 +88,8 @@ extern "C" fn available(_cfg: *const c_char) -> *mut c_char {
 
 /// 示例用的进程内状态（演示「插件自己保管配置」）
 ///
-/// 真实插件应把配置持久化到自己的存储（或走宿主代存 `scope: "host"`）；
+/// 真实插件应把配置持久化到**自己的私有数据目录**（ADR-021：宿主不再代存配置，
+/// 敏感内容经宿主能力表 `seal`/`unseal` 加密）；
 /// 这里用 `Mutex<Option<String>>` 只为把「读回自己写过的值」这条链路演示清楚。
 static GREETING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 

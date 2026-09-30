@@ -43,28 +43,30 @@ export function clearPlugins() {
 }
 
 /**
- * 某分区的区块（已按 `ui.order` 排序）：`settings` | `dashboard`
+ * 插件页要展示的插件卡片列表
+ *
+ * 界面**完全由 `ui.blocks` 声明**：宿主不再有「设置页/概览页」分区概念
+ * （`PluginUi.section`/`order` 已移除），因此这里**不过滤也不排序**，
+ * 顺序以 `/api/plugins` 返回为准。
  *
  * 说明：**不按 `available` 过滤** —— 未配置的插件也要露出卡片，用户才能去配置它；
  * `available` 留给组件内部决定要不要显示「未启用」徽标或提示。
  */
-export function sectionsFor(plugins, section = 'settings') {
-  return (plugins || [])
-    .filter((p) => p && p.ui && p.ui.section === section)
-    .sort((a, b) => (a.ui.order || 0) - (b.ui.order || 0));
+export function pluginCards(plugins) {
+  return (plugins || []).filter((p) => p && p.id);
 }
 
 /**
- * `/api/plugins` 不可用时的兜底区块（保持页面可用，不依赖网络）
+ * `/api/plugins` 不可用时的兜底卡片（保持页面可用，不依赖网络）
  *
- * 仅用于展示位置与顺序；正常路径永远以接口返回为准。
+ * 仅用于展示位置；正常路径永远以接口返回为准。
  * `blocks` 为空 → 卡片会显示「暂未声明界面」提示，这是**接口失败**时的预期表现
  * （正常联网时后端会给出完整 blocks）。
  *
  * 只保留**核心内置**的 WebDAV 目标：增强类插件（如酷族账号 kzwr）一律外置，
  * 由 `/api/plugins` 动态露出，这里写死等于把厂商专属逻辑又混回前端。
  */
-export const FALLBACK_SECTIONS = [
+export const FALLBACK_PLUGINS = [
   {
     id: 'webdav',
     name: 'WebDAV',
@@ -72,6 +74,6 @@ export const FALLBACK_SECTIONS = [
     builtin: true,
     available: true,
     api_base: '',
-    ui: { section: 'settings', title: '备份目标（WebDAV）', order: 10, blocks: [] },
+    ui: { title: '备份目标（WebDAV）', blocks: [] },
   },
 ];

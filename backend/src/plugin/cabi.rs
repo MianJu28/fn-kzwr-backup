@@ -14,7 +14,6 @@ use axum::routing::get;
 use axum::Router;
 use serde_json::Value;
 
-use crate::infra::config::ConfigManager;
 use crate::AppState;
 
 use super::abi::{
@@ -344,7 +343,7 @@ impl EnhancePlugin for CApiEnhance {
         self.describe.caps.into()
     }
 
-    fn available(&self, cfg: &crate::infra::config::AppConfig, _mgr: &ConfigManager) -> bool {
+    fn available(&self, cfg: &crate::infra::config::AppConfig) -> bool {
         let snap = CfgSnapshot::from_config(cfg);
         self.call_available(&snap.to_json())
     }

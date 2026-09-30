@@ -52,7 +52,7 @@
 //!
 //! **插件配置由插件自己保管**（ADR-021）：宿主**不再代存** —— 插件把键值写进
 //! 能力表给的 `own_data_dir`，敏感内容先用 `seal` 加密（密钥在宿主手里，插件拿不到）。
-//! `cfg.self_config` 因此**恒为空对象**（保留字段仅为 ABI 兼容）；
+//! 快照不再含插件配置（`self_config` 键已随 ABI v2 移除）；
 //! `cfg.after_backup_task` 只在 `after_backup` 事件里有值，
 //! 表示「刚才完成的是哪个任务」，插件据此套用该任务自己的回收站门槛。
 //!
@@ -79,7 +79,13 @@ use std::os::raw::{c_char, c_int};
 use serde::{Deserialize, Serialize};
 
 /// C ABI 版本：**仅破坏性改动 +1**；不变则插件无需随宿主升级重编译
-pub const C_ABI_VERSION: u32 = 1;
+///
+/// **v2（2026-09-29 清理）**：主表/目标表/宿主表移除全部 `config_get`/`config_set`
+/// 死字段（ADR-021 后宿主不再代存插件配置，这些槽位要么恒为 None、要么恒失败）。
+/// 字段位于表**中部**，删除即改变布局 ⇒ 必须升版本：v1 插件的表会被
+/// `abi != C_ABI_VERSION` 干净拒绝（而不是错读函数指针导致崩溃）。
+/// 随包插件与本仓库插件同步重编译；符号名不变（版本在 abi 字段校验，与符号无关）。
+pub const C_ABI_VERSION: u32 = 2;
 
 /// 宿主版本（插件可用于日志/兼容判断；`cfg_json` 里也会给）
 pub const HOST_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -148,7 +154,11 @@ impl KzwrPluginAbi {
 // ── 宿主能力表（宿主 → 插件下发；见 [`HostBindFn`]）────────────────────────
 
 /// 宿主能力表 ABI 版本（独立于主表 `C_ABI_VERSION` 计数）
-pub const HOST_ABI_VERSION: u32 = 1;
+///
+/// **v2**：移除已弃用的 `config_get`/`config_set` 桩（见 [`C_ABI_VERSION`] 说明）。
+/// SDK 侧 `host_bind` 会先校验版本，v1 老插件拿到 v2 表会返回非 0 并安全降级
+/// （只是没有能力表，声明式通道仍可用）。
+pub const HOST_ABI_VERSION: u32 = 2;
 
 /// 宿主能力表的回调类型别名（首个参数一律是宿主签发的 `ctx`）
 /// 日志：`level` = 0 trace / 1 debug / 2 info / 3 warn / 4 error
@@ -159,15 +169,11 @@ pub type HostAuditFn = extern "C" fn(*mut c_void, *const c_char, *const c_char, 
 pub type HostAlertFn = extern "C" fn(*mut c_void, i32, *const c_char);
 /// 消解告警：按前缀批量消解本插件此前上报的告警
 pub type HostResolveFn = extern "C" fn(*mut c_void, *const c_char);
-/// 读自己的配置（返回 NULL = 不存在；非空归**插件**释放，用 `free_str`）
-pub type HostCfgGetFn = extern "C" fn(*mut c_void, *const c_char) -> *mut c_char;
-/// 写/删自己的配置：0 = 已受理（异部落盘），非 0 = 拒绝（非法键名/队列满/已失效）
-pub type HostCfgSetFn = extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int;
 /// 进度上报：`done/total`（total=0 表示未知），`label` 可为 NULL
 pub type HostProgressFn = extern "C" fn(*mut c_void, *const c_char, u64, u64, *const c_char);
 /// 注册定时器：`kind` 非空，`cron` 本地时区；0 = 已受理
 pub type HostScheduleFn = extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int;
-/// 释放宿主分配的字符串（只用于 `config_get`/`own_data_dir` 的返回值）
+/// 释放宿主分配的字符串（只用于 `own_data_dir` 的返回值）
 pub type HostFreeStrFn = extern "C" fn(*mut c_char);
 
 /// **加密**：把明文封成可用宿主密钥解开的密文（返回 base64 文本，NULL = 失败）
@@ -185,7 +191,7 @@ pub type HostUnsealFn = extern "C" fn(*mut c_void, *const c_char) -> *mut c_char
 /// 取到 `None` 就必须退回到「声明式回传」或本地默认行为，**不能崩**。
 ///
 /// ## 为什么 `free_str` 紧跟在 `size` 之后（必需前缀）
-/// 它是唯一**非可选**的入口（插件要用它释放 `config_get` / `own_data_dir` 返回的串）。
+/// 它是唯一**非可选**的入口（插件要用它释放 `own_data_dir` 返回的串）。
 /// 放进必需前缀，[`KzwrHostAbi::MIN_SIZE`] 才能只覆盖 `abi + size + free_str`——
 /// 于是**新插件遇到老宿主**（表更短、缺若干能力字段）时仍然接受整表，
 /// 只是逐字段探测后跳过缺失的能力；否则就得整表拒绝，白白丢掉所有可用能力。
@@ -195,11 +201,11 @@ pub type HostUnsealFn = extern "C" fn(*mut c_void, *const c_char) -> *mut c_char
 /// 1. **写操作入队，不同步落库**。插件回调常跑在 `spawn_blocking` 线程（甚至插件
 ///    自己的 tokio runtime 里），而宿主的告警链路含 `tokio::spawn` → 直接调用会
 ///    panic「`must be called from the context of a Tokio runtime`」。故 `log`/`audit`/
-///    `alert`/`resolve`/`progress`/`config_set`/`schedule` 只做一次 `try_send`，由宿主
+///    `alert`/`resolve`/`progress`/`schedule` 只做一次 `try_send`，由宿主
 ///    唯一的消费任务落库。队列满 ⇒ 丢弃并计数（绝不打回插件线程）。
-/// 2. **`config_get` 是唯一同步读**（无锁、无副作用），因此必须满足宿主不变式：
-///    **宿主不得跨 FFI 持任何锁**。写完立刻读能拿到自己的值（待落盘覆盖层）。
-/// 3. **能力被 ctx 限定到本插件**：所有命名空间（配置键、告警、定时器、数据目录）
+/// 2. **同步入口只有纯计算**（`now_ms`/`own_data_dir`/`seal`/`unseal`），无锁、
+///    无副作用，因此满足宿主不变式：**宿主不得跨 FFI 持任何锁**。
+/// 3. **能力被 ctx 限定到本插件**：所有命名空间（告警、定时器、数据目录）
 ///    都由 ctx 决定，参数里**没有**插件 id 可填 → 改不了、也读不到别的插件。
 ///    ctx 在插件被禁用/卸载时失效，之后的调用被静默丢弃。
 ///
@@ -224,17 +230,6 @@ pub struct KzwrHostAbi {
     pub alert: Option<HostAlertFn>,
     /// 消解本插件此前上报的告警（按消息前缀）
     pub resolve_alerts: Option<HostResolveFn>,
-
-    // ── 本插件自管配置（**已弃用**：插件应把配置存自己的 `own_data_dir`）──
-    /// ~~同步读一个键（明文；NULL = 不存在）~~
-    ///
-    /// **已弃用（2026-09-28）**：宿主不再代存插件配置。保留字段是为了 ABI 兼容，
-    /// 实现已改为恒返回 NULL；插件请用 `own_data_dir` + `seal`/`unseal` 自管。
-    pub config_get: Option<HostCfgGetFn>,
-    /// ~~写一个键（值空串 = 删除该键）；0 = 已受理~~
-    ///
-    /// **已弃用**：实现恒返回非 0（拒绝）。理由同上。
-    pub config_set: Option<HostCfgSetFn>,
 
     // ── 环境（纯读，无副作用） ─────────────────────────────────────
     /// 宿主版本串（**静态内存，插件不得释放**）
@@ -333,12 +328,6 @@ pub struct KzwrTargetAbi {
     pub ping: Option<extern "C" fn(*mut c_void) -> i32>,
     /// 保存前的连通性测试（实例尚未建立时用；入参 `target_json`）
     pub test_json: Option<extern "C" fn(*const c_char) -> *mut c_char>,
-
-    // ── 插件自管配置（**已弃用**：ADR-021 起宿主不再代存）──────────────
-    /// 读一个键（返回 JSON 字符串或裸字符串；NULL = 不存在）
-    pub config_get: Option<extern "C" fn(*const c_char) -> *mut c_char>,
-    /// 写一个键：0 = 成功
-    pub config_set: Option<extern "C" fn(*const c_char, *const c_char) -> i32>,
 
     /// 最近一次错误的详情（JSON）
     pub last_error_json: Option<extern "C" fn(*mut c_void) -> *mut c_char>,
@@ -575,7 +564,8 @@ impl From<AbiCaps> for crate::plugin::api::EnhanceCaps {
 /// 传给插件的配置快照（`cfg_json`）
 ///
 /// **不含任何凭据**：既没有宿主的密码/token，也没有插件自己的配置
-/// （后者由插件自管，见 ADR-021）。`self_config` 恒为空对象，仅为 ABI 兼容保留。
+/// （后者由插件自管，见 ADR-021）。v2 起快照**不含** `self_config` 键
+/// （原字段恒为空对象，纯属死重；插件一律读自己的 `own_data_dir`）。
 #[derive(Default, Clone)]
 pub struct CfgSnapshot {
     /// 宿主版本（插件可用于日志/兼容判断）
@@ -588,12 +578,6 @@ pub struct CfgSnapshot {
     pub targets: Vec<CfgTarget>,
     /// 任务（id/名称/是否启用/源路径/目标/目录/定时）
     pub tasks: Vec<CfgTask>,
-    /// ~~**本插件自己的**配置（明文键值对，已解密）~~
-    ///
-    /// **已弃用（ADR-021）**：宿主不再代存插件配置，本字段**恒为空对象**。
-    /// 插件请改用能力表的 `own_data_dir`（+ `seal`/`unseal`）自管配置。
-    /// 保留字段是为了 ABI 兼容（老插件读它只会得到空对象，回退到默认值）。
-    pub self_config: std::collections::BTreeMap<String, String>,
     /// 触发本次 `after_backup` 事件的任务 id（其它事件为 `None`）
     ///
     /// 有了它，插件才能知道「刚才那次备份是哪个任务」，从而套用**该任务自己的**
@@ -677,25 +661,8 @@ impl CfgSnapshot {
                     recycle_min_age_days: t.retention.recycle_min_age_days,
                 })
                 .collect(),
-            // 明文自配置由调用方随后用 `with_self_config` 填（需要 ConfigManager 才能解密）
-            self_config: std::collections::BTreeMap::new(),
             after_backup_task: None,
         }
-    }
-
-    /// ~~填入**本插件自己的**配置（明文）~~
-    ///
-    /// **已弃用（ADR-021）**：宿主不再代存插件配置，故这里**什么都不做**
-    /// （`self_config` 恒为空对象）。保留方法签名是为了让既有调用点零改动，
-    /// 插件读到空对象后应回退到自己的 `own_data_dir`。
-    #[deprecated(note = "宿主不再代存插件配置（ADR-021）；插件改用 own_data_dir")]
-    pub fn with_self_config(
-        self,
-        _cfg: &crate::infra::config::AppConfig,
-        _plugin_id: &str,
-        _mgr: &crate::infra::config::ConfigManager,
-    ) -> Self {
-        self
     }
 
     /// 标记「本次 `after_backup` 事件由哪个任务触发」
@@ -760,8 +727,6 @@ impl CfgSnapshot {
             "utc_offset_minutes": self.utc_offset_minutes,
             "targets": targets,
             "tasks": tasks,
-            // 本插件自己的明文配置（隔离：只含本插件命名空间；**含凭据，禁止写日志**）
-            "self_config": self.self_config,
             // 仅 after_backup 事件有值：告诉插件「刚才完成的是哪个任务」
             "after_backup_task": self.after_backup_task,
         })

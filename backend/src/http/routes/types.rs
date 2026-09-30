@@ -80,6 +80,12 @@ pub struct ConfigResponse {
     pub plugins_disabled: Vec<String>,
     /// **每个插件文件对应的公钥**（文件名 → base64 公钥；一插件一公钥）
     pub plugins_plugin_pubkeys: std::collections::BTreeMap<String, String>,
+    /// 是否启用插件市场（默认关闭：关闭时不发起任何网络请求）
+    pub market_enabled: bool,
+    /// 是否在启动时自动检查更新（默认关：不在用户没要求时联网）
+    pub market_auto_check: bool,
+    /// 单个制品下载上限（MB）
+    pub market_max_artifact_mb: u32,
     /// 告警 Webhook 地址（空 = 不外发）
     pub webhook_url: Option<String>,
     /// Webhook 自定义请求头
@@ -236,6 +242,15 @@ pub struct ConfigSaveRequest {
     /// `FN_KZWR_PLUGINS_ALLOW_UNSIGNED=1`）。不传则保持原值。
     #[serde(default)]
     pub plugins_pubkeys: Option<Vec<String>>,
+    /// 插件市场开关（不传则保持原值）
+    #[serde(default)]
+    pub market_enabled: Option<bool>,
+    /// 启动时自动检查更新（不传则保持原值）
+    #[serde(default)]
+    pub market_auto_check: Option<bool>,
+    /// 单个制品下载上限 MB（不传则保持原值）
+    #[serde(default)]
+    pub market_max_artifact_mb: Option<u32>,
 }
 
 /// 备份响应
@@ -470,12 +485,6 @@ pub struct ConfigBundle {
     /// 多任务（源路径 + 目标引用 + cron + 保留策略）
     #[serde(default)]
     pub tasks: Vec<crate::infra::config::TaskConfig>,
-    /// 插件自管数据（明文键值对；敏感，导出需管理员口令，导入重新加密）
-    #[serde(default)]
-    pub plugin_data: std::collections::BTreeMap<
-        String,
-        std::collections::BTreeMap<String, String>,
-    >,
 }
 
 /// 导出/导入包里的单个目标（**含明文凭据**，仅存于导出的 JSON 文本）
@@ -683,4 +692,25 @@ pub struct SetupCheckResponse {
 pub struct AuditResponse {
     pub entries: Vec<crate::domain::audit::AuditEntry>,
     pub error: Option<String>,
+}
+
+// ── 插件市场 ──────────────────────────────────────────────────────────────
+
+/// 安装请求
+#[derive(Debug, Deserialize)]
+pub struct MarketInstallRequest {
+    /// 插件 id（索引里的 `id`）
+    #[serde(default)]
+    pub id: String,
+    /// 要安装的版本（空 = 装最新的兼容版本）
+    #[serde(default)]
+    pub version: String,
+}
+
+/// 市场列表查询参数
+#[derive(Debug, Deserialize)]
+pub struct MarketCatalogQuery {
+    /// `1`/`true` = 强制重新拉取索引
+    #[serde(default)]
+    pub refresh: String,
 }

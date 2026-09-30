@@ -78,4 +78,16 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 lto = true
 strip = true
 codegen-units = 1
-panic = "abort"
+# ⚠️ **刻意不设 `panic = "abort"`**（2026-09-29，曾设过，已按评审去掉）
+#
+# 设成 abort 会让**宿主全部 15 处 `catch_unwind` 在 release 下失效**
+# （实测：panic 直接终止进程，连返回值都打印不出来）。插件是第三方代码，
+# 一次 panic 就会把宿主连同所有备份任务一起干掉 —— 这在插件生态下不可接受。
+#
+# 代价：二进制更大（实测 8,967,728 → 10,059,600 字节，**+12.2%**），
+# 且 panic 走 unwind 而非立即终止。换回的是「插件 panic 不再等于宿主崩溃」。
+#
+# ⚠️ 实测补充：仅去掉 abort **救不了** panic 写在 `extern "C" fn` 函数体内的情形 —
+# 即便宿主是 unwind，运行时仍报 `thread caused non-unwinding panic. aborting.`
+# （`extern "C"` 的 `nounwind` 属性所致）。那条必须由插件侧用
+# `sdk::guard_str` 的**闭包形态**来防，详见 `plugins/sdk` 与 §7.8。
