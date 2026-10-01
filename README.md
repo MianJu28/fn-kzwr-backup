@@ -159,3 +159,4 @@ export TRIM_APP_SOCK=/tmp/fn-kzwr-backup.sock
 
 > **酷族网软**：官网 [www.kzwr.com](https://www.kzwr.com)。免费用户提供 10G 空间、不限速，
 > 但下载站位于大陆境外，实际速度取决于你的网络情况。
+# Test PR
