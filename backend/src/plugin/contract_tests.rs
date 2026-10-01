@@ -474,24 +474,27 @@ fn target_caps_honours_explicit_no_credentials() {
     assert_eq!(caps.url_placeholder.as_deref(), Some("/vol1/backup"));
 }
 
-/// example-localfs 的 describe 必须能被宿主解析，且声明「不用凭据」
-///
-/// 这是**回归测试**：该插件此前没声明 `needs_credentials`，导致它的目标在
-/// 「目标」页建不出来（保存时被「新目标必须填写用户名与密码」拒绝）。
-#[test]
-fn example_localfs_declares_credential_free_target() {
-    let src = read_repo_file("plugins/example-localfs/src/lib.rs");
-    // 从源码里抽出 describe 的 JSON 字面量不现实，这里断言关键声明存在，
-    // 真正的端到端解析由 `AbiTargetCaps` 的反序列化测试覆盖。
-    assert!(
-        src.contains("\"needs_credentials\": false"),
-        "example-localfs 必须声明 needs_credentials=false，否则其目标无法在「目标」页创建"
-    );
-    assert!(
-        src.contains("\"url_label\""),
-        "应声明 url_label，让前端把「地址」渲染成「目录路径」（否则用户不知道该填路径）"
-    );
-}
+// TODO: example-localfs 已迁移到插件仓库，此测试需改为从插件仓库读取源码
+// /// example-localfs 的 describe 必须能被宿主解析，且声明「不用凭据」
+// ///
+// /// 这是**回归测试**：该插件此前没声明 `needs_credentials`，导致它的目标在
+// /// 「目标」页建不出来（保存时被「新目标必须填写用户名与密码」拒绝）。
+// #[test]
+// fn example_localfs_declares_credential_free_target() {
+//     // TODO: 改为从插件仓库读取
+//     // let src = read_repo_file("plugins/example-localfs/src/lib.rs");
+//     let src = include_str!("../../../../dist/market-repo/examples/localfs/src/lib.rs");
+//     // 从源码里抽出 describe 的 JSON 字面量不现实，这里断言关键声明存在，
+//     // 真正的端到端解析由 `AbiTargetCaps` 的反序列化测试覆盖。
+//     assert!(
+//         src.contains("\"needs_credentials\": false"),
+//         "example-localfs 必须声明 needs_credentials=false，否则其目标无法在「目标」页创建"
+//     );
+//     assert!(
+//         src.contains("\"url_label\""),
+//         "应声明 url_label，让前端把「地址」渲染成「目录路径」（否则用户不知道该填路径）"
+//     );
+// }
 
 /// `PluginEntry` 必须把「是否需要凭据」与 `kind` 暴露给前端
 ///
@@ -599,23 +602,26 @@ fn target_field_secret_detection_is_conservative() {
     assert!(!parse(r#"{"key":"a","label":"A"}"#).is_secret());
 }
 
-/// `example-localfs` 必须声明 form，且 `url` 是必填项
-///
-/// 回归：该插件此前没有任何 form 声明，弹窗只能回退到 WebDAV 默认表单，
-/// 于是「目录路径」以外的插件自有字段（如 subdir）在界面上根本无从填写。
-#[test]
-fn example_localfs_declares_its_own_form() {
-    let src = read_repo_file("plugins/example-localfs/src/lib.rs");
-    assert!(src.contains("\"form\": ["), "example-localfs 应声明 target.form");
-    assert!(
-        src.contains("\"key\": \"subdir\""),
-        "应声明插件自有字段（验证「非 well-known 键按目标存储」这条路径）"
-    );
-    assert!(
-        src.contains("\"key\": \"url\""),
-        "应声明 url 字段（well-known 键，映射到 TargetConfig.url）"
-    );
-}
+// TODO: example-localfs 已迁移到插件仓库，此测试需改为从插件仓库读取源码
+// /// `example-localfs` 必须声明 form，且 `url` 是必填项
+// ///
+// /// 回归：该插件此前没有任何 form 声明，弹窗只能回退到 WebDAV 默认表单，
+// /// 于是「目录路径」以外的插件自有字段（如 subdir）在界面上根本无从填写。
+// #[test]
+// fn example_localfs_declares_its_own_form() {
+//     // TODO: 改为从插件仓库读取
+//     // let src = read_repo_file("plugins/example-localfs/src/lib.rs");
+//     let src = include_str!("../../../../dist/market-repo/examples/localfs/src/lib.rs");
+//     assert!(src.contains("\"form\": ["), "example-localfs 应声明 target.form");
+//     assert!(
+//         src.contains("\"key\": \"subdir\""),
+//         "应声明插件自有字段（验证「非 well-known 键按目标存储」这条路径）"
+//     );
+//     assert!(
+//         src.contains("\"key\": \"url\""),
+//         "应声明 url 字段（well-known 键，映射到 TargetConfig.url）"
+//     );
+// }
 
 /// `abi-layout.txt` 必须与宿主 `abi.rs` 同步
 ///

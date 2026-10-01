@@ -829,8 +829,10 @@ greeting = "enc:CCCC"
 accounts = "enc:whatever"
 percent = "enc:90"
 
-[plugin_data.example-localfs]
-root = "/vol1/backup"
+[plugin_data.webdav]
+url = "https://example.com/webdav"
+username = "user"
+password = "pass"
 "#,
         )
         .expect("write legacy config");
@@ -927,35 +929,35 @@ root = "/vol1/backup"
         let mut cfg = AppConfig::default();
         let mut a = TargetConfig {
             id: "a".to_string(),
-            kind: "example-localfs".to_string(),
+            kind: "webdav".to_string(),
             ..Default::default()
         };
-        a.fields.insert("subdir".to_string(), "alpha".to_string());
+        a.fields.insert("url".to_string(), "https://a.example.com".to_string());
         let mut b = TargetConfig {
             id: "b".to_string(),
-            kind: "example-localfs".to_string(),
+            kind: "webdav".to_string(),
             ..Default::default()
         };
-        b.fields.insert("subdir".to_string(), "beta".to_string());
+        b.fields.insert("url".to_string(), "https://b.example.com".to_string());
         cfg.targets.push(a);
         cfg.targets.push(b);
 
         assert_eq!(
-            cfg.target_by_id("a").unwrap().fields.get("subdir").map(String::as_str),
-            Some("alpha")
+            cfg.target_by_id("a").unwrap().fields.get("url").map(String::as_str),
+            Some("https://a.example.com")
         );
         assert_eq!(
-            cfg.target_by_id("b").unwrap().fields.get("subdir").map(String::as_str),
-            Some("beta")
+            cfg.target_by_id("b").unwrap().fields.get("url").map(String::as_str),
+            Some("https://b.example.com")
         );
         // 改一个不影响另一个
         cfg.target_by_id_mut("a")
             .unwrap()
             .fields
-            .insert("subdir".to_string(), "changed".to_string());
+            .insert("url".to_string(), "changed".to_string());
         assert_eq!(
-            cfg.target_by_id("b").unwrap().fields.get("subdir").map(String::as_str),
-            Some("beta"),
+            cfg.target_by_id("b").unwrap().fields.get("url").map(String::as_str),
+            Some("https://b.example.com"),
             "改目标 a 的字段不应影响目标 b"
         );
     }
@@ -966,20 +968,20 @@ root = "/vol1/backup"
         let (_d, m) = mgr();
         let mut t = TargetConfig {
             id: "t".to_string(),
-            kind: "example-localfs".to_string(),
+            kind: "webdav".to_string(),
             ..Default::default()
         };
         // 明文键
-        t.fields.insert("subdir".to_string(), "my-backups".to_string());
+        t.fields.insert("url".to_string(), "https://example.com".to_string());
         // 敏感键：加密存储
         let enc = m.encrypt_field("s3cr3t").expect("加密");
         assert!(enc.starts_with("enc:"), "敏感字段应带 enc: 前缀");
         assert_ne!(enc, "s3cr3t", "不得明文落盘");
-        t.fields.insert("token".to_string(), enc);
+        t.fields.insert("password".to_string(), enc);
 
         let plain = t.custom_fields_plain(&m);
-        assert_eq!(plain.get("subdir").map(String::as_str), Some("my-backups"));
-        assert_eq!(plain.get("token").map(String::as_str), Some("s3cr3t"), "读出应为明文");
+        assert_eq!(plain.get("url").map(String::as_str), Some("https://example.com"));
+        assert_eq!(plain.get("password").map(String::as_str), Some("s3cr3t"), "读出应为明文");
     }
 
     /// `None` 表示「未设置」而非「顺序上传」—— 二者必须可区分
