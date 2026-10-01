@@ -48,13 +48,17 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # ⚠️ actions/cache 的 v1/v2/v4 已被 GitHub 判为废弃版本，runner 会直接
+      #    拒绝执行（插件仓库 CI 已实测踩到）。这里钉 v6.1.0 的 commit SHA。
       - name: 缓存 cargo
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-${{ matrix.arch }}-${{ hashFiles('backend/Cargo.lock', 'plugins/*/Cargo.lock') }}
+          # 示例插件已迁出主仓库（plugins/ 只留 sdk 与 kzwr），故不再 glob
+          # `plugins/*/Cargo.lock` —— 该路径已不存在，写进 hashFiles 会让 key 恒定。
+          key: cargo-${{ matrix.arch }}-${{ hashFiles('backend/Cargo.lock') }}
           restore-keys: cargo-${{ matrix.arch }}-
 
       # ARM 交叉编译：rusqlite(bundled) 与 ring 含 C 代码，必须给出交叉 C 工具链，
@@ -149,7 +153,7 @@ jobs:
           fi
 
       - name: 上传产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fn-kzwr-backup-fpk-${{ matrix.arch }}
           path: dist/fn-kzwr-backup-app/*.fpk
