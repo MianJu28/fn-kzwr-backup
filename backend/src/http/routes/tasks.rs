@@ -92,6 +92,7 @@ pub(super) fn task_view(state: &AppState, t: &crate::infra::config::TaskConfig) 
         "schedule_cron": t.schedule_cron.clone().unwrap_or_default(),
         "schedule_next": next,
         "retention": RetentionView::from(&t.retention),
+        "strict": t.strict,
     })
 }
 
@@ -136,7 +137,14 @@ pub(super) async fn task_save(
     State(state): State<AppState>,
     Json(body): Json<TaskSaveRequest>,
 ) -> Json<serde_json::Value> {
-    let mut cfg = { state.config.lock().unwrap().load().unwrap_or_default() };
+    // **整段持有同一把锁**：load → 校验 → 改 → save 必须在一次临界区内完成。
+    //
+    // 曾经是「先 load（锁 A 用完即放）… 末尾再 save（锁 B）」，两个并发的保存请求
+    // 会各自读到同一份旧配置，后写的覆盖先写的 —— 用户在界面上连点两次「保存」
+    // 就静默丢一次修改，而且没有任何日志。config_save 一直是单 guard 的正确写法，
+    // 这里照它改。
+    let mut guard = state.config.lock().unwrap();
+    let mut cfg = guard.load().unwrap_or_default();
     // cron 先校验（错误时直接返回，不动配置）
     if let Some(cron) = &body.schedule_cron {
         if let Err(e) = crate::domain::scheduler::validate_cron(cron) {
@@ -172,11 +180,23 @@ pub(super) async fn task_save(
         enabled: body
             .enabled
             .unwrap_or_else(|| existing.as_ref().map(|t| t.enabled).unwrap_or(true)),
-        paths: body
-            .paths
-            .clone()
-            .or_else(|| existing.as_ref().map(|t| t.paths.clone()))
-            .unwrap_or_default(),
+        paths: {
+            let p = body
+                .paths
+                .clone()
+                .or_else(|| existing.as_ref().map(|t| t.paths.clone()))
+                .unwrap_or_default();
+            // **新建任务时至少要有 1 个备份路径**。
+            //
+            // 旧实现直接 `unwrap_or_default()`：前端漏传（或直接调 API 传 `{}`）
+            // 就会创建一个「没有任何路径」的任务 —— 它显示在列表里，
+            // 跑起来却什么都没备份，用户很容易误以为「已配好」。
+            // 编辑已有任务时允许保持原值（老配置可能就是空的，不该卡住保存）。
+            if p.is_empty() && existing.is_none() {
+                return Json(err("请至少添加一个要备份的文件夹"));
+            }
+            p
+        },
         target_id,
         target_folder: body
             .target_folder
@@ -201,15 +221,23 @@ pub(super) async fn task_save(
             .map(crate::infra::config::RetentionConfig::from)
             .or_else(|| existing.as_ref().map(|t| t.retention.clone()))
             .unwrap_or_default(),
+        // 严格模式：缺省保持原值（与 `paths`/`retention` 的「未传不改」语义一致）
+        strict: body
+            .strict
+            .or_else(|| existing.as_ref().map(|t| t.strict))
+            .unwrap_or(false),
     };
     match cfg.tasks.iter_mut().find(|t| t.id == id) {
         Some(slot) => *slot = task,
         None => cfg.tasks.push(task),
     }
-    if let Err(e) = state.config.lock().unwrap().save(&cfg) {
+    // 仍在锁内：save 与上面的 load/校验构成同一个原子步骤
+    if let Err(e) = guard.save(&cfg) {
         return Json(err(format!("{:#}", e)));
     }
     let saved = cfg.task_by_id(&id).cloned().unwrap_or_default();
+    // 放锁后再记审计/组响应：task_view 内部自己会取锁，这里必须已经释放
+    drop(guard);
     state.audit.record(
         "task.save",
         format!(
@@ -222,7 +250,28 @@ pub(super) async fn task_save(
         true,
         None,
     );
-    Json(serde_json::json!({ "success": true, "task": task_view(&state, &saved), "error": null }))
+    // 软校验：路径不存在不阻断保存（外接盘可能暂时未挂载、网络盘可能掉线），
+    // 但要把话说明白 —— 否则用户保存成功、等到定时任务跑了才看到「路径不存在」告警。
+    let missing: Vec<String> = saved
+        .paths
+        .iter()
+        .filter(|p| !std::path::Path::new(p.as_str()).exists())
+        .cloned()
+        .collect();
+    let warnings: Vec<String> = if missing.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!(
+            "这些路径当前不存在，备份时会失败并被跳过：{}",
+            missing.join("、")
+        )]
+    };
+    Json(serde_json::json!({
+        "success": true,
+        "task": task_view(&state, &saved),
+        "warnings": warnings,
+        "error": null
+    }))
 }
 
 /// `POST /api/tasks/:id/delete`：删除任务（`purge=true` 同时删除它的快照记录）
@@ -247,13 +296,23 @@ pub(super) async fn task_delete(
     } else {
         0
     };
+    // 事件总线的「最后一帧」也要跟着清：否则「概览 → 实时任务」会继续展示
+    // 这个已经不存在的任务上次的结果（实测会让人误以为故障仍在）。
+    let cleared = state
+        .eventbus
+        .clear_if_task(crate::eventbus::TaskKind::Backup, &id);
     state.audit.record(
         "task.delete",
         format!("删除任务 {id}（清理快照记录 {purged} 条）"),
         true,
         None,
     );
-    Json(serde_json::json!({ "success": true, "purged": purged, "error": null }))
+    Json(serde_json::json!({
+        "success": true,
+        "purged": purged,
+        "live_cleared": cleared,
+        "error": null
+    }))
 }
 
 /// `POST /api/tasks/:id/run`：立即执行该任务
@@ -286,11 +345,27 @@ pub(super) async fn task_run(
 pub(super) struct BackupRunFlag<'a> {
     flag: &'a std::sync::atomic::AtomicBool,
     task_id: &'a std::sync::RwLock<Option<String>>,
+    kind: &'a std::sync::RwLock<Option<crate::eventbus::TaskKind>>,
+    cancel: &'a std::sync::atomic::AtomicBool,
+    /// 事件总线：用于兜底补发终态（见 Drop）
+    eventbus: &'a crate::eventbus::EventBus,
 }
 
 impl Drop for BackupRunFlag<'_> {
     fn drop(&mut self) {
+        // **兜底发布终态**：备份若因取消、重试耗尽、panic 等路径离开，
+        // 都不会走到正常的「发布 Completed/Failed」代码，事件总线会永远停在
+        // `status=progress`。前端「实时任务」卡片于是永久显示「进行中」——
+        // 即使 `busy` 已是 false（实测：备份收尾阶段结束后卡片仍转圈）。
+        // 与恢复侧同一处理（`restore.rs` 的 RunFlag::drop）。
+        self.eventbus.finalize_if_unfinished(
+            crate::eventbus::TaskKind::Backup,
+            "任务异常结束（未收到终态事件，请查看运行日志）",
+        );
         *self.task_id.write().unwrap() = None;
+        *self.kind.write().unwrap() = None;
+        // **必须清零取消标志**：否则上一次取消会立刻终止下一次任务
+        self.cancel.store(false, std::sync::atomic::Ordering::SeqCst);
         self.flag.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -344,10 +419,18 @@ pub async fn run_task_now(state: &AppState, task_id: &str) -> BackupResponse {
     let _running = BackupRunFlag {
         flag: &state.backup_running,
         task_id: &state.running_task_id,
+        kind: &state.running_kind,
+        cancel: &state.cancel_requested,
+        eventbus: &state.eventbus,
     };
     // 记录本任务 id（在 CAS 成功之后、真正开跑之前）：
     // 插件启停接口据此保护「正在进行的任务」，不把它级联禁用。
     *state.running_task_id.write().unwrap() = Some(task_id.to_string());
+    // 标记运行类型（取消接口据此区分备份/恢复）+ **清零上次的取消标志**
+    *state.running_kind.write().unwrap() = Some(crate::eventbus::TaskKind::Backup);
+    state
+        .cancel_requested
+        .store(false, std::sync::atomic::Ordering::SeqCst);
 
     // 1) 解析任务与它的目标（未就绪 → 明确提示，不静默失败）
     let ctx = match task_context(state, task_id) {
@@ -416,6 +499,40 @@ pub async fn run_task_now(state: &AppState, task_id: &str) -> BackupResponse {
     // 3) 执行多路径备份（job_id 前缀 = 任务 id → 每任务独立快照）
     let job_id = ctx.task.id.clone();
     let account = ctx.account.clone();
+    //
+    // 保留策略启用时才需要「兄弟任务」：共用同一「目标 + 目标文件夹」的其它任务，
+    // 其文件与本任务在云端处在同一棵树里，必须一并算作受管理，否则会被误删。
+    //
+    // 读取配置失败时**不放弃备份**：备份本身与保留策略无关，只是本次清理
+    // 无法拿到完整受管理集合 —— 此时**关掉保留策略**是最安全的降级
+    // （宁可不清理，也不能把兄弟任务的文件当孤儿删掉）。
+    let retention = if retention.is_some() {
+        let siblings = {
+            let mgr = state.config.lock().unwrap();
+            mgr.load().ok().map(|cfg| {
+                cfg.tasks_sharing_target_folder(&ctx.task.target_id, &target_folder, &ctx.task.id)
+                    .into_iter()
+                    .flat_map(crate::infra::config::AppConfig::job_roots_of)
+                    .collect::<Vec<(String, String)>>()
+            })
+        };
+        match siblings {
+            Some(s) => Some((retention.expect("retention 已确认非空"), s)),
+            None => {
+                tracing::warn!(
+                    task = %ctx.task.id,
+                    "读取配置失败：本次备份跳过保留策略清理（受管理集合不完整，清理会误删）"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let (retention, sibling_jobs) = match retention {
+        Some((rt, s)) => (Some(rt), s),
+        None => (None, Vec::new()),
+    };
     let job = BackupJob {
         job_id: job_id.clone(),
         account: account.clone(),
@@ -426,6 +543,12 @@ pub async fn run_task_now(state: &AppState, task_id: &str) -> BackupResponse {
         target_prefix: Some(target_folder),
         eventbus: Some(state.eventbus.clone()),
         retention,
+        sibling_jobs,
+        strict: ctx.task.strict,
+        // 密文暂存目录：`$TRIM_PKGTMP/staging`（流式加密大文件的落点，见 backup.rs）
+        staging_dir: Some(state.backup_tmp.clone()),
+        // 取消标志：用户在界面上点「取消」时，任务在**下一个文件边界**停下
+        cancel: Some(state.cancel_requested.clone()),
     };
     tracing::info!(task = %task_label, target = %ctx.task.target_id, paths = paths.len(), "开始执行备份任务");
     match job.run_multi(&paths).await {
@@ -496,4 +619,101 @@ pub async fn run_task_now(state: &AppState, task_id: &str) -> BackupResponse {
             }
         }
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 实时任务：查询当前状态 / 取消
+// ════════════════════════════════════════════════════════════════════════════
+
+/// `GET /api/tasks/live`：当前任务状态快照
+///
+/// 前端刷新页面或**退出应用再进来**（WebView 重建、WS 重连）时，之前通过 WS
+/// 收到的事件全部丢失，界面会显示「没有任务在跑」，而后台其实还在跑。
+/// 事件总线保留了最后一帧，这里把它一并返回，前端首屏即可还原进度。
+pub(super) async fn tasks_live(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let running = state
+        .running_kind
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or(None);
+    let backup = state.eventbus.last_snapshot(crate::eventbus::TaskKind::Backup);
+    let restore = state
+        .eventbus
+        .last_snapshot(crate::eventbus::TaskKind::Restore);
+    Json(serde_json::json!({
+        "busy": state.backup_running.load(std::sync::atomic::Ordering::SeqCst)
+            || running.is_some(),
+        "running_kind": running,
+        "running_task_id": state.running_task_id.read().map(|g| g.clone()).unwrap_or(None),
+        "cancel_requested": state
+            .cancel_requested
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "backup": backup.as_ref().map(|e| live_view(e)),
+        "restore": restore.as_ref().map(|e| live_view(e)),
+    }))
+}
+
+/// 把最后一帧事件转成前端可直接渲染的形状（与 WS 的 `event` 同构）
+fn live_view(e: &crate::eventbus::DomainEvent) -> serde_json::Value {
+    serde_json::json!({
+        "type": "event",
+        "kind": e.kind,
+        "status": e.status,
+        "phase": e.phase,
+        "job_id": e.job_id,
+        "current_file": e.current_file,
+        "done": e.done,
+        "total": e.total,
+        "bytes_done": e.bytes_done,
+        "bytes_total": e.bytes_total,
+        "elapsed_ms": e.elapsed_ms,
+        "speed": e.speed,
+        "message": e.message,
+        "ts": e.ts,
+    })
+}
+
+/// `POST /api/tasks/cancel`：请求取消当前正在执行的任务
+///
+/// ## 取消是「协作式」的，不是强杀
+/// 置位标志后，任务在**下一个文件边界**停止。原因：
+/// - 单文件的传输在插件 FFI 里推进（`write_chunk` / `read_chunk` 循环），
+///   同进程模型下无法从外部打断（否则会留下半截分片）；
+/// - 文件边界停下是安全的：已完成的文件快照已落盘，下次备份/恢复接着处理未完成的。
+///
+/// 因此接口返回 `accepted`，并说明「将在当前文件结束后停止」，而不是假装已终止。
+pub(super) async fn tasks_cancel(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let busy = state.backup_running.load(std::sync::atomic::Ordering::SeqCst)
+        || state.running_kind.read().map(|g| g.is_some()).unwrap_or(false);
+    if !busy {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": Some("当前没有正在执行的任务".to_string()),
+        }));
+    }
+    if state
+        .cancel_requested
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Json(serde_json::json!({
+            "success": true,
+            "already": true,
+            "message": "取消请求已提交，正在等待当前文件结束",
+        }));
+    }
+    state
+        .cancel_requested
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let kind = state.running_kind.read().map(|g| g.clone()).unwrap_or(None);
+    let what = match kind {
+        Some(crate::eventbus::TaskKind::Backup) => "备份",
+        Some(crate::eventbus::TaskKind::Restore) => "恢复",
+        _ => "任务",
+    };
+    tracing::info!(kind = ?kind, "收到取消{}请求", what);
+    state.audit.record("task.cancel", format!("请求取消{what}任务"), true, None);
+    Json(serde_json::json!({
+        "success": true,
+        "message": format!("已请求取消{what}：将在当前文件传输结束后停止（已完成的文件不会回退）"),
+    }))
 }

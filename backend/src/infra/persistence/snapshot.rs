@@ -205,12 +205,21 @@ impl SnapshotStore {
     }
 
     /// 获取单个文件的快照记录（可选）
-    pub fn get_entry(&self, job_id: &str, rel_path: &str) -> rusqlite::Result<Option<SnapshotEntry>> {
+    pub fn get_entry(
+        &self,
+        account: &str,
+        job_id: &str,
+        rel_path: &str,
+    ) -> rusqlite::Result<Option<SnapshotEntry>> {
         let conn = self.conn.lock().unwrap();
+        // ⚠️ **必须带 `account` 条件**：表主键是 (account, job_id, rel_path)。
+        // 缺了它时多账号共用同一 job_id 会 `query_row` 命中任意一行 ——
+        // 读到别的账号的快照（`query_row` 遇多行不报错，只取第一行，无声无息）。
         let row = conn
             .query_row(
-                "SELECT rel_path, size, mtime_secs, is_dir, digest FROM sync_snapshots WHERE job_id=?1 AND rel_path=?2",
-                [job_id, rel_path],
+                "SELECT rel_path, size, mtime_secs, is_dir, digest FROM sync_snapshots \
+                 WHERE account=?1 AND job_id=?2 AND rel_path=?3",
+                [account, job_id, rel_path],
                 |r| {
                     Ok(SnapshotEntry {
                         rel_path: r.get(0)?,

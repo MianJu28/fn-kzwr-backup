@@ -48,8 +48,11 @@ use plugins::{
     plugin_uninstall, plugins_list,
 };
 use restore::{restore_files, restore_prune, restore_run, restore_tree};
-use targets::{target_delete, target_parallel, target_save, target_test, targets_list};
-use tasks::{backup_run, task_delete, task_run, task_save, tasks_list};
+use targets::{
+    proxy_get, proxy_save, proxy_test, target_delete, target_parallel, target_save, target_test,
+    targets_list,
+};
+use tasks::{backup_run, task_delete, task_run, task_save, tasks_cancel, tasks_list, tasks_live};
 
 // ── Handler ────────────────────────────────────
 
@@ -92,10 +95,17 @@ pub fn router(state: AppState) -> Router {
         .route("/targets/:id/test", post(target_test))
         // 并发度**按目标**配置（同一个插件可被多个目标实例化，不能共用一份）
         .route("/targets/:id/parallel", post(target_parallel))
+        // 网络代理（全局一份；目标级开关在 /targets 的 use_proxy）
+        .route("/proxy", get(proxy_get).post(proxy_save))
+        // 代理测试：真的经代理发一次请求（不只是校验地址格式）
+        .route("/proxy/test", post(proxy_test))
         .route("/tasks", get(tasks_list).post(task_save))
         .route("/tasks/:id/delete", post(task_delete))
         .route("/tasks/:id/run", post(task_run))
         .route("/backup/run", post(backup_run))
+        // 实时任务状态 / 取消（协作式：在文件边界停止）
+        .route("/tasks/live", get(tasks_live))
+        .route("/tasks/cancel", post(tasks_cancel))
         .route("/restore/files", get(restore_files))
         .route("/restore/tree", get(restore_tree))
         .route("/restore/run", post(restore_run))
@@ -121,7 +131,83 @@ pub fn router(state: AppState) -> Router {
     // 这样才能支持运行时启停插件（禁用后立即 404、重新启用立即恢复），
     // 也让新加载的插件无需重启即可提供服务。核心仍不感知具体插件的路径。
     core = core.route("/p/:plugin_id/*action", axum::routing::any(plugin_dispatch));
-    core.with_state(state)
+    core
+        // 全局请求体上限（axum 0.7 默认 **2MB**，对配置导入这类接口不够；
+        // 不设上限则任何接口都能被喂超大 body 撑爆内存）。
+        //
+        // 取 32MB：配置导入/插件安装（.so）需要远超 2MB，而 32MB 已足够
+        // 容纳最大的合法载荷；再大就是不正常的请求了，直接 413 拒绝。
+        .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
+        // 把「非 JSON 的错误响应」统一改写成 JSON（必须在内层，最后执行）
+        .layer(axum::middleware::map_response(jsonify_error_body))
+        .with_state(state)
+}
+
+/// 把**非 JSON 的错误响应体**改写成 `{"error": "..."}`
+///
+/// ## 为什么需要
+/// 本项目 API 契约是「一律 JSON，错误放 error 字段」，前端 `req()` 会 `res.json()`。
+/// 但有两类响应是**纯文本**的：
+/// 1. axum 的 `Json<T>` 提取失败 —— `422` + `Failed to deserialize ...`；
+/// 2. axum 的 body 上限超限 —— `413` + `length limit exceeded`。
+///
+/// 前端拿到纯文本就会抛「响应解析失败（HTTP 4xx）」，**真实的参数错误被完全掩盖**
+/// （用户看不到「缺少 config 字段」这类有用信息）。
+///
+/// 这里在响应离开应用前检查：状态码 ≥ 400 且 Content-Type 不是 JSON ⇒ 把 body
+/// 读出来塞进 `{"error": ...}`，并统一成 400/413 这类可读状态码。
+async fn jsonify_error_body(resp: axum::response::Response) -> axum::response::Response {
+    use axum::body::to_bytes;
+    use axum::response::IntoResponse;
+
+    // ⚠️ 必须放行 **101 Switching Protocols**（WebSocket 升级）。
+    //
+    // `is_success()` 只覆盖 2xx、`is_redirection()` 只覆盖 3xx —— 101 两者都不属于，
+    // 于是 WebSocket 握手成功后会被这里当成「错误响应」改写：
+    // 客户端收到 400 + {"error":"请求失败（HTTP 101 Switching Protocols）"}，
+    // 表现为**实时通道永远连不上**，而 HTTP 接口一切正常。
+    // 这类回归只在真机点开页面时才暴露（单测与 curl 都不走 WS）。
+    if resp.status().is_success()
+        || resp.status().is_redirection()
+        || resp.status() == axum::http::StatusCode::SWITCHING_PROTOCOLS
+    {
+        return resp;
+    }
+    // 已经是 JSON 的（绝大多数业务错误）原样放行
+    let is_json = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("application/json"))
+        .unwrap_or(false);
+    if is_json {
+        return resp;
+    }
+    let status = resp.status();
+    let (mut parts, body) = resp.into_parts();
+    let text = match to_bytes(body, 64 * 1024).await {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(_) => String::new(),
+    };
+    let msg = if text.trim().is_empty() {
+        format!("请求失败（HTTP {status}）")
+    } else {
+        text.trim().to_string()
+    };
+    // 参数类错误统一 400（便于前端区分「请求写错」与「服务端故障」）；
+    // 413（超限）与 5xx 保留原码，它们有独立语义。
+    let out_status = if status.is_server_error()
+        || status == axum::http::StatusCode::PAYLOAD_TOO_LARGE
+    {
+        status
+    } else {
+        axum::http::StatusCode::BAD_REQUEST
+    };
+    parts.headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    (out_status, axum::Json(serde_json::json!({ "error": msg }))).into_response()
 }
 
 /// 把 `/api/p/<插件id>/<动作…>` 分发给该插件自己的 `routes()`

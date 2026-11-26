@@ -383,11 +383,12 @@ pub(super) async fn config_export(
     State(state): State<AppState>,
     Json(body): Json<ConfigExportRequest>,
 ) -> Json<ConfigExportResponse> {
-    if body.passphrase.as_str() != state.passphrase.expose_secret().as_str() {
+    // 口令闸门：常数时间比较 + 失败限速（5 次错 → 锁 60s）
+    if !state.check_passphrase(&body.passphrase) {
         return Json(ConfigExportResponse {
             success: false,
             config: None,
-            error: Some("管理员口令错误".to_string()),
+            error: Some(crate::passphrase_err(&state)),
         });
     }
     let (cfg, creds, bundle_targets) = {
@@ -400,6 +401,15 @@ pub(super) async fn config_export(
             .iter()
             .map(|t| {
                 let (u, p) = mgr.target_credentials(t).unwrap_or((None, None));
+                // 插件自定义字段：`enc:` 前缀的是加密存储的，导出为明文但**记下键名**，
+                // 导入时才知道哪些要重新加密（插件可能尚未安装，无从问它）。
+                let plain = t.custom_fields_plain(&mgr);
+                let secret_fields: Vec<String> = t
+                    .fields
+                    .iter()
+                    .filter(|(_, v)| v.starts_with("enc:"))
+                    .map(|(k, _)| k.clone())
+                    .collect();
                 BundleTarget {
                     id: t.id.clone(),
                     name: t.name.clone(),
@@ -409,6 +419,10 @@ pub(super) async fn config_export(
                     password: p,
                     enabled: t.enabled,
                     parallel: t.parallel,
+                    // 代理开关随配置包一起导入（导入是「恢复整套设置」，不能丢）
+                    use_proxy: t.use_proxy,
+                    fields: plain,
+                    secret_fields,
                 }
             })
             .collect();
@@ -462,10 +476,10 @@ pub(super) async fn config_import(
     State(state): State<AppState>,
     Json(body): Json<ConfigImportRequest>,
 ) -> Json<ConfigImportResponse> {
-    if body.passphrase.as_str() != state.passphrase.expose_secret().as_str() {
+    if !state.check_passphrase(&body.passphrase) {
         return Json(ConfigImportResponse {
             success: false,
-            error: Some("管理员口令错误".to_string()),
+            error: Some(crate::passphrase_err(&state)),
         });
     }
     let bundle: ConfigBundle = match serde_json::from_str(&body.config) {
@@ -564,7 +578,38 @@ pub(super) async fn config_import(
                     password_enc,
                     enabled: t.enabled,
                     parallel: t.parallel,
-                    fields: std::collections::BTreeMap::new(),
+                    // 插件自定义字段（ADR-019/020：本地目录路径、bucket 等都在这）
+                    //
+                    // 为什么必须导入：不还原的话换机后插件拿到的 `target_json.config`
+                    // 缺字段 → 备份报「目标未配置」，而用户看不出是导入丢的。
+                    //
+                    // 敏感键（`secret_fields` 里列出过的）用**当前口令**重新加密 ——
+                    // 导出包里的明文只是传输形态，落盘必须是密文（与 username/password
+                    // 的处理一致）。加密失败按「不落盘该键」处理并告警，而不是整体拒绝导入：
+                    // 一个字段坏掉不至于让整个目标不可用，但**不能**悄悄存成明文。
+                    fields: {
+                        let mut m = std::collections::BTreeMap::new();
+                        for (k, v) in &t.fields {
+                            if v.is_empty() {
+                                continue;
+                            }
+                            if t.secret_fields.iter().any(|s| s == k) {
+                                match mgr.encrypt_field(v) {
+                                    Ok(enc) => {
+                                        m.insert(k.clone(), enc);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(target = %t.id, key = %k, err = %e, "导入：目标敏感字段加密失败，已跳过该字段");
+                                    }
+                                }
+                            } else {
+                                m.insert(k.clone(), v.clone());
+                            }
+                        }
+                        m
+                    },
+                    // 代理开关随包还原（导入是「恢复整套设置」）
+                    use_proxy: t.use_proxy,
                 });
             }
             cfg.targets = targets;

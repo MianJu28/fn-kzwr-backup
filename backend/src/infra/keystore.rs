@@ -45,15 +45,30 @@ pub fn save_keystore(keys: &AgeKeys, passphrase: &SecretString, path: &Path) -> 
 fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .context("打开密钥库文件失败")?;
-    f.write_all(data).context("写入密钥库文件失败")?;
-    // 已存在的文件不会被 `mode` 改动（它只管新建），故显式收紧一次
+    // **必须原子写**：`truncate(true)` 会先清空既有文件再写入，若此刻断电/被 kill
+    // /磁盘满，`keystore.age` 就变成空文件或半截文件 —— 而它是**唯一一份**私钥密文，
+    // 一旦损坏则全部历史备份永久不可解密。
+    //
+    // 做法：同目录临时文件（0600）→ fsync → rename（同分区 rename 原子）。
+    // 与 `market.rs::atomic_write` 同一模式。
+    let tmp = path.with_extension("age.tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("创建临时密钥库失败：{}", tmp.display()))?;
+        f.write_all(data).context("写入临时密钥库文件失败")?;
+        // rename 之前必须落盘，否则 rename 后仍可能在掉电时只剩空文件
+        f.sync_all().context("刷新临时密钥库失败")?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("替换密钥库失败：{}", path.display()));
+    }
+    // rename 后确保权限（rename 保留临时文件的 0600，这里再钉一次以防 umask 干扰）
     let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(path, perms).context("收紧密钥库权限失败")?;
     Ok(())

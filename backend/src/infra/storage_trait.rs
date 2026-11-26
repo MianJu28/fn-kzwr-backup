@@ -128,6 +128,24 @@ pub trait TargetStorage: Send + Sync {
         self.write_stream(path, stream).await
     }
 
+    /// 已知总字节数时的流式写入（默认忽略 `total`，退回 [`Self::write_stream_progress`]）。
+    ///
+    /// 为什么单独加这一个方法：WebDAV 的 PUT 必须带**精确** `Content-Length`
+    /// （否则只能发 chunked，且发送前无法判断是否需要拆分为 ≤100MB 的分片）。
+    /// 调用方在加密阶段就已知道密文总长（`encrypt_stream_to_staging` 返回
+    /// `enc_len`），把它一路带到这里，目标端就能**边收边发** —— 既不用先把密文
+    /// 落盘，也不用整份读进内存。
+    async fn write_stream_sized(
+        &self,
+        path: &Path,
+        stream: Box<dyn Stream<Item = Bytes> + Send + Unpin>,
+        total: u64,
+        progress: ProgressCb,
+    ) -> StorageResult<()> {
+        let _ = total;
+        self.write_stream_progress(path, stream, progress).await
+    }
+
     /// 测试连接与凭证是否有效
     async fn ping(&self) -> StorageResult<()>;
 
@@ -335,7 +353,147 @@ impl TargetStorage for SwapTarget {
         self.current().write_stream_progress(path, stream, progress).await
     }
 
+    /// **必须转发**：默认实现会丢掉 `total`，目标端就只能退回「先攒后传」的老路
+    async fn write_stream_sized(
+        &self,
+        path: &Path,
+        stream: Box<dyn Stream<Item = Bytes> + Send + Unpin>,
+        total: u64,
+        progress: ProgressCb,
+    ) -> StorageResult<()> {
+        self.current()
+            .write_stream_sized(path, stream, total, progress)
+            .await
+    }
+
     async fn ping(&self) -> StorageResult<()> {
         self.current().ping().await
+    }
+}
+
+#[cfg(test)]
+mod sized_forwarding_tests {
+    use super::*;
+    use futures::StreamExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// 记录收到的 `total` 的假目标
+    struct TotalRecorder {
+        total: Arc<AtomicU64>,
+    }
+
+    #[async_trait]
+    impl TargetStorage for TotalRecorder {
+        async fn write_stream(
+            &self,
+            _path: &Path,
+            mut stream: Box<dyn Stream<Item = Bytes> + Send + Unpin>,
+        ) -> StorageResult<()> {
+            while stream.next().await.is_some() {}
+            self.total.store(0, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn write_stream_sized(
+            &self,
+            _path: &Path,
+            mut stream: Box<dyn Stream<Item = Bytes> + Send + Unpin>,
+            total: u64,
+            _progress: ProgressCb,
+        ) -> StorageResult<()> {
+            while stream.next().await.is_some() {}
+            self.total.store(total, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn read_stream(
+            &self,
+            _path: &Path,
+        ) -> StorageResult<Box<dyn Stream<Item = StorageResult<Bytes>> + Send + Unpin>> {
+            Ok(Box::new(futures::stream::empty()))
+        }
+        async fn delete(&self, _path: &Path) -> StorageResult<()> {
+            Ok(())
+        }
+        async fn list(&self, _prefix: &str) -> StorageResult<Vec<FileDescriptor>> {
+            Ok(Vec::new())
+        }
+        async fn ping(&self) -> StorageResult<()> {
+            Ok(())
+        }
+    }
+
+    /// `SwapTarget` 必须把 `total` 转发给内层 —— 漏转就会让目标端退回「先攒后传」，
+    /// 而这正是「write_begin 在沙箱里建 /tmp 文件失败」那条老路的入口。
+    #[tokio::test]
+    async fn swap_target_forwards_sized_total() {
+        let rec = Arc::new(AtomicU64::new(u64::MAX));
+        let inner = Arc::new(TotalRecorder { total: rec.clone() });
+        let swap = SwapTarget::new(inner);
+        let noop: ProgressCb = Arc::new(|_, _, _| {});
+        let data = [1u8; 32];
+        let body = futures::stream::iter(data.chunks(8).map(Bytes::copy_from_slice).collect::<Vec<_>>());
+        swap.write_stream_sized(Path::new("x.age"), Box::new(body), 32, noop)
+            .await
+            .expect("转发应成功");
+        assert_eq!(
+            rec.load(Ordering::Relaxed),
+            32,
+            "SwapTarget 必须把 total 原样转发给内层目标"
+        );
+    }
+
+    /// 只实现 `write_stream` 的假目标（用 trait 的默认 `write_stream_sized`）
+    struct DefaultOnly {
+        total: Arc<AtomicU64>,
+    }
+
+    #[async_trait]
+    impl TargetStorage for DefaultOnly {
+        async fn write_stream(
+            &self,
+            _path: &Path,
+            mut stream: Box<dyn Stream<Item = Bytes> + Send + Unpin>,
+        ) -> StorageResult<()> {
+            while stream.next().await.is_some() {}
+            // 默认实现不会告诉它 total，只能记 0
+            self.total.store(0, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn read_stream(
+            &self,
+            _path: &Path,
+        ) -> StorageResult<Box<dyn Stream<Item = StorageResult<Bytes>> + Send + Unpin>> {
+            Ok(Box::new(futures::stream::empty()))
+        }
+        async fn delete(&self, _path: &Path) -> StorageResult<()> {
+            Ok(())
+        }
+        async fn list(&self, _prefix: &str) -> StorageResult<Vec<FileDescriptor>> {
+            Ok(Vec::new())
+        }
+        async fn ping(&self) -> StorageResult<()> {
+            Ok(())
+        }
+    }
+
+    /// 反向对照：确认上一条断言真的「能失败」——
+    /// 若某个包装器漏转发（退化成 trait 默认实现），total 就根本到不了内层。
+    #[tokio::test]
+    async fn control_default_impl_loses_total() {
+        let rec = Arc::new(AtomicU64::new(u64::MAX));
+        let inner = DefaultOnly { total: rec.clone() };
+        let noop: ProgressCb = Arc::new(|_, _, _| {});
+        let body = futures::stream::iter(vec![Bytes::from_static(b"abc")]);
+        inner
+            .write_stream_sized(Path::new("x.age"), Box::new(body), 99, noop)
+            .await
+            .expect("调用应成功");
+        assert_eq!(
+            rec.load(Ordering::Relaxed),
+            0,
+            "对照组：默认实现确实丢掉了 total（说明 SwapTarget 的转发是必需的）"
+        );
     }
 }

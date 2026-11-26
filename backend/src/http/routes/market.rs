@@ -148,6 +148,15 @@ pub(super) async fn market_install(
         return Json(err("该版本已被撤销，拒绝安装"));
     }
 
+    // **3.5) 校验制品元数据（必须早于任何落盘/下载）**
+    //
+    // `file_name` 来自远程索引（外部数据）。安装会 `dir.join(&file_name)`，
+    // 若不校验就可能被 `../` 穿越写到插件目录之外。手动安装路径一直有这层检查，
+    // 市场路径此前漏了 —— 两条入口必须是同一条纪律。
+    if let Err(e) = market::validate_artifact_meta(&v) {
+        return Json(err(e));
+    }
+
     // 4) 同名文件若已绑定**其它**公钥 ⇒ 拒绝（防覆盖已信任的其它来源文件）
     let dir = match market::install_dir() {
         Ok(d) => d,
@@ -178,7 +187,13 @@ pub(super) async fn market_install(
     }
     let so_path = dir.join(&v.file_name);
     let sig_path = market::installed_sig_path(&dir, &v.file_name);
-    if let Err(e) = atomic_write(&so_path, &so).and_then(|_| atomic_write(&sig_path, &sig)) {
+    // **.so 与 .sig 必须一起成功或一起回滚**。
+    //
+    // 旧实现是两次独立的 `atomic_write` 顺序执行：若 `.so` 已 rename 成功、
+    // 而 `.sig` 失败（磁盘满/权限），磁盘上就留下「**新的 .so + 旧的 .sig**」——
+    // 该插件此后每次加载都必然验签失败，而错误信息只会说「签名校验未通过」，
+    // 根因（落盘只完成了一半）完全看不出来。
+    if let Err(e) = write_so_and_sig_atomic(&so_path, &so, &sig_path, &sig) {
         return Json(err(e));
     }
 
@@ -315,6 +330,70 @@ fn installed_versions(state: &AppState) -> std::collections::HashMap<String, Str
 }
 
 /// 原子写：先写同目录临时文件再 rename，避免半截文件被当成有效产物
+/// 把 `.so` 与 `.sig` **成对**落盘：两者要么都换成新的，要么都保持旧的
+///
+/// 顺序：先各写临时文件（并 fsync），再依次 rename；第二个 rename 失败时
+/// 把第一个 rename 回滚（用先前备份的旧文件）。
+fn write_so_and_sig_atomic(
+    so_path: &std::path::Path,
+    so: &[u8],
+    sig_path: &std::path::Path,
+    sig: &[u8],
+) -> Result<(), String> {
+    use std::io::Write;
+
+    // 1) 两个临时文件：先全部写好并落盘，避免 rename 之后才发现写失败
+    let so_tmp = so_path.with_extension("so.tmp-install");
+    let sig_tmp = sig_path.with_extension("sig.tmp-install");
+    let write_tmp = |p: &std::path::Path, bytes: &[u8]| -> Result<(), String> {
+        let mut f = std::fs::File::create(p)
+            .map_err(|e| format!("创建临时文件 {} 失败：{e}", p.display()))?;
+        f.write_all(bytes)
+            .map_err(|e| format!("写入 {} 失败：{e}", p.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("刷新 {} 失败：{e}", p.display()))?;
+        Ok(())
+    };
+    if let Err(e) = write_tmp(&so_tmp, so).and_then(|_| write_tmp(&sig_tmp, sig)) {
+        let _ = std::fs::remove_file(&so_tmp);
+        let _ = std::fs::remove_file(&sig_tmp);
+        return Err(e);
+    }
+
+    // 2) 备份旧 .so（用于第二个 rename 失败时回滚）
+    let so_bak = so_path.with_extension("so.bak-install");
+    let had_old_so = so_path.exists();
+    if had_old_so {
+        if let Err(e) = std::fs::rename(so_path, &so_bak) {
+            let _ = std::fs::remove_file(&so_tmp);
+            let _ = std::fs::remove_file(&sig_tmp);
+            return Err(format!("备份旧插件失败：{e}"));
+        }
+    }
+
+    // 3) 依次 rename：.so 先，.sig 后
+    if let Err(e) = std::fs::rename(&so_tmp, so_path) {
+        if had_old_so {
+            let _ = std::fs::rename(&so_bak, so_path); // 回滚
+        }
+        let _ = std::fs::remove_file(&sig_tmp);
+        return Err(format!("安装插件文件失败：{e}"));
+    }
+    if let Err(e) = std::fs::rename(&sig_tmp, sig_path) {
+        // **关键回滚**：.sig 没换成功，就把 .so 也恢复成旧的，
+        // 否则会留下「新 so + 旧 sig」这种必然验签失败的状态。
+        let _ = std::fs::remove_file(so_path);
+        if had_old_so {
+            let _ = std::fs::rename(&so_bak, so_path);
+        }
+        return Err(format!(
+            "安装签名文件失败：{e}（已回滚到旧版本，插件仍可正常加载）"
+        ));
+    }
+    let _ = std::fs::remove_file(&so_bak);
+    Ok(())
+}
+
 fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("tmp-market");
     std::fs::write(&tmp, bytes).map_err(|e| format!("写入 {} 失败：{e}", tmp.display()))?;

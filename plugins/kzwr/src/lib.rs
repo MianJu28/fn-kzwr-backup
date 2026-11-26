@@ -84,11 +84,16 @@ extern "C" fn available(cfg: *const c_char) -> *mut c_char {
 /// GET 用于回显（`echo` / `metric` / 列表），POST 用于写入。未识别的动作返回
 /// `{"success":false,"error":"未知动作 …"}` —— **不返回空指针**，让前端能看到原因。
 extern "C" fn action(action: *const c_char, request: *const c_char) -> *mut c_char {
-    let action = unsafe { sdk::from_c_str(action) };
-    let request = unsafe { sdk::from_c_str(request) };
-    guard_str(move || match rt::block_on(run_action(&action, &request)) {
-        Some(s) => s,
-        None => "{\"success\":false,\"error\":\"插件内部错误：runtime 不可用\"}".to_string(),
+    // 取值也必须放进闭包：`extern "C" fn` 体内 panic 会 abort 宿主（见 `health` 说明）。
+    // `from_c_str` 现在是纯 UTF-8 转换、不会 panic，但它属于「随时可能被改动」的
+    // 边界代码 —— 放进来才是结构性安全。
+    guard_str(move || {
+        let action = unsafe { sdk::from_c_str(action) };
+        let request = unsafe { sdk::from_c_str(request) };
+        match rt::block_on(run_action(&action, &request)) {
+            Some(s) => s,
+            None => "{\"success\":false,\"error\":\"插件内部错误：runtime 不可用\"}".to_string(),
+        }
     })
 }
 
@@ -149,16 +154,26 @@ async fn run_action(action: &str, request: &str) -> Option<String> {
 
 // ── health ────────────────────────────────────────────────────────────────
 extern "C" fn health(cfg: *const c_char) -> *mut c_char {
-    let cfg = parse_cfg(unsafe { sdk::from_c_str(cfg) });
-    guard_str(move || rt::block_on(actions::health(&cfg)))
+    // ⚠️ **所有语句都必须在闭包内**。
+    //
+    // `extern "C" fn` 带 `nounwind`：panic 若发生在这个函数体里，无法被任何
+    // `catch_unwind` 拦截，直接 `panic_cannot_unwind` → **abort 整个宿主进程**。
+    // 因此函数体只允许「一行 `guard_str(闭包)`」，逻辑全部进闭包。
+    // （`parse_cfg` 现在不 panic，但把它留在外面等于埋雷：
+    //   将来谁在其中加一个 unwrap，宿主就会崩。）
+    guard_str(move || {
+        let cfg = parse_cfg(unsafe { sdk::from_c_str(cfg) });
+        rt::block_on(actions::health(&cfg))
+    })
 }
 
 // ── event ─────────────────────────────────────────────────────────────────
 /// 生命周期事件：`startup` / `patrol` / `after_backup` / `reload`
 extern "C" fn event(event: *const c_char, cfg: *const c_char) -> *mut c_char {
-    let event = unsafe { sdk::from_c_str(event) };
-    let cfg = parse_cfg(unsafe { sdk::from_c_str(cfg) });
+    // 同 `health`：函数体只允许一行，逻辑全在闭包内（见那里的说明）
     guard_str(move || {
+        let event = unsafe { sdk::from_c_str(event) };
+        let cfg = parse_cfg(unsafe { sdk::from_c_str(cfg) });
         let out = rt::block_on(async {
             match event.as_str() {
                 "startup" => Some(actions::on_startup(&cfg).await),
@@ -289,10 +304,14 @@ mod tests {
         assert_eq!(v2["default_percent"], state::DEFAULT_PERCENT);
     }
 
+    /// **保存失败必须如实上报**（回归）
+    ///
+    /// 旧契约是把配置塞进 `config` 字段让宿主代存；ADR-021 之后宿主**完全忽略**
+    /// 该字段，于是「落盘失败 → 退回声明式回写」变成静默丢数据：
+    /// 动作返回 success:true，用户刷新后账号却消失。
+    /// 现在（测试环境无插件私有目录 ⇒ 无处落盘）必须明确报错。
     #[test]
     fn add_then_remove_writes_back_accounts_json() {
-        // 无网络环境下 add 会先校验 token 而失败 —— 这里直接测 CRUD 的回写骨架：
-        // 用 remove 验证「删除后重写 accounts + 清掉该账号阈值键」。
         let cfg = cfg_with(&[(
             "accounts",
             r#"[{"id":"a1","name":"一","token":"t1"},{"id":"a2","name":"二","token":"t2"}]"#,
@@ -300,29 +319,36 @@ mod tests {
         let req = json!({"body": {"id": "a2"}, "cfg": cfg, "method": "POST"}).to_string();
         let v: Value = serde_json::from_str(&rt::block_on(run_action("accounts/remove", &req)).unwrap())
             .unwrap();
-        assert_eq!(v["success"], true);
-        let set = v["config"]["set"].as_object().unwrap();
-        let kept: Value = serde_json::from_str(set["accounts"].as_str().unwrap()).unwrap();
-        assert_eq!(kept.as_array().unwrap().len(), 1);
-        assert_eq!(kept[0]["id"], "a1");
-        assert_eq!(v["config"]["remove"].as_array().unwrap()[0], "percent-a2");
-        // 审计声明存在（删除账号必须留痕）
+        // 本测试环境没有插件私有目录 ⇒ 保存必然失败 ⇒ success 必须为 false 且带 error
+        assert_eq!(
+            v["success"], false,
+            "无法落盘时必须报错，不能假装保存成功"
+        );
+        assert!(
+            v["error"].as_str().map(|e| !e.is_empty()).unwrap_or(false),
+            "必须给出可读的失败原因：{v}"
+        );
+        // 审计声明仍应存在（删除动作必须留痕，即便保存失败）
         assert_eq!(v["audit"][0]["action"], "kzwr.accounts.remove");
     }
 
+    /// 阈值键名必须是 `percent-<id>`（连字符），且**绝不能**出现 `percent.<id>`
+    ///
+    /// 宿主对键名有规则校验（不允许点号），用错会整条写不进去。
+    /// 直接断言键名生成函数 —— 它才是唯一权威（不再依赖 `config` 回写的中间态）。
     #[test]
     fn percent_writeback_key_uses_hyphen_not_dot() {
+        let key = state::percent_key("a1");
+        assert_eq!(key, "percent-a1", "键名必须是 percent-<id>");
+        assert!(!key.contains('.'), "宿主不允许键名含点号");
+
+        // 端到端确认：动作失败时也不得泄漏出 `percent.` 形态
         let cfg = cfg_with(&[("accounts", r#"[{"id":"a1","name":"一","token":"t1"}]"#)]);
-        let req = json!({"body": {"id": "a1", "percent": 88}, "cfg": cfg, "method": "POST"}).to_string();
-        let v: Value = serde_json::from_str(&rt::block_on(run_action("accounts/percent", &req)).unwrap()).unwrap();
-        assert_eq!(v["success"], true);
-        let keys: Vec<&String> = v["config"]["set"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .collect();
-        assert!(keys.contains(&&"percent-a1".to_string()), "实际键名 {keys:?}");
-        assert!(!v.to_string().contains("percent.a1"));
+        let req =
+            json!({"body": {"id": "a1", "percent": 88}, "cfg": cfg, "method": "POST"}).to_string();
+        let v: Value =
+            serde_json::from_str(&rt::block_on(run_action("accounts/percent", &req)).unwrap()).unwrap();
+        assert!(!v.to_string().contains("percent.a1"), "不得出现点号形态：{v}");
     }
 
     #[test]
@@ -350,11 +376,20 @@ mod tests {
         assert_eq!(snap.accounts.len(), 1);
         assert_eq!(snap.accounts[0].id, state::LEGACY_ACCOUNT_ID);
         assert_eq!(snap.accounts[0].token, "OLD-TOKEN");
-        // 列表首次读取应带 accounts + 删除 token 的回写
+        // 列表读取必须能报出迁移后的账号（旧 token 已变成 accounts[0]）
         let req = json!({"body": {}, "cfg": cfg, "method": "GET"}).to_string();
         let v: Value = serde_json::from_str(&rt::block_on(run_action("accounts", &req)).unwrap()).unwrap();
-        assert_eq!(v["config"]["remove"].as_array().unwrap()[0], "token");
-        assert!(v["config"]["set"]["accounts"].is_string());
+        let list = v["accounts"]
+            .as_array()
+            .expect("应返回账号列表");
+        assert_eq!(list.len(), 1, "遗留 token 应迁移为 1 个账号");
+        assert_eq!(list[0]["id"], state::LEGACY_ACCOUNT_ID);
+        // **凭据永不回传前端**：列表里不能出现 token 字段
+        assert!(
+            list[0].get("token").is_none(),
+            "账号列表绝不能回传 token：{:?}",
+            list[0]
+        );
     }
 
     #[test]
@@ -380,15 +415,20 @@ mod tests {
             ("percent", "55"),
             ("percent-a1", "88"),
         ]);
+        // 直接验证 Writeback 的意图：0 必须用 **set** 表达，不能用 remove
+        let mut wb = state::Writeback::default();
+        wb.set_kv(state::percent_key("a1"), "0");
+        assert!(
+            wb.has_key_set(&state::percent_key("a1")),
+            "0 必须以 set 形式表达（remove 会被解释成「未设置」→ 回落全局值）"
+        );
+        // 动作层：0 是合法输入（不被拒），只是本测试环境无处落盘
         let req = json!({"body": {"id": "a1", "percent": 0}, "cfg": cfg, "method": "POST"}).to_string();
         let v: Value =
             serde_json::from_str(&rt::block_on(run_action("accounts/percent", &req)).unwrap()).unwrap();
-        assert_eq!(v["success"], true);
-        let set = v["config"]["set"].as_object().unwrap();
-        assert_eq!(set["percent-a1"].as_str(), Some("0"), "0 必须显式写入");
         assert!(
-            v["config"]["remove"].is_null() || v["config"]["remove"].as_array().unwrap().is_empty(),
-            "0 不得通过删键表达： {:?}", v["config"]
+            v["error"].as_str().map(|e| !e.contains("阈值")).unwrap_or(true),
+            "0 是合法阈值，不应报「阈值非法」类错误：{v}"
         );
         // 写 0 → 读 0，不被全局 55 覆盖
         let after = cfg_with(&[
@@ -414,14 +454,17 @@ mod tests {
                 serde_json::from_str(&rt::block_on(run_action("accounts/percent", &req)).unwrap())
                     .unwrap();
             assert_eq!(v["success"], false, "{bad} 应被拒绝：{v}");
+            // 被拒绝的写入不得产生任何配置回写
             assert!(v["config"].is_null(), "被拒绝的写入不得回显 config：{v}");
         }
-        // 100 合法（边界）
+        // 100 合法（边界）：不应因「越界」被拒
         let req = json!({"body": {"id": "a1", "percent": 100}, "cfg": cfg, "method": "POST"}).to_string();
         let v: Value =
             serde_json::from_str(&rt::block_on(run_action("accounts/percent", &req)).unwrap()).unwrap();
-        assert_eq!(v["success"], true);
-        assert_eq!(v["config"]["set"]["percent-a1"].as_str(), Some("100"));
+        assert!(
+            v["error"].as_str().map(|e| !e.contains("非法") && !e.contains("越界")).unwrap_or(true),
+            "100 是合法边界值，不应被判非法：{v}"
+        );
     }
 
     #[test]

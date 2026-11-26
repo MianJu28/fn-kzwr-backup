@@ -45,11 +45,25 @@
   /** 正在配置的插件（null = 弹窗关闭） */
   let editing = null;
   /** 正在切换启停的插件 id（按钮 loading 用） */
-  let toggling = null;
+  // 用**集合**而不是单 id：多张卡片可先后触发启停，单槽会被后一次覆盖，
+  // 前一次的 finally 又把槽清空 ⇒ 后一次还在请求中、按钮已恢复可点（可重复提交）。
+  let toggling = new Set();
+  const setToggling = (id, on) => {
+    const next = new Set(toggling);
+    if (on) next.add(id);
+    else next.delete(id);
+    toggling = next;
+  };
 
   // 插件卡片：组成与顺序由后端 `/api/plugins` 决定；接口不可用时退回内置兜底，保证页面可用
   $: pluginSections = pluginCards(
-    plugins && plugins.length ? plugins : FALLBACK_PLUGINS
+    // ⚠️ **不再用 FALLBACK_PLUGINS 兜底假数据**。
+    //
+    // 旧做法在 `/api/plugins` 失败时渲染一张「并不存在」的 webdav 卡片
+    //（`available: true`，带「启用/停用」「设置」按钮）。用户点「停用」会真的发出
+    // `POST /api/plugins/webdav/enable {enabled:false}` —— 把线上插件停掉，
+    // 而此刻他看到的是一份假数据。宁可显示「加载失败」，也不给能改真实状态的入口。
+    plugins && plugins.length ? plugins : []
   );
 
   /**
@@ -78,7 +92,11 @@
         if (b.type !== 'metric' || !b.action) continue;
         const path = b.action.startsWith('/') ? b.action : `/${b.action}`;
         const key = `${p.id}|${b.action}`;
-        jobs.push(
+        // ⚠️ **必须包成惰性 thunk**：`api.pluginGet()` 是 async 函数，
+        // 调用时**立刻**执行到 `await fetch()` —— 请求当场就发出去了。
+        // 若直接 push Promise，下面的分批 `Promise.all` 只控制「等待顺序」，
+        // 请求早已全部飞出，限流形同虚设。
+        jobs.push(() =>
           api
             .pluginGet(p.api_base, path)
             .then((r) => {
@@ -101,11 +119,53 @@
         );
       }
     }
-    if (jobs.length) await Promise.all(jobs);
+    // **限制并发**：一次只放 MAX_CONCURRENT 个请求。
+    // 插件多时（每个插件若干 metric 块）全量并发会瞬间打出几十个请求，
+    // 网关与后端都可能被拖慢，页面其余部分也跟着卡。
+    const MAX_CONCURRENT = 6;
+    for (let i = 0; i < jobs.length; i += MAX_CONCURRENT) {
+      // 到这一步才真正发请求，因此同一时刻在飞的不会超过 MAX_CONCURRENT 个
+      await Promise.all(jobs.slice(i, i + MAX_CONCURRENT).map((fn) => fn()));
+    }
   }
 
-  // 清单变化时拉一次实时值（弹窗内操作完成后由 onPluginDone 触发父级重取）
-  $: if (plugins && plugins.length) loadLiveMetrics(plugins);
+  /**
+   * 清单**内容**指纹：避免「引用变了但内容没变」时重复拉取
+   *
+   * `plugins` 是 prop，父组件每次 `loadPlugins()` 都会赋一个新数组 ——
+   * 即使内容完全相同，`$:` 也会重新触发。而 `loadLiveMetrics` 会为**每个**
+   * 插件的每个 metric 块各发一个 HTTP 请求：插件一多就变成请求风暴，
+   * 既拖慢页面，也可能撞上后端限流。
+   *
+   * 这里用「id + 指标键」拼指纹，只有真正变化才重新拉。
+   */
+  let metricsKey = '';
+  /**
+   * 显式刷新信号：结构指纹只反映「插件的 id 与指标键」，
+   * 而指标**值**（如空间用量）会在设置变更后变化 —— 指纹不变，
+   * 只凭指纹就不会重拉，用户改完账号配额回到卡片仍是旧数字。
+   * 因此设置弹窗操作完成后主动 +1 强制刷新。
+   */
+  let metricsEpoch = 0;
+  let metricsEpochSeen = -1;
+  function fingerprint(list) {
+    const parts = [];
+    for (const p of list || []) {
+      if (p.disabled || !p.api_base) continue;
+      for (const b of (p.ui && p.ui.blocks) || []) {
+        if (b.type === 'metric' && b.action) parts.push(`${p.id}|${b.action}`);
+      }
+    }
+    return parts.sort().join(',');
+  }
+  $: {
+    const fp = fingerprint(plugins);
+    if (fp && (fp !== metricsKey || metricsEpoch !== metricsEpochSeen)) {
+      metricsKey = fp;
+      metricsEpochSeen = metricsEpoch;
+      loadLiveMetrics(plugins);
+    }
+  }
 
   function pluginStats(p) {
     const blocks = (p.ui && p.ui.blocks) || [];
@@ -146,7 +206,7 @@
       });
       if (!yes) return;
     }
-    toggling = p.id;
+    setToggling(p.id, true);
     try {
       const r = await api.pluginSetEnabled(p.id, next);
       if (r && r.error) {
@@ -163,17 +223,28 @@
       } else {
         toast.success(next ? '插件已启用，立即生效' : '插件已停用，立即生效');
       }
+      // 设置变更后：强制刷新实时指标（值变了但结构指纹没变）
+      metricsEpoch += 1;
       if (onPluginDone) await onPluginDone();
     } catch (e) {
       toast.error(e.message);
     } finally {
-      toggling = null;
+      setToggling(p.id, false);
     }
   }
 </script>
 
 <!-- ── 插件卡片区（概览 + 设置/启停入口）──────────────────────── -->
-{#if pluginSections.length === 0}
+{#if plugins.length === 0}
+  <section class="card">
+    <div class="card-body">
+      <div class="empty">
+        <strong>插件清单加载失败</strong>
+        <div>请检查服务状态后刷新页面（下方「外置插件」管理仍可使用）。</div>
+      </div>
+    </div>
+  </section>
+{:else if pluginSections.length === 0}
   <section class="card">
     <div class="card-body">
       <div class="empty">
@@ -213,7 +284,7 @@
       <div class="pc-body">
         {#if ps.metrics.length}
           <div class="pc-metrics">
-            {#each ps.metrics as m, i (i)}
+            {#each ps.metrics as m, mi ((m.action || m.label || "metric") + "#" + mi)}
               {@const live = m.action ? liveMetrics[`${p.id}|${m.action}`] : null}
               <div class="pc-metric">
                 <span class="pc-metric-k">{m.label}</span>
@@ -245,9 +316,9 @@
           <button
             class="btn btn-sm {p.disabled ? 'btn-primary' : 'btn-ghost danger'}"
             on:click={() => toggleEnabled(p)}
-            disabled={busy || toggling === p.id}
+            disabled={busy || toggling.has(p.id)}
           >
-            {#if toggling === p.id}
+            {#if toggling.has(p.id)}
               <span class="spin"></span>
             {:else if p.disabled}
               <Icon name="zap" size={14} />启用

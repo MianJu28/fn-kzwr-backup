@@ -102,6 +102,10 @@ async fn main() -> Result<()> {
         target_prefix: Some(TARGET_FOLDER.to_string()),
         eventbus: None,
         retention: None,
+        sibling_jobs: Vec::new(),
+        strict: false,
+        staging_dir: None,
+        cancel: None,
     };
 
     println!("=== 3. 首次全量备份（4 个文件，含多级嵌套）===");

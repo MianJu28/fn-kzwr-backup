@@ -11,6 +11,8 @@
   import MessagesPanel from './components/MessagesPanel.svelte';
   import Toast from './components/Toast.svelte';
   import ConfirmDialog from './components/ConfirmDialog.svelte';
+  import { onMount, onDestroy } from 'svelte';
+  import { confirmDialog } from './lib/confirm.js';
   import Icon from './components/Icon.svelte';
   import Logo from './components/Logo.svelte';
 
@@ -58,6 +60,8 @@
 
   // 实时任务（WebSocket）
   let liveStatus = null;
+  /** 取消请求已提交且尚未生效（`busy` 已有，复用现有的忙标志） */
+  let cancelRequested = false;
   let wsConnected = false;
 
   // 密钥
@@ -174,32 +178,58 @@
     }
   }
 
+  /**
+   * 「只采纳最新一次请求」的序号守卫
+   *
+   * 多个 load 函数会被并发/连续触发（保存后 `handleTasksChanged` + WS 事件 +
+   * 60 秒轮询）。若前一次请求比后一次**更晚返回**（网络抖动、后端偶发慢），
+   * 旧数据就会覆盖新数据 —— 表现为「刚保存完，界面又跳回旧值」。
+   *
+   * 用法：进入时取号，回来时比对；不是最新就丢弃结果。
+   */
+  const _reqSeq = new Map();
+  function seqFor(name) {
+    const next = (_reqSeq.get(name) || 0) + 1;
+    _reqSeq.set(name, next);
+    return next;
+  }
+  function isLatest(name, seq) {
+    return _reqSeq.get(name) === seq;
+  }
+
   /** 多任务/多目标：任务列表 + 可选目标（/api/tasks 一并返回） */
   async function loadTasks() {
+    const __seq = seqFor('tasks');
     try {
       const d = await api.tasks();
+      if (!isLatest('tasks', __seq)) return; // 有更新的请求在飞：丢弃旧结果
       tasks = d.tasks || [];
       targetOptions = d.targets || [];
     } catch (e) {
-      error = e.message;
+      if (isLatest('tasks', __seq)) error = e.message;
     }
   }
 
   /** 目标详情列表（/api/targets：含地址、账号、被引用任务数） */
   async function loadTargets() {
+    const __seq = seqFor('targets');
     try {
       const d = await api.targets();
+      if (!isLatest('targets', __seq)) return;
       targets = d.targets || [];
     } catch (e) {
-      error = e.message;
+      if (isLatest('targets', __seq)) error = e.message;
     }
   }
 
   /** 任务或目标变更后：刷新任务、目标、配置（legacy 视图）与恢复列表 */
   async function handleTasksChanged() {
-    await Promise.all([loadTasks(), loadTargets()]);
-    await loadConfig();
-    await loadRestoreFiles();
+    // **一次性并行拉全部**：此前是「先等 tasks+targets，再等 config，再等 restoreFiles」
+    // 三段串行，每段都要等一个来回 —— 保存任务后要等 3 个 RTT 界面才更新。
+    // 这四项互不依赖，并发发出即可，感知延迟从 3×RTT 降到 1×RTT。
+    // 实时任务卡也要跟着刷新：删掉任务后后端会把「最后一帧」一并丢弃，
+    // 不重拉的话卡片会一直挂着那个已不存在任务的上次结果。
+    await Promise.all([loadTasks(), loadTargets(), loadConfig(), loadRestoreFiles(), loadLive()]);
   }
 
   async function loadRestoreFiles() {
@@ -211,18 +241,104 @@
     }
   }
 
+  /**
+   * 拉取当前任务状态快照
+   *
+   * 为什么需要：WS 只推**增量**事件。刷新页面或退出应用再进来时 WebView 重建、
+   * WS 重连，之前收到的进度全丢，界面会显示「没有任务在跑」，而后台其实还在跑。
+   * 这里在首屏与 WS 重连时各拉一次，把「最后一帧」补回来。
+   */
+  async function loadLive() {
+    try {
+      const r = await api.tasksLive();
+      // 优先展示备份，其次恢复（同时只会有一个在跑）
+      let ev = r.backup || r.restore || null;
+      // ⚠️ **事件总线的「最后一帧」可能停在 progress**：任务若是被取消、
+      // 或因为重试耗尽而静默结束，未必有终态（completed/failed）事件发出。
+      // 后端 `busy` 才是「此刻是否真有任务在跑」的唯一权威来源，
+      // 所以不忙时不能把 progress/started 帧当成「还在进行中」渲染，
+      // 否则任务早已结束、卡片却永久停在「进行中」（实测踩到）。
+      if (ev && !r.busy && (ev.status === 'progress' || ev.status === 'started')) {
+        ev = { ...ev, status: 'failed', message: ev.message || '任务已结束（未收到终态事件）' };
+      }
+      if (ev) {
+        liveStatus = {
+          kind: ev.kind,
+          status: ev.status,
+          phase: ev.phase,
+          current_file: ev.current_file,
+          done: ev.done,
+          total: ev.total,
+          bytes_done: ev.bytes_done,
+          bytes_total: ev.bytes_total,
+          elapsed_ms: ev.elapsed_ms,
+          speed: ev.speed,
+          at: Date.now(),
+          message: ev.message,
+        };
+      }
+      busy = !!r.busy;
+      cancelRequested = !!r.cancel_requested;
+    } catch (e) {
+      /* 快照失败不影响主流程 */
+    }
+  }
+
+  /**
+   * 取消当前正在执行的备份/恢复
+   *
+   * 必须说清「不是立刻停」：后端是**协作式取消**，在当前文件传完后才停
+   * （单文件的传输在插件 FFI 里推进，从外部打断会留下半截分片）。
+   * 不这样写用户会以为按钮没生效而反复点。
+   */
+  async function cancelRunning() {
+    const kindText = liveStatus && liveStatus.kind === 'restore' ? '恢复' : '备份';
+    const ok = await confirmDialog({
+      title: `取消${kindText}任务？`,
+      message:
+        // ⚠️ 确认框按**纯文本**渲染（`{state.message}` 会被转义），
+        // 因此这里不能写 Markdown 的 `**` 或 HTML 标签 —— 用户会看到字面量。
+        `将在当前文件传输结束后停止（不是立刻中断）。\n` +
+        `已完成的文件会保留，不会回退；下次${kindText}会接着处理未完成的文件。`,
+      confirmText: '取消任务',
+      cancelText: '继续执行',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      const r = await api.cancelTask();
+      if (r.success) {
+        cancelRequested = true;
+        toast.info(r.message || '已请求取消，等待当前文件结束', '正在取消');
+      } else {
+        toast.error(r.error || '取消失败', '取消任务');
+      }
+    } catch (e) {
+      toast.error(String(e.message || e), '取消任务');
+    }
+  }
+
   async function loadAll() {
     loading = true;
-    await Promise.all([
-      loadHealth(),
-      loadConfig(),
-      loadKeys(),
-      loadAlerts(),
-      loadRestoreFiles(),
-      loadTasks(),
-      loadTargets(),
-    ]);
-    loading = false;
+    try {
+      await Promise.all([
+        loadHealth(),
+        loadConfig(),
+        loadKeys(),
+        loadAlerts(),
+        loadRestoreFiles(),
+        loadTasks(),
+        loadTargets(),
+        loadLive(),
+      ]);
+    } catch (e) {
+      // 各 load 内部都已 catch；这里兜住意外（例如某个 load 被改动后漏了 catch），
+      // 否则 loading 会永远为 true —— 首屏骨架屏卡死、页面永不渲染。
+      console.error('[loadAll]', e);
+      error = String(e && e.message ? e.message : e);
+    } finally {
+      loading = false;
+    }
   }
 
   /* ── 页面切换 ─────────────────────────────────────────────── */
@@ -235,13 +351,23 @@
 
   /* ── WebSocket 实时状态 ───────────────────────────────────── */
 
+  /** 当前 WS 实例（保留引用以便主动关闭；否则重连定时器会一直续命） */
+  let ws = null;
+  /** 重连定时器句柄（组件销毁时必须清掉） */
+  let wsRetryTimer = null;
+  /** 是否已销毁（阻止 close 回调里再排新的重连） */
+  let disposed = false;
+
   function connectWS() {
+    if (disposed) return;
     try {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
       // 带网关前缀（统一网关下应用在 /app/<appname>，裸 /api 会落到宿主）
-      const ws = new WebSocket(`${proto}://${location.host}${APP_BASE}/api/ws`);
+      ws = new WebSocket(`${proto}://${location.host}${APP_BASE}/api/ws`);
       ws.onopen = () => {
         wsConnected = true;
+        // 重连后补一次快照：断线期间的事件已经丢了
+        loadLive();
       };
       ws.onmessage = (evt) => {
         try {
@@ -283,7 +409,11 @@
       };
       ws.onclose = () => {
         wsConnected = false;
-        setTimeout(connectWS, 3000);
+        // 组件已销毁（切换/关闭页面）就不要再排重连，否则会留下一个
+        // 永不停止的 3 秒定时器链，持续占用连接与内存。
+        if (disposed) return;
+        if (wsRetryTimer) clearTimeout(wsRetryTimer);
+        wsRetryTimer = setTimeout(connectWS, 3000);
       };
       ws.onerror = () => ws.close();
     } catch (e) {
@@ -333,8 +463,9 @@
         return { error: d.error };
       }
       pluginsEnabledCfg = !!d.plugins_enabled;
-      // 后端已让开关热生效；这里再拉一次清单，让插件列表立刻反映装载/卸载结果
-      await handlePluginDone();
+      // 后端已让开关热生效；清单刷新放后台跑，不阻塞按钮。
+      // 用户马上能继续操作，列表会在下一帧自动补上。
+      handlePluginDone();
       return {};
     } catch (e) {
       error = e.message;
@@ -350,7 +481,9 @@
     error = null;
     try {
       setupResult = await api.setupCheck();
-      await loadAlerts();
+      // 体检结果的展示不依赖提醒列表：**后台刷新**，不阻塞按钮恢复可点。
+      // （此前是 `await loadAlerts()` 后才解除 busy，用户点完要等一下才能再点。）
+      loadAlerts();
       return setupResult;
     } catch (e) {
       error = e.message;
@@ -366,10 +499,13 @@
    * 刷新消息提醒与配置（插件可用性可能已变化，如 token 已配置/清除）
    */
   async function handlePluginDone() {
-    await loadAlerts();
-    await loadConfig();
-    // 启停插件会级联影响任务（被停用）与目标（未就绪），故一并刷新
-    await Promise.all([loadTasks(), loadTargets()]);
+    // 同上：四项互不依赖，一次并行发出（原为三段串行）
+    await Promise.all([
+      loadAlerts(),
+      loadConfig(),
+      loadTasks(),
+      loadTargets(),
+    ]);
   }
 
   /** 切换调试日志：立即生效并持久化 */
@@ -413,7 +549,21 @@
   /* ── 操作：密钥 / 通知 / 配置迁移 ─────────────────────────── */
 
   async function handleSetKey(privateKey) {
-    const d = await api.setKey(privateKey);
+    // 更换私钥是**破坏性不可逆**操作（此前全部备份将无法解密），
+    // 与「导出私钥」同一把闸门：先验证管理员口令，并明确告知后果。
+    const pass = await confirmDialog({
+      title: '更换加密私钥？',
+      message:
+        // 同上：纯文本渲染，不要写 HTML 标签
+        '更换后，此前的所有备份都将无法解密（它们是用旧私钥加密的）。\n' +
+        '请先确认已妥善保存旧私钥。此操作需要验证管理员口令。',
+      confirmText: '验证并更换',
+      danger: true,
+      input: true,
+      placeholder: '管理员口令',
+    });
+    if (pass === false || !pass) return { success: false, error: '已取消' };
+    const d = await api.setKey(privateKey, pass);
     if (d.success) {
       keyInfo = { public_key: d.public_key };
       revealKey = '';
@@ -485,11 +635,36 @@
 
   /* ── 启动 ─────────────────────────────────────────────────── */
 
-  initTheme();
-  loadAll();
-  connectWS();
-  // 「消息提醒」轮询：后台巡检（空间预警等）产生的消息不依赖页面操作，每 60 秒拉取一次
-  setInterval(() => loadAlerts(), 60000);
+  /**
+   * 启动与清理
+   *
+   * 之前这些是**模块体顶层语句**：Svelte 会在组件实例化时执行，但**永远不清理**。
+   * 后果：
+   * - WebSocket 的 `onclose` 里 `setTimeout(connectWS, 3000)` 会一直续命，
+   *   组件销毁后仍在重连、仍占着一个长连接；
+   * - 60 秒轮询定时器同理，且它每轮都会发一次 HTTP 请求。
+   */
+  let alertsTimer = null;
+
+  onMount(() => {
+    loadAll();
+    connectWS();
+    // 「消息提醒」轮询：后台巡检（空间预警等）产生的消息不依赖页面操作
+    alertsTimer = setInterval(() => loadAlerts(), 60000);
+  });
+
+  onDestroy(() => {
+    // 标记已销毁：阻止 WS 的 close 回调再排重连
+    disposed = true;
+    if (wsRetryTimer) clearTimeout(wsRetryTimer);
+    if (alertsTimer) clearInterval(alertsTimer);
+    try {
+      if (ws && ws.readyState <= 1) ws.close();
+    } catch (e) {
+      /* 忽略 */
+    }
+    ws = null;
+  });
 </script>
 
 <div class="app">
@@ -641,7 +816,7 @@
         </div>
 
         <aside class="rail">
-          <LiveStatus {liveStatus} {wsConnected} />
+          <LiveStatus {liveStatus} {wsConnected} onCancel={cancelRunning} {cancelRequested} />
         </aside>
       </div>
     </div>

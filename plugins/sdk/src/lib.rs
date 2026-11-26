@@ -516,9 +516,8 @@ pub fn to_c_string(s: impl AsRef<str>) -> *mut c_char {
 /// }
 /// ```
 ///
-/// 这也是宿主 release 用 `panic = "abort"` 的**放大器**：宿主侧的
-/// `catch_unwind` 在 release 下同样失效（panic 直接 abort），
-/// 所以兜底只能在插件侧、且必须以这种闭包形态写。
+/// 兜底必须在**插件侧**完成，且必须以这种闭包形态写。宿主侧的 `catch_unwind`
+/// 对「已越界的 panic」无能为力（见 `catch_c_str` 的能力边界说明）。
 pub fn guard_str<F>(f: F) -> *mut c_char
 where
     F: FnOnce() -> String + std::panic::UnwindSafe,
@@ -567,7 +566,7 @@ where
 /// **panic 兜底**：执行 `f`，把 panic 转成 `{"success":false,"error":…}`
 ///
 /// 供 [`guarded_entry!`] / 插件自带包装使用。**绝不让 panic 越过 C 边界** ——
-/// 宿主 release 是 `panic = "abort"`，panic 一旦越界就是整个进程 abort。
+/// panic 一旦越界（发生在 `extern "C" fn` 函数体内）就是整个宿主进程 abort。
 ///
 /// ## 与 `panic = "abort"` 的关系（重要）
 ///
@@ -663,8 +662,9 @@ macro_rules! export_plugin_v1 {
 ///
 /// 实测三条结论（2026-09-29，用 release 构建的真实 .so + 宿主验证）：
 ///
-/// 1. **宿主 release 用 `panic = "abort"` ⇒ 宿主侧 `catch_unwind` 全部失效**
-///    （panic 直接 abort，连返回值都打印不出来）。所以兜底只能在**插件侧**。
+/// 1. **宿主源码刻意不设 `panic = "abort"`**（见 `backend/Cargo.toml` 的说明），
+///    因此宿主侧 `catch_unwind` 对**普通 Rust 路径**的 panic 是有效的；但它救不了
+///    「已经越过 C 边界的 panic」—— 那由语言机制决定（见下条）。
 /// 2. **panic 若发生在 `extern "C" fn` 的函数体内 ⇒ 无法被任何 `catch_unwind` 拦截**：
 ///    `extern "C" fn` 带 `nounwind`，运行时报 `panic_cannot_unwind` 并 abort 整个进程。
 ///    —— **这是语言机制限制，包装救不了它**。

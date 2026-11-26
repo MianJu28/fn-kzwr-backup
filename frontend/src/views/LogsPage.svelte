@@ -15,6 +15,14 @@
   let lines = [];
   let truncated = false;
   let size = 0;
+  /** 加载失败原因（与「确实没有日志」区分开）
+   *
+   * ⚠️ 这个声明不能省：`load()` 里先执行 `loadErr = ''`，若变量未声明，
+   * 在 ES module（严格模式）下会抛 `ReferenceError`，且抛出点在 `try` **之外**，
+   * `finally` 也不会执行 ⇒ `loading` 永远停在 true，页面永久卡在「刷新中」，
+   * 请求一个都不会发出。vite 构建对这种「未声明赋值」只报 warning，不失败。
+   */
+  let loadErr = '';
   let loading = false;
   let clearing = false;
   let savingDebug = false;
@@ -24,16 +32,24 @@
 
   /** 调试日志开关（切换即保存并热生效） */
   async function toggleDebug(e) {
-    const v = e.currentTarget.checked;
+    const el = e.currentTarget;
+    const want = el.checked;
     if (!onSaveDebug) return;
     savingDebug = true;
     try {
-      const r = await onSaveDebug(v);
+      const r = await onSaveDebug(want);
       if (r && r.error) {
+        // ⚠️ **必须回滚复选框**：`checked={debug}` 是单向属性，
+        // `debug` prop 没变时 Svelte 不会重写 DOM，于是复选框停在用户拨到的位置，
+        // 用户以为已开启调试日志 —— 实际后端返回了错误。
+        el.checked = !want;
         toast.error(r.error);
         return;
       }
-      toast.success(v ? '已开启调试日志：将记录详细请求/响应日志' : '已关闭调试日志');
+      toast.success(want ? '已开启调试日志：将记录详细请求/响应日志' : '已关闭调试日志');
+    } catch (err) {
+      el.checked = !want; // 网络异常同样回滚
+      toast.error(String(err && err.message ? err.message : err));
     } finally {
       savingDebug = false;
     }
@@ -41,13 +57,20 @@
 
   async function load() {
     loading = true;
+    loadErr = '';
     try {
       const d = await api.logsTail(TAIL);
       lines = d.lines || [];
       truncated = !!d.truncated;
       size = d.size || 0;
-      if (d.error) toast.error(d.error);
+      // 业务错误（如日志文件不可读）也记下来：否则界面会显示「暂无日志」，
+      // 把「读不出来」误报成「确实没有」。
+      if (d.error) {
+        loadErr = d.error;
+        toast.error(d.error);
+      }
     } catch (e) {
+      loadErr = e.message;
       toast.error(e.message, '读取日志失败');
     } finally {
       loading = false;

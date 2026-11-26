@@ -27,6 +27,32 @@
 //! 3. **`/proc/self` 也会被挡**。插件运行需要它，白名单里必须**显式允许**。
 //!    （好消息：`/proc/<宿主 pid>/mem` 同样被挡 —— 那是同 uid 读内存的经典通道。）
 //!
+//! ## 已知缺口：Unix socket 不受 Landlock 约束（2026-11-24 实测）
+//!
+//! Landlock 的路径规则只作用于 `open()` 族系统调用（含 `O_PATH`），
+//! **不作用于 `connect(2)`**。实测（两份等价 C 程序，均在 ABI v7 内核上）：
+//!
+//! | 场景 | `connect()` 到 Unix socket |
+//! |------|---------------------------|
+//! | socket 所在目录**在**只读白名单里 | **成功** |
+//! | socket 所在目录**不在**白名单里 | **仍然成功** |
+//!
+//! 即：**本沙箱无法阻止插件连接宿主机上的任何 Unix socket**。
+//! 能挡住的只有 DAC 文件权限 —— 例如 `/run/docker.sock` 是 `root:docker`，
+//! 插件跑在应用用户下连不上，那是**权限位**的功劳，不是沙箱的。
+//!
+//! 影响面：`/run` 下还有 `trim_share.sock`、`com.trim.app.center.sock` 等
+//! `root:root` 的 socket，同样靠 DAC 挡住。若某个 socket 被放宽到
+//! 应用用户可写，插件即可通过它获得越过沙箱的能力。
+//!
+//! 彻底修复需要以下之一（均超出当前范围，需产品决策）：
+//! 1. Landlock 未来的 `scope` 支持（当前内核版的 `scoped` 字段不覆盖 socket）；
+//! 2. 用 seccomp 过滤 `connect(AF_UNIX, ...)` 的 `sun_path` 白名单；
+//! 3. 进程隔离（档位 C：独立进程 + fd 传递，见 `PLUGIN_ISOLATION.md`）。
+//!
+//! 因此本模块的加固**只覆盖文件读写**；排查隔离问题时请不要假设
+//! 「施加了 Landlock 就碰不到 socket」。
+//!
 //! ## 降级策略
 //! 内核不支持 Landlock（`landlock_create_ruleset` 返回 `ENOSYS`）或施加失败时：
 //! **记警告并继续运行**（不阻断插件），因为「可用性」优先于「加固」；
@@ -89,7 +115,17 @@ const RULE_NET_PORT: i32 = 2;
 const PR_SET_NO_NEW_PRIVS: i32 = 38;
 
 /// 只读 + 列目录（给系统目录用）
+///
+/// ⚠️ `RO`/`RW` 含 `FS_READ_DIR`，那是**目录专属**权限位。
+/// Landlock 对**普通文件**的 `path_beneath` 规则若带目录专属位，内核直接返回
+/// `EINVAL`，规则**静默不生效** —— 实测 `/dev/urandom`、`/dev/null`、`/dev/zero`
+/// 三条规则从未生效过（只是恰好被其它规则覆盖，靠运气）。
+/// 因此下面另给 `*_FILE` 变体，按对象类型选位。
 const RO: u64 = FS_READ_FILE | FS_READ_DIR | FS_EXECUTE;
+/// 只读**文件**（不含目录位，用于 `/dev/urandom` 这类设备/普通文件）
+const RO_FILE: u64 = FS_READ_FILE | FS_EXECUTE;
+/// 只**列目录**（不放行目录内文件的读取，用于 `/proc/self` 这类必须收窄的目录）
+const RO_DIR_ONLY: u64 = FS_READ_DIR | FS_EXECUTE;
 /// 读写（给插件数据目录、目标目录、临时目录用）
 const RW: u64 = RO
     | FS_WRITE_FILE
@@ -99,6 +135,11 @@ const RW: u64 = RO
     | FS_REMOVE_DIR
     | FS_TRUNCATE
     | FS_MAKE_SYM;
+/// 读写**文件**（不含目录位）
+const RW_FILE: u64 = FS_READ_FILE
+    | FS_WRITE_FILE
+    | FS_TRUNCATE
+    | FS_EXECUTE;
 
 #[inline]
 fn sys_landlock_create_ruleset(attr: *const LandlockRulesetAttr, size: usize, flags: u32) -> i64 {
@@ -180,16 +221,48 @@ impl SandboxPolicy {
     /// 文件的能力（`example-localfs` 的临时落定等），又切断插件间信道。
     pub fn for_plugin(plugin_id: &str, own_data_dir: &Path, extra: &[PathBuf]) -> Self {
         let mut paths: Vec<(PathBuf, bool)> = vec![
-            // ⚠️ `/proc/self` 必须显式允许：Landlock 会连它一起挡住
+            // `/proc/self` **只给「列目录」，不给「读文件」**。
+            //
+            // ⚠️ 这里是整个沙箱最要紧的一处。实测（Landlock ABI v7）：
+            // 若按 `RO`（含 `FS_READ_FILE`）放行 `/proc/self`，那么插件线程里的
+            // `/proc/self` 指向**本进程**，于是 `/proc/self/mem` 可读 ——
+            // 插件扫 `/proc/self/maps` 拿到地址后 `pread` 就能直接读出内存里的
+            // `AGE-SECRET-KEY-*`，**完全绕过** `keystore.age` 的加密与 0600 权限。
+            // `/proc/self/environ` 同理会泄漏 `TRIM_PASSPHRASE`。
+            //
+            // 收窄后（实测）：`status`/`stat`/`maps`/`fd` 放行，
+            // `environ`/`mem`/`cmdline` 一律 Permission denied。
             (PathBuf::from("/proc/self"), false),
             (PathBuf::from("/etc"), false),
             (PathBuf::from("/usr"), false),
-            (PathBuf::from("/dev/urandom"), false),
-            (PathBuf::from("/dev/null"), true),
-            (PathBuf::from("/dev/zero"), false),
-            // CA 证书与 DNS 解析（kzwr 要联网）
-            (PathBuf::from("/run"), false),
+            // CA 证书与 DNS 解析（kzwr 要联网）。
+            //
+            // 用**精确子路径**而不是整目录 `/run`：Landlock 不拦 `connect()`
+            // （见模块头「已知缺口」），整目录放行仍会暴露 `/run` 下的普通文件。
+            (PathBuf::from("/run/systemd/resolve"), false),
+            (PathBuf::from("/run/nscd"), false),
         ];
+        // 逐文件放行 `/proc/self` 下插件真正需要的那几项。
+        //
+        // 为什么要逐条给：目录规则只给 `FS_READ_DIR` 后，目录内**所有文件**都读不了；
+        // 而很多运行时/库会读 `status`、`maps`、`fd/`。这几项不含敏感内容。
+        // 目录在 `/proc` 上是魔法文件系统，`metadata().is_dir()` 对 `/proc/self`
+        // 会解析成真实目录，故下面按「是否目录」自动选权限位（见 `add_rules_and_restrict`）。
+        // ⚠️ **只放行纯信息类文件**，绝不放行这几类：
+        // - `/proc/self/mem`：直接读进程内存（会泄漏 age 私钥）—— 本就不能给。
+        // - `/proc/self/environ`：泄露 `TRIM_PASSPHRASE` 等环境变量。
+        // - `/proc/self/root`：是指向 `/` 的**目录**，放行它等于把整个根目录
+        //   重新开成可读，前面所有收窄都白做。
+        // - `/proc/self/cwd`：同理，指向进程工作目录。
+        // - `/proc/self/fd`：是目录，且 `fd/N` 可重开已打开的文件（含密钥库）。
+        // - `/proc/self/task`：是目录，内含每个线程的 `mem`/`environ`，等价绕过。
+        for f in ["status", "stat", "statm", "maps", "mountinfo", "limits"] {
+            paths.push((PathBuf::from("/proc/self").join(f), false));
+        }
+        // 设备文件用**文件位**（目录位会让内核返回 EINVAL，规则静默失效）
+        paths.push((PathBuf::from("/dev/urandom"), false));
+        paths.push((PathBuf::from("/dev/null"), true));
+        paths.push((PathBuf::from("/dev/zero"), false));
         paths.push((own_data_dir.to_path_buf(), true));
         // 插件专属临时目录（替代共享可写的 /tmp）
         paths.push((Self::plugin_tmp_dir(plugin_id), true));
@@ -282,12 +355,36 @@ impl SandboxPolicy {
             let Ok(c) = CString::new(path.as_os_str().as_encoded_bytes()) else {
                 continue;
             };
-            // O_PATH：只取「目录句柄」，不需要真实打开权限
+            // O_PATH：只取「句柄」，不需要真实打开权限
             let pfd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
             if pfd < 0 {
                 continue;
             }
-            let allowed = if *writable { RW } else { RO };
+            // **按对象类型选权限位**（这不是细节，错了规则会静默失效）：
+            //
+            // Landlock 对「普通文件」的 `path_beneath` 规则若带目录专属位
+            // （`FS_READ_DIR` / `FS_MAKE_DIR` / `FS_REMOVE_DIR` 等），内核直接返回
+            // `EINVAL`。实测：`/dev/urandom` 按 `RO` 加规则 ⇒ `Invalid argument`，
+            // 规则从未生效；去掉目录位后 OK。
+            //
+            // 反过来，只给文件位而不给 `FS_READ_DIR` 的目录规则，会让目录内所有
+            // 文件都读不到 —— 这也是为什么 `/proc/self` 用 `RO_DIR_ONLY` 时必须
+            // 再逐文件放行。
+            let is_dir = unsafe {
+                let mut st: libc::stat = std::mem::zeroed();
+                libc::fstat(pfd, &mut st) == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFDIR
+            };
+            // 目录默认可「列 + 读内部文件」；只有 `/proc/self` 这类必须收窄的
+            // 才用 `RO_DIR_ONLY`（只列不放读）。用「路径是否以 /proc/self 开头」
+            // 判断，而不是再加一个布尔字段 —— 白名单里只有这一处需要这种语义。
+            let narrow = path == std::path::Path::new("/proc/self");
+            let allowed = match (is_dir, *writable) {
+                (true, true) => RW,
+                (true, false) if narrow => RO_DIR_ONLY,
+                (true, false) => RO,
+                (false, true) => RW_FILE,
+                (false, false) => RO_FILE,
+            };
             let rule = LandlockPathBeneathAttr {
                 allowed_access: allowed,
                 parent_fd: pfd,
@@ -300,10 +397,23 @@ impl SandboxPolicy {
             );
             unsafe { libc::close(pfd) };
             if added < 0 {
-                // 某些路径（如 /dev/urandom 是文件而非目录）在旧内核上会失败；
-                // 不因此中断整套规则 —— 让其余规则仍生效。
                 let e = io::Error::last_os_error();
-                tracing::debug!(path = %path.display(), err = %e, "Landlock 规则跳过（非目录或不受支持）");
+                // **必须是 warn 而非 debug**：默认日志级别是 info，
+                // debug 会让「规则悄悄没生效」完全不可见 —— 这正是本文件
+                // 曾长期存在 `/dev/*` 规则失效却无人发现的原因。
+                // `EINVAL` = 规则写错（权限位不匹配对象类型），一定要修；
+                // `ENOENT` = 路径不存在（可忽略）。
+                if e.raw_os_error() == Some(libc::ENOENT) {
+                    tracing::debug!(path = %path.display(), "Landlock 跳过（路径不存在）");
+                } else {
+                    tracing::warn!(
+                        path = %path.display(),
+                        is_dir,
+                        writable,
+                        err = %e,
+                        "Landlock 规则添加失败（该路径未受保护）"
+                    );
+                }
             }
         }
 
@@ -534,5 +644,124 @@ mod isolation_tests {
         assert!(own_ok, "插件自己的数据目录应可写（否则插件无法工作）");
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod memory_isolation_tests {
+    use super::*;
+
+    /// **沙箱必须挡住 `/proc/self/mem`**（否则私钥可被插件直接读走）
+    ///
+    /// ## 这条为什么最重要
+    /// 插件与宿主**同进程**。若插件能读 `/proc/self/mem`，它就能：
+    /// 1. 读 `/proc/self/maps` 拿到 `state.crypto` / `passphrase` 的地址；
+    /// 2. `pread(/proc/self/mem)` 直接取出内存里的 `AGE-SECRET-KEY-*`；
+    /// ⇒ **完全绕过** `keystore.age` 的加密与 0600 权限，全部备份可被解密。
+    ///
+    /// 旧实现给 `/proc/self` 加的是 `RO`（含 `FS_READ_FILE`），实测 mem/environ
+    /// 全部可读 —— 沙箱的存在理由被架空。现改为「目录只给 READ_DIR + 逐文件放行」。
+    #[test]
+    fn sandbox_blocks_proc_self_mem_and_environ() {
+        let own = std::env::temp_dir().join(format!("kzwr-memtest-{}", std::process::id()));
+        std::fs::create_dir_all(&own).ok();
+        let policy = SandboxPolicy::for_plugin("memtest", &own, &[]);
+        if policy.apply_to_current_thread().is_err() {
+            return; // 内核不支持 Landlock：本环境无法验证（不留假绿）
+        }
+        // 沙箱生效后探测
+        let mem = std::fs::File::open("/proc/self/mem");
+        assert!(
+            mem.is_err(),
+            "/proc/self/mem 必须被拒绝（否则插件可直接读出内存里的 age 私钥）"
+        );
+        let env = std::fs::File::open("/proc/self/environ");
+        assert!(
+            env.is_err(),
+            "/proc/self/environ 必须被拒绝（否则会泄漏 TRIM_PASSPHRASE 等环境变量）"
+        );
+        // 但插件正常需要的几项必须仍然可读（不能把功能挡死）
+        assert!(
+            std::fs::File::open("/proc/self/status").is_ok(),
+            "/proc/self/status 应保持可读（很多运行时依赖它）"
+        );
+        assert!(
+            std::fs::File::open("/dev/urandom").is_ok(),
+            "/dev/urandom 必须可读（否则随机数失败，插件无法工作）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod socket_gap_tests {
+    use super::*;
+
+    /// **记录已知缺口**：Landlock 不拦 Unix socket 的 `connect()`
+    ///
+    /// 这不是「期望行为」，而是把实测结论固化成测试：
+    /// 若将来换用 seccomp / 进程隔离补上这个洞，本测试会失败 —— 那时应当
+    /// 把它改成「必须被拒绝」，正好是升级的验收信号。
+    ///
+    /// 之所以值得单独测：`PLUGIN_ISOLATION.md` 与模块注释都容易让人误以为
+    /// 「施加了 Landlock 就碰不到 socket」。这个误会会让后续的安全评估失真。
+    #[test]
+    fn landlock_does_not_block_unix_socket_connect() {
+        // 在施加沙箱**之前**建好一个可连的 unix socket（放在不被白名单覆盖的目录）
+        let dir = std::env::temp_dir().join(format!(
+            "kzwr-sockgap-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        let sp = dir.join("t.sock");
+        let _ = std::fs::remove_file(&sp);
+        let sp_c = CString::new(sp.as_os_str().as_encoded_bytes()).unwrap();
+
+        // bind + listen
+        let srv = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(srv >= 0, "创建 socket 失败");
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (i, b) in sp_c.as_bytes().iter().enumerate() {
+            addr.sun_path[i] = *b as libc::c_char;
+        }
+        let alen = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        let r = unsafe { libc::bind(srv, &addr as *const _ as *const libc::sockaddr, alen) };
+        assert_eq!(r, 0, "bind 失败: {}", std::io::Error::last_os_error());
+        unsafe { libc::listen(srv, 1) };
+        // 放宽权限，排除 DAC 干扰（本测试只想看 Landlock 的行为）
+        let _ = std::fs::set_permissions(&sp, std::os::unix::fs::PermissionsExt::from_mode(0o777));
+
+        // 施加一份**故意不含该目录**的白名单策略
+        let policy = SandboxPolicy {
+            paths: vec![
+                (PathBuf::from("/proc/self"), false),
+                (PathBuf::from("/usr"), false),
+            ],
+            net_ports: Vec::new(),
+            restrict_net: false,
+        };
+        if policy.apply_to_current_thread().is_err() {
+            // 内核不支持 Landlock：本环境无法验证，直接跳过（不留假绿）
+            unsafe { libc::close(srv) };
+            return;
+        }
+
+        // 沙箱生效后尝试 connect
+        let c = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(c >= 0);
+        let rc = unsafe { libc::connect(c, &addr as *const _ as *const libc::sockaddr, alen) };
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(c);
+            libc::close(srv);
+        }
+        let _ = std::fs::remove_file(&sp);
+        let _ = std::fs::remove_dir(&dir);
+
+        // 断言「当前仍是缺口」：connect 成功。若这里失败，说明已经补上，应改注释与文档。
+        assert_eq!(
+            rc, 0,
+            "connect 被拒绝了（{err}）—— 说明 Unix socket 缺口已被补上，             请更新 sandbox.rs 模块头的「已知缺口」说明与本测试"
+        );
     }
 }

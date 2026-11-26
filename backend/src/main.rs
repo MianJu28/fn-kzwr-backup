@@ -20,6 +20,7 @@ async fn main() -> anyhow::Result<()> {
     let var_dir = std::path::PathBuf::from(&var_dir);
     let cfg_dir = std::path::PathBuf::from(&cfg_dir);
     let tmp_dir = std::path::PathBuf::from(&tmp_dir);
+    // 密文暂存目录：只在加密阶段落一次盘（目标端已改为边收边发，不再二次落盘）
     let backup_tmp = tmp_dir.join("staging");
     std::fs::create_dir_all(&backup_tmp).ok();
 
@@ -161,9 +162,14 @@ async fn main() -> anyhow::Result<()> {
         audit,
         market: Arc::new(fnos_backup::plugin::market::Market::default()),
         backup_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancel_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // 目标配置快照：reload_targets 据此判断「哪些目标真的变了」以决定复用
+        target_snapshots: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        running_kind: Arc::new(std::sync::RwLock::new(None)),
         running_task_id: Arc::new(std::sync::RwLock::new(None)),
         crypto,
         passphrase: passphrase.clone(),
+        passphrase_gate: Arc::new(fnos_backup::domain::passphrase::PassphraseGate::new()),
         cfg_dir,
         pending_key_reveal: pending_reveal,
         store,
@@ -414,6 +420,16 @@ async fn serve_unix(
         std::fs::create_dir_all(parent).ok();
     }
     let listener = tokio::net::UnixListener::bind(&sock)?;
+    // 收紧 socket 权限：`bind` 创建的文件按 umask 走，通常是 **0777**（人人可连）。
+    // 本机任意用户（含其它被攻破的应用）都能连上来调管理接口 —— 口令是唯一的
+    // 屏障，而 P1-6 之前它还没有限速。只对本应用用户/组开放（0660）。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o660)) {
+            tracing::warn!("收紧 Unix Socket 权限失败（{}）：{e}", sock.display());
+        }
+    }
     info!("统一网关已监听: {} （前缀 {}）", sock.display(), prefix);
 
     let svc = StripGatewayPrefix {

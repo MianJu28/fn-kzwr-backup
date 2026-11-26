@@ -29,6 +29,17 @@ pub(super) async fn keys_set(
     State(state): State<AppState>,
     Json(body): Json<KeysSetRequest>,
 ) -> Json<KeysChangeResponse> {
+    // **口令闸门**：更换私钥会让此前全部备份永久不可解密，属破坏性操作。
+    // 与 `keys_export` / `config_import` 同一把闸门，不能留缺口。
+    let passphrase = body.passphrase.clone().unwrap_or_default();
+    if !state.check_passphrase(&passphrase) {
+        return Json(KeysChangeResponse {
+            success: false,
+            public_key: None,
+            private_key: None,
+            error: Some(crate::passphrase_err(&state)),
+        });
+    }
     let trimmed = body.private_key.trim();
     if trimmed.is_empty() {
         return Json(KeysChangeResponse {
@@ -183,10 +194,11 @@ pub(super) async fn keys_export(
     Json(body): Json<KeysExportRequest>,
 ) -> Json<KeysExportResponse> {
     // 校验管理员口令（安装向导设置的应用口令）
-    if body.passphrase.as_str() != state.passphrase.expose_secret().as_str() {
+    // 口令闸门：常数时间比较 + 失败限速（见 `domain::passphrase`）
+    if !state.check_passphrase(&body.passphrase) {
         return Json(KeysExportResponse {
             private_key: None,
-            error: Some("管理员口令错误".to_string()),
+            error: Some(crate::passphrase_err(&state)),
         });
     }
     let ks_path = crate::infra::keystore::keystore_path(&state.cfg_dir);

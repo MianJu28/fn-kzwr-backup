@@ -28,7 +28,8 @@
     try {
       return await api.auditClear(passphrase);
     } catch (e) {
-      toast.error(e.message, '清空审计失败');
+      // **不在这里 toast**：`AuditSection` 拿到 `{error}` 后会统一提示一次。
+      // 两处都弹会让用户看到两条一模一样的错误。
       return { error: e.message };
     }
   }

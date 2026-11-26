@@ -53,6 +53,84 @@ pub struct AppConfig {
     /// 插件市场设置（**默认关闭**：不在用户未要求时联网或加载代码）
     #[serde(default)]
     pub market: MarketSettings,
+    /// 网络代理（可选）：目标端可**按目标**选择是否走它
+    #[serde(default)]
+    pub proxy: ProxySettings,
+}
+
+/// 网络代理设置（全局一份；各目标自行决定是否使用）
+///
+/// ## 为什么是「全局定义 + 按目标启用」
+/// 代理通常是**环境级**的（公司出口、家中软路由、机场），改一次要全员生效；
+/// 但「哪些目标该走代理」是**每个目标自己的事** —— 例如官方 kzwr 需要代理翻墙，
+/// 而自建的局域网 WebDAV 反而不能被代理（否则内网地址被发到出口就废了）。
+/// 两者放在一起（每个目标各填一遍地址）会导致「改代理要改 N 个目标」，
+/// 故拆成：地址/凭据在一处维护，开关在每个目标上。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProxySettings {
+    /// 是否启用代理功能（关闭时所有目标都直连，即使目标勾了「使用代理」）
+    ///
+    /// 保留这个总开关是为了**紧急止血**：代理配错会让全部备份一起失败，
+    /// 此时用户需要一个「先全部直连」的开关，而不必逐个目标去取消勾选。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 代理地址，如 `http://192.168.1.2:7890` / `socks5://127.0.0.1:1080`
+    ///
+    /// 支持 `http` / `https` / `socks5` / `socks5h` 四种 scheme
+    /// （`socks5h` 表示**由代理解析域名**，跨境场景通常需要它，否则本地 DNS 会污染）。
+    #[serde(default)]
+    pub url: String,
+    /// 代理认证用户名（可选，已加密存储）
+    #[serde(default)]
+    pub username_enc: Option<String>,
+    /// 代理认证密码（可选，已加密存储）
+    #[serde(default)]
+    pub password_enc: Option<String>,
+    /// 不走代理的地址列表（逗号分隔，**仅对主机名/域名生效**）
+    ///
+    /// 语义与 `NO_PROXY` 一致：命中则直连。常见用法是填 `localhost,127.0.0.1,*.local`。
+    /// 目标级开关优先于此列表：目标显式勾了「使用代理」就必定走代理。
+    #[serde(default)]
+    pub no_proxy: String,
+}
+
+impl ProxySettings {
+    /// 是否配了可用的代理地址
+    pub fn configured(&self) -> bool {
+        !self.url.trim().is_empty()
+    }
+
+    /// 生效判定：总开关打开且填了地址
+    pub fn usable(&self) -> bool {
+        self.enabled && self.configured()
+    }
+
+    /// 为某个目标解析出「该注入给插件的代理」`{"url","username","password"}`
+    ///
+    /// `None` = 直连。判定顺序：总开关 → 本目标是否勾选 → `no_proxy` 是否命中。
+    ///
+    /// 放在这里（而不是插件/路由各写一遍）是为了**保证 target_open 与连通性测试
+    /// 用同一份判定**：两处判定不一致时，会出现「测试通过但备份失败」这类极难排查的故障。
+    pub fn resolve_for(
+        &self,
+        mgr: &ConfigManager,
+        target_url: &str,
+        use_proxy: bool,
+    ) -> Option<serde_json::Value> {
+        if !use_proxy || !self.usable() {
+            return None;
+        }
+        if crate::infra::target::webdav::host_matches_no_proxy(target_url, &self.no_proxy) {
+            return None;
+        }
+        let user = mgr.decrypt_field(&self.username_enc).ok().flatten();
+        let pass = mgr.decrypt_field(&self.password_enc).ok().flatten();
+        Some(serde_json::json!({
+            "url": self.url.trim(),
+            "username": user.unwrap_or_default(),
+            "password": pass.unwrap_or_default(),
+        }))
+    }
 }
 
 /// 插件市场设置
@@ -168,7 +246,11 @@ pub const DEFAULT_TARGET_ID: &str = "default";
 pub const DEFAULT_TASK_ID: &str = "default";
 
 /// 远程目标：一个目的地 = 一个目标插件实例 + 一套凭据
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// `PartialEq` 用于 [`AppState::reload_targets`] 判断「这个目标的配置是否真的变了」：
+/// 没变就复用已有实例，避免每次保存任何配置都重建全部目标（新建沙箱线程池 +
+/// 调插件 `target_open`），那是「保存配置要等好久」的主要来源之一。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TargetConfig {
     /// 稳定 id（任务通过它引用目标；创建后不再改变）
     pub id: String,
@@ -212,6 +294,13 @@ pub struct TargetConfig {
     /// 键名规则（非空、≤64、`[A-Za-z0-9_-]`，**不允许点号**）。
     #[serde(default)]
     pub fields: std::collections::BTreeMap<String, String>,
+    /// 本目标是否走「设置 → 网络代理」里配置的代理
+    ///
+    /// 默认 `false`（直连）：代理配置可能存在但用户只希望某些目标用它，
+    /// 且**升级老配置时必须保持原有直连行为**（老配置里没有这个字段）。
+    /// 实际是否生效还要看总开关 `AppConfig::proxy.enabled`。
+    #[serde(default)]
+    pub use_proxy: bool,
 }
 
 fn default_target_kind() -> String {
@@ -223,6 +312,31 @@ fn default_true() -> bool {
 }
 
 impl TargetConfig {
+    /// **语义等价**比较：忽略加密字段的密文差异，只比「解出来是什么」
+    ///
+    /// ## 为什么不能直接用 `==`
+    /// `username_enc` / `password_enc` 是 age 口令加密（**随机 salt，非确定性**）：
+    /// 同样的密码每次加密都得到不同密文。而"保存目标"每次都会重新加密一遍，
+    /// 于是 `new == old` **永远为 false** —— 依赖它的「配置未变则复用实例」优化
+    /// 从不生效，每次保存都要重建线程池 + 重跑 `target_open`（实测 7.5s）。
+    ///
+    /// 这里按**明文**比较；解密失败的字段退回比密文（保守：宁可重建）。
+    pub fn same_as(&self, other: &Self, mgr: &ConfigManager) -> bool {
+        let plain = |f: &Option<String>| -> Option<String> {
+            mgr.decrypt_field(f).ok().flatten()
+        };
+        self.id == other.id
+            && self.name == other.name
+            && self.kind == other.kind
+            && self.url == other.url
+            && self.enabled == other.enabled
+            && self.parallel == other.parallel
+            && self.fields == other.fields
+            && self.use_proxy == other.use_proxy
+            && plain(&self.username_enc) == plain(&other.username_enc)
+            && plain(&self.password_enc) == plain(&other.password_enc)
+    }
+
     /// 凭据是否已配置（用户名 + 密码齐备）
     pub fn configured(&self) -> bool {
         self.username_enc.is_some() && self.password_enc.is_some()
@@ -282,6 +396,14 @@ pub struct TaskConfig {
     /// 保留策略（孤儿文件清理等）
     #[serde(default)]
     pub retention: RetentionConfig,
+    /// **严格模式**（ADR-004）：mtime+size 变化时再用 BLAKE3 内容哈希确认
+    ///
+    /// 关（默认）时只比 mtime+size —— O(1)，覆盖绝大多数场景。
+    /// 开时对每个「疑似变化」的文件读一遍算哈希：能识破 mtime 被改写回旧值
+    /// （`rsync -a`、部分下载/拷贝工具回写 mtime）造成的漏传，代价是每次备份
+    /// 要完整读一遍这些文件。
+    #[serde(default)]
+    pub strict: bool,
 }
 
 impl Default for TaskConfig {
@@ -297,6 +419,7 @@ impl Default for TaskConfig {
             target_folder: default_target_folder(),
             schedule_cron: None,
             retention: RetentionConfig::default(),
+            strict: false,
         }
     }
 }
@@ -322,6 +445,7 @@ impl AppConfig {
                 enabled: true,
                 parallel: None,
                 fields: std::collections::BTreeMap::new(),
+                use_proxy: false,
             });
             changed = true;
         }
@@ -348,6 +472,7 @@ impl AppConfig {
                 target_folder: self.backup.target_folder.clone(),
                 schedule_cron: self.backup.schedule_cron.clone(),
                 retention: self.backup.retention.clone(),
+                strict: false,
             });
             changed = true;
         }
@@ -398,6 +523,52 @@ impl AppConfig {
                 } else {
                     t.name.clone()
                 }
+            })
+            .collect()
+    }
+
+    /// 与「该目标 + 该目标文件夹」组合相同的**其它**任务（保留策略必须知道它们）
+    ///
+    /// ## 为什么需要
+    /// 目标端布局是 `/<目标文件夹>/<源文件夹名>/…`，而保留策略扫描的是**整个**
+    /// `/<目标文件夹>` 前缀。多个任务可以共用同一个目标（`ADR-014` 明确支持：
+    /// 「一个目标可被多个任务共用」），于是这些任务的文件在云端**处在同一棵树里**。
+    ///
+    /// 若保留策略的「受管理集合」只算本任务的快照，它就会把**别的任务刚备份的
+    /// 文件判为孤儿并删除** —— 而那些任务的快照仍认为文件存在，下次增量判定
+    /// 「未变化」不重传 ⇒ 云端缺失且**不会自愈**（只能手工「清理缺失记录」+全量重传）。
+    ///
+    /// 这是静默的数据丢失，故受管理集合必须包含同组合的**全部**任务。
+    pub fn tasks_sharing_target_folder(
+        &self,
+        target_id: &str,
+        target_folder: &str,
+        exclude_task_id: &str,
+    ) -> Vec<&TaskConfig> {
+        let folder = target_folder.trim_matches('/');
+        self.tasks
+            .iter()
+            .filter(|t| {
+                t.id != exclude_task_id
+                    && t.target_id == target_id
+                    && t.target_folder.trim_matches('/') == folder
+            })
+            .collect()
+    }
+
+    /// 把任务展开为保留策略所需的 `(job_id, 源文件夹名)` 列表
+    ///
+    /// 快照 key 与备份侧一致：`job_id = "{task.id}-{源序号}"`（ADR-014）。
+    pub fn job_roots_of(task: &TaskConfig) -> Vec<(String, String)> {
+        task.paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let name = std::path::Path::new(p)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                (format!("{}-{}", task.id, i), name)
             })
             .collect()
     }
@@ -531,6 +702,41 @@ pub struct ConfigManager {
     /// 在每个请求热路径上都会解密。以**密文本身**作缓存键：用户保存新凭据时
     /// 密文随之改变、旧键自然失效，无需手动清理。
     cache: std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+    /// **整份配置的解析缓存**（按文件 mtime+len 失效）
+    ///
+    /// ## 为什么需要
+    /// `load()` 是热路径上最常被调用的函数：一次「保存目标」的请求里，
+    /// 保存/重建目标池/审计/构造响应会各调一次，全应用 48 处调用点。
+    /// 每次都 `read_to_string` + TOML 解析 + `migrate()`，在 NAS 的低频 CPU 上
+    /// 累积起来就是用户能感知的「点保存要等一下」。
+    ///
+    /// 用 `(mtime, len)` 作失效判据：配置只在 save 时变化，而 save 必然改 mtime，
+    /// 因此缓存不会读到旧值（比「手动清缓存」更不易漏）。
+    parsed: std::sync::Mutex<Option<ParsedCache>>,
+}
+
+/// 配置解析缓存条目
+struct ParsedCache {
+    /// 缓存对应的文件指纹（mtime 纳秒 + 文件长度）
+    fingerprint: (u128, u64),
+    /// 解析好（且已 migrate）的配置
+    cfg: AppConfig,
+}
+
+/// 取文件的指纹（`(mtime_ns, len)`）；文件不存在时给一个不可能撞上的值
+fn file_fingerprint(path: &std::path::Path) -> (u128, u64) {
+    match std::fs::metadata(path) {
+        Ok(m) => {
+            let ns = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            (ns, m.len())
+        }
+        Err(_) => (0, 0),
+    }
 }
 
 impl ConfigManager {
@@ -540,20 +746,47 @@ impl ConfigManager {
             path: cfg_dir.join(CONFIG_FILE),
             passphrase,
             cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            parsed: std::sync::Mutex::new(None),
         }
     }
 
     /// 加载配置（不存在则返回默认）；**顺带做旧配置迁移（仅内存，不落盘）**
+    ///
+    /// 结果按文件指纹（mtime+len）缓存：配置只在保存时变化，
+    /// 因此重复调用不再重复读盘与解析 TOML（详见 [`ConfigManager::parsed`]）。
     pub fn load(&self) -> Result<AppConfig> {
         if !self.path.exists() {
             let mut cfg = AppConfig::default();
             cfg.migrate();
             return Ok(cfg);
         }
+        let fp = file_fingerprint(&self.path);
+        // 命中缓存：直接返回克隆（AppConfig 的克隆远快于读盘 + TOML 解析）
+        if let Ok(g) = self.parsed.lock() {
+            if let Some(c) = g.as_ref() {
+                if c.fingerprint == fp {
+                    return Ok(c.cfg.clone());
+                }
+            }
+        }
         let content = std::fs::read_to_string(&self.path).context("读取配置文件失败")?;
         let mut cfg: AppConfig = toml::from_str(&content).context("解析配置失败")?;
         cfg.migrate();
+        // 回填缓存（并发时多个线程可能都解析一次，结果一致，无害）
+        if let Ok(mut g) = self.parsed.lock() {
+            *g = Some(ParsedCache { fingerprint: fp, cfg: cfg.clone() });
+        }
         Ok(cfg)
+    }
+
+    /// 主动作废解析缓存（保存后调用）
+    ///
+    /// 虽然指纹能自然失效，但「同一纳秒内写入 + 长度不变」理论上会让指纹相同；
+    /// 保存路径显式作废一次，把这种极端情况也堵掉。
+    fn invalidate_parsed(&self) {
+        if let Ok(mut g) = self.parsed.lock() {
+            *g = None;
+        }
     }
 
     /// 加载配置；若发生了旧配置迁移则立即落盘（供启动时调用一次）
@@ -582,7 +815,41 @@ impl ConfigManager {
         let mut cfg = config.clone();
         cfg.sync_legacy_mirror();
         let content = toml::to_string_pretty(&cfg).context("序列化配置失败")?;
-        std::fs::write(&self.path, content).context("写入配置文件失败")?;
+        // 敏感字段虽已加密（`enc:`），但配置里还有 WebDAV 地址、备份路径、插件开关
+        // 等隐私信息；`fs::write` 建的文件按 umask 走通常是 **0644**（人人可读）。
+        // 因此：新建时按 0600 创建，已存在的文件**不动**它的权限（用户可能有意
+        // 放宽给备份脚本读取，不该每次保存都被改回去）。
+        Self::write_private(&self.path, &content)?;
+        // 显式作废解析缓存：虽指纹能自然失效，但「同一纳秒内保存且长度不变」
+        // 理论上会让指纹相同，这里把它彻底堵掉（保存是低频操作，代价可忽略）。
+        self.invalidate_parsed();
+        Ok(())
+    }
+
+    /// 写文件并保证**新建时**是 0600（已存在则保留既有权限）
+    ///
+    /// 与 `infra::keystore` 的私钥落盘同口径 —— 那里一直是亲手 0600，
+    /// 配置这边却漏了。
+    fn write_private(path: &Path, content: &str) -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let exists = path.exists();
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .context("打开配置文件失败")?;
+        f.write_all(content.as_bytes())
+            .context("写入配置文件失败")?;
+        f.sync_all().ok();
+        if !exists {
+            // `mode()` 只在创建时生效，显式再收紧一次（umask 已由 mode 抵消，
+            // 但某些文件系统/挂载选项下仍会偏差）
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
         Ok(())
     }
 
@@ -628,6 +895,7 @@ impl ConfigManager {
                 enabled: true,
                 parallel: None,
                 fields: std::collections::BTreeMap::new(),
+                use_proxy: false,
             });
         } else {
             // 主目标（首个启用者）就地更新
@@ -1000,4 +1268,182 @@ password = "pass"
         assert_ne!(t_unset.parallel, t_sequential.parallel);
     }
 
+}
+
+#[cfg(test)]
+mod target_eq_tests {
+    use super::*;
+
+    fn mk(id: &str, user: &str, pass: &str, url: &str) -> TargetConfig {
+        TargetConfig {
+            id: id.to_string(),
+            name: "n".to_string(),
+            kind: "webdav".to_string(),
+            url: Some(url.to_string()),
+            username_enc: Some(user.to_string()),
+            password_enc: Some(pass.to_string()),
+            enabled: true,
+            parallel: None,
+            fields: Default::default(),
+            use_proxy: false,
+        }
+    }
+
+    /// **复用安全性**：配置完全相同时必须判等（否则每次保存都白重建实例）
+    #[test]
+    fn identical_configs_compare_equal() {
+        assert_eq!(mk("a", "u", "p", "https://x"), mk("a", "u", "p", "https://x"));
+    }
+
+    /// **凭据变更必须导致不等**：否则会复用旧连接、用错账号
+    #[test]
+    fn credential_change_breaks_equality() {
+        let base = mk("a", "u", "p", "https://x");
+        assert_ne!(base, mk("a", "u", "p2", "https://x"), "改密码必须重建");
+        assert_ne!(base, mk("a", "u2", "p", "https://x"), "改用户名必须重建");
+        assert_ne!(base, mk("a", "u", "p", "https://y"), "改地址必须重建");
+    }
+
+    /// 其它影响连接行为的字段同样必须触发重建
+    #[test]
+    fn behavior_affecting_fields_break_equality() {
+        let base = mk("a", "u", "p", "https://x");
+        let mut t = base.clone();
+        t.enabled = false;
+        assert_ne!(base, t, "启停变化必须重建");
+
+        let mut t = base.clone();
+        t.parallel = Some(4);
+        assert_ne!(base, t, "并发度变化必须重建");
+
+        let mut t = base.clone();
+        t.use_proxy = true;
+        assert_ne!(base, t, "代理开关变化必须重建");
+
+        let mut t = base.clone();
+        t.fields.insert("root".to_string(), "/data".to_string());
+        assert_ne!(base, t, "插件自定义字段变化必须重建");
+    }
+}
+
+#[cfg(test)]
+mod load_bench {
+    use super::*;
+
+    /// 基准：有缓存 vs 无缓存（每次强制重解析）的 `load()` 耗时
+    ///
+    /// 不算断言硬门槛（机器差异大），而是把实测值打印出来验证优化确实生效。
+    #[test]
+    #[ignore = "基准测试：cargo test --release -- --ignored --nocapture"]
+    fn bench_load_with_and_without_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = ConfigManager::new(dir.path(), age::secrecy::SecretString::from("t".to_string()));
+        // 造一份接近真实的配置（多个目标 + 任务 + 插件字段）
+        let mut cfg = AppConfig::default();
+        for i in 0..5 {
+            let mut t = TargetConfig::default();
+            t.id = format!("t{i}");
+            t.name = format!("目标{i}");
+            t.kind = "webdav".to_string();
+            t.url = Some("https://dav.kzwr.com/dav".to_string());
+            t.username_enc = Some(format!("enc:dummy{i}"));
+            t.password_enc = Some(format!("enc:dummy{i}"));
+            cfg.targets.push(t);
+        }
+        m.save(&cfg).unwrap();
+
+        const N: usize = 200;
+
+        // 有缓存（当前实现）
+        let t0 = std::time::Instant::now();
+        for _ in 0..N {
+            let _ = m.load().unwrap();
+        }
+        let cached = t0.elapsed();
+
+        // 无缓存：每次作废后再 load（等价于旧实现）
+        let t1 = std::time::Instant::now();
+        for _ in 0..N {
+            m.invalidate_parsed();
+            let _ = m.load().unwrap();
+        }
+        let uncached = t1.elapsed();
+
+        eprintln!(
+            "[bench-load] {N} 次：有缓存 {cached:?} / 无缓存 {uncached:?} ⇒ 提速 {:.1}×",
+            uncached.as_secs_f64() / cached.as_secs_f64()
+        );
+        assert!(cached < uncached, "缓存必须更快");
+    }
+}
+
+#[cfg(test)]
+mod load_cache_tests {
+    use super::*;
+
+    fn mgr(dir: &std::path::Path) -> ConfigManager {
+        ConfigManager::new(dir, age::secrecy::SecretString::from("t".to_string()))
+    }
+
+    /// **配置解析缓存**：重复 `load()` 必须返回一致结果
+    ///
+    /// 这是「保存配置要等一下」的主要来源之一：一次保存请求里 `load()` 被调
+    /// 多次（保存/重建目标池/审计/构造响应），每次都读盘 + 解析 TOML。
+    #[test]
+    fn repeated_load_returns_same_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mgr(dir.path());
+        let mut cfg = AppConfig::default();
+        cfg.debug = true;
+        m.save(&cfg).unwrap();
+
+        let a = m.load().unwrap();
+        let b = m.load().unwrap();
+        let c = m.load().unwrap();
+        assert_eq!(a.debug, b.debug);
+        assert_eq!(b.debug, c.debug);
+        assert!(a.debug, "缓存不应改变内容");
+    }
+
+    /// 保存后必须立刻读到新值（缓存不能导致「改了没生效」）
+    #[test]
+    fn save_invalidates_cache_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mgr(dir.path());
+
+        let mut cfg = AppConfig::default();
+        cfg.debug = false;
+        m.save(&cfg).unwrap();
+        assert!(!m.load().unwrap().debug, "初始值");
+
+        // 改值再存：必须立刻读到 true
+        let mut cfg2 = m.load().unwrap();
+        cfg2.debug = true;
+        m.save(&cfg2).unwrap();
+        assert!(m.load().unwrap().debug, "保存后必须读到新值（缓存需失效）");
+    }
+
+    /// 外部直接改文件（不经 save）也要能读到新内容（指纹失效兜底）
+    #[test]
+    fn external_file_change_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        let m = mgr(dir.path());
+
+        let mut cfg = AppConfig::default();
+        cfg.debug = false;
+        m.save(&cfg).unwrap();
+        assert!(!m.load().unwrap().debug);
+
+        // 模拟「外部工具改了配置」：直接写文件
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let mut cfg2 = m.load().unwrap();
+        cfg2.debug = true;
+        std::fs::write(&path, toml::to_string_pretty(&cfg2).unwrap()).unwrap();
+
+        assert!(
+            m.load().unwrap().debug,
+            "文件被外部修改后必须检测到（靠 mtime/len 指纹）"
+        );
+    }
 }

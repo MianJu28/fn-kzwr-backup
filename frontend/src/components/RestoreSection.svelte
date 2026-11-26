@@ -4,6 +4,7 @@
   import TreeNode from '../TreeNode.svelte';
   import Icon from './Icon.svelte';
   import { fmtBytes } from '../lib/format.js';
+  import { confirmDialog } from '../lib/confirm.js';
 
   export let restoreFolders = [];
   export let backupPaths = [];
@@ -123,12 +124,16 @@
 
   /** 清理快照中云端已不存在的文件记录（只动快照元数据，不删云端/本地文件） */
   async function pruneMissing(folder) {
-    if (
-      !confirm(
-        `检查 ${folder.path} 的备份记录，移除云端已不存在的文件？\n（只清理失效的快照记录，不会删除云端或本地任何文件）`
-      )
-    )
-      return;
+    // 用统一的 `confirmDialog` 而不是原生 `confirm()`：
+    // 原生对话框样式与全站不一致、阻塞主线程、且无法定制按钮文案。
+    const ok = await confirmDialog({
+      title: '清理失效的备份记录？',
+      message:
+        `检查 ${folder.path} 的备份记录，移除云端已不存在的文件？\n` +
+        '（只清理失效的快照记录，不会删除云端或本地任何文件）',
+      confirmText: '检查并清理',
+    });
+    if (!ok) return;
     working = true;
     msg = '';
     try {

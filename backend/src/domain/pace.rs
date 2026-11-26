@@ -31,6 +31,8 @@ pub struct FileMeter {
     last_written: u64,
     /// 上次观测时该请求已用时（毫秒）
     last_elapsed_ms: u64,
+    /// 因耗时过短而被跳过、尚未计入的字节数
+    last_pending_bytes: u64,
 }
 
 impl Default for SpeedMeter {
@@ -49,6 +51,7 @@ impl SpeedMeter {
         FileMeter {
             last_written: 0,
             last_elapsed_ms: 0,
+            last_pending_bytes: 0,
         }
     }
 
@@ -61,7 +64,7 @@ impl SpeedMeter {
     /// 当前速度（字节/秒；无有效样本时为 0）
     pub fn speed_bps(&self) -> u64 {
         if self.ms > 0 {
-            self.bytes.saturating_mul(1000) / self.ms
+            self.bytes.saturating_mul(1000).checked_div(self.ms).unwrap_or(0)
         } else {
             0
         }
@@ -75,14 +78,25 @@ impl FileMeter {
     /// - `elapsed_ms`：本请求从开始到此刻的毫秒数（每次请求从 0 重新计）
     pub fn observe(&mut self, shared: &mut SpeedMeter, written: u64, elapsed_ms: u64) {
         if elapsed_ms < MIN_OBSERVE_MS {
-            return; // 过短的观测（可能被本地缓冲）忽略，避免速度虚高
+            // 过短的观测（可能被本地缓冲）**不作为样本**，但**也不推进基线**：
+            // 这些字节与耗时会在下一次有效观测里一并计入（见下方增量算法）。
+            //
+            // ⚠️ 早期版本在这里直接 `return` 而不更新基线，等于把这些字节从账上
+            // 抹掉；当所有观测都短于阈值时（如目标端把数据瞬间抽干、耗时恒为 0），
+            // 计量器**一个样本都收不到**，速度就永远显示「—」。
+            if written >= self.last_written {
+                self.last_pending_bytes = written - self.last_written;
+            }
+            return;
         }
-        // 字节增量：written 回退说明换请求（重置），否则为同请求内的增量
+        // 字节增量：written 回退说明换请求（重置），否则为同请求内的增量。
+        // 同时把上次被阈值跳过的字节补回来（它们确实已经传出去了）。
         let db = if written >= self.last_written {
             written - self.last_written
         } else {
             written
-        };
+        } + self.last_pending_bytes;
+        self.last_pending_bytes = 0;
         // 耗时增量：elapsed 回退说明换请求（新请求从 0 起算）
         let dm = if elapsed_ms >= self.last_elapsed_ms {
             elapsed_ms - self.last_elapsed_ms

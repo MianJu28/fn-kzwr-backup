@@ -81,8 +81,17 @@ impl ActResult {
                 Value::Array(self.resolve.iter().cloned().map(Value::String).collect()),
             );
         }
-        if let Some(c) = self.wb.commit() {
-            out.insert("config".to_string(), c);
+        // **保存失败必须如实报错**，不能悄悄丢掉。
+        //
+        // 旧实现落盘失败后「退回声明式回写」（把配置塞进 `config` 字段），
+        // 但宿主 ADR-021 之后**完全忽略** `config` ⇒ 用户看到 success:true、
+        // 实际什么都没存上，刷新后账号/阈值全部消失。
+        //
+        // 这里改为：失败即把 `success` 置 false 并给出原因。动作的其余部分
+        // （alerts/audit）仍然带上——它们对排障有价值。
+        if let Err(e) = self.wb.commit() {
+            out.insert("success".to_string(), Value::Bool(false));
+            out.insert("error".to_string(), Value::String(e));
         }
         if !self.audit.is_empty() {
             out.insert(
@@ -345,6 +354,17 @@ pub async fn accounts_remove(cfg: &Value, body: &Value) -> ActResult {
     let mut r = ActResult::ok(json!({"success": true, "message": format!("已删除账号「{name}」")}));
     r.write("accounts", Snapshot::accounts_json(&snap.accounts));
     r.drop_key(crate::state::percent_key(&id));
+    // ⚠️ **必须同时清掉遗留 `token` 键**，否则账号会「复活」。
+    //
+    // `Snapshot::from_value` 的逻辑是：`accounts` 为空 且 存在 `token` 键
+    // ⇒ 自动生成一个 `legacy` 账号（迁移兼容）。于是用户删掉最后一个由遗留
+    // token 迁移来的账号后，下次读取它又回来了，**根本删不掉**。
+    //
+    // 判据：列表已空，或删除的正是那个 legacy 账号 —— 两种情况下遗留 token
+    // 都失去了存在意义（它代表「唯一账号」）。
+    if snap.accounts.is_empty() || id == crate::state::LEGACY_ACCOUNT_ID {
+        r.drop_key("token");
+    }
     r.audit("kzwr.accounts.remove", format!("删除酷族账号「{name}」"), true);
     r
 }
@@ -660,7 +680,11 @@ async fn empty_trash_gated(
         // 占用门槛只在首轮判断（首页采样；后续轮次已在执行清理）
         if round == 0 {
             out.total_bytes = items.iter().filter_map(api::trash_item_size).sum();
-            if max_gb > 0 && out.total_bytes < max_gb * 1024 * 1024 * 1024 {
+            // `saturating_mul`：`recycle_max_gb` 来自任务配置且没有上限校验，
+            // 写一个极大值（如 2^54）时 `* 1024^3` 会在 release 下静默回绕成很小的数
+            // ⇒ 门槛形同虚设 ⇒ **更激进地删东西**（危险方向）。饱和乘法堵住它。
+            let gate_bytes = max_gb.saturating_mul(1024 * 1024 * 1024);
+            if max_gb > 0 && out.total_bytes < gate_bytes {
                 out.kept = items.len();
                 out.reason = Some(format!(
                     "回收站占用 {} MB 不足 {} GB，本次未清空",
@@ -675,7 +699,10 @@ async fn empty_trash_gated(
         for it in &items {
             match api::trash_item_deleted_ms(it) {
                 Some(ts) => {
-                    let age_days = (now_ms - ts).max(0) / 86_400_000;
+                    // `saturating_sub`：`ts` 取自远端 JSON，可为任意 i64
+                    //（含 i64::MIN）。普通减法在 release 下会回绕成巨大正值
+                    // ⇒ 年龄判成「很老」⇒ 被物理删除。饱和减法把极端值压到 0。
+                    let age_days = now_ms.saturating_sub(ts).max(0) / 86_400_000;
                     if min_age_days == 0 || age_days as u64 >= min_age_days {
                         deletable.push(it.clone());
                     } else {
@@ -700,11 +727,18 @@ async fn empty_trash_gated(
             });
             return Ok(out);
         }
-        let n = deletable.len();
-        api::delete_trash_items(client, token, &deletable)
+        // 用**实际提交删除的条数**（而不是本页候选数）累加：
+        // 提不出 id 的条目会被 api 层丢弃，按候选数计会让「已清理」虚高。
+        let submitted = api::delete_trash_items(client, token, &deletable)
             .await
             .map_err(|e| format!("删除回收站条目失败: {e}"))?;
-        out.emptied += n;
+        if submitted == 0 {
+            // 一条都没提交成功：继续循环只会反复翻到同一页、空转到轮次上限
+            //（最多 200 轮 × 2 次请求，全程占住该插件唯一的串行线程）。
+            out.reason = Some("本页条目均无法提交删除，已停止以免空转".to_string());
+            return Ok(out);
+        }
+        out.emptied += submitted;
     }
     Ok(out)
 }
@@ -848,10 +882,25 @@ async fn patrol_quota(cfg: &Value, note_startup: bool) -> ActResult {
         } else {
             0
         };
-        if threshold == 0 || threshold > 100 || info.total == 0 {
+        // 用**稳定 id** 做告警前缀，而不是账号名：
+        // - 两个同名账号会互相消解对方的告警；
+        // - 账号改名后，旧名字的告警再也不会被任何 resolve 命中，永久挂在提醒里。
+        let prefix = format!("{QUOTA_ALERT_PREFIX}[{}]", a.id);
+        // 关闭预警（0）或拿不到容量信息时，必须**清掉既有告警**。
+        //
+        // 曾经这里是 `continue`（在 `r.resolve.push` 之前）：用户把阈值设为 0 想关预警，
+        // 之后每轮巡检都从这里跳过，那条空间告警**永远停在消息提醒里**，
+        // 直到占用真的回落 —— 而用户已经明确说「不要预警了」。
+        // `health()` 在同样条件下会 resolve，两条巡检路径的行为必须一致。
+        if threshold == 0 || info.total == 0 {
+            r.resolve.push(prefix);
             continue;
         }
-        let prefix = format!("{QUOTA_ALERT_PREFIX}「{}」", a.name);
+        if threshold > 100 {
+            // `percent_for` 已把 >100 夹到合法区间，这里是纯防御（不可达）
+            r.resolve.push(prefix);
+            continue;
+        }
         if pct >= threshold {
             r.warn(
                 "warn",
@@ -923,6 +972,9 @@ pub async fn on_after_backup(cfg: &Value) -> ActResult {
     }
     let mut emptied = 0u64;
     let mut reasons: Vec<String> = Vec::new();
+    // 失败次数（与 reasons 里的「跳过」说明区分开）
+    let mut failures: u32 = 0;
+
     for t in &matched {
         let max_gb = t.get("recycle_max_gb").and_then(|x| x.as_u64()).unwrap_or(0);
         let min_age = t.get("recycle_min_age_days").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -949,18 +1001,24 @@ pub async fn on_after_backup(cfg: &Value) -> ActResult {
                 Err(e) => {
                     crate::log::warn(format!("任务 {tname} 账号 {} 清理回收站失败: {e}", a.name));
                     reasons.push(format!("{tname} {}：失败 {e}", a.name));
+                    // 单独计数：`reasons` 里也混有「跳过」类说明，
+                    // 不能拿它判断成败（审计的 ok 要反映真实结果）。
+                    failures += 1;
                 }
             }
         }
     }
     if emptied > 0 || !reasons.is_empty() {
+        // `ok` 必须反映**真实结果**：审计是后台动作唯一可追溯的痕迹，
+        // 恒为 true 等于把失败洗成成功（用户事后查审计只会看到「一切正常」）。
+        let ok = failures == 0;
         r.audit(
             "kzwr.trash.auto",
             format!(
                 "备份后自动清理回收站：删除 {emptied} 项{}",
                 if reasons.is_empty() { String::new() } else { format!("（{}）", reasons.join("；")) }
             ),
-            true,
+            ok,
         );
     }
     r.body = json!({
@@ -991,7 +1049,10 @@ pub async fn health(cfg: &Value) -> String {
     for a in &snap.accounts {
         let info = fetch_member(&client, &a.token).await;
         let threshold = snap.percent_for(&a.id);
-        let prefix = format!("{QUOTA_ALERT_PREFIX}「{}」", a.name);
+        // 与 `patrol_quota` 用**同一个前缀**（含稳定 id）：
+        // 两处若不一致，巡检发出的告警「健康检查」消解不掉（反之亦然），
+        // 用户会看到告警明明已恢复却一直挂着。
+        let prefix = format!("{QUOTA_ALERT_PREFIX}[{}]", a.id);
         if !info.login {
             out.push(json!({
                 "key": format!("kzwr.{}", a.id),

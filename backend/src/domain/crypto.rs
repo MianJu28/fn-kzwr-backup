@@ -165,6 +165,20 @@ impl CryptoSession {
                 read_len += n;
             }
             let chunk_len = u32::from_le_bytes(len_buf) as usize;
+            // **必须先校验长度再分配**。
+            //
+            // `chunk_len` 来自目标端（云端）数据 —— 一个被篡改/损坏的备份文件
+            // 只要把前 4 字节写成 `0xFFFFFFFF`，这里就会尝试分配 4GiB，
+            // 在 NAS 上直接 OOM（进程被 OOM killer 杀掉）。
+            // 加密侧每块最多 CHUNK_SIZE 明文，密文只多 age 头/认证标签，
+            // 因此上界是明确的。
+            const MAX_CHUNK_CIPHER: usize = CHUNK_SIZE + 64 * 1024;
+            if chunk_len == 0 || chunk_len > MAX_CHUNK_CIPHER {
+                anyhow::bail!(
+                    "密文块长度非法（{chunk_len} 字节，上限 {MAX_CHUNK_CIPHER}）：\
+                     备份文件可能已损坏或被篡改"
+                );
+            }
             let mut ciphertext = vec![0u8; chunk_len];
             reader.read_exact(&mut ciphertext).context("读取密文失败")?;
 
@@ -187,5 +201,64 @@ impl std::str::FromStr for AgeKeys {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
         Self::from_secret_key(s)
+    }
+}
+
+#[cfg(test)]
+mod corrupt_input_tests {
+    use super::*;
+
+    /// **反 OOM 回归**：伪造的超大块长度必须被拒绝，而不是尝试分配 4GiB
+    ///
+    /// `chunk_len` 来自云端备份文件；被篡改/损坏时若直接 `vec![0u8; len]`，
+    /// NAS 上会 OOM（进程被 killer 杀掉）。这是恢复路径上最容易被 4 个字节打崩的点。
+    #[test]
+    fn absurd_chunk_length_is_rejected_not_allocated() {
+        let keys = AgeKeys::generate();
+        let crypto = CryptoSession::full(&keys);
+        // 构造：长度前缀 = u32::MAX，后无数据
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&u32::MAX.to_le_bytes());
+        let mut out = Vec::new();
+        let err = crypto
+            .decrypt_stream(std::io::Cursor::new(&bad), &mut out)
+            .expect_err("超大块长度必须报错");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("长度非法") || msg.contains("损坏"),
+            "错误信息应指出长度非法：{msg}"
+        );
+    }
+
+    /// 零长度块同样非法（否则会无限空转或产生空块）
+    #[test]
+    fn zero_chunk_length_is_rejected() {
+        let keys = AgeKeys::generate();
+        let crypto = CryptoSession::full(&keys);
+        let bad = 0u32.to_le_bytes().to_vec();
+        let mut out = Vec::new();
+        assert!(
+            crypto
+                .decrypt_stream(std::io::Cursor::new(&bad), &mut out)
+                .is_err(),
+            "零长度块必须报错"
+        );
+    }
+
+    /// 正常数据必须仍能正常往返（防止校验把功能写坏）
+    #[test]
+    fn normal_roundtrip_still_works() {
+        let keys = AgeKeys::generate();
+        let crypto = CryptoSession::full(&keys);
+        let plain = b"hello age chunk".to_vec();
+        let mut enc = Vec::new();
+        crypto
+            .encrypt_stream(std::io::Cursor::new(&plain), &mut enc)
+            .expect("加密应成功");
+        let mut out = Vec::new();
+        crypto
+            .decrypt_stream(std::io::Cursor::new(&enc), &mut out)
+            .expect("解密应成功");
+        assert_eq!(out, plain);
     }
 }

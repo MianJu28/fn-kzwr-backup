@@ -7,6 +7,7 @@ pub mod audit;
 pub mod backup;
 pub mod crypto;
 pub mod pace;
+pub mod passphrase;
 pub mod restore;
 pub mod retention;
 pub mod scheduler;

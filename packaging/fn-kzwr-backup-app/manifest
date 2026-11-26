@@ -1,5 +1,5 @@
 appname               = fn-kzwr-backup
-version               = 0.5.2
+version               = 0.7.21
 display_name          = 酷族备份
 desc                  = <b>酷族备份</b> —— 飞牛 NAS 增量加密备份<br>把指定文件夹增量、age 加密备份到<a href='https://www.kzwr.com' target='_blank'>酷族网软</a>官方 WebDAV。<br>支持断点续传、大文件自动分片、cron 定时、实时进度与速度、保留策略，按文件或目录选择性恢复。<br><br><b>酷族网软</b>：官网 <a href='https://www.kzwr.com' target='_blank'>www.kzwr.com</a>。<br>免费用户提供 10G 空间、不限速，但下载站在大陆境外，实际速度看网络情况。<br><br>意见建议反馈：<a href='https://github.com/MianJu28/fn-kzwr-backup/issues' target='_blank'>github.com/MianJu28/fn-kzwr-backup/issues</a><br>邮箱：mianju@agent.qq.com
 platform              = x86
@@ -15,4 +15,4 @@ ctl_stop              = true
 checkport             = false
 disable_authorization_path = false
 micro_app             = true
-changelog             = kzwr 增强功能完全迁出主程序，改为随包分发的外置插件（plugins/kzwr）：主程序不再内置任何厂商专属逻辑，升级主程序不需要重编插件。插件支持多账号（多个 access-token，各自独立的云端空间预警阈值），账号增删改与阈值均在「插件」页的设置弹窗里完成，令牌明文永不回传前端。新增通用「多账号」界面区块（accounts）：任何多凭据插件都能直接复用，前端无需为插件写专属组件。新增插件声明式副作用通道：插件可在返回值里声明 alerts（告警）、resolve（条件恢复后自动消解）、config（把自身配置加密持久化）、audit（后台动作留痕），全程不回调宿主。插件自配置读回、体检项、告警来源与审计标签全部通用化。注意：本次迁移<b>不搬运旧的单 token 配置</b>，请在「插件」页重新填写 access-token。
+changelog             = v0.7.7：真机联调发现并修复的 3 个问题。① <b>目标编辑保存耗时 7.5 秒</b>：实测定位到两个叠加原因 —— (a) 凭据用 age 口令加密（scrypt，单次约 1.9 秒），改密码时会加密两次；(b) 更关键的是「配置未变则复用目标实例」的优化<b>从未生效</b>：该优化用 `TargetConfig ==` 比较，而凭据字段是<b>随机化加密</b>（每次密文都不同），于是永远判为「已变化」→ 每次都重建沙箱线程池 + 重跑插件 `target_open`。现已改为按<b>解密后的明文</b>比较。实测前端真实编辑（回显用户名、密码留空）从 7.5s 降至 <b>7~28ms</b>。② <b>参数错误信息被吞</b>：axum 的 JSON 提取失败返回 <b>422 + 纯文本</b>，前端 `res.json()` 解析失败后只报「响应解析失败（HTTP 422）」，真实原因（如「缺少 config 字段」）完全看不到。现加响应中间件：非 JSON 的错误体统一改写为 `{"error":"…"}` 并归一为 400（413/5xx 保留原码）。实测 413 超限也已是 JSON。③ <b>能建出空任务</b>：`/api/tasks` 传空对象会创建一个没有任何备份路径的任务，它显示在列表里却什么都不备份。现要求新建任务至少一个路径（编辑时保持原值）。

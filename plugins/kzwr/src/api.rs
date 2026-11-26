@@ -31,12 +31,30 @@ const RETRY_ATTEMPTS: u32 = 3;
 pub type ApiResult<T> = Result<T, String>;
 
 /// 客户端（无状态：token 由调用方按账号传入，故可全局共享一个连接池）
+///
+/// `Clone` 是廉价的：`reqwest::Client` 内部就是 `Arc`，克隆共享同一个连接池。
+#[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
 }
 
 impl Client {
+    /// 取**全局共享**的客户端
+    ///
+    /// 为什么不能每次 `new()`：`reqwest::Client` 内部持有连接池与 DNS 缓存，
+    /// 每个动作新建一个就让 keep-alive 完全失效（每次请求都要重新 TCP+TLS 握手）。
+    /// 而本插件是「一个动作里对多个账号各发若干个请求」的模式，
+    /// 建连开销会成倍放大；`rt.rs` 的注释也明确要求「建一次全局复用」。
+    ///
+    /// 本结构无状态（token 按账号现传），因此天然可共享。
     pub fn new() -> Self {
+        static SHARED: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+        SHARED
+            .get_or_init(Self::build)
+            .clone()
+    }
+
+    fn build() -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .default_headers({
@@ -135,22 +153,29 @@ impl Client {
         loop {
             attempt += 1;
             // 闭包只做请求构造（同步、不 panic）；发送与解析的错误都走下面的分支
-            let result = match build().send().await {
+            // 重试判定必须**结构化**，不能靠错误字符串前缀：
+            // 5xx 若带 JSON 消息，`parse_response` 返回的是那个消息文本（不以
+            // "HTTP 5" 开头）⇒ 旧逻辑会**漏掉**本该重试的服务端故障；
+            // 反过来「读响应失败」这类明确网络错误又不在前缀表里 ⇒ 也不重试。
+            let (result, retryable): (ApiResult<Value>, bool) = match build().send().await {
                 Ok(resp) => {
                     let status = resp.status();
-                    if status.as_u16() >= 500 && attempt < RETRY_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_millis(500_u64 * attempt as u64)).await;
-                        continue;
+                    if status.as_u16() >= 500 {
+                        // 消费掉响应体让连接可复用（否则每次重试都要重新建连）
+                        let _ = resp.bytes().await;
+                        (Err(format!("服务端错误 HTTP {status}")), true)
+                    } else {
+                        // 4xx 是确定性错误（token 失效/参数错），重试没有意义
+                        let retryable = false;
+                        (parse_response(resp).await, retryable)
                     }
-                    parse_response(resp).await
                 }
-                Err(e) => Err(format!("网络请求失败: {e}")),
+                // 构造/发送失败：网络类，可重试
+                Err(e) => (Err(format!("网络请求失败: {e}")), true),
             };
             match result {
                 Ok(v) => return Ok(v),
                 Err(msg) => {
-                    // 只重试确定性之外的错误
-                    let retryable = msg.starts_with("网络请求失败") || msg.starts_with("HTTP 5");
                     if retryable && attempt < RETRY_ATTEMPTS {
                         tokio::time::sleep(Duration::from_millis(500_u64 * attempt as u64)).await;
                         continue;
@@ -169,6 +194,19 @@ async fn parse_response(resp: reqwest::Response) -> ApiResult<Value> {
         Ok(t) => t,
         Err(e) => return Err(format!("读取响应失败: {e}")),
     };
+    // 2xx 但**不是 JSON** ⇒ 一定是异常（站点改版 / 风控页 / 网关 HTML 错误页）。
+    //
+    // 旧实现把它包成 `Value::String` 继续往上走，于是：
+    // - `member_is_login` 取不到 `data.isLogin` → 保守返回 `true`（当成已登录）；
+    // - `member_space` 取不到字段 → 全是 0；
+    // ⇒ 健康检查输出「token 有效；空间已用 0%」而巡检因 `total == 0` 直接跳过。
+    // 结果是**站点坏了但界面全绿、空间预警彻底失效且无人知晓**。
+    if status.as_u16() < 400 && serde_json::from_str::<Value>(&body_text).is_err() {
+        let head: String = body_text.chars().take(120).collect();
+        return Err(format!(
+            "响应不是 JSON（可能是站点改版或风控页，HTTP {status}）：{head}"
+        ));
+    }
     let data: Value =
         serde_json::from_str(&body_text).unwrap_or_else(|_| Value::String(body_text.clone()));
 
@@ -252,17 +290,24 @@ pub fn trash_item_size(it: &Value) -> Option<u64> {
     None
 }
 
-/// 条目的删除时间（毫秒）。解析不出时返回 `None`，调用方**保守保留**该条目。
+/// 条目的**删除时间**（毫秒）。解析不出时返回 `None`，调用方**保守保留**该条目。
+///
+/// ## 为什么只认「删除语义」的键
+/// 保留策略的语义是「只清理**删除**时间早于 N 天的条目」，用来防止刚删的东西
+/// 被立刻物理销毁（用户可能想反悔）。
+///
+/// 曾经这里还包含 `updateTime` / `time` / `createTime`：那是**创建/修改**时间，
+/// 语义完全不同。一个 3 年前的旧文件今天被删，`createTime` 让它**立刻**满足
+/// 「年龄 ≥ 7 天」而被物理删除 —— 恰好是保留策略要防的那一幕，且不可恢复。
+///
+/// 拿不到删除时间时返回 `None`，调用方走「无法判定 ⇒ 保留」分支（保守）。
 pub fn trash_item_deleted_ms(it: &Value) -> Option<i64> {
-    const KEYS: [&str; 8] = [
+    const KEYS: [&str; 5] = [
         "deletedDate",
         "deleteTime",
         "deletedAt",
         "deleteAt",
         "deleteDate",
-        "updateTime",
-        "time",
-        "createTime",
     ];
     for k in KEYS {
         let Some(v) = it.get(k) else { continue };
@@ -347,7 +392,13 @@ pub fn trash_item_id(it: &Value) -> Option<String> {
 }
 
 /// 单页批量删除（文件/文件夹自动分组）
-pub async fn delete_trash_items(client: &Client, token: &str, items: &[Value]) -> ApiResult<()> {
+/// 删除回收站条目；返回**实际提交删除的条数**
+///
+/// 返回数量而不是 `()`：调用方（`empty_trash_gated`）用它累加「已清理」计数。
+/// 旧实现返回 `()`，调用方按 `deletable.len()` 计数 —— 而本函数用 `filter_map`
+/// **丢弃**提不出 id 的条目，于是计数虚高（前端显示删了 N 项，实际少删），
+/// 且提不出 id 的条目下一轮又会被翻到，循环一路空转到轮次上限。
+pub async fn delete_trash_items(client: &Client, token: &str, items: &[Value]) -> ApiResult<usize> {
     let file_pids: Vec<String> = items
         .iter()
         .filter(|it| !trash_is_folder(it))
@@ -375,7 +426,7 @@ pub async fn delete_trash_items(client: &Client, token: &str, items: &[Value]) -
     if !folder_ids.is_empty() {
         client.delete_trash_folders(token, &folder_ids).await?;
     }
-    Ok(())
+    Ok(file_pids.len() + folder_ids.len())
 }
 
 /// 截断 JSON 原文（日志/错误信息用，避免刷出超大响应）
@@ -401,5 +452,56 @@ pub fn human_bytes(bytes: u64) -> String {
         format!("{:.0} {}", v, UNITS[i])
     } else {
         format!("{:.1} {}", v, UNITS[i])
+    }
+}
+
+#[cfg(test)]
+mod delete_time_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// **误删防护回归**：只有「删除时间」才能用于保留天数判定
+    ///
+    /// 曾经把 `createTime`/`updateTime`/`time` 也当成删除时间：一个 3 年前的旧文件
+    /// 今天被删，`createTime` 会让它立刻满足「年龄 ≥ 7 天」→ 被物理删除，
+    /// 恰好是保留策略要防的场景（不可恢复）。
+    #[test]
+    fn create_time_is_not_treated_as_delete_time() {
+        let old_create = json!({
+            "createTime": 1_600_000_000_000i64, // 2020 年的创建时间
+            "name": "旧文件"
+        });
+        assert!(
+            trash_item_deleted_ms(&old_create).is_none(),
+            "只有创建时间时必须返回 None（让调用方保守保留），不能当成「很老」"
+        );
+
+        // 同理：updateTime / time 都不是删除时间
+        assert!(trash_item_deleted_ms(&json!({"updateTime": 1_600_000_000_000i64})).is_none());
+        assert!(trash_item_deleted_ms(&json!({"time": 1_600_000_000_000i64})).is_none());
+    }
+
+    /// 真正的删除时间字段必须能被识别（否则保留策略永远无法生效）
+    #[test]
+    fn delete_time_fields_are_recognized() {
+        for k in ["deletedDate", "deleteTime", "deletedAt", "deleteAt", "deleteDate"] {
+            let it = json!({ k: 1_700_000_000_000i64 });
+            assert_eq!(
+                trash_item_deleted_ms(&it),
+                Some(1_700_000_000_000),
+                "删除时间字段 {k} 必须被识别"
+            );
+        }
+    }
+
+    /// 秒级时间戳要能自动转毫秒
+    #[test]
+    fn second_precision_is_normalized_to_ms() {
+        let it = json!({ "deleteTime": 1_700_000_000i64 }); // 秒
+        assert_eq!(
+            trash_item_deleted_ms(&it),
+            Some(1_700_000_000_000),
+            "秒级时间戳应换算成毫秒"
+        );
     }
 }

@@ -255,84 +255,91 @@ impl Writeback {
         self.store.is_some()
     }
 
-    /// 落盘：自管存储则「读—改—写」整份配置；否则返回 `config` 声明交给宿主
+    /// 该键是否被本批**显式赋值**（而非删除）
     ///
-    /// 返回 `Some(json)` 表示**需要**宿主代存（老宿主路径）；
-    /// 返回 `None` 表示已自行落盘（新路径）或无事可做。
-    pub fn commit(&self) -> Option<Value> {
-        if self.set.is_empty() && self.remove.is_empty() {
-            return None;
-        }
-        if let Some(store) = &self.store {
-            // 读—改—写：整份配置加密落盘（避免只写局部导致其余键丢失）
-            let mut kv = store.load();
-            let Some(obj) = kv.as_object_mut() else {
-                return self.declarative();
-            };
-            for (k, v) in &self.set {
-                obj.insert(k.clone(), Value::String(v.clone()));
-            }
-            for k in &self.remove {
-                obj.remove(k);
-            }
-            if !store.save(&kv) {
-                // 落盘失败：退回声明式回写，至少让宿主代存一次（不丢用户数据）
-                return self.declarative();
-            }
-            return None;
-        }
-        self.declarative()
+    /// 仅测试使用：用于钉住「`0` 必须用 set 表达，不能删键」这条踩过坑的语义。
+    ///
+    /// 存在理由：`0` 必须用 `set` 表达（删键会被解释成「未设置」→ 回落全局值），
+    /// 这个区别对本项目踩过坑，测试需要能直接观察意图。
+    #[cfg(test)]
+    pub fn has_key_set(&self, key: &str) -> bool {
+        self.set.iter().any(|(k, _)| k == key)
     }
 
-    /// 声明式回写形态：`{"set":{…},"remove":[…]}`（老宿主路径）
-    fn declarative(&self) -> Option<Value> {
+    /// 落盘：自管存储则「读—改—写」整份配置
+    ///
+    /// ## 为什么返回 `Result` 而不是 `Option<Value>`
+    /// 旧实现落盘失败时「退回声明式回写」，注释写着「至少让宿主代存一次（不丢用户数据）」
+    /// —— 但宿主的 `apply_side_effects` **早已不再处理 `config` 字段**
+    /// （ADR-021：宿主不代存插件配置，见 `cabi.rs`）。于是：
+    /// - 配置没存上；
+    /// - 宿主把 `config` 丢弃；
+    /// - 动作仍然返回 `{"success":true,"message":"已添加账号…"}`。
+    ///
+    /// 结果就是用户看到「已添加」，刷新后账号消失（阈值更是连提示都没有）。
+    /// 现在改为**失败必须上抛**，让动作如实报错。
+    pub fn commit(&self) -> Result<(), String> {
         if self.set.is_empty() && self.remove.is_empty() {
-            return None;
+            return Ok(());
         }
-        let mut map = serde_json::Map::new();
-        for (k, v) in &self.set {
-            map.insert(k.clone(), Value::String(v.clone()));
-        }
-        let mut j = serde_json::Map::new();
-        if !map.is_empty() {
-            j.insert("set".to_string(), Value::Object(map));
-        }
-        if !self.remove.is_empty() {
-            j.insert(
-                "remove".to_string(),
-                Value::Array(self.remove.iter().map(|k| Value::String(k.clone())).collect()),
+        let Some(store) = &self.store else {
+            return Err(
+                "无法保存配置：宿主未下发插件私有目录（能力表未就绪）".to_string()
             );
+        };
+        // **读—改—写**必须基于「能安全解释」的既有配置：
+        // 若现有文件解不开（换口令/半写），以空对象为基底写回会覆盖掉全部账号。
+        let mut kv = match store.load_checked() {
+            crate::store::Loaded::Absent => Value::Object(Default::default()),
+            crate::store::Loaded::Ok(v) => v,
+            crate::store::Loaded::Corrupt(why) => {
+                return Err(format!(
+                    "{why}；已拒绝写入以免覆盖既有账号（请检查宿主口令是否变更）"
+                ))
+            }
+        };
+        let Some(obj) = kv.as_object_mut() else {
+            return Err("配置存储内容不是 JSON 对象，已拒绝写入以免覆盖".to_string());
+        };
+        for (k, v) in &self.set {
+            obj.insert(k.clone(), Value::String(v.clone()));
         }
-        Some(Value::Object(j))
+        for k in &self.remove {
+            obj.remove(k);
+        }
+        store.save(&kv)?;
+        Ok(())
     }
-}
-
-#[cfg(test)]
+}#[cfg(test)]
 mod tests {
     //! 配置存储的**新路径**（自管 + 加密）与**兼容路径**（声明式回写）行为
     use super::*;
 
-    /// 声明式回写形态（老宿主路径）必须与旧契约**逐字节兼容**
+    /// **失败必须上抛**：没有私有目录时 commit 必须报错，而不是假装成功
     ///
-    /// 老宿主靠解析 `{"set":{…},"remove":[…]}` 落库；格式变了老宿主就读不到，
-    /// 所以这条测试钉住 JSON 形状。
+    /// 旧实现会「退回声明式回写」把配置塞进 `config` 字段，但宿主 ADR-021 之后
+    /// 完全忽略该字段 ⇒ 配置没存上、动作却返回 success:true，用户刷新后账号消失。
     #[test]
-    fn declarative_writeback_keeps_legacy_shape() {
-        let mut wb = Writeback::default(); // store=None ⇒ 走声明式
+    fn commit_fails_loudly_without_store() {
+        let mut wb = Writeback::default(); // store=None
         wb.set_kv("percent", "77");
-        wb.set_kv("accounts", "[]");
-        wb.remove_key("token");
-        let j = wb.commit().expect("应有回写声明");
-        assert_eq!(j["set"]["percent"], "77");
-        assert_eq!(j["set"]["accounts"], "[]");
-        assert_eq!(j["remove"][0], "token");
+        let r = wb.commit();
+        assert!(
+            r.is_err(),
+            "没有插件私有目录时必须返回错误（否则用户会以为已保存）"
+        );
+        let msg = r.unwrap_err();
+        assert!(
+            msg.contains("私有目录") || msg.contains("能力表"),
+            "错误信息应说明原因：{msg}"
+        );
     }
 
-    /// 无事可做时**不产生**回写声明（避免空 set/remove 触发无意义落盘）
+    /// 无事可做时 commit 应当成功且不写盘
     #[test]
-    fn empty_writeback_emits_nothing() {
+    fn empty_writeback_is_a_noop() {
         let wb = Writeback::default();
-        assert!(wb.commit().is_none(), "空回写不应产生声明");
+        assert!(wb.commit().is_ok(), "空回写应视为成功（无操作）");
     }
 
     /// 键值布局解析：`from_value` 吃的是**键值表**（自管存储与 self_config 同布局）

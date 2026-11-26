@@ -42,6 +42,8 @@
       target_id: targetOptions.length ? targetOptions[0].id : '',
       target_folder: 'fn-backup',
       schedule_cron: '',
+      // 严格模式（ADR-004）：mtime/size 变化时再读一遍内容算 BLAKE3 确认
+      strict: false,
       retention: {
         enabled: false,
         cleanup_unmanaged: false,
@@ -58,9 +60,41 @@
     previewNext = [];
     previewErr = '';
     pathInput = '';
+    ageDraft = String(editing.retention.min_age_days ?? 0);
   }
 
-  function startEdit(t) {
+  /** 当前编辑内容是否与「原始任务」不同（用于切换/关闭时的脏检查） */
+  function isDirty() {
+    if (!editing) return false;
+    const orig = tasks.find((x) => x.id === editing.id);
+    if (!orig) return false;
+    if ((editing.name || '') !== (orig.name || '')) return true;
+    if (editing.schedule_cron !== (orig.schedule_cron || '')) return true;
+    if (editing.target_id !== (orig.target_id || '')) return true;
+    if (editing.target_folder !== (orig.target_folder || 'fn-backup')) return true;
+    if ((editing.enabled !== false) !== (orig.enabled !== false)) return true;
+    const a = JSON.stringify(editing.paths || []);
+    const b = JSON.stringify(orig.paths || []);
+    if (a !== b) return true;
+    const ra = JSON.stringify(editing.retention || {});
+    const rb = JSON.stringify(orig.retention || {});
+    return ra !== rb;
+  }
+
+  /** 切换编辑对象前的脏检查：避免静默丢弃已填写的内容 */
+  async function confirmDiscard() {
+    if (!isDirty()) return true;
+    return await confirmDialog({
+      title: '放弃未保存的修改？',
+      message: '当前正在编辑任务，切换将丢失已填写但未保存的内容。',
+      confirmText: '放弃修改',
+      danger: true,
+    });
+  }
+
+  async function startEdit(t) {
+    // 切到**另一个**任务且当前有未保存修改时，先确认
+    if (editing && editing.id !== t.id && !(await confirmDiscard())) return;
     editing = {
       id: t.id,
       name: t.name || '',
@@ -69,11 +103,14 @@
       target_id: t.target_id || (targetOptions.length ? targetOptions[0].id : ''),
       target_folder: t.target_folder || 'fn-backup',
       schedule_cron: t.schedule_cron || '',
+      strict: t.strict === true,
       retention: { ...blankTask().retention, ...(t.retention || {}) },
     };
     previewNext = t.schedule_next || [];
     previewErr = '';
     pathInput = '';
+    // 草稿态与服务端值对齐（用户可能中途清空输入框）
+    ageDraft = String(editing.retention.min_age_days ?? 0);
   }
 
   function cancelEdit() {
@@ -100,10 +137,16 @@
     setField('paths', [...editing.paths, v]);
   }
 
-  function removePath(i) {
+  /** 按**值**删除路径
+   *
+   * 不能用下标：路径列表是 `{#each ... (p)}` keyed 的，Svelte 4 不为 keyed each
+   * 提供索引变量，写 `i` 会抛 `ReferenceError` ——「移除」按钮直接失效，
+   * 用户无法删除已添加的备份路径。按值删同时也更稳：并发增删时下标会错位。
+   */
+  function removePath(p) {
     setField(
       'paths',
-      editing.paths.filter((_, idx) => idx !== i)
+      editing.paths.filter((x) => x !== p)
     );
   }
 
@@ -130,15 +173,29 @@
     }
   }
 
+  /**
+   * 预览 cron 的下几次触发时间
+   *
+   * ⚠️ **必须带序号守卫**：用户手输 `0 3 * * *` 后失焦发一次请求，紧接着点
+   * 「每小时」预设又发一次。若前者后返回，`previewNext`/`previewErr` 会被它覆盖，
+   * 界面显示的预览就与输入框里的 cron **不对应**，用户会以为表达式写错了。
+   */
+  let previewSeq = 0;
+  /** 保留天数输入框的草稿值（字符串，允许暂时为空） */
+  let ageDraft = '0';
+
   async function previewCron(cron) {
+    const seq = ++previewSeq; // 只认最后一次
     previewErr = '';
     previewNext = [];
     if (!cron.trim()) return;
     try {
       const r = await api.schedulePreview(cron.trim());
+      if (seq !== previewSeq) return; // 过期响应：直接丢弃
       if (r && r.valid) previewNext = r.next || [];
       else previewErr = (r && r.error) || '表达式无效';
     } catch (e) {
+      if (seq !== previewSeq) return;
       previewErr = e.message;
     }
   }
@@ -166,6 +223,7 @@
         target_id: editing.target_id,
         target_folder: editing.target_folder.trim() || 'fn-backup',
         schedule_cron: editing.schedule_cron,
+        strict: !!editing.strict,
         retention: editing.retention,
       };
       if (editing.id) body.id = editing.id;
@@ -174,7 +232,13 @@
         toast.error(r.error);
         return;
       }
-      toast.success(editing.id ? '任务已更新' : '任务已创建');
+      // 后端会回传「路径不存在」之类的软告警：保存是成功了，但跑起来会失败。
+      // 只在成功提示后补一句，避免用户以为一切就绪。
+      if (r.warnings && r.warnings.length) {
+        toast.warn(r.warnings.join('\n'));
+      } else {
+        toast.success(editing.id ? '任务已更新' : '任务已创建');
+      }
       editing = null;
       if (onChanged) await onChanged();
     } catch (e) {
@@ -188,10 +252,14 @@
     running = t.id;
     try {
       const r = await api.runTask(t.id);
-      if (r.error) {
+      // ⚠️ **必须先判 `skipped`**：后端在「已有备份在跑」时同时返回
+      // `skipped: true` 与 `error: Some("已有备份任务正在执行，本次触发已跳过")`
+      //（见 routes/tasks.rs 的 CAS 失败分支）。旧顺序先判 `r.error`，
+      // 于是「排队跳过」被渲染成红色的「备份失败」——用户会以为出故障了。
+      if (r.skipped) {
+        toast.warn(r.error || '已有备份在执行，本次已跳过', `「${t.name || t.id}」已跳过`);
+      } else if (r.error) {
         toast.error(r.error, `「${t.name || t.id}」备份失败`);
-      } else if (r.skipped) {
-        toast.warn(r.error || '已有备份在执行，本次已跳过');
       } else {
         toast.success(`上传 ${r.uploaded} 个文件（${fmtBytes(r.uploaded_bytes || 0)}）`, `「${t.name || t.id}」备份完成`);
       }
@@ -301,6 +369,9 @@
             {#if t.retention && t.retention.enabled}
               <span class="meta"><b>保留</b>{t.retention.cleanup_unmanaged ? '清理孤儿' : '仅记录'}</span>
             {/if}
+            {#if t.strict}
+              <span class="meta"><b>变更检测</b>严格（内容哈希）</span>
+            {/if}
           </div>
           <div class="row-sub">
             {#each t.paths || [] as p}
@@ -354,10 +425,10 @@
           {/if}
         </div>
 
-        {#each editing.paths as p, i}
+        {#each editing.paths as p (p)}
           <div class="row-sub">
             <code>{p}</code>
-            <button class="btn btn-sm btn-ghost" on:click={() => removePath(i)} disabled={saving}>移除</button>
+            <button class="btn btn-sm btn-ghost" on:click={() => removePath(p)} disabled={saving}>移除</button>
           </div>
         {/each}
 
@@ -368,7 +439,7 @@
           {:else}
             <select id="tk-target" value={editing.target_id}
               on:change={(e) => setField('target_id', e.target.value)} disabled={saving}>
-              {#each targetOptions as o}
+              {#each targetOptions as o (o.id)}
                 <option value={o.id}>{o.name || o.id}{o.ready ? '' : '（未配置凭据）'}</option>
               {/each}
             </select>
@@ -390,7 +461,7 @@
               on:blur={() => previewCron(editing.schedule_cron)} disabled={saving} />
           </div>
           <div class="row-sub">
-            {#each CRON_PRESETS as p}
+            {#each CRON_PRESETS as p (p.value)}
               <button class="chip" on:click={() => { setField('schedule_cron', p.value); previewCron(p.value); }}
                 disabled={saving}>{p.label}</button>
             {/each}
@@ -416,8 +487,15 @@
           </label>
           <div class="field-row">
             <label for="tk-age">只清理早于</label>
-            <input id="tk-age" type="number" min="0" value={editing.retention.min_age_days}
-              on:input={(e) => setRetention('min_age_days', Number(e.target.value) || 0)} disabled={saving} />
+            <!-- ⚠️ 用**字符串草稿态**而不是直接绑定数字：
+                 `Number('') || 0` 会把清空的输入框变回 0，而 `editing` 被替换会
+                 触发重渲染、把 DOM 的 value 写回 0 —— 用户想删掉旧值再输入时，
+                 输入框会顽固显示 0，输入 15 反而变成 015。 -->
+            <input id="tk-age" type="number" min="0" value={ageDraft}
+              on:input={(e) => {
+                ageDraft = e.target.value;
+                setRetention('min_age_days', Number(ageDraft) || 0);
+              }} disabled={saving} />
             <span class="field-hint">天（0 = 不限制）</span>
           </div>
         </div>
@@ -427,6 +505,17 @@
             on:change={(e) => setField('enabled', e.target.checked)} disabled={saving} />
           <span>启用该任务</span>
         </label>
+
+        <label class="switch-row">
+          <input type="checkbox" checked={!!editing.strict}
+            on:change={(e) => setField('strict', e.target.checked)} disabled={saving} />
+          <span>严格变更检测（内容哈希）</span>
+        </label>
+        <p class="field-hint">
+          默认只比较修改时间与大小，速度快但可能漏掉「mtime 被改回旧值」的改动。
+          开启后对每个疑似变化的文件再读一遍计算 BLAKE3 内容哈希 —— 不会漏备份，
+          代价是每次扫描要把这些文件完整读一遍（大文件/慢盘上明显更慢）。
+        </p>
 
         <div class="row-actions">
           <button class="btn btn-primary" on:click={save} disabled={saving}>

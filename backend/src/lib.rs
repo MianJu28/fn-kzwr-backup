@@ -12,7 +12,7 @@ pub mod http;
 pub mod infra;
 pub mod plugin;
 
-use age::secrecy::SecretString;
+use age::secrecy::{ExposeSecret, SecretString};
 use domain::alerts::AlertSink;
 use domain::crypto::CryptoSession;
 use eventbus::EventBus;
@@ -71,6 +71,13 @@ pub struct AppState {
     pub target: Arc<SwapTarget>,
     /// **多目标池**：`目标 id → 适配器`（任务按 `target_id` 取自己的实例）
     pub targets: Arc<TargetPool>,
+    /// 上次装配时每个目标的**配置快照**（`目标 id → TargetConfig`）
+    ///
+    /// 用于 `reload_targets` 判断「哪些目标的配置真的变了」：没变的直接复用已有实例。
+    /// 重建一个实例意味着新建沙箱线程池 + 调插件 `target_open`（最坏等 30s），
+    /// 而用户改一个**无关目标**或只改全局设置时，其它目标的配置根本没动 ——
+    /// 此前却全部重建，这是「保存个配置要等好久」的主要来源之一。
+    pub target_snapshots: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::infra::config::TargetConfig>>>,
     /// 主目标 id（随配置刷新）
     pub primary_target_id: Arc<RwLock<String>>,
     /// 主目标是否已配置（凭据就绪；未配置时 target 为占位适配器）
@@ -82,10 +89,24 @@ pub struct AppState {
     /// `backup_running` 只回答「有没有在跑」，禁用一个插件时需要知道
     /// **具体是哪个任务**在跑（该任务不能被级联禁用，否则会打断正在进行的备份）。
     pub running_task_id: Arc<RwLock<Option<String>>>,
+    /// **取消请求标志**（备份 / 恢复共用）
+    ///
+    /// 置位后正在跑的任务会在**下一个可中断点**停下（文件之间、等待下一个文件时），
+    /// 而不是立刻强杀：a. 备份已上传的文件快照已落盘，中断不会破坏一致性；
+    /// b. 单个文件的传输在 FFI 里推进，无法从外部打断（同进程模型的固有限制）。
+    /// 任务开始前会清零，避免上一次的取消请求把新任务立刻终止。
+    pub cancel_requested: Arc<AtomicBool>,
+    /// 当前正在跑的是哪类任务（`None` = 空闲），供取消接口判断该不该置位
+    pub running_kind: Arc<RwLock<Option<crate::eventbus::TaskKind>>>,
     /// 加密会话（备份加密/恢复解密；密钥变更后可热替换）
     pub crypto: Arc<CryptoSwap>,
     /// 应用口令（密钥库/配置敏感字段加密；更换密钥时需复用它重新加密落盘）
     pub passphrase: Arc<SecretString>,
+    /// **管理员口令校验闸门**（常数时间比较 + 失败限速，见 `domain::passphrase`）
+    ///
+    /// 所有敏感操作（导出私钥 / 导出导入配置 / 查看审计）共用这一个闸门，
+    /// 以免各处各写一行 `!=` 而漏掉限速。
+    pub passphrase_gate: Arc<crate::domain::passphrase::PassphraseGate>,
     /// 配置目录（config.toml / 密钥库所在）
     pub cfg_dir: PathBuf,
     /// 待一次性展示的自动生成私钥（首次启动自动生成时设置，读取后清空）
@@ -124,7 +145,26 @@ pub struct AppState {
     pub market: Arc<crate::plugin::market::Market>,
 }
 
+/// 口令校验失败时给用户的统一文案
+///
+/// 冷却中额外提示剩余秒数 —— 否则用户只会看到「口令错误」，不知道自己被限速了，
+/// 反而会反复重试（而重试本身又会被记为失败，陷入死循环）。
+pub fn passphrase_err(state: &AppState) -> String {
+    match state.passphrase_gate.lock_remaining_secs() {
+        Some(secs) => format!("口令错误次数过多，请 {secs} 秒后再试"),
+        None => "管理员口令错误".to_string(),
+    }
+}
+
 impl AppState {
+    /// 校验管理员口令（**常数时间比较 + 失败限速**）
+    ///
+    /// 统一入口：所有敏感操作都走这里，避免各处各写一行 `!=` 而漏掉限速。
+    pub fn check_passphrase(&self, input: &str) -> bool {
+        self.passphrase_gate
+            .verify(input, self.passphrase.expose_secret().as_str())
+    }
+
     /// 按配置重建目标池（启动时、目标/任务配置变更后调用）
     ///
     /// 同步更新：目标池、主目标适配器、主目标 id、`target_ready`。
@@ -134,10 +174,52 @@ impl AppState {
         // 从而给出明确提示，而不是静默使用一个用户已禁用的插件。
         self.plugins.set_disabled(&cfg.plugins.disabled);
 
+        // **只重建配置真正变化的目标**（核心优化）
+        //
+        // `build` 会为每个目标新建沙箱线程池线程并调用插件 `target_open`
+        // （可能等 DNS/远程配置，最长 30s）。而 `reload_targets` 有 13 处调用点
+        // （保存目标/任务/插件/市场/开关…），其中绝大多数只改动**一个**目标
+        // 或纯全局设置 —— 此前却把**全部**目标都重建一遍，这就是
+        // 「保存个配置要等好久」的主要来源。
+        //
+        // 判据：`TargetConfig` 完全相等 ⇒ 复用池中已有实例。
+        // 含凭据**密文**：改了账号/密码密文必变，因此不会误用旧连接。
+        let prev = self
+            .target_snapshots
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let mut reused: Vec<(String, String, bool)> = Vec::new();
+        let mut to_build: Vec<crate::infra::config::TargetConfig> = Vec::new();
+        let unchanged_map = {
+            let mgr = self.config.lock().unwrap();
+            let mut m = std::collections::HashMap::new();
+            for t in &cfg.targets {
+                if let Some(old) = prev.get(&t.id) {
+                    // 用**语义等价**而非 `==`：加密是随机化的（见 TargetConfig::same_as）
+                    m.insert(t.id.clone(), t.same_as(old, &mgr));
+                }
+            }
+            m
+        };
+        for t in &cfg.targets {
+            let unchanged = unchanged_map.get(&t.id).copied().unwrap_or(false);
+            // 只在「配置没变」且「池里已装配过（不是占位适配器）」时复用
+            if unchanged && self.targets.is_ready(&t.id) {
+                reused.push((
+                    t.id.clone(),
+                    self.targets.describe(&t.id).unwrap_or_default(),
+                    true,
+                ));
+            } else {
+                to_build.push(t.clone());
+            }
+        }
         let built = {
             let mgr = self.config.lock().unwrap();
-            self.plugins.build_targets(cfg, &mgr)
+            self.plugins.build_targets_for(&to_build, cfg, &mgr)
         };
+
         let primary_id = cfg
             .primary_target()
             .map(|t| t.id.clone())
@@ -146,6 +228,17 @@ impl AppState {
         let mut items: Vec<(String, Arc<dyn TargetStorage>, String, bool)> = Vec::new();
         let mut ready_count = 0usize;
         let mut primary: Option<(Arc<dyn TargetStorage>, String, bool)> = None;
+        // 先放入复用的（配置未变，实例原样保留，不重建线程池）
+        for (id, name, ready) in reused {
+            let storage = self.targets.get(&id);
+            if id == primary_id {
+                primary = Some((storage.clone(), name.clone(), ready));
+            }
+            if ready {
+                ready_count += 1;
+            }
+            items.push((id, storage, name, ready));
+        }
         for b in built {
             if b.id == primary_id {
                 primary = Some((b.storage.clone(), b.name.clone(), b.ready));
@@ -171,6 +264,10 @@ impl AppState {
         *self.primary_target_id.write().unwrap() = primary_id;
         self.target_ready
             .store(primary_ready, std::sync::atomic::Ordering::Relaxed);
+        // 更新快照：下次 reload 据此判断「没变就复用」
+        if let Ok(mut g) = self.target_snapshots.write() {
+            *g = cfg.targets.iter().map(|t| (t.id.clone(), t.clone())).collect();
+        }
         ready_count
     }
 

@@ -126,6 +126,10 @@ async fn main() -> Result<()> {
         target_prefix: Some("fn-backup".to_string()),
         eventbus: None,
         retention: Some(RetentionPolicy::new(target.clone(), "fn-backup")),
+        sibling_jobs: Vec::new(),
+        strict: false,
+        staging_dir: None,
+        cancel: None,
     };
 
     println!("=== 1. 多路径备份（并发上传 + 保留策略清理）===");
@@ -176,6 +180,8 @@ async fn main() -> Result<()> {
         eventbus: None,
         meta: meta.clone(),
         snapshot_target: None,
+        staging_dir: None,
+        cancel: None,
     };
     let dest = root.join("restore-out");
     let rs = rjob

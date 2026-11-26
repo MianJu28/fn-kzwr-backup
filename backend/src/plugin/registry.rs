@@ -24,9 +24,20 @@ struct ExternalSet {
     enhances: Vec<Arc<dyn EnhancePlugin>>,
     /// 动态库句柄：与上面两组插件**配套**保活（Drop 会让 vtable 悬空）
     ///
-    /// 命名为 `_libs`：本字段**从不被读取**，它的用途恰恰是「在这里被持有、
-    /// 在 `ExternalSet` drop 时才 drop」—— 下划线前缀如实表达这一点，
-    /// 也让 dead_code  lint 静音（若哪天误删它，插件会在运行中被卸载）。
+    /// ## 为什么 drop 时**不真正 `dlclose`**
+    ///
+    /// 注释里曾写「旧的一组由 Arc 引用计数托管，不会悬空」—— 这只保证了**内存对象**
+    /// 活着，**没保证代码段活着**：`CApiTarget` / `AbiTargetStorage` 内部只有
+    /// `&'static KzwrTargetAbi` 与裸 `th` 句柄，**并不持有 `Library`**。
+    ///
+    /// 于是「热重载插件」与「正在跑的备份」并发时：`ExternalSet` 被整组替换 →
+    /// 旧的 `_libs` 被 drop → `dlclose` 卸载代码段 → 备份线程下一次 FFI 调用
+    /// 跳进已解除映射的地址 ⇒ **段错误**（Rust 无法捕获）。
+    ///
+    /// 因此这里的 `Drop` 只做 `mem::forget`：进程生命周期内不卸载动态库。
+    /// 这与 `host_abi` 模块头「宿主从不 dlclose」的既定取舍一致
+    /// （卸载的唯一安全时机是「保证没有任何在途调用」，而同进程模型无法保证）。
+    /// 代价：热重载会累积旧库的映射（每个插件几 MB，重载频率极低，可接受）。
     _libs: Vec<libloading::Library>,
     /// 加载报告（供 `/api/plugins` 诊断）
     reports: Vec<ExternalPluginReport>,
@@ -34,6 +45,16 @@ struct ExternalSet {
     paths: HashMap<String, String>,
     /// 扫描过的插件目录（(路径, 来源说明)）
     dirs: Vec<(String, String)>,
+}
+
+impl Drop for ExternalSet {
+    fn drop(&mut self) {
+        // 见 `_libs` 字段说明：**绝不 dlclose**（在途 FFI 调用会跳进已卸载的代码段）。
+        // `mem::take` 取出后 forget，避免 `Library::drop` 触发卸载。
+        for lib in std::mem::take(&mut self._libs) {
+            std::mem::forget(lib);
+        }
+    }
 }
 
 pub struct PluginRegistry {
@@ -365,8 +386,17 @@ impl PluginRegistry {
     ///
     /// 凭据不全/插件不支持/已禁用 → `ready=false` + 占位适配器（服务照常启动，
     /// 调用该目标时返回明确的配置提示，不影响其它目标）。
-    pub fn build_targets(&self, cfg: &AppConfig, mgr: &ConfigManager) -> Vec<BuiltTarget> {
-        cfg.targets
+    /// 只构建**指定的目标子集**（配置未变的目标由调用方复用，不必重建）
+    ///
+    /// `all` 只用于回退分支拼提示文案（占位适配器的 message 需要目标的总数感知语义），
+    /// 当前实现只用到被构建的目标，故传 `cfg` 保持一致的行为。
+    pub fn build_targets_for(
+        &self,
+        subset: &[crate::infra::config::TargetConfig],
+        _all: &AppConfig,
+        mgr: &ConfigManager,
+    ) -> Vec<BuiltTarget> {
+        subset
             .iter()
             .map(|t| {
                 let built = self

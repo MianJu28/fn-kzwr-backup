@@ -171,6 +171,12 @@ pub struct TargetSaveRequest {
     /// 未出现在本次请求里的键**保持原值**（与 `password` 缺省不改语义一致）。
     #[serde(default)]
     pub fields: std::collections::BTreeMap<String, String>,
+    /// 本目标是否走「设置 → 网络代理」配置的代理
+    ///
+    /// `None` = 保持原值（与 `password` 同样的「缺省不改」语义：
+    /// 老前端不传该字段时不能把用户的勾选悄悄清掉）。
+    #[serde(default)]
+    pub use_proxy: Option<bool>,
 }
 
 pub(super) fn default_test_true() -> bool {
@@ -196,6 +202,9 @@ pub struct TaskSaveRequest {
     pub schedule_cron: Option<String>,
     #[serde(default)]
     pub retention: Option<RetentionView>,
+    /// 严格模式（ADR-004）：mtime/size 变化时再用 BLAKE3 内容哈希确认
+    #[serde(default)]
+    pub strict: Option<bool>,
 }
 
 /// 任务删除请求（`purge=true` 同时清理该任务的快照记录）
@@ -380,6 +389,13 @@ pub struct KeysInfoResponse {
 pub struct KeysSetRequest {
     /// age 私钥（"AGE-SECRET-KEY-1..."）
     pub private_key: String,
+    /// 管理员口令（用于校验操作权限）
+    ///
+    /// 更换私钥是**破坏性且不可逆**的操作：此前所有备份都会变得无法解密。
+    /// 因此必须与导出私钥、导入配置同一把闸门（`check_passphrase`），
+    /// 否则任何能连上网关的进程都能把私钥换成自己的。
+    #[serde(default)]
+    pub passphrase: Option<String>,
 }
 
 /// 密钥变更响应（generate 成功时 private_key 仅此一次返回）
@@ -506,6 +522,27 @@ pub struct BundleTarget {
     /// 该目标的上传并发度（`null` = 未设置）；随包导出/导入，避免换机后退回默认值
     #[serde(default)]
     pub parallel: Option<u32>,
+    /// 该目标是否走网络代理；随包导出/导入（代理本身在 `AppConfig::proxy` 里）
+    #[serde(default)]
+    pub use_proxy: bool,
+    /// **插件自定义目标字段**（键 → 明文）
+    ///
+    /// ADR-019/020 之后目标表单字段（本地目录目标的路径、第三方对象存储的 bucket
+    /// 等）存在 `TargetConfig.fields`；不随包携带的话，换机导入后这些目标会
+    /// **静默失效**（字段全空 → 备份报「目标未配置」，而用户看不出原因）。
+    ///
+    /// 导出为**明文**（包本身已是敏感件 —— 它同时含 WebDAV 明文密码），
+    /// 导入时按 [`Self::secret_fields`] 决定哪些键要重新加密。
+    #[serde(default)]
+    pub fields: std::collections::BTreeMap<String, String>,
+    /// `fields` 中**原本加密存储**的键名（导入时据此重新加密）
+    ///
+    /// 为什么单列一份而不是「全加密」或「全明文」：字段是否敏感由插件的
+    /// `form[].secret` 声明，而导入时该插件可能尚未安装（换机后常见顺序是
+    /// 先导入配置、后装插件）。把「哪些键敏感」写进包里，导入方无需插件
+    /// 即可正确还原加密状态。
+    #[serde(default)]
+    pub secret_fields: Vec<String>,
 }
 
 /// 配置导出请求（需管理员口令）
@@ -713,4 +750,39 @@ pub struct MarketCatalogQuery {
     /// `1`/`true` = 强制重新拉取索引
     #[serde(default)]
     pub refresh: String,
+}
+
+/// 保存网络代理设置的请求
+///
+/// `username` / `password` 为 `None` = **保持原值**（前端回显只给「是否已设置」，
+/// 用户不改凭据时不会传它们；把 `None` 当清空会导致改无关字段时密码被抹掉）。
+#[derive(Debug, Deserialize)]
+pub struct ProxySaveRequest {
+    pub enabled: bool,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub no_proxy: String,
+}
+
+/// 测试代理连通性的请求（字段全可选：便于「未保存就先试」）
+#[derive(Debug, Default, Deserialize)]
+pub struct ProxyTestRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub no_proxy: Option<String>,
+    /// 测试时访问的目标地址（不传则用已配置的 WebDAV 目标或官方默认）
+    #[serde(default)]
+    pub target_url: Option<String>,
 }

@@ -41,7 +41,11 @@ type Job = Box<dyn FnOnce() + Send + 'static>;
 struct Worker {
     tx: mpsc::Sender<Job>,
     /// 该线程是否已成功施加沙箱（诊断用）
-    sandboxed: bool,
+    ///
+    /// 用 `Arc<AtomicBool>` **共享**线程内部的标志，而不是在 spawn 后立即读一份快照：
+    /// 线程这时往往还没被调度，`flag.store(true)` 尚未执行，读到的必然是 `false`，
+    /// 且此后永不更新 —— 结果是诊断接口恒报「未受沙箱保护」，排障时被严重误导。
+    sandboxed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// 全部插件的专属线程（进程级单例；插件只增不减，与 ctx 同理）
@@ -124,14 +128,37 @@ pub fn is_sandboxed(plugin_id: &str) -> Option<bool> {
         .lock()
         .ok()?
         .get(plugin_id)
-        .map(|w| w.sandboxed)
+        .map(|w| w.sandboxed.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// 回收某个插件的专属线程（插件卸载/重装时调用）
+///
+/// `WORKERS` 是只增不减的进程级表：插件被卸载、或换 id 重装后，
+/// 旧线程会**永远**活着（每条占一个 kernel 线程 + 一份 Landlock 规则集），
+/// 一直空转在 `rx.recv()` 上直到进程退出。插件生态下频繁装卸会累积几十条僵尸线程。
+///
+/// 移除表项后：若没有其它 `Arc<Worker>` 在飞，`tx` 随之 drop ⇒ 线程 `recv` 返回
+/// `Err` ⇒ 循环退出 ⇒ 线程结束。在飞的调用会自然结束，不会被强杀。
+pub fn forget(plugin_id: &str) {
+    if let Ok(mut m) = workers().lock() {
+        if let Some(w) = m.remove(plugin_id) {
+            tracing::debug!(plugin = %plugin_id, "回收插件专属线程");
+            drop(w);
+        }
+    }
 }
 
 /// 已建专属线程的插件 id 列表（诊断用）
 pub fn sandboxed_plugins() -> Vec<(String, bool)> {
     let mut v: Vec<(String, bool)> = workers()
         .lock()
-        .map(|m| m.iter().map(|(k, w)| (k.clone(), w.sandboxed)).collect())
+        .map(|m| {
+            m.iter()
+                .map(|(k, w)| {
+                    (k.clone(), w.sandboxed.load(std::sync::atomic::Ordering::Relaxed))
+                })
+                .collect()
+        })
         .unwrap_or_default();
     v.sort();
     v
@@ -190,10 +217,9 @@ fn get_or_spawn(plugin_id: &str, policy: SandboxPolicy) -> Option<Arc<Worker>> {
             // 注意：**不保存 JoinHandle**。线程的生命周期由通道决定
             // （所有 Worker Arc 释放 ⇒ tx 关闭 ⇒ 循环退出）。
             // 保存 handle 也没用：我们从不 join（进程退出时随之一并结束）。
-            let w = Arc::new(Worker {
-                tx,
-                sandboxed: sandboxed.load(std::sync::atomic::Ordering::Relaxed),
-            });
+            // 共享同一个 `sandboxed` 原子标志：线程真正施加沙箱后会置 true，
+            // 诊断接口因此能反映**当前真实状态**（而不是 spawn 瞬间的快照）
+            let w = Arc::new(Worker { tx, sandboxed });
             map.insert(plugin_id.to_string(), w.clone());
             Some(w)
         }
@@ -343,15 +369,21 @@ mod crossbeam_like {
 
     impl Sender {
         pub fn send(&self, job: super::Job) -> Result<(), ()> {
-            {
-                let mut q = self.inner.q.lock().unwrap();
-                q.push_back(job);
-            }
+            // ⚠️ **必须在持锁状态下 notify**。
+            //
+            // 曾经是「先 unlock 再 notify_one」，那是经典的 Condvar 丢失唤醒：
+            // 消费者可能刚 `pop_front()` 拿到 None、还没进入 `wait()`，此时生产者的
+            // notify 到达 —— 由于消费者尚未 wait，这次通知被丢弃；随后消费者进入
+            // `wait()` 永久阻塞，尽管队列里已经有任务了。
+            // 表现：备份任务无声卡死，日志停在「已提交待传清单」之后。
+            let mut q = self.inner.q.lock().unwrap();
+            q.push_back(job);
             self.inner.cv.notify_one();
             Ok(())
         }
         pub fn close(&self) {
             *self.inner.closed.lock().unwrap() = true;
+            // 同理：`notify_all` 在 closed 锁内（顺序无关，但保持一致性）
             self.inner.cv.notify_all();
         }
     }
@@ -449,5 +481,54 @@ impl Drop for InstancePool {
     fn drop(&mut self) {
         // 唤醒所有等待的线程，让它们看到 closed 后退出
         self.tx.close();
+    }
+}
+
+#[cfg(test)]
+mod condvar_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+    use std::sync::Arc as StdArc;
+
+    /// **丢失唤醒回归**：生产者「解锁后再 notify」时，消费者可能错过通知而永久阻塞。
+    ///
+    /// 本测试用高并发反复压测 `send`/`recv`：修复前（notify 在锁外）在压力下
+    /// 有一定概率卡住；修复后（持锁 notify）必须全部跑完。
+    #[test]
+    fn high_contention_send_recv_never_deadlocks() {
+        let (tx, rx) = crossbeam_like::channel();
+        let rx = StdArc::new(rx);
+        let done = StdArc::new(AtomicUsize::new(0));
+        const N: usize = 5000;
+
+        // 一个消费者线程：直到全部收到
+        let rx2 = rx.clone();
+        let done2 = done.clone();
+        let consumer = std::thread::spawn(move || {
+            while done2.load(AOrd::Relaxed) < N {
+                if rx2.recv().is_none() {
+                    break;
+                }
+                done2.fetch_add(1, AOrd::Relaxed);
+            }
+        });
+
+        // 生产者在另一个线程里连续投递
+        let producer = std::thread::spawn(move || {
+            for _ in 0..N {
+                let _ = tx.send(Box::new(|| {}));
+            }
+        });
+
+        producer.join().expect("生产者不应 panic");
+        // 给消费者一个合理的完成窗口；卡住即视为丢失唤醒
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while done.load(AOrd::Relaxed) < N && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let got = done.load(AOrd::Relaxed);
+        // 关闭通道让消费者退出（若它卡住，join 会失败）
+        drop(consumer);
+        assert_eq!(got, N, "只收到 {got}/{N}，疑似丢失唤醒导致消费者永久阻塞");
     }
 }

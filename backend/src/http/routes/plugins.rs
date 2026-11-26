@@ -328,12 +328,18 @@ pub(super) async fn plugin_set_enabled(
 /// 旧的一组由 `Arc` 引用计数托管 —— 若此刻正在执行备份，它持有的 `Arc<dyn TargetStorage>`
 /// 会让旧的动态库继续存活到该次备份结束，因此不会出现悬空指针。
 pub(super) async fn plugin_reload(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let mgr = state.config.lock().unwrap();
-    let cfg = mgr.load().unwrap_or_default();
-    
-    // 走统一入口：内部会把旧 ctx 全部失效、对新插件重新下发能力表
-
-    // 走统一入口：内部会把旧 ctx 全部失效、对新插件重新下发能力表
+    // ⚠️ **必须在锁外调用 `reload_targets`**。
+    //
+    // `reload_targets` 内部会 `self.config.lock()`；`std::sync::Mutex` 不可重入，
+    // 在持有同一把锁时调用它就是**自死锁**（non-poison 下 pthread 会阻塞/报
+    // EDEADLK，`.unwrap()` 直接 panic；而 panic 会让锁 poison，此后全进程
+    // ~60 处 `config.lock().unwrap()` 全部 panic ⇒ 应用整体不可用）。
+    //
+    // 同文件的 `plugin_set_enabled` 写法是对的（先 `drop(mgr)`），这里此前漏了。
+    let cfg = {
+        let mgr = state.config.lock().unwrap();
+        mgr.load().unwrap_or_default()
+    }; // 锁在此释放
     apply_plugin_switch(&state, &cfg);
     let ready = state.reload_targets(&cfg);
     let enabled = crate::plugin::loader::enabled_by_env().unwrap_or(cfg.plugins.enabled);

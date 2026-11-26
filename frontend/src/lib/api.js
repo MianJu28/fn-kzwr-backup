@@ -9,18 +9,54 @@
  */
 import { APP_BASE } from './appBase.js';
 
+/**
+ * 默认请求超时（毫秒）
+ *
+ * 没有超时的话，后端一旦卡住（例如插件 target_open 阻塞），前端就会**无限等待**
+ * 且按钮一直是忙碌态 —— 用户只能刷新页面。给一个上限，让失败可见、可重试。
+ * 60s 足以覆盖任何正常操作（备份/恢复的进度靠 WS 推送，不占 HTTP 请求）。
+ */
+const DEFAULT_TIMEOUT_MS = 60000;
+
 async function req(path, options = {}) {
-  const res = await fetch(APP_BASE + path, options);
-  let data;
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, ...init } = options;
+  // 用 AbortController 实现超时（fetch 本身没有 timeout 选项）
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
   try {
-    data = await res.json();
+    const res = await fetch(APP_BASE + path, { ...init, signal: ac.signal });
+    let data;
+    try {
+      data = await res.json();
+    } catch (e) {
+      throw new Error(`响应解析失败（HTTP ${res.status}）`);
+    }
+    // **HTTP 层失败必须抛异常**（不能因为响应体里有 `error` 字段就放行）。
+    //
+    // 旧逻辑是 `if (!res.ok && data.error === undefined) throw`，意思是
+    // 「非 2xx 但响应体带 error 字段」会被当作**成功**原样返回。而后端的
+    // 非 2xx 响应恰恰都带 error（如插件被禁用时返回 404 + {error:"插件…不存在…"}），
+    // 于是调用方 `const r = await api.xxx(); if (r.error) ...` 时虽然大多能兜住，
+    // 但任何只判断 `r.success`/直接取字段的地方都会拿到 undefined 而不报错。
+    //
+    // 现在分层明确：
+    // - 非 2xx ⇒ 抛异常（网络/路由层失败）；
+    // - 2xx + body.error ⇒ 交给调用方处理（业务失败，后端约定如此）。
+    if (!res.ok) {
+      const msg =
+        (data && (data.error || data.message)) || `请求失败（HTTP ${res.status}）`;
+      throw new Error(String(msg));
+    }
+    return data;
   } catch (e) {
-    throw new Error(`响应解析失败（HTTP ${res.status}）`);
+    // AbortError 统一转成可读文案，避免界面出现 "The user aborted a request."
+    if (e && e.name === 'AbortError') {
+      throw new Error(`请求超时（${Math.round(timeoutMs / 1000)}s 无响应），请重试`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
   }
-  if (!res.ok && data && data.error === undefined) {
-    throw new Error(`请求失败（HTTP ${res.status}）`);
-  }
-  return data;
 }
 
 const get = (path) => req(path);
@@ -42,7 +78,7 @@ export const api = {
 
   // age 密钥
   keys: () => get('/api/keys'),
-  setKey: (private_key) => post('/api/keys', { private_key }),
+  setKey: (private_key, passphrase) => post('/api/keys', { private_key, passphrase }),
   generateKey: () => post('/api/keys/generate'),
   exportKey: (passphrase) => post('/api/keys/export', { passphrase }),
   backupAck: () => post('/api/keys/backup-ack'),
@@ -105,6 +141,14 @@ export const api = {
    * 并发度属于「这个目标用几条连接」，故按目标 id 配置 —— 互不影响。
    */
   targetParallel: (id, parallel) => post(`/api/targets/${id}/parallel`, { parallel }),
+  // 网络代理（全局一份；目标级开关随 /api/targets 的 use_proxy 提交）
+  // 实时任务状态快照（刷新/重进应用后还原进度）与取消
+  tasksLive: () => get('/api/tasks/live'),
+  cancelTask: () => post('/api/tasks/cancel', {}),
+  getProxy: () => get('/api/proxy'),
+  saveProxy: (body) => post('/api/proxy', body),
+  // 测试代理：真的经代理发一次请求（不只是校验地址）
+  testProxy: (body) => post('/api/proxy/test', body),
   /**
    * 设置某个**目标插件**的上传并发路数（并发回传）
    *

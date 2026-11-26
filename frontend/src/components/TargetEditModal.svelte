@@ -35,6 +35,12 @@
   let secretSet = {};
   let formMsg = '';
   let formOk = true;
+  /** 本目标是否走全局代理 */
+  let useProxy = false;
+  /** 全局代理是否已启用（关闭时勾选无意义，给出提示而不是静默生效） */
+  let proxyUsable = false;
+  /** 全局代理地址（仅用于提示文案） */
+  let proxyUrl = '';
   /** 防止把外层刷新导致的对象换引用当成「切换了目标」 */
   let initedKey = null;
 
@@ -55,9 +61,13 @@
         key: 'url',
         label: plugin?.url_label || '地址',
         kind: 'text',
-        required: true,
-        placeholder: plugin?.url_placeholder || 'https://dav.kzwr.com/dav',
-        hint: plugin?.url_hint || '留空则用官方默认地址 https://dav.kzwr.com/dav',
+        // ⚠️ **不是必填**：插件对空 url 会回退到 `DEFAULT_URL`（见
+        // `webdav_abi::target_json` 的 `.unwrap_or(DEFAULT_URL)`）。
+        // 曾把它标成 required，导致提示写着「留空用默认地址」、
+        // 实际却弹「请填写地址」—— 用户照着提示做反而被拦下。
+        required: false,
+        placeholder: plugin?.url_placeholder || 'https://dav.kzwr.com/dav（留空用默认）',
+        hint: plugin?.url_hint || '留空则使用官方默认地址 https://dav.kzwr.com/dav',
       },
       ...(plugin?.needs_credentials === false
         ? []
@@ -110,8 +120,16 @@
       }
       values = next;
       secretSet = sec;
+      // 代理开关随目标保存（`use_proxy`），初始化时回显
+      useProxy = editing.use_proxy === true;
       formMsg = '';
       formOk = true;
+      // 拉一次全局代理状态：勾了但全局没启用时要明确提示，否则用户以为已生效
+      api.getProxy().then((p) => {
+        proxyUsable = !!p.usable;
+        proxyUrl = p.url || '';
+      }).catch(() => {});
+
     }
   }
 
@@ -155,6 +173,8 @@
         enabled: values.__enabled !== '0',
         // 插件字段统一走 `fields`；url/username/password 由后端归位到既有存储
         fields: {},
+        // 是否使用全局代理（后端按 use_proxy + 总开关 + no_proxy 三重判定）
+        use_proxy: useProxy,
       };
       if (editing.id) body.id = editing.id;
       for (const f of fields) {
@@ -168,7 +188,17 @@
       }
       // 后端仍从顶层读 url/username/password；为兼容老路径也带上（值为空则省略）
       if (body.fields.url != null) body.url = body.fields.url;
-      if (body.fields.username) body.username = body.fields.username;
+      // ⚠️ **只在用户名真的改了时才提交它**。
+      //
+      // 表单会回显已有用户名（`values.username` 非空），若无条件提交，后端就把
+      // 它当成「用户改了用户名」并要求同时提供密码；而密码栏留空表示「不修改」，
+      // 于是目标一旦配好凭据，改名称/地址/并发/代理任何字段都会报
+      // 「新填写用户名时必须同时提供密码」，而用户根本没碰用户名。
+      const usernameChanged =
+        (body.fields.username || '').trim() !== (editing.username || '').trim();
+      if (body.fields.username && (usernameChanged || !editing.id)) {
+        body.username = body.fields.username;
+      }
       if (body.fields.password) body.password = body.fields.password;
 
       const r = await api.saveTarget(body);
@@ -259,6 +289,12 @@
                   on:input={(e) => setValue(f.key, e.target.value)}
                   disabled={saving}
                 />
+                {#if f.key === 'url' && !(values[f.key] ?? '').trim() && editing.kind === 'webdav'}
+                  <p class="field-hint">
+                    <Icon name="info" size={13} />
+                    留空将使用默认地址 <code>{editing.effective_url || 'https://dav.kzwr.com/dav'}</code>
+                  </p>
+                {/if}
               {/if}
               {#if f.hint}
                 <p class="field-hint">{f.hint}</p>
@@ -275,6 +311,31 @@
             on:change={(e) => setValue('__enabled', e.target.checked ? '1' : '0')} disabled={saving} />
           <span>启用该目标</span>
         </label>
+
+        <!--
+          网络代理：**宿主级**开关（不属于任何插件）。
+          代理地址/凭据是环境配置，在「设置 → 网络代理」统一维护；
+          这里只决定本目标是否使用它。
+        -->
+        <label class="switch-row">
+          <input type="checkbox" bind:checked={useProxy} disabled={saving} />
+          <span>使用网络代理</span>
+        </label>
+        {#if useProxy && !proxyUsable}
+          <p class="field-hint warn-hint">
+            <Icon name="alert" size={13} />
+            全局代理尚未启用或地址未填（「设置 → 网络代理」）。当前保存后本目标仍会直连。
+          </p>
+        {:else if useProxy}
+          <p class="field-hint">
+            将经 <code>{proxyUrl}</code> 访问本目标。若目标地址命中「不走代理的地址」，
+            仍会直连（内网目标建议保持直连）。
+          </p>
+        {:else}
+          <p class="field-hint">
+            直连。跨境访问较慢或被阻断时，可在「设置 → 网络代理」配好代理后勾选此项。
+          </p>
+        {/if}
 
         {#if formMsg}
           <div class="alert {formOk ? 'alert-ok' : 'alert-warn'}">
@@ -298,6 +359,19 @@
   .target-modal {
     max-width: 560px;
     width: 100%;
+  }
+  /* 代理未生效时的提示要比普通 hint 更醒目（否则用户以为已生效） */
+  .warn-hint {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    color: #b8791f;
+  }
+  .field-hint code {
+    font-size: 11px;
+    padding: 1px 4px;
+    border-radius: 3px;
+    background: rgba(127, 127, 127, 0.12);
   }
   .grow {
     flex: 1;

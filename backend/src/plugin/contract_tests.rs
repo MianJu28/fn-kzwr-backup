@@ -28,6 +28,68 @@ fn read_describe(plugin: &str) -> String {
 }
 
 #[test]
+/// **市场仓库里的每个插件 describe.json 都必须能被宿主真实类型解析**
+///
+/// 这条为什么重要：`describe.json` 是插件与宿主的**第一道契约**。
+/// 若它不满足 `AbiDescribe` 的 schema（例如往 `target.form` 里放了 `tips` 条目 ——
+/// 那是 `ui.blocks` 的语法，而 `AbiTargetField.key/label` 是必填），
+/// 宿主在 `cabi::describe_of` 就 `Err`，`loader` 只记 warn 并**跳过整个插件**：
+/// 用户看到的是「插件装上了但列表里什么都没有」，且没有降级路径。
+///
+/// `dist/market-repo` 下的插件是随市场分发的产物，必须逐个验。
+#[test]
+fn market_repo_describes_parse_with_host_types() {
+    let root = std::path::Path::new(PLUGINS_DIR).join("../dist/market-repo");
+    if !root.is_dir() {
+        return; // 市场仓库不在此检出（CI 可能只带主仓库）
+    }
+    let mut checked = 0usize;
+    for group in ["official", "community", "examples"] {
+        let dir = root.join(group);
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let desc = p.join("describe.json");
+            if !desc.is_file() {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&desc).expect("读取 describe.json 失败");
+            let raw = raw.replace("{{version}}", "0.0.0-test");
+            let v: crate::plugin::abi::AbiDescribe = serde_json::from_str(&raw).unwrap_or_else(|e| {
+                panic!(
+                    "{} 无法被宿主 AbiDescribe 解析（该插件会被静默跳过加载）：{e}",
+                    desc.display()
+                )
+            });
+            assert!(
+                !v.id.trim().is_empty(),
+                "{} 的 id 为空",
+                desc.display()
+            );
+            // `target.form` 的每条都必须有 key/label（缺则整插件加载失败）
+            if let Some(t) = &v.target {
+                for (i, f) in t.form.iter().enumerate() {
+                    assert!(
+                        !f.key.trim().is_empty(),
+                        "{} 的 target.form[{i}] 缺 key",
+                        desc.display()
+                    );
+                    assert!(
+                        !f.label.trim().is_empty(),
+                        "{} 的 target.form[{i}] 缺 label",
+                        desc.display()
+                    );
+                }
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "市场仓库里一个 describe.json 都没找到（路径不对？）");
+}
+
 fn kzwr_describe_parses_with_host_types() {
     let v: crate::plugin::abi::AbiDescribe =
         serde_json::from_str(&read_describe("kzwr")).expect("kzwr describe.json 必须能被宿主的 AbiDescribe 解析");

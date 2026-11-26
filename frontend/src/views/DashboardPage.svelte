@@ -28,7 +28,9 @@
   $: taskEnabled = tasks.filter((t) => t.enabled !== false).length;
   /** 目标已就绪（凭据齐全）且任务已启用 = 真正能跑的任务 */
   $: taskReady = tasks.filter((t) => t.enabled !== false && t.target_ready).length;
-  $: taskWithCron = tasks.filter((t) => t.schedule_cron).length;
+  // 只统计**启用中**且配了 cron 的任务：停用任务的 cron 不会生效，
+// 计入会让用户以为「有 N 个会自动备份」。
+$: taskWithCron = tasks.filter((t) => t.enabled !== false && t.schedule_cron).length;
 
   $: targetTotal = targets.length;
   $: targetReady = targets.filter((t) => t.ready).length;
@@ -89,7 +91,7 @@
 
       <div class="stat">
         <div class="stat-label">云端文件</div>
-        <div class="stat-value">{fileCount || '—'}</div>
+        <div class="stat-value">{fileCount == null ? '—' : fileCount}</div>
         <div class="stat-sub">{dirCount} 个目录可恢复</div>
       </div>
 

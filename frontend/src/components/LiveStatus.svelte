@@ -6,6 +6,22 @@
 
   export let liveStatus = null;
   export let wsConnected = false;
+  /** 取消当前任务（父组件实现；为 null 时不显示按钮） */
+  export let onCancel = null;
+  /** 取消请求已提交、等待当前文件结束 */
+  export let cancelRequested = false;
+
+  let cancelling = false;
+
+  async function doCancel() {
+    if (!onCancel || cancelling) return;
+    cancelling = true;
+    try {
+      await onCancel();
+    } finally {
+      cancelling = false;
+    }
+  }
 
   // 每秒刷新，使「用时」在两次事件之间也能连续走动
   let now = Date.now();
@@ -149,10 +165,33 @@
   <div class="card-foot conn">
     <span class="dot" class:on={wsConnected} class:off={!wsConnected} class:pulse={wsConnected}></span>
     <span>{wsConnected ? '实时通道已连接' : '实时通道断开，正在重连…'}</span>
+    {#if running && onCancel}
+      <div class="spacer"></div>
+      {#if cancelRequested}
+        <span class="cancelling">
+          <Icon name="clock" size={13} />
+          正在取消，等当前文件结束…
+        </span>
+      {:else}
+        <button class="btn btn-sm btn-danger" on:click={doCancel} disabled={cancelling || !wsConnected}>
+          {cancelling ? '提交中…' : '取消任务'}
+        </button>
+      {/if}
+    {/if}
   </div>
 </section>
 
 <style>
+  .spacer {
+    flex: 1;
+  }
+  .cancelling {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--warn-text, #b8791f);
+  }
   .live.active {
     border-color: var(--primary-soft-border);
   }

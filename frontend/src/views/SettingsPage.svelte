@@ -3,7 +3,7 @@
    * 设置页（核心设置）
    *
    * 插件化重构后本页**只保留不属于插件的核心能力**：
-   *   加密密钥（age） / 通知（Webhook） / 配置导入导出
+   *   加密密钥（age） / 通知（Webhook） / 网络代理 / 配置导入导出
    *
    * 已移出本页的内容：
    *   - 插件卡片 → 新的「插件」页（PluginsPage）
@@ -15,6 +15,7 @@
   import KeySection from '../components/KeySection.svelte';
   import NotifySection from '../components/NotifySection.svelte';
   import ConfigSection from '../components/ConfigSection.svelte';
+  import ProxySection from '../components/ProxySection.svelte';
 
   export let busy = false;
 
@@ -51,5 +52,7 @@
 />
 
 <NotifySection {webhookUrl} {webhookHeaders} {webhookBody} {busy} onSave={onSaveWebhook} onTest={onTestWebhook} />
+
+<ProxySection {busy} />
 
 <ConfigSection {busy} {onExportConfig} {onImportConfig} />

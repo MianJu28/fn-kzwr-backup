@@ -290,16 +290,34 @@ fn save_cache(var_dir: &std::path::Path, raw: &[u8], sig: &[u8]) -> Result<(), S
     Ok(())
 }
 
+/// 索引源请求的重定向上限。
+///
+/// GitHub Release 的 `latest/download/<file>` 需 2 次 302 才落到对象存储；
+/// 上限必须 ≥2，否则备用索引源必然因 "error following redirect" 不可用。
+/// 保留有限上限（而非 unlimited），避免恶意源造成无限重定向环。
+const MARKET_REDIRECT_LIMIT: usize = 5;
+
+/// 市场请求用的 HTTP client。
+///
+/// 重定向上限必须覆盖 GitHub Release `latest/download/<file>` 的两级 302：
+///   .../releases/latest/download/X → .../releases/download/<tag>/X
+///   → objects.githubusercontent.com/...
+/// 设成 1 会在第二次跳转时报 "error following redirect"，令备用索引源必然失败。
+/// 仍设上限（5），避免恶意索引源造成无限重定向环。
+fn http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(MARKET_REDIRECT_LIMIT))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("构造 HTTP 客户端失败：{e}"))
+}
+
 /// 受限的 HTTPS GET（仅 https、超时）
 async fn http_get(url: &str) -> Result<Vec<u8>, String> {
     if !url.starts_with("https://") {
         return Err(format!("拒绝非 https 地址：{url}"));
     }
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(1))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("构造 HTTP 客户端失败：{e}"))?;
+    let client = http_client()?;
     let resp = client
         .get(url)
         .send()
@@ -529,6 +547,56 @@ pub fn install_dir() -> Result<PathBuf, String> {
 }
 
 /// 该插件的签名文件路径（落盘后）
+/// 校验市场条目里的 `file_name` 是否安全
+///
+/// ## 为什么必须要它
+/// `file_name` 来自**远程索引**（`index.json`），属于外部数据。安装流程会
+/// `install_dir().join(&v.file_name)` 后落盘 —— 若索引被投毒（例如
+/// `"file_name": "../../../etc/cron.d/x.so"`），就能把文件写到插件目录之外，
+/// 属于典型的**路径穿越**。
+///
+/// 手动安装路径（`routes/plugins.rs`）一直有这层校验，市场路径此前漏了 ——
+/// 两条入口必须同一条纪律。
+///
+/// 规则（宁可严格）：
+/// - 非空、不含路径分隔符、不含 `..`
+/// - 必须以 `.so` 结尾（插件制品只可能是动态库）
+/// - 不含 NUL（会截断底层 C 接口）
+pub fn validate_file_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("制品文件名为空".to_string());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(format!("制品文件名不合法（含路径分隔符或 ..）：{name}"));
+    }
+    if name.contains('\0') {
+        return Err(format!("制品文件名含 NUL：{name}"));
+    }
+    if !name.ends_with(".so") {
+        return Err(format!("制品文件名必须以 .so 结尾：{name}"));
+    }
+    // 额外的保守检查：不允许绝对路径（万一在某些平台被解释为绝对路径）
+    if std::path::Path::new(name).is_absolute() {
+        return Err(format!("制品文件名不能是绝对路径：{name}"));
+    }
+    Ok(())
+}
+
+/// 下载并校验一个市场制品，返回 `(so 字节, sig 字节)`
+///
+/// 校验顺序是**先 sha256 再验签** —— 两者都过才算可信：
+/// sha256 防传输损坏/被替换，验签防「索引本身被篡改后指向攻击者的合法签名制品」。
+pub fn validate_artifact_meta(v: &CatalogVersion) -> Result<(), String> {
+    validate_file_name(&v.file_name)?;
+    if v.sha256_so.trim().is_empty() {
+        return Err(format!("索引缺少 {} 的 sha256", v.file_name));
+    }
+    if v.sig_url.trim().is_empty() {
+        return Err(format!("索引缺少 {} 的签名地址", v.file_name));
+    }
+    Ok(())
+}
+
 pub fn installed_sig_path(dir: &std::path::Path, file_name: &str) -> PathBuf {
     sig_path_of(&dir.join(file_name))
 }
@@ -536,6 +604,17 @@ pub fn installed_sig_path(dir: &std::path::Path, file_name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn market_redirect_limit_covers_github_release_chain() {
+        // GitHub Release `latest/download/X` 会经 2 次 302：
+        //   /releases/latest/download/X → /releases/download/<tag>/X → objects.githubusercontent.com
+        // 上限若回退到 1，备用索引源会必然报 "error following redirect"。
+        assert!(
+            MARKET_REDIRECT_LIMIT >= 2,
+            "重定向上限必须 ≥2 才能覆盖 GitHub Release 的两级跳转"
+        );
+    }
 
     #[test]
     fn version_compare_numeric() {
@@ -660,5 +739,68 @@ mod tests {
             yanked: false,
         };
         assert!(is_revoked(&cat, &v));
+    }
+}
+
+#[cfg(test)]
+mod file_name_tests {
+    use super::*;
+
+    /// **路径穿越防护**：索引里的 `file_name` 必须被严格校验
+    ///
+    /// 背景：安装流程 `install_dir().join(&v.file_name)` 直接落盘，
+    /// 而 `file_name` 来自**远程 index.json**（外部数据）。若索引被投毒，
+    /// 未校验就会把文件写到插件目录之外（如 `../../../etc/cron.d/`）。
+    #[test]
+    fn rejects_path_traversal_and_absolute_paths() {
+        // 经典穿越
+        assert!(validate_file_name("../../../etc/cron.d/evil.so").is_err());
+        assert!(validate_file_name("..\\..\\windows\\evil.so").is_err());
+        assert!(validate_file_name("a/../b.so").is_err());
+        // 子目录
+        assert!(validate_file_name("sub/evil.so").is_err());
+        // 绝对路径
+        assert!(validate_file_name("/tmp/evil.so").is_err());
+        // 空
+        assert!(validate_file_name("").is_err());
+        // 非 .so
+        assert!(validate_file_name("evil.sh").is_err());
+        assert!(validate_file_name("evil.so.jpg").is_err());
+    }
+
+    /// 正常的制品名要放行（不能把功能关死）
+    #[test]
+    fn accepts_normal_artifact_names() {
+        assert!(validate_file_name("libfn_kzwr_plugin_kzwr.so").is_ok());
+        assert!(validate_file_name("kzwr-0.5.2.so").is_ok());
+        assert!(validate_file_name("a_b-c.1.so").is_ok());
+    }
+
+    /// 元数据不完整也要拒绝（缺 sha256 / 签名地址就无法校验完整性）
+    #[test]
+    fn rejects_incomplete_metadata() {
+        let mut v = CatalogVersion {
+            version: "0.1.0".into(),
+            released_at: String::new(),
+            file_name: "x.so".into(),
+            url: "https://example.com/x.so".into(),
+            sig_url: String::new(),
+            sha256_so: String::new(),
+            sha256_sig: String::new(),
+            size_bytes: 0,
+            abi: 2,
+            arch: "x86_64".into(),
+            glibc_min: String::new(),
+            min_host_version: String::new(),
+            source_commit: String::new(),
+            yanked: false,
+        };
+        assert!(validate_artifact_meta(&v).is_err(), "缺 sha256 应拒绝");
+
+        v.sha256_so = "abc".into();
+        assert!(validate_artifact_meta(&v).is_err(), "缺 sig_url 应拒绝");
+
+        v.sig_url = "https://example.com/x.so.sig".into();
+        assert!(validate_artifact_meta(&v).is_ok(), "字段齐了应放行");
     }
 }

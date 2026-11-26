@@ -26,12 +26,24 @@
 
   /** 正在编辑的目标（null = 未编辑；id 为空 = 新建） */
   let editing = null;
-  let saving = false;
-  let testing = null; // 正在测试的目标 id
-  let formMsg = '';
-  let formOk = true;
+  // 用**集合**（同 PluginsPage.toggling）：单槽在并发下会互相覆盖。
+  let testing = new Set();
+  const setTesting = (id, on) => {
+    const next = new Set(testing);
+    if (on) next.add(id);
+    else next.delete(id);
+    testing = next;
+  };
   /** 并发度：正在保存的目标 id（与目标保存分开，互不影响） */
-  let parSaving = null;
+  // 与 testing 同理：单槽在并发下会互相覆盖（前一个 finally 清空后，
+  // 后一个还在请求中却已恢复可点）
+  let parSaving = new Set();
+  const setParSaving = (id, on) => {
+    const next = new Set(parSaving);
+    if (on) next.add(id);
+    else next.delete(id);
+    parSaving = next;
+  };
 
   /** 按目标类型（插件 id）查插件条目 */
   function pluginOf(kind) {
@@ -65,20 +77,33 @@
 
   /** 保存**该目标**的上传并发路数（并发度按目标配置，互不影响） */
   async function saveParallel(id, n) {
-    parSaving = id;
+    setParSaving(id, true);
+    // 失败也要重拉列表：输入框里是用户的**键入值**，而服务端并未改变。
+    // 不重拉的话界面显示 8，实际仍是「顺序」，用户下次进来才发现「变回去了」。
+    let needReload = false;
     try {
-      const v = Math.max(0, Math.min(8, Math.floor(Number(n) || 0)));
+      const raw = String(n ?? '').trim();
+      const num = Number(raw);
+      if (raw === '' || !Number.isFinite(num)) {
+        toast.error('请填写 0~8 之间的数字');
+        needReload = true;
+        return;
+      }
+      const v = Math.max(0, Math.min(8, Math.floor(num)));
       const r = await api.targetParallel(id, v);
       if (r && r.error) {
         toast.error(r.error);
+        needReload = true;
         return;
       }
       toast.success(v >= 2 ? `已启用并发回传（${v} 路），下次备份生效` : '已改为顺序上传，下次备份生效');
       if (onChanged) await onChanged();
     } catch (e) {
       toast.error(e.message);
+      needReload = true;
     } finally {
-      parSaving = null;
+      setParSaving(id, false);
+      if (needReload && onChanged) await onChanged();
     }
   }
 
@@ -144,7 +169,6 @@
       enabled: true,
       fields: {},
     };
-    formMsg = '';
   }
 
   /** 切换目标类型：地址等字段的语义随之改变，故重置为适合该插件的默认值 */
@@ -160,7 +184,6 @@
       // 自定义字段属于旧类型，一并清掉（弹窗会按新插件的 form 重新初始化）
       fields: {},
     };
-    formMsg = '';
   }
 
   function startEdit(t) {
@@ -168,24 +191,29 @@
       id: t.id,
       name: t.name || '',
       kind: t.kind || 'webdav',
+      // 用 `url`（用户填的原值，可能为空 = 用默认地址），而不是 effective_url：
+      // 若把生效地址塞回输入框，用户一保存就把「留空用默认」变成了「显式写死」，
+      // 以后官方改默认地址跟他无关了。effective_url 只用于提示文案。
       url: t.url || '',
+      effective_url: t.effective_url || '',
       username: t.username || '',
       password: '',
       enabled: t.enabled !== false,
       password_set: t.password_set,
+      // ⚠️ **代理开关必须带上**：此前漏了这一行，弹窗里 `editing.use_proxy`
+      // 恒为 undefined ⇒ 复选框永远显示未勾选，用户以为设置没保存。
+      use_proxy: t.use_proxy === true,
       // 插件自定义字段的**回显值**（敏感字段为布尔，非明文）
       fields: t.fields || {},
     };
-    formMsg = '';
   }
 
   function cancelEdit() {
     editing = null;
-    formMsg = '';
   }
 
   async function test(t) {
-    testing = t.id;
+    setTesting(t.id, true);
     try {
       const r = await api.testTarget(t.id);
       if (r.error) toast.error(r.error, `「${t.name || t.id}」连接失败`);
@@ -193,7 +221,7 @@
     } catch (e) {
       toast.error(e.message);
     } finally {
-      testing = null;
+      setTesting(t.id, false);
     }
   }
 
@@ -248,19 +276,28 @@
             {#if !t.enabled}<span class="badge badge-danger">已停用</span>{/if}
           </div>
           <div class="row-sub">
-            <code>{t.backend || t.url || '—'}</code>
+            <!-- 用 effective_url：url 留空时内置 WebDAV 会回退到默认地址，
+                 只显示空 url 会让用户以为没配置 -->
+            <code>{t.backend || t.effective_url || t.url || '—'}</code>
             {#if t.username}<span class="meta"><b>账号</b>{t.username}</span>{/if}
             <span class="meta"><b>被引用</b>{t.tasks || 0} 个任务</span>
-            {#if supportsPlan(t.kind)}
+            <!-- ⚠️ 传 `t`（目标对象）而不是 `t.kind`（字符串）：
+                 `supportsPlan`/`parallelOf` 内部读 `t.supports_plan` 与 `t.kind`，
+                 传字符串时 `'webdav'.kind` 是 undefined ⇒ 恒判不支持 ⇒
+                 这行摘要永远不显示（而下面的输入行一直传对了 `t`）。 -->
+            {#if supportsPlan(t)}
               <span class="meta">
-                <b>上传并发</b>{parallelOf(t.kind) >= 2 ? `${parallelOf(t.kind)} 路` : '顺序'}
+                <b>上传并发</b>{parallelOf(t) >= 2 ? `${parallelOf(t)} 路` : '顺序'}
               </span>
+            {/if}
+            {#if t.use_proxy}
+              <span class="meta meta-proxy"><b>网络</b>经代理</span>
             {/if}
           </div>
         </div>
         <div class="row-actions">
-          <button class="btn btn-sm" on:click={() => test(t)} disabled={busy || testing === t.id}>
-            {testing === t.id ? '测试中…' : '测试连接'}
+          <button class="btn btn-sm" on:click={() => test(t)} disabled={busy || testing.has(t.id)}>
+            {testing.has(t.id) ? '测试中…' : '测试连接'}
           </button>
           <button class="btn btn-sm" on:click={() => startEdit(t)} disabled={busy}>编辑</button>
           <button class="btn btn-sm btn-danger" on:click={() => remove(t)} disabled={busy}>删除</button>
@@ -280,7 +317,7 @@
             min="0"
             max="8"
             value={parallelOf(t)}
-            disabled={parSaving === t.id}
+            disabled={parSaving.has(t.id)}
             on:change={(e) => saveParallel(t.id, e.target.value)}
           />
         </div>

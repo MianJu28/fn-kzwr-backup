@@ -17,10 +17,10 @@ pub(super) async fn audit_clear(
     let passphrase = body
         .and_then(|Json(b)| Some(b.passphrase))
         .unwrap_or_default();
-    if passphrase.as_str() != state.passphrase.expose_secret().as_str() {
+    if !state.check_passphrase(&passphrase) {
         return Json(AuditClearResponse {
             cleared: 0,
-            error: Some("管理员口令错误".to_string()),
+            error: Some(crate::passphrase_err(&state)),
         });
     }
     let cleared = state.audit.clear();
@@ -80,14 +80,37 @@ pub(super) async fn setup_check(State(state): State<AppState>) -> Json<SetupChec
     });
 
     // 2) 目标配置 + 实连（多目标：逐个检查）
-    let (cfg, target_creds) = {
+    // 代理设置同样要在锁内取出（解密凭据需要 `mgr`），供下方实连探测使用
+    let (cfg, target_creds, proxy_plan) = {
         let mgr = state.config.lock().unwrap();
         let cfg = mgr.load().unwrap_or_default();
         let mut map = std::collections::HashMap::new();
+        let mut plans: std::collections::HashMap<String, (String, String, String)> =
+            std::collections::HashMap::new();
         for t in &cfg.targets {
             map.insert(t.id.clone(), mgr.target_credentials(t).unwrap_or((None, None)));
+            let url = t.url.clone().unwrap_or_default();
+            if let Some(pj) = cfg.proxy.resolve_for(&mgr, &url, t.use_proxy) {
+                let purl = pj.get("url").and_then(|x| x.as_str()).unwrap_or("");
+                if !purl.is_empty() {
+                    plans.insert(
+                        t.id.clone(),
+                        (
+                            purl.trim().to_string(),
+                            pj.get("username")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            pj.get("password")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        ),
+                    );
+                }
+            }
         }
-        (cfg, map)
+        (cfg, map, plans)
     };
     if cfg.targets.iter().all(|t| !t.enabled) {
         items.push(CheckItem {
@@ -112,14 +135,37 @@ pub(super) async fn setup_check(State(state): State<AppState>) -> Json<SetupChec
             let (user, pass) = target_creds.get(&t.id).cloned().unwrap_or((None, None));
             match (user, pass) {
                 (Some(u), Some(p)) => {
-                    let url = t
-                        .url
-                        .clone()
-                        .unwrap_or_else(|| crate::infra::target::webdav::DEFAULT_URL.to_string());
-                    match crate::infra::target::webdav::WebdavTarget::new(&url, &u, &p)
-                        .ping()
-                        .await
-                    {
+                    // url 留空（`Some("")`，而非 `None`）时必须回退到官方默认地址：
+                    // 内置 WebDAV 的 UI 不暴露地址，库里存的往往是空串。
+                    // 只判 `None` 会让 `WebdavTarget::new("")` 拼出无效 URL，
+                    // ping 报 `PROPFIND  失败: builder error`（注意双空格 = url 为空）。
+                    let url = crate::infra::target::webdav::effective_url(t.url.as_deref());
+                    // ⚠️ **必须挂上代理**，与正式装配路径保持一致。
+                    //
+                    // 旧实现只 `WebdavTarget::new(...)` 就 ping：完全忽略 `[proxy]` 设置
+                    // 与该目标的 `use_proxy` 开关。于是在「必须走代理才能访问云端」的
+                    // 网络里，体检必然报
+                    //   所有目标均不可用：… PROPFIND  失败: builder error
+                    // 而目标页显示「已就绪」、备份也能正常跑 —— 用户看到的是一个
+                    // **比实际更糟的假警报**，会把排查方向带偏。
+                    // 复用 `ProxySettings::resolve_for`，保证与插件装配同一套判定。
+                    let mut target = crate::infra::target::webdav::WebdavTarget::new(&url, &u, &p);
+                    if let Some((purl, pu, pp)) = proxy_plan.get(&t.id) {
+                        match reqwest::Proxy::all(purl.trim()) {
+                            Ok(mut px) => {
+                                if !pu.is_empty() {
+                                    px = px.basic_auth(pu, pp);
+                                }
+                                target = target.with_proxy(Some(px));
+                            }
+                            // 代理地址解析失败不阻断体检：退回直连并如实报告
+                            Err(e) => tracing::warn!(
+                                err = %e, url = %purl,
+                                "体检：代理地址无效，本次按直连探测"
+                            ),
+                        }
+                    }
+                    match target.ping().await {
                         Ok(_) => ok_list.push(format!("{label}（{url}）")),
                         Err(e) => fail_list.push(format!("{label}：{e:#}")),
                     }

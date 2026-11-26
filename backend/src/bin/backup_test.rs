@@ -120,6 +120,10 @@ async fn main() -> Result<()> {
         target_prefix: None,
         eventbus: None,
         retention: None,
+        sibling_jobs: Vec::new(),
+        strict: false,
+        staging_dir: None,
+        cancel: None,
     };
 
     // 1) 首次全量备份

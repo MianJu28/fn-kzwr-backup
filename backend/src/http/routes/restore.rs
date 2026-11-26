@@ -458,6 +458,53 @@ pub(super) async fn restore_run(
         Some(s) => (s.target.clone(), s.target_folder.clone()),
         None => (state.target.clone(), state.target_folder.clone()),
     };
+    // **运行互斥 + 取消标志初始化**（恢复此前完全没有互斥：
+    // 并发恢复会争抢同一份带宽与磁盘，且两个任务互相覆盖进度面板）。
+    {
+        use std::sync::atomic::Ordering;
+        if state
+            .backup_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Json(RestoreResponse {
+                restored: 0,
+                restored_bytes: 0,
+                error: Some("已有任务正在执行，请等它结束后再恢复".to_string()),
+                missing: Vec::new(),
+            });
+        }
+        *state.running_kind.write().unwrap() = Some(crate::eventbus::TaskKind::Restore);
+        // 清零上次的取消请求，否则新任务一开跑就会被立刻终止
+        state.cancel_requested.store(false, Ordering::SeqCst);
+    }
+    // RAII：无论成功/失败/取消都要释放运行标志
+    struct RunFlag<'a>(&'a AppState);
+    impl Drop for RunFlag<'_> {
+        fn drop(&mut self) {
+            // **兜底发布终态**：任何路径离开（正常完成 / 报错 / 取消 / 重试耗尽后
+            // 静默返回到达不了 Err 分支）都必须让事件总线离开 progress 态。
+            //
+            // 否则 `last_snapshot` 会永远返回 last 那一帧 `status=progress`：
+            // 前端的「实时任务」卡片就永久停在「进行中」，即使后端 `busy` 已是 false
+            // （实测复现：恢复卡在 9/12 后既不完成也不报错，面板一直转圈）。
+            // 兜底：离开作用域时若最后一帧仍是「进行中」，补发终态事件。
+            // 覆盖正常完成 / 报错 / 取消 / 重试耗尽静默返回之外的**所有遗漏路径**。
+            self.0.eventbus.finalize_if_unfinished(
+                crate::eventbus::TaskKind::Restore,
+                "任务异常结束（未收到终态事件，请查看运行日志）",
+            );
+            *self.0.running_kind.write().unwrap() = None;
+            self.0
+                .cancel_requested
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.0
+                .backup_running
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _flag = RunFlag(&state);
+
     let job = RestoreJob {
         target: restore_target,
         crypto: state.crypto.get(),
@@ -466,6 +513,10 @@ pub(super) async fn restore_run(
         eventbus: Some(state.eventbus.clone()),
         meta,
         snapshot_target,
+        // 大文件恢复时密文落盘点（不进内存，见 `restore_one`）
+        staging_dir: Some(state.backup_tmp.clone()),
+        // 取消标志：用户点「取消」时在文件边界停下
+        cancel: Some(state.cancel_requested.clone()),
     };
     match job.run(&files, std::path::Path::new(&restore_root)).await {
         Ok(summary) => {

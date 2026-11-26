@@ -2,7 +2,7 @@
   ".url": {
     "fn-kzwr-backup.Application": {
       "title": "酷族备份",
-      "icon": "images/ICON_256.PNG",
+      "icon": "images/ICON_{0}.PNG",
       "type": "iframe",
       "protocol": "",
       "gatewayPrefix": "/app/fn-kzwr-backup",
